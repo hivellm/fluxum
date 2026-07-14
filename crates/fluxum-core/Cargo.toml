@@ -8,22 +8,27 @@ repository.workspace = true
 
 [dependencies]
 arc-swap.workspace = true
+crc32c.workspace = true
 fluxum-protocol.workspace = true
 hmac.workspace = true
 inventory.workspace = true
 jsonwebtoken.workspace = true
+rmp-serde.workspace = true
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 
 [lints]
 workspace = true

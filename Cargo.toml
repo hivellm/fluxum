@@ -12,6 +12,7 @@ repository = "https://github.com/hivellm/fluxum"
 # Kept minimal for T0.1; external deps land here as phases need them.
 [workspace.dependencies]
 arc-swap = "1"
+crc32c = "0.6"
 criterion = "0.5"
 fluxum-core = { path = "crates/fluxum-core", version = "0.1.0" }
 fluxum-macros = { path = "crates/fluxum-macros", version = "0.1.0" }
@@ -33,6 +34,7 @@ syn = { version = "2", features = ["full"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = "3"
 thiserror = "2"
+tokio = { version = "1", default-features = false }
 tracing = "0.1"
 trybuild = "1"
 

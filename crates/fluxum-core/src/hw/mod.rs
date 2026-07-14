@@ -159,8 +159,10 @@ pub struct EffectiveConfig {
     pub commit_log_write_buffer_bytes: Derived<u64>,
     /// Checkpoint cadence (`storage.checkpoint_interval_tx`).
     pub checkpoint_interval_tx: Derived<u64>,
-    /// SIMD tier selection mode (`simd`; per-kernel selection lands with T2.10).
+    /// SIMD tier selection mode (`simd`, HWA-032).
     pub simd: Derived<SimdMode>,
+    /// Per-kernel SIMD selection resolved for this CPU (HWA-033, T2.10).
+    pub simd_kernels: Derived<crate::simd::Selection>,
 }
 
 impl EffectiveConfig {
@@ -221,7 +223,8 @@ where
 
 /// Pure derivation of every adaptive default (HWA-011): a function of one
 /// immutable [`HardwareProfile`] and the loaded [`Config`], unit-testable
-/// with synthetic profiles. Fails only on an HWA-015 memory shortfall.
+/// with synthetic profiles. Fails only on an HWA-015 memory shortfall or a
+/// forced SIMD tier the running CPU does not support (HWA-032).
 pub fn derive(hardware: &HardwareProfile, config: &Config) -> Result<EffectiveConfig> {
     let cores = hardware.effective_cores();
     let memory = hardware.effective_memory_bytes();
@@ -284,6 +287,16 @@ pub fn derive(hardware: &HardwareProfile, config: &Config) -> Result<EffectiveCo
         }
     }
 
+    // SIMD dispatch resolution (SPEC-016 §5): builds the dispatch table for
+    // the real CPU (detection + selection + HWA-055 self-check) so the boot
+    // event reports the per-kernel tiers actually in use (HWA-033). A forced
+    // tier the CPU does not support is a boot-abort error (HWA-032).
+    let simd = Derived::new(config.simd, pinned(config, "simd"));
+    let simd_kernels = Derived::new(
+        crate::simd::Dispatch::new(config.simd)?.selection(),
+        simd.source,
+    );
+
     Ok(EffectiveConfig {
         hardware: hardware.clone(),
         worker_threads,
@@ -298,7 +311,8 @@ pub fn derive(hardware: &HardwareProfile, config: &Config) -> Result<EffectiveCo
             config.storage.checkpoint_interval_tx,
             pinned(config, "storage.checkpoint_interval_tx"),
         ),
-        simd: Derived::new(config.simd, pinned(config, "simd")),
+        simd,
+        simd_kernels,
     })
 }
 

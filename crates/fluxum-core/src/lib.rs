@@ -15,11 +15,15 @@
 //!   trait, and the link-time registry behind `#[fluxum::table]` (SPEC-001)
 //! - [`store`] — [`store::MemStore`]: MVCC committed/tx state, lock-free
 //!   snapshot reads, single-writer commit/rollback (SPEC-002 §2, T2.1)
+//! - [`commitlog`] — [`commitlog::CommitLog`]: append-only durability log
+//!   with group-commit flush actor, rotation, replay, and non-destructive
+//!   torn-tail quarantine (SPEC-002 §3/§5, T2.2)
 //! - [`index`] — [`index::BTreeIndex`]: secondary B-tree indexes over
 //!   memcomparable keys, maintained inside the commit merge (SPEC-001 §5,
 //!   T2.4)
 
 pub mod auth;
+pub mod commitlog;
 pub mod config;
 pub mod error;
 pub mod hw;
