@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use arc_swap::ArcSwap;
 
 use crate::error::{FluxumError, Result};
-use crate::index::{BTreeIndex, IndexId};
-use crate::schema::{IndexSchema, Schema, TableSchema};
+use crate::index::{BTreeIndex, IndexId, Rect, SpatialIndexState};
+use crate::schema::{IndexSchema, Schema, SpatialKind, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
 use crate::store::row::{
@@ -25,12 +25,26 @@ pub struct StoreOptions {
     /// advances per durable allocation (`auto_inc_allocation_step`,
     /// default 4096). Must be ≥ 1.
     pub auto_inc_allocation_step: u64,
+    /// SPX-003 QuadTree leaf bucket size (max entries per leaf before it
+    /// splits), default 8. Must be ≥ 1. Any value produces identical query
+    /// results — this only tunes tree height vs in-bucket scan.
+    pub spatial_bucket_size: usize,
+    /// SPX-004 root bounds for this shard's spatial indexes: the shard's
+    /// assigned region under geospatial partitioning (SPEC-007), or the
+    /// table's configured coordinate range otherwise. Width and height must
+    /// be finite and > 0. Rows outside the bounds are still indexed
+    /// correctly (overflow bucket) — the bounds only size the tree.
+    pub spatial_bounds: Rect,
 }
 
 impl Default for StoreOptions {
     fn default() -> Self {
         Self {
             auto_inc_allocation_step: 4096,
+            spatial_bucket_size: 8,
+            // ±2^20 covers typical projected-coordinate workloads; out-of-
+            // bounds rows stay correct via the overflow bucket (SPX-004).
+            spatial_bounds: Rect::new(-1_048_576.0, -1_048_576.0, 2_097_152.0, 2_097_152.0),
         }
     }
 }
@@ -128,6 +142,22 @@ impl MemStore {
                 "auto_inc_allocation_step must be >= 1 (STG-040)".into(),
             ));
         }
+        if options.spatial_bucket_size == 0 {
+            return Err(FluxumError::Storage(
+                "spatial_bucket_size must be >= 1 (SPX-003)".into(),
+            ));
+        }
+        let b = options.spatial_bounds;
+        if !(b.x.is_finite() && b.y.is_finite() && b.w.is_finite() && b.h.is_finite())
+            || b.w <= 0.0
+            || b.h <= 0.0
+        {
+            return Err(FluxumError::Storage(format!(
+                "spatial_bounds must be finite with positive extents, got \
+                 ({}, {}, {}, {}) (SPX-004)",
+                b.x, b.y, b.w, b.h
+            )));
+        }
         let mut catalog: HashMap<TableId, &'static TableSchema> = HashMap::new();
         let mut tables: HashMap<TableId, Arc<TableState>> = HashMap::new();
         let mut counters: HashMap<TableId, AutoIncCounter> = HashMap::new();
@@ -146,6 +176,7 @@ impl MemStore {
                     schema: table,
                     rows: BTreeMap::new(),
                     indexes: build_btree_indexes(table)?,
+                    spatial: build_spatial_index(table, &options)?,
                     auto_inc_high_water: 0,
                 }),
             );
@@ -375,6 +406,25 @@ impl Tx<'_> {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
     }
 
+    /// Spatial region query over the committed snapshot captured at `begin`
+    /// (STG-004: pending writes are never visible). See
+    /// [`super::Snapshot::spatial_region`].
+    pub fn spatial_region(&self, table: TableId, region: Rect) -> Result<Vec<Row>> {
+        self.base.table(table)?.spatial_region(region)
+    }
+
+    /// Spatial radius query over the committed snapshot captured at `begin`.
+    /// See [`super::Snapshot::spatial_radius`].
+    pub fn spatial_radius(&self, table: TableId, x: f64, y: f64, r: f64) -> Result<Vec<Row>> {
+        self.base.table(table)?.spatial_radius(x, y, r)
+    }
+
+    /// Spatial point query over the committed snapshot captured at `begin`.
+    /// See [`super::Snapshot::spatial_point`].
+    pub fn spatial_point(&self, table: TableId, x: f64, y: f64) -> Result<Vec<Row>> {
+        self.base.table(table)?.spatial_point(x, y)
+    }
+
     /// Commit: merge `TxState` into a new `CommittedState` and swap it in
     /// atomically (STG-005). Constraints were enforced eagerly at write
     /// time, so the merge itself is infallible under the single-writer
@@ -412,6 +462,9 @@ impl Tx<'_> {
                         for index in table.indexes.values_mut() {
                             index.insert(&row, pk.clone())?;
                         }
+                        if let Some(spatial) = &mut table.spatial {
+                            spatial.insert_row(&row, pk.clone())?;
+                        }
                         table.rows.insert(pk, row.clone());
                         diff.inserts.push(row);
                     }
@@ -419,6 +472,9 @@ impl Tx<'_> {
                         let old = table.rows.remove(&pk).ok_or_else(invariant_missing_row)?;
                         for index in table.indexes.values_mut() {
                             index.remove(&old, &pk)?;
+                        }
+                        if let Some(spatial) = &mut table.spatial {
+                            spatial.remove_row(&old, &pk)?;
                         }
                         diff.deletes.push((pk, old));
                     }
@@ -430,6 +486,13 @@ impl Tx<'_> {
                         for index in table.indexes.values_mut() {
                             index.remove(&old, &pk)?;
                             index.insert(&row, pk.clone())?;
+                        }
+                        if let Some(spatial) = &mut table.spatial {
+                            // SPX-032: old coordinates out, new coordinates
+                            // in — atomic with the row swap on this private
+                            // pre-swap copy, so no stale entry can publish.
+                            spatial.remove_row(&old, &pk)?;
+                            spatial.insert_row(&row, pk.clone())?;
                         }
                         diff.deletes.push((pk, old));
                         diff.inserts.push(row);
@@ -536,9 +599,48 @@ fn invariant_missing_row() -> FluxumError {
     )
 }
 
+/// The empty spatial index of `table`, if it declares one (SPEC-008).
+///
+/// At most one `#[spatial(...)]` declaration per table: SPEC-008 models "the
+/// table's spatial index" (SPX-020/021 route by table alone), so a second
+/// declaration is rejected here. The R-tree variant lands with T2.6.
+fn build_spatial_index(
+    table: &'static TableSchema,
+    options: &StoreOptions,
+) -> Result<Option<SpatialIndexState>> {
+    let mut spatial = None;
+    for index in table.indexes {
+        let IndexSchema::Spatial { kind, columns } = index else {
+            continue;
+        };
+        if spatial.is_some() {
+            return Err(FluxumError::Schema(format!(
+                "table `{}`: multiple #[spatial(...)] declarations; a table has at most one \
+                 spatial index (SPEC-008)",
+                table.name
+            )));
+        }
+        spatial = Some(match kind {
+            SpatialKind::QuadTree => SpatialIndexState::quadtree(
+                columns,
+                options.spatial_bounds,
+                options.spatial_bucket_size,
+            ),
+            SpatialKind::RTree => {
+                return Err(FluxumError::Schema(format!(
+                    "table `{}`: R-tree spatial indexes land with T2.6 (SPEC-008 SPX-010); \
+                     declare #[spatial(quadtree(x, y))] for point data",
+                    table.name
+                )));
+            }
+        });
+    }
+    Ok(spatial)
+}
+
 /// Empty secondary B-tree indexes for `table`, keyed by stable [`IndexId`]
 /// (STG-051), one per `#[index(btree(...))]` declaration. Spatial
-/// declarations are SPEC-008 (T2.5) surface and are skipped here.
+/// declarations are handled by [`build_spatial_index`].
 fn build_btree_indexes(table: &'static TableSchema) -> Result<BTreeMap<IndexId, BTreeIndex>> {
     let mut indexes = BTreeMap::new();
     for index in table.indexes {

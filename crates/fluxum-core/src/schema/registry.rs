@@ -53,6 +53,11 @@ impl Schema {
         let mut map: BTreeMap<&'static str, &'static TableSchema> = BTreeMap::new();
         for table in tables {
             validate_table(table)?;
+            if let Some(advisory) = spatial_stream_advisory(table) {
+                // SPX-040: advisory, never a rejection — bounded-rate
+                // location tracking is a fully supported workload.
+                tracing::warn!(target: "fluxum::schema", "{advisory}");
+            }
             if map.insert(table.name, table).is_some() {
                 return Err(FluxumError::Schema(format!(
                     "duplicate table name `{}`: every #[fluxum::table] struct must have a \
@@ -83,6 +88,35 @@ impl Schema {
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
     }
+}
+
+/// The SPX-040 event-stream advisory for a `#[spatial]` table, if its name
+/// matches a common event-stream pattern (`*Log`, `*Stream`, `*Tick`,
+/// `*Trace`, `*History`).
+///
+/// Non-fatal by design: spatial indexes serve persistent geospatial state
+/// updated at a bounded cadence; an unbounded high-frequency position stream
+/// pays O(log n) index maintenance per append and should be downsampled or
+/// aggregated before persisting. Emitted as a `tracing` warning during
+/// schema assembly; exposed so tooling and tests can evaluate it directly.
+pub fn spatial_stream_advisory(table: &TableSchema) -> Option<String> {
+    let has_spatial = table
+        .indexes
+        .iter()
+        .any(|index| matches!(index, IndexSchema::Spatial { .. }));
+    if !has_spatial {
+        return None;
+    }
+    const STREAM_SUFFIXES: &[&str] = &["log", "stream", "tick", "trace", "history"];
+    let name = table.name.to_ascii_lowercase();
+    let suffix = STREAM_SUFFIXES.iter().find(|s| name.ends_with(*s))?;
+    Some(format!(
+        "table `{}`: #[spatial] on a `*{suffix}`-named table — spatial indexes are for \
+         persistent geospatial state with a bounded update cadence, not for unbounded \
+         high-frequency position streams; downsample or aggregate the stream before \
+         persisting (SPX-040, advisory only)",
+        table.name
+    ))
 }
 
 /// Validate one table against the DM-040 startup checks.

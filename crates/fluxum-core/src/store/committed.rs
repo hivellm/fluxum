@@ -6,8 +6,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
-use crate::index::IndexId;
 use crate::index::btree::{self, BTreeIndex};
+use crate::index::{IndexId, Rect, SpatialIndexState};
 use crate::schema::TableSchema;
 use crate::store::TableId;
 use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
@@ -15,10 +15,10 @@ use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
 /// One table's committed contents (STG-002).
 ///
 /// `rows` is the logical primary map (BTreeMap for O(log n) point lookup and
-/// deterministic iteration); `indexes` the secondary B-tree indexes (T2.4),
-/// maintained together with `rows` inside the commit merge so a published
-/// snapshot's rows and indexes are always mutually consistent. Spatial index
-/// structures join this struct with SPEC-008.
+/// deterministic iteration); `indexes` the secondary B-tree indexes (T2.4)
+/// and `spatial` the SPEC-008 spatial index (T2.5), all maintained together
+/// with `rows` inside the commit merge so a published snapshot's rows and
+/// indexes are always mutually consistent.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
@@ -28,6 +28,8 @@ pub struct TableState {
     /// Secondary B-tree indexes by stable id (STG-051), one per
     /// `#[index(btree(...))]` declaration (DM-030/DM-031).
     pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
+    /// The `#[spatial(...)]` index, if declared (SPEC-008, SPX-030).
+    pub(crate) spatial: Option<SpatialIndexState>,
     /// Durable auto-inc high-water mark (STG-040): every value ≤ this has
     /// been covered by a batch allocation that a committed [`super::TxDiff`]
     /// carried (T2.2 persists it through the commit log).
@@ -154,6 +156,46 @@ impl TableState {
         })
     }
 
+    /// The table's spatial index, or the SPX-022 error when none is
+    /// declared.
+    pub(crate) fn spatial(&self) -> Result<&SpatialIndexState> {
+        self.spatial.as_ref().ok_or_else(|| {
+            FluxumError::Storage(format!("table '{}' has no spatial index", self.schema.name))
+        })
+    }
+
+    /// Resolve index-returned PKs to rows (spatial indexes and the row map
+    /// of one snapshot are mutually consistent, so every PK resolves).
+    fn rows_of(&self, pks: Vec<PkBytes>) -> Vec<Row> {
+        pks.iter()
+            .filter_map(|pk| {
+                let row = self.rows.get(pk);
+                debug_assert!(
+                    row.is_some(),
+                    "spatial index points at a pk absent from the row map"
+                );
+                row.cloned()
+            })
+            .collect()
+    }
+
+    /// Rows inside `region` via the spatial index (SPX-020). Never a scan.
+    pub(crate) fn spatial_region(&self, region: Rect) -> Result<Vec<Row>> {
+        Ok(self.rows_of(self.spatial()?.query_region(region)))
+    }
+
+    /// Rows within Euclidean distance `r` of `(x, y)` via the spatial index
+    /// (SPX-021): bbox prefilter + exact circle filter, distance exactly `r`
+    /// included.
+    pub(crate) fn spatial_radius(&self, x: f64, y: f64, r: f64) -> Result<Vec<Row>> {
+        Ok(self.rows_of(self.spatial()?.query_radius(x, y, r)))
+    }
+
+    /// Rows at exactly `(x, y)` (IEEE `==`) via the spatial index.
+    pub(crate) fn spatial_point(&self, x: f64, y: f64) -> Result<Vec<Row>> {
+        Ok(self.rows_of(self.spatial()?.query_point(x, y)))
+    }
+
     /// STG-007 rule 2 check: every secondary index equals (bit-identically)
     /// a freshly built index over this table's committed rows.
     pub(crate) fn verify_index_integrity(&self, table_id: TableId) -> Result<()> {
@@ -166,6 +208,19 @@ impl TableState {
                 return Err(FluxumError::Storage(format!(
                     "index {index_id} on table `{}` ({table_id}) diverged from a fresh \
                      rebuild over CommittedState (STG-007)",
+                    self.schema.name
+                )));
+            }
+        }
+        if let Some(spatial) = &self.spatial {
+            let mut rebuilt = spatial.fresh_like();
+            for (pk, row) in &self.rows {
+                rebuilt.insert_row(row, pk.clone())?;
+            }
+            if rebuilt != *spatial {
+                return Err(FluxumError::Storage(format!(
+                    "spatial index on table `{}` ({table_id}) diverged from a fresh rebuild \
+                     over CommittedState (STG-007, SPX-030)",
                     self.schema.name
                 )));
             }
@@ -255,6 +310,26 @@ impl Snapshot {
         key: &[RowValue],
     ) -> Result<impl Iterator<Item = &Row>> {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// Rows of `table` inside `region` (bounds inclusive, SPX-020),
+    /// resolved via the spatial index — never a table scan (SPX-023).
+    /// Errors when the table declares no `#[spatial(...)]` index (SPX-022).
+    pub fn spatial_region(&self, table: TableId, region: Rect) -> Result<Vec<Row>> {
+        self.state.table(table)?.spatial_region(region)
+    }
+
+    /// Rows of `table` within Euclidean distance `r` of `(x, y)` — bbox
+    /// prefilter + exact circle filter, distance exactly `r` included
+    /// (SPX-021). Errors when the table has no spatial index (SPX-022).
+    pub fn spatial_radius(&self, table: TableId, x: f64, y: f64, r: f64) -> Result<Vec<Row>> {
+        self.state.table(table)?.spatial_radius(x, y, r)
+    }
+
+    /// Rows of `table` at exactly `(x, y)` (IEEE `==`) via the spatial
+    /// index. Errors when the table has no spatial index (SPX-022).
+    pub fn spatial_point(&self, table: TableId, x: f64, y: f64) -> Result<Vec<Row>> {
+        self.state.table(table)?.spatial_point(x, y)
     }
 
     /// Verify STG-007 rule 2 for `table`: every secondary index is

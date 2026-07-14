@@ -17,7 +17,7 @@
 
 pub mod registry;
 
-pub use registry::{Schema, TableDef};
+pub use registry::{Schema, TableDef, spatial_stream_advisory};
 
 // Re-export so macro-generated code can register via
 // `::fluxum_core::schema::inventory::submit!` without the user crate

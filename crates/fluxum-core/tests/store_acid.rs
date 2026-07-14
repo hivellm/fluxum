@@ -77,6 +77,7 @@ fn store_with_step(step: u64) -> MemStore {
         &schema,
         StoreOptions {
             auto_inc_allocation_step: step,
+            ..StoreOptions::default()
         },
     )
     .expect("store builds")

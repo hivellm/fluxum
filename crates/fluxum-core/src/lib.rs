@@ -20,7 +20,8 @@
 //!   torn-tail quarantine (SPEC-002 §3/§5, T2.2)
 //! - [`index`] — [`index::BTreeIndex`]: secondary B-tree indexes over
 //!   memcomparable keys, maintained inside the commit merge (SPEC-001 §5,
-//!   T2.4)
+//!   T2.4); [`index::QuadTree`]: the SPEC-008 spatial point index behind
+//!   `#[spatial(quadtree(x, y))]` (T2.5)
 //! - [`simd`] — runtime-dispatched SIMD kernels with scalar oracles
 //!   ([`simd::Dispatch`], SPEC-016 §5–§8, T2.10)
 
