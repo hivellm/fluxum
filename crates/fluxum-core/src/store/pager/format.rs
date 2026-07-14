@@ -23,9 +23,11 @@
 //!
 //! `flags` bit assignments:
 //!
-//! - bits 0–1: compression codec — `0` none, `1` LZ4, `2` zstd, `3` reserved.
-//!   T2.8 writes codec `0` only; the LZ4/zstd write paths land with T2.9.
-//!   Pages are self-describing, so mixed-codec files read correctly.
+//! - bits 0–1: compression codec — `0` none, `1` LZ4, `2` zstd, `3` reserved
+//!   (rejected on read). A non-zero codec stores the payload as
+//!   `raw_len: u32 LE` + codec block — see [`super::codec`] for the full
+//!   stored-payload layout (TIER-040). Pages are self-describing, so
+//!   mixed-codec files read correctly (TIER-041).
 //! - bit 2: index page — interior/leaf B-tree node rather than a data leaf.
 //! - bit 3: overflow page (TIER-026).
 //! - bits 8–11: page-format version, currently `1`.
@@ -233,13 +235,33 @@ pub fn decode_page(
             header.version()
         )));
     }
-    if header.codec() != 0 {
+    if header.codec() == 0b11 {
         return Err(FluxumError::Storage(format!(
-            "page {page_id} of table {table_id:#010x} uses compression codec {} — \
-             page compression decode lands with T2.9 (TIER-040)",
-            header.codec()
+            "page {page_id} of table {table_id:#010x} carries reserved compression \
+             codec bits 3 (TIER-021)"
         )));
     }
+    Ok((header, &image[PAGE_HEADER_LEN..]))
+}
+
+/// Header fields and payload of a **trusted** page image (one produced by
+/// [`encode_page`] and held in a pool frame) — no CRC verification, no
+/// coordinate checks. Cold-tier reads must go through [`decode_page`].
+pub(crate) fn trusted_header(image: &[u8]) -> Result<(PageHeader, &[u8])> {
+    if image.len() < PAGE_HEADER_LEN {
+        return Err(FluxumError::Storage(format!(
+            "trusted page image of {} bytes is shorter than the {PAGE_HEADER_LEN}-byte header",
+            image.len()
+        )));
+    }
+    let header = PageHeader {
+        page_id: u64::from_le_bytes([
+            image[4], image[5], image[6], image[7], image[8], image[9], image[10], image[11],
+        ]),
+        table_id: u32::from_le_bytes([image[12], image[13], image[14], image[15]]),
+        row_count: u32::from_le_bytes([image[16], image[17], image[18], image[19]]),
+        flags: u16::from_le_bytes([image[20], image[21]]),
+    };
     Ok((header, &image[PAGE_HEADER_LEN..]))
 }
 
@@ -374,14 +396,39 @@ mod tests {
     }
 
     #[test]
-    fn compressed_codec_bits_are_rejected_until_t2_9() {
-        let header = PageHeader::new(4, 5, 0, 0b01); // codec = LZ4
+    fn reserved_codec_bits_3_are_rejected() {
+        let header = PageHeader::new(4, 5, 0, 0b11); // reserved codec value
         let image = encode_page(&header, b"z").unwrap_or_else(|e| panic!("{e}"));
         let err = match decode_page(&image, 0, 5, 4) {
-            Ok(_) => panic!("compressed page served without a decoder"),
+            Ok(_) => panic!("reserved-codec page served"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("T2.9"), "{err}");
+        assert!(err.to_string().contains("reserved compression"), "{err}");
+    }
+
+    #[test]
+    fn known_codec_bits_decode_as_self_describing() {
+        // Codec bits 1 (LZ4) and 2 (zstd) are valid version-1 flags; the
+        // payload comes back stored-form for [`super::super::codec`] to
+        // decompress (TIER-041 mixed-codec files).
+        for codec in [0b01u16, 0b10u16] {
+            let header = PageHeader::new(4, 5, 0, codec);
+            let image = encode_page(&header, b"stored-form").unwrap_or_else(|e| panic!("{e}"));
+            let (decoded, payload) = decode_page(&image, 0, 5, 4).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(decoded.codec(), codec);
+            assert_eq!(payload, b"stored-form");
+        }
+    }
+
+    #[test]
+    fn trusted_header_matches_decode_page() {
+        let header = PageHeader::new(11, 22, 33, FLAG_INDEX);
+        let image = encode_page(&header, b"abc").unwrap_or_else(|e| panic!("{e}"));
+        let (trusted, payload) = trusted_header(&image).unwrap_or_else(|e| panic!("{e}"));
+        let (decoded, _) = decode_page(&image, 0, 22, 11).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(trusted, decoded);
+        assert_eq!(payload, b"abc");
+        assert!(trusted_header(&image[..10]).is_err());
     }
 
     #[test]

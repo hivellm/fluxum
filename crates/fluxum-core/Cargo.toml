@@ -13,6 +13,7 @@ fluxum-protocol.workspace = true
 hmac.workspace = true
 inventory.workspace = true
 jsonwebtoken.workspace = true
+lz4.workspace = true
 rmp-serde.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
@@ -23,6 +24,7 @@ sysinfo.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
 crc.workspace = true
@@ -45,4 +47,8 @@ harness = false
 
 [[bench]]
 name = "simd_kernels"
+harness = false
+
+[[bench]]
+name = "compression"
 harness = false

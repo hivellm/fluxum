@@ -15,6 +15,14 @@
 //! Creation is two-phase crash-safe: every object is written durably
 //! (temp + fsync + rename) before the fsynced manifest lands as the commit
 //! record.
+//!
+//! Manifests and objects are zstd-compressed on disk (SPEC-015 TIER-042,
+//! T2.9; level = `storage.checkpoint_compression_level`, default 3) via the
+//! shared artifact codec ([`crate::store::pager::codec`], reused by the
+//! T7.3 backup archives). Object identity is the hash of the **stored**
+//! (compressed) bytes, so on-disk hash verification needs no decompression;
+//! artifacts are self-describing through the zstd frame magic, and raw
+//! artifacts written before compression landed keep reading correctly.
 
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
@@ -27,6 +35,9 @@ use crate::commitlog::segment::sync_dir;
 use crate::error::{FluxumError, Result};
 use crate::store::committed::Snapshot;
 use crate::store::crc32;
+use crate::store::pager::codec::{
+    DEFAULT_ARTIFACT_ZSTD_LEVEL, compress_artifact, decompress_artifact,
+};
 use crate::store::row::Row;
 use crate::types::Timestamp;
 
@@ -104,21 +115,35 @@ pub struct LoadedTable {
 pub struct CheckpointRepo {
     dir: PathBuf,
     objects: PathBuf,
+    /// zstd level for manifests and objects (TIER-042).
+    zstd_level: i32,
     /// Replica-transfer pins (STG-023): checkpoints being transferred are
     /// never pruned until the transfer completes.
     pins: Mutex<HashSet<u64>>,
 }
 
 impl CheckpointRepo {
-    /// Open (or create) the repository in `dir` (`snapshot_dir`, STG-020).
+    /// Open (or create) the repository in `dir` (`snapshot_dir`, STG-020)
+    /// at the default artifact compression level (TIER-042).
     pub fn open(dir: &Path) -> Result<Self> {
         let objects = dir.join("objects");
         fs::create_dir_all(&objects)?;
         Ok(Self {
             dir: dir.to_path_buf(),
             objects,
+            zstd_level: DEFAULT_ARTIFACT_ZSTD_LEVEL,
             pins: Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Set the zstd level for newly written artifacts
+    /// (`storage.checkpoint_compression_level`, TIER-042). Reading is
+    /// level-agnostic; changing the level never invalidates existing
+    /// checkpoints (unchanged chunks written at another level simply hash
+    /// as new objects).
+    pub fn with_compression_level(mut self, level: i32) -> Self {
+        self.zstd_level = level;
+        self
     }
 
     /// The repository directory.
@@ -206,21 +231,23 @@ impl CheckpointRepo {
             timestamp: Timestamp::now().as_micros(),
             tables,
         };
-        let bytes = encode_manifest(&manifest)?;
+        let bytes = compress_artifact(&encode_manifest(&manifest)?, self.zstd_level)?;
         write_durable(&stats.manifest, &bytes)?;
         sync_dir(&self.dir)?;
         Ok(stats)
     }
 
-    /// Encode and durably store one row chunk, sharing it by content hash
-    /// when an identical object already exists (STG-021).
+    /// Encode, zstd-compress (TIER-042), and durably store one row chunk,
+    /// sharing it by content hash when an identical object already exists
+    /// (STG-021; the hash covers the stored/compressed bytes).
     fn write_chunk(
         &self,
         rows: &mut Vec<Vec<LogValue>>,
         stats: &mut CheckpointStats,
     ) -> Result<serde_bytes::ByteBuf> {
-        let bytes = rmp_serde::to_vec(rows)
+        let encoded = rmp_serde::to_vec(rows)
             .map_err(|e| FluxumError::Storage(format!("checkpoint chunk encoding failed: {e}")))?;
+        let bytes = compress_artifact(&encoded, self.zstd_level)?;
         rows.clear();
         let hash = ObjectHash::of(&bytes);
         let path = self.objects.join(hash.to_string());
@@ -279,6 +306,10 @@ impl CheckpointRepo {
                         "checkpoint object {hash}: content hash mismatch"
                     )));
                 }
+                // Hash verified over the stored bytes; decompress after
+                // (raw pre-compression objects pass through, TIER-042).
+                let bytes = decompress_artifact(&bytes)
+                    .map_err(|e| FluxumError::Storage(format!("checkpoint object {hash}: {e}")))?;
                 let chunk: Vec<Vec<LogValue>> = rmp_serde::from_slice(&bytes).map_err(|e| {
                     FluxumError::Storage(format!("checkpoint object {hash}: decode failed: {e}"))
                 })?;

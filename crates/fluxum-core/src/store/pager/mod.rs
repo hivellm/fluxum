@@ -28,10 +28,21 @@
 //! [`crate::store::MemStore`] and the [`crate::commitlog::CommitLog`];
 //! recovery is checkpoint root + log replay (TIER-061, T2.3). Accordingly
 //! the live page directory (`page_id → extent`) is in-memory here and is
-//! persisted by the T2.3 checkpoint manifest; page compression (TIER-040+)
-//! is T2.9 — pages are self-describing via header codec bits, and this tier
-//! writes codec `0`.
+//! persisted by the T2.3 checkpoint manifest.
+//!
+//! # Compression (TIER-040..044, T2.9)
+//!
+//! Cold pages are compressed on the spill path — LZ4 by default, zstd or
+//! none per `storage.page_compression` — subject to the
+//! `storage.compression_min_bytes` threshold and the 12.5% saving gate; the
+//! codec actually used is recorded per page in the header flag bits, so
+//! every page is self-describing and mixed-codec files read correctly.
+//! Decompression happens exactly once, on fault-in after CRC verification;
+//! pool frames always hold uncompressed images. See [`codec`] for the
+//! stored-payload layout (freeze surface) and the zstd artifact codec that
+//! checkpoints/backups share (TIER-042).
 
+pub mod codec;
 pub mod format;
 pub mod metrics;
 pub mod pagefile;
@@ -40,6 +51,7 @@ pub mod tree;
 
 mod cold;
 
+pub use codec::PageCodec;
 pub use cold::ColdTable;
 pub use metrics::{MetricsSnapshot, PagerMetrics};
 pub use pool::{BufferPool, PageGuard, PoolOptions};
@@ -52,7 +64,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use sha2::{Digest as _, Sha256};
 
-use crate::config::Config;
+use crate::config::{Config, PageCompression};
 use crate::error::{FluxumError, Result};
 use crate::hw::EffectiveConfig;
 use crate::store::TableId;
@@ -84,6 +96,10 @@ pub struct PagerOptions {
     pub high_watermark: f64,
     /// Watermark reclaim drains to (TIER-031).
     pub low_watermark: f64,
+    /// Codec for newly written cold pages (TIER-041).
+    pub compression: PageCompression,
+    /// Payloads below this many bytes are stored raw (TIER-040).
+    pub compression_min_bytes: usize,
 }
 
 impl PagerOptions {
@@ -96,6 +112,8 @@ impl PagerOptions {
             pool_capacity_bytes: effective.bufferpool_capacity_bytes.value,
             high_watermark: config.storage.evictor_high_watermark,
             low_watermark: config.storage.evictor_low_watermark,
+            compression: config.storage.page_compression,
+            compression_min_bytes: config.storage.compression_min_bytes as usize,
         }
     }
 
@@ -132,6 +150,8 @@ struct TableIo {
 pub struct Pager {
     shard_id: u32,
     page_size: usize,
+    compression: codec::PageCodec,
+    compression_min_bytes: usize,
     dir: PathBuf,
     pool: Arc<BufferPool>,
     tables: Mutex<HashMap<TableId, Arc<TableIo>>>,
@@ -155,6 +175,8 @@ impl Pager {
         Ok(Arc::new(Self {
             shard_id: options.shard_id,
             page_size: options.page_size,
+            compression: codec::PageCodec::from(options.compression),
+            compression_min_bytes: options.compression_min_bytes,
             dir: dir.into(),
             pool,
             tables: Mutex::new(HashMap::new()),
@@ -234,14 +256,26 @@ impl Pager {
         }
     }
 
-    /// The spill path (TIER-013/TIER-025): write the page copy-on-write to
-    /// a fresh extent, repoint the live directory, then free the superseded
-    /// extent.
+    /// The spill path (TIER-013/TIER-025): compress the page per the
+    /// configured codec (TIER-040 — raw when below the threshold or the
+    /// saving gate), write it copy-on-write to a fresh extent, repoint the
+    /// live directory, then free the superseded extent.
     fn spill(&self, key: PageKey, image: &[u8]) -> Result<()> {
+        let compressed =
+            codec::compress_image(image, self.compression, self.compression_min_bytes)?;
+        let stored: &[u8] = compressed.as_deref().unwrap_or(image);
+        PagerMetrics::add(
+            &self.metrics.compression_raw_bytes,
+            codec::payload_len(image),
+        );
+        PagerMetrics::add(
+            &self.metrics.compression_stored_bytes,
+            codec::payload_len(stored),
+        );
         let io = self.table_io(TableId::from_raw(key.table_id))?;
         let extent = {
             let mut file = io.file.lock().unwrap_or_else(PoisonError::into_inner);
-            file.write_page(image)?
+            file.write_page(stored)?
         };
         let old = {
             let mut directory = io.directory.lock().unwrap_or_else(PoisonError::into_inner);
@@ -254,9 +288,11 @@ impl Pager {
         Ok(())
     }
 
-    /// Serve a page: pool hit (zero I/O, TIER-014) or fault-in (TIER-032:
-    /// directory lookup → one `pread` → **mandatory CRC32C verification** →
-    /// insert-evicting-if-needed → pin). Concurrent misses coalesce.
+    /// Serve a page: pool hit (zero I/O, zero decompression, TIER-014) or
+    /// fault-in (TIER-032: directory lookup → one `pread` → **mandatory
+    /// CRC32C verification** → decompress if the codec bits say so
+    /// (TIER-044, exactly once) → insert-evicting-if-needed → pin).
+    /// Concurrent misses coalesce.
     pub fn fault(self: &Arc<Self>, table_id: TableId, page_id: u64) -> Result<PageGuard> {
         let key = PageKey {
             shard_id: self.shard_id,
@@ -281,12 +317,17 @@ impl Pager {
             };
             // TIER-032 step 3: verify before serving — a tampered page is
             // never served (TIER-062 handling is the caller's rollback).
-            let (header, _) =
+            let (header, payload) =
                 format::decode_page(&image, self.shard_id, table_id.as_u32(), page_id)?;
             if header.is_index() {
                 PagerMetrics::add(&self.metrics.page_reads_index, 1);
             } else {
                 PagerMetrics::add(&self.metrics.page_reads_data, 1);
+            }
+            // TIER-032 step 4 / TIER-044: rebuild the uncompressed pool
+            // image — decompression happens here and only here.
+            if header.codec() != 0 {
+                return codec::decompress_image(&header, payload, self.page_size);
             }
             Ok(image)
         };
@@ -440,6 +481,9 @@ mod tests {
         );
         assert_eq!(options.high_watermark, 0.95);
         assert_eq!(options.low_watermark, 0.90);
+        // TIER-040/041 defaults: LZ4 above 1 KiB.
+        assert_eq!(options.compression, PageCompression::Lz4);
+        assert_eq!(options.compression_min_bytes, 1024);
     }
 
     #[test]
@@ -453,6 +497,8 @@ mod tests {
                 pool_capacity_bytes: 16 * 4096,
                 high_watermark: 0.95,
                 low_watermark: 0.90,
+                compression: PageCompression::Lz4,
+                compression_min_bytes: 1024,
             },
         )
         .unwrap_or_else(|e| panic!("{e}"));

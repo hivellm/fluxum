@@ -163,6 +163,11 @@ pub struct StorageConfig {
     pub checkpoint_interval_tx: u64,
     /// Page compression codec.
     pub page_compression: PageCompression,
+    /// Payloads smaller than this are stored raw (TIER-040).
+    pub compression_min_bytes: u32,
+    /// zstd level for checkpoint manifests/objects and backup artifacts
+    /// (TIER-042).
+    pub checkpoint_compression_level: i32,
     /// Pool-occupancy fraction that wakes eviction (TIER-031).
     pub evictor_high_watermark: f64,
     /// Pool-occupancy fraction eviction reclaims down to (TIER-031).
@@ -181,6 +186,8 @@ impl Default for StorageConfig {
             page_size: 8192,
             checkpoint_interval_tx: 10_000,
             page_compression: PageCompression::default(),
+            compression_min_bytes: 1024,
+            checkpoint_compression_level: 3,
             evictor_high_watermark: 0.95,
             evictor_low_watermark: 0.90,
             commit_log_write_buffer_bytes: AutoOr::Auto,
@@ -845,6 +852,8 @@ storage:
   checkpoint_dir: ./data/checkpoints
   checkpoint_interval_tx: 10000
   page_compression: lz4
+  compression_min_bytes: 1024
+  checkpoint_compression_level: 3
 replication:
   role: primary
   mode: async

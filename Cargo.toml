@@ -22,6 +22,7 @@ fluxum-testmod = { path = "crates/fluxum-testmod", version = "0.1.0" }
 hmac = "0.12"
 inventory = "0.3"
 jsonwebtoken = "9"
+lz4 = "1"
 proc-macro2 = "1"
 proptest = "1"
 quote = "1"
@@ -39,6 +40,7 @@ tokio = { version = "1", default-features = false }
 tracing = "0.1"
 trybuild = "1"
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
+zstd = "0.13"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

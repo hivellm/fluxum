@@ -30,6 +30,12 @@ pub struct PagerMetrics {
     pub(crate) page_reads_index: AtomicU64,
     /// Counter: physical page writes (spill + flush).
     pub(crate) page_writes: AtomicU64,
+    /// Counter: uncompressed payload bytes offered to the spill path
+    /// (`fluxum_page_compression_ratio` numerator input, TIER-043/080).
+    pub(crate) compression_raw_bytes: AtomicU64,
+    /// Counter: payload bytes actually stored by the spill path (raw when
+    /// compression was skipped or discarded, TIER-040).
+    pub(crate) compression_stored_bytes: AtomicU64,
 }
 
 /// A point-in-time copy of every counter, for assertions and export.
@@ -53,12 +59,25 @@ pub struct MetricsSnapshot {
     pub page_reads_index: u64,
     /// `fluxum_page_writes_total` counter.
     pub page_writes: u64,
+    /// `fluxum_page_compression_raw_bytes_total` counter.
+    pub compression_raw_bytes: u64,
+    /// `fluxum_page_compression_stored_bytes_total` counter.
+    pub compression_stored_bytes: u64,
 }
 
 impl MetricsSnapshot {
     /// Total physical page reads, data + index.
     pub fn page_reads_total(&self) -> u64 {
         self.page_reads_data + self.page_reads_index
+    }
+
+    /// The `fluxum_page_compression_ratio` gauge value — raw ÷ stored
+    /// payload bytes over everything spilled so far (TIER-043/080); `None`
+    /// before the first spill. The T5.6 exporter derives the per-table
+    /// series from per-pager snapshots.
+    pub fn compression_ratio(&self) -> Option<f64> {
+        (self.compression_stored_bytes > 0)
+            .then(|| self.compression_raw_bytes as f64 / self.compression_stored_bytes as f64)
     }
 
     /// Total evictions, clean + spill.
@@ -94,6 +113,14 @@ impl MetricsSnapshot {
                 self.page_reads_index,
             ),
             ("fluxum_page_writes_total", self.page_writes),
+            (
+                "fluxum_page_compression_raw_bytes_total",
+                self.compression_raw_bytes,
+            ),
+            (
+                "fluxum_page_compression_stored_bytes_total",
+                self.compression_stored_bytes,
+            ),
         ]
     }
 }
@@ -111,6 +138,8 @@ impl PagerMetrics {
             page_reads_data: self.page_reads_data.load(Ordering::Relaxed),
             page_reads_index: self.page_reads_index.load(Ordering::Relaxed),
             page_writes: self.page_writes.load(Ordering::Relaxed),
+            compression_raw_bytes: self.compression_raw_bytes.load(Ordering::Relaxed),
+            compression_stored_bytes: self.compression_stored_bytes.load(Ordering::Relaxed),
         }
     }
 
@@ -153,5 +182,24 @@ mod tests {
         assert_eq!(get("fluxum_page_reads_total{index=\"true\"}"), 2);
         assert_eq!(get("fluxum_page_reads_total{index=\"false\"}"), 0);
         assert_eq!(get("fluxum_bufferpool_bytes"), 75);
+    }
+
+    #[test]
+    fn compression_ratio_is_raw_over_stored() {
+        let metrics = PagerMetrics::default();
+        assert_eq!(metrics.snapshot().compression_ratio(), None);
+        PagerMetrics::add(&metrics.compression_raw_bytes, 9_000);
+        PagerMetrics::add(&metrics.compression_stored_bytes, 3_000);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.compression_ratio(), Some(3.0));
+        let samples = snap.samples();
+        assert!(
+            samples.contains(&("fluxum_page_compression_raw_bytes_total", 9_000)),
+            "{samples:?}"
+        );
+        assert!(
+            samples.contains(&("fluxum_page_compression_stored_bytes_total", 3_000)),
+            "{samples:?}"
+        );
     }
 }

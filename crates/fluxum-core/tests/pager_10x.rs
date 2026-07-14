@@ -26,6 +26,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use fluxum_core::FluxumError;
+use fluxum_core::config::PageCompression;
 use fluxum_core::index::IndexId;
 use fluxum_core::schema::{
     ColumnSchema, FluxType, IndexSchema, Schema, SpatialKind, TableAccess, TableSchema,
@@ -117,6 +118,9 @@ fn reading(id: u64, rng: &mut Rng, payload_len: usize) -> Vec<RowValue> {
 }
 
 /// A pager with a deliberately tiny pool: 64 frames × 4 KiB = 256 KiB.
+/// Compression stays off so this suite measures the T2.8 tiering invariants
+/// (e.g. the raw 10× on-disk footprint) unchanged; the T2.9 compression
+/// suite lives in `page_compression.rs`.
 fn tiny_pager(dir: &std::path::Path) -> Arc<Pager> {
     Pager::open(
         dir,
@@ -126,6 +130,8 @@ fn tiny_pager(dir: &std::path::Path) -> Arc<Pager> {
             pool_capacity_bytes: 64 * 4096,
             high_watermark: 0.95,
             low_watermark: 0.90,
+            compression: PageCompression::None,
+            compression_min_bytes: 1024,
         },
     )
     .expect("pager opens")
