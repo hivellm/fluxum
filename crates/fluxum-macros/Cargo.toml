@@ -16,6 +16,7 @@ syn.workspace = true
 
 [dev-dependencies]
 fluxum-core.workspace = true
+fluxum-testmod.workspace = true
 trybuild.workspace = true
 
 [lints]

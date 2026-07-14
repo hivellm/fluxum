@@ -1,0 +1,15 @@
+[package]
+name = "fluxum-testmod"
+description = "Test-only module crate: verifies cross-crate link-time schema registration (SPEC-001 acceptance 2)"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluxum-core.workspace = true
+fluxum-macros.workspace = true
+
+[lints]
+workspace = true

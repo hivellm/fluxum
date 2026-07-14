@@ -156,6 +156,7 @@ name = "fluxum-macros"
 version = "0.1.0"
 dependencies = [
  "fluxum-core",
+ "fluxum-testmod",
  "proc-macro2",
  "quote",
  "syn",
@@ -176,6 +177,14 @@ dependencies = [
 [[package]]
 name = "fluxum-server"
 version = "0.1.0"
+
+[[package]]
+name = "fluxum-testmod"
+version = "0.1.0"
+dependencies = [
+ "fluxum-core",
+ "fluxum-macros",
+]
 
 [[package]]
 name = "fnv"

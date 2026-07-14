@@ -14,6 +14,7 @@ repository = "https://github.com/hivellm/fluxum"
 fluxum-core = { path = "crates/fluxum-core", version = "0.1.0" }
 fluxum-macros = { path = "crates/fluxum-macros", version = "0.1.0" }
 fluxum-protocol = { path = "crates/fluxum-protocol", version = "0.1.0" }
+fluxum-testmod = { path = "crates/fluxum-testmod", version = "0.1.0" }
 hmac = "0.12"
 inventory = "0.3"
 jsonwebtoken = "9"

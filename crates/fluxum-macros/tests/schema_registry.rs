@@ -1,8 +1,8 @@
 //! End-to-end registry tests (T1.1 items 1.4/1.7/1.8): tables declared with
-//! `#[fluxum::table]` in this crate are collected at link time by the
-//! registry that lives in `fluxum-core` — declaration and collection already
-//! span two crates; the OQ-1 spike (task dir) additionally verified
-//! collection across two library crates plus a binary on this platform.
+//! `#[fluxum::table]` in this test crate *and* in a second workspace crate
+//! (`fluxum-testmod`) are collected at link time by the registry that lives
+//! in `fluxum-core` (SPEC-001 acceptance 2). Mechanism per OQ-1: `inventory`
+//! — see the T1.1 task's `oq1-linktime-registry.md`.
 #![allow(dead_code)]
 #![allow(clippy::expect_used)]
 
@@ -11,6 +11,10 @@ use fluxum_core::schema::{
 };
 use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_macros as fluxum;
+// A crate that is linked but never referenced is dropped by the linker along
+// with its registrations (OQ-1); this reference keeps fluxum-testmod's
+// cross-crate table declarations alive.
+use fluxum_testmod as _;
 
 #[fluxum::table(public)]
 pub struct User {
@@ -82,6 +86,7 @@ fn all_declared_tables_are_collected_at_link_time() {
     assert_eq!(
         names,
         [
+            "AuditEvent", // declared in fluxum-testmod, not in this crate
             "ChatMessage",
             "OnlineUser",
             "Sensor",
@@ -90,6 +95,21 @@ fn all_declared_tables_are_collected_at_link_time() {
             "User"
         ]
     );
+}
+
+#[test]
+fn tables_from_a_second_workspace_crate_are_collected() {
+    // SPEC-001 acceptance 2: declarations spanning two workspace crates all
+    // appear in the assembled schema.
+    let schema = assemble();
+    let audit = schema
+        .table("AuditEvent")
+        .expect("AuditEvent is declared in fluxum-testmod");
+    assert_eq!(audit.access, TableAccess::Public);
+    assert_eq!(audit.primary_key, &[0u16]);
+    assert_eq!(audit.auto_inc, Some(0));
+    assert_eq!(audit.indexes, &[IndexSchema::BTree { columns: &[1] }]);
+    assert_eq!(audit.columns[1].ty, FluxType::Identity);
 }
 
 #[test]
