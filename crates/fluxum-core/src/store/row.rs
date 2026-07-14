@@ -12,7 +12,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use fluxum_protocol::{FluxBinError, FluxBinWriter};
+use fluxum_protocol::{FluxBinError, FluxBinReader, FluxBinWriter};
 
 use crate::error::{FluxumError, Result};
 use crate::schema::{FluxType, TableSchema};
@@ -301,6 +301,86 @@ pub(crate) fn encode_pk_values(schema: &TableSchema, pk_values: &[RowValue]) -> 
     Ok(PkBytes(w.into_bytes().into()))
 }
 
+/// FluxBIN-encode a full row: every column value in declaration order,
+/// concatenated (SPEC-006 RPC-040). This is the leaf-page row encoding of
+/// the paged cold tier (SPEC-015 TIER-021) — byte-identical to the wire
+/// form, so pages, log entries, and diffs share one row representation.
+pub(crate) fn encode_row(values: &[RowValue]) -> Result<Vec<u8>> {
+    let mut w = FluxBinWriter::new();
+    for value in values {
+        value.encode(&mut w)?;
+    }
+    Ok(w.into_bytes())
+}
+
+/// Decode a FluxBIN row encoded by [`encode_row`], driven by the table
+/// schema (FluxBIN is not self-describing). Verifies exact consumption —
+/// trailing bytes are a decode error, never silently ignored.
+pub(crate) fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
+    let mut r = FluxBinReader::new(bytes);
+    let mut values = Vec::with_capacity(schema.columns.len());
+    for column in schema.columns {
+        values.push(decode_value(&mut r, &column.ty).map_err(|e| {
+            FluxumError::Storage(format!(
+                "table `{}`: column `{}` failed FluxBIN decode: {e}",
+                schema.name, column.name
+            ))
+        })?);
+    }
+    r.expect_eof().map_err(|e| {
+        FluxumError::Storage(format!(
+            "table `{}`: trailing bytes after the last column: {e}",
+            schema.name
+        ))
+    })?;
+    Ok(Row::new(values))
+}
+
+/// Decode one value of type `ty` (recursive for `Option`/`List`).
+fn decode_value(r: &mut FluxBinReader<'_>, ty: &FluxType) -> Result<RowValue> {
+    let map = |e: FluxBinError| FluxumError::Storage(e.to_string());
+    Ok(match ty {
+        FluxType::Bool => RowValue::Bool(r.read_bool().map_err(map)?),
+        FluxType::I8 => RowValue::I8(r.read_i8().map_err(map)?),
+        FluxType::I16 => RowValue::I16(r.read_i16().map_err(map)?),
+        FluxType::I32 => RowValue::I32(r.read_i32().map_err(map)?),
+        FluxType::I64 => RowValue::I64(r.read_i64().map_err(map)?),
+        FluxType::U8 => RowValue::U8(r.read_u8().map_err(map)?),
+        FluxType::U16 => RowValue::U16(r.read_u16().map_err(map)?),
+        FluxType::U32 => RowValue::U32(r.read_u32().map_err(map)?),
+        FluxType::U64 => RowValue::U64(r.read_u64().map_err(map)?),
+        FluxType::F32 => RowValue::F32(r.read_f32().map_err(map)?),
+        FluxType::F64 => RowValue::F64(r.read_f64().map_err(map)?),
+        FluxType::Str => RowValue::Str(r.read_str().map_err(map)?.to_owned()),
+        FluxType::Bytes => RowValue::Bytes(r.read_bytes().map_err(map)?.to_vec()),
+        FluxType::Identity => {
+            RowValue::Identity(Identity::from_bytes(r.read_identity().map_err(map)?))
+        }
+        FluxType::ConnectionId => {
+            RowValue::ConnectionId(ConnectionId::new(r.read_connection_id().map_err(map)?))
+        }
+        FluxType::EntityId => RowValue::EntityId(EntityId::new(r.read_entity_id().map_err(map)?)),
+        FluxType::Timestamp => {
+            RowValue::Timestamp(Timestamp::from_micros(r.read_timestamp().map_err(map)?))
+        }
+        FluxType::Option(inner) => {
+            if r.read_option_tag().map_err(map)? {
+                RowValue::Optional(Some(Box::new(decode_value(r, inner)?)))
+            } else {
+                RowValue::Optional(None)
+            }
+        }
+        FluxType::List(inner) => {
+            let count = r.read_seq_len().map_err(map)?;
+            let mut items = Vec::with_capacity(usize::try_from(count).unwrap_or(0).min(4096));
+            for _ in 0..count {
+                items.push(decode_value(r, inner)?);
+            }
+            RowValue::List(items)
+        }
+    })
+}
+
 /// Human-readable PK for error messages: `(v1, v2, …)` from the row's PK
 /// columns.
 pub(crate) fn display_pk_of_row(schema: &TableSchema, values: &[RowValue]) -> String {
@@ -425,6 +505,25 @@ mod tests {
         assert_eq!(a.value(0), Some(&RowValue::I32(-2)));
         assert_eq!(a.value(99), None);
         assert_eq!(a.values().len(), 5);
+    }
+
+    #[test]
+    fn full_row_fluxbin_round_trips_and_rejects_trailing_bytes() {
+        let row = sensor_row();
+        let bytes = encode_row(&row).unwrap_or_else(|e| panic!("{e}"));
+        let decoded = decode_row(&SENSOR, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(decoded.values(), &row[..]);
+
+        let mut long = bytes.clone();
+        long.push(0);
+        assert!(
+            decode_row(&SENSOR, &long).is_err(),
+            "trailing byte accepted"
+        );
+        assert!(
+            decode_row(&SENSOR, &bytes[..bytes.len() - 1]).is_err(),
+            "truncated row accepted"
+        );
     }
 
     #[test]

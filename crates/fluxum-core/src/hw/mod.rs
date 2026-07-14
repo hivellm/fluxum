@@ -153,6 +153,9 @@ pub struct EffectiveConfig {
     pub shards: Derived<u32>,
     /// Memory budget in bytes (`memory.budget`, SPEC-015 TIER-002).
     pub memory_budget_bytes: Derived<u64>,
+    /// Buffer-pool capacity: `memory.bufferpool_fraction × budget`
+    /// (SPEC-015 TIER-003; reported for TIER-005 budget transparency).
+    pub bufferpool_capacity_bytes: Derived<u64>,
     /// Subscription fan-out concurrency (`subscriptions.fanout_concurrency`).
     pub fanout_concurrency: Derived<usize>,
     /// Commit-log write buffer (`storage.commit_log_write_buffer_bytes`).
@@ -297,11 +300,17 @@ pub fn derive(hardware: &HardwareProfile, config: &Config) -> Result<EffectiveCo
         simd.source,
     );
 
+    // TIER-003: the pool receives `bufferpool_fraction` of the budget; the
+    // remainder is headroom for TxState, subscription buffers, and slack.
+    let bufferpool_capacity =
+        (config.memory.bufferpool_fraction * budget.value.as_u64() as f64) as u64;
+
     Ok(EffectiveConfig {
         hardware: hardware.clone(),
         worker_threads,
         shards,
         memory_budget_bytes: Derived::new(budget.value.as_u64(), budget.source),
+        bufferpool_capacity_bytes: Derived::new(bufferpool_capacity, budget.source),
         fanout_concurrency,
         commit_log_write_buffer_bytes: Derived::new(
             write_buffer.value.as_u64(),
@@ -388,6 +397,11 @@ mod tests {
         // TIER-002: max(128 MiB, 0.5 × 512 MiB) = 256 MiB (droplet reference).
         assert_eq!(effective.memory_budget_bytes.value, 256 << 20);
         assert_eq!(effective.memory_budget_bytes.source, Provenance::Auto);
+        // TIER-003: pool capacity = 0.8 × 256 MiB.
+        assert_eq!(
+            effective.bufferpool_capacity_bytes.value,
+            (0.8 * (256u64 << 20) as f64) as u64
+        );
         // clamp(2 × 2, 2, 64) = 4.
         assert_eq!(effective.fanout_concurrency.value, 4);
         // clamp(512 MiB / 1024 = 512 KiB, 64 KiB, 4 MiB) = 512 KiB.

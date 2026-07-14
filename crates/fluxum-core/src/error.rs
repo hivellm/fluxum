@@ -29,6 +29,34 @@ pub enum FluxumError {
     #[error("storage error: {0}")]
     Storage(String),
 
+    /// The buffer pool has no evictable frame — every frame is pinned or in
+    /// flight. The faulting operation fails (and its transaction rolls back
+    /// per SPEC-002 STG-006) rather than allocate past the memory budget
+    /// (SPEC-015 TIER-003).
+    #[error(
+        "buffer pool exhausted: no evictable frame among {capacity} \
+         (all pinned or faulting); the operation must roll back (TIER-003)"
+    )]
+    BufferPoolExhausted {
+        /// Pool capacity in frames.
+        capacity: usize,
+    },
+
+    /// A cold-tier page failed its CRC32C integrity check on fault-in and
+    /// was not served (SPEC-015 TIER-021/TIER-032/TIER-062).
+    #[error(
+        "page corrupt: shard {shard_id}, table {table_id:#010x}, page \
+         {page_id} failed CRC32C verification on fault-in (TIER-062)"
+    )]
+    PageCorrupt {
+        /// Owning shard.
+        shard_id: u32,
+        /// Owning table (STG-050 stable id).
+        table_id: u32,
+        /// Page id within the (shard, table) page file.
+        page_id: u64,
+    },
+
     /// Wire-protocol failure (framing, encoding, unexpected message).
     #[error("protocol error: {0}")]
     Protocol(String),

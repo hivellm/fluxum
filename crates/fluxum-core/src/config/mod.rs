@@ -111,6 +111,13 @@ pub struct MemoryConfig {
     pub auto_fraction: f64,
     /// Floor for the `auto` derivation.
     pub auto_floor_bytes: ByteSize,
+    /// Fraction of the budget handed to the buffer pool (TIER-003); the
+    /// remainder is headroom for `TxState`, subscription buffers, and
+    /// allocator slack.
+    pub bufferpool_fraction: f64,
+    /// RSS tolerance floor above the budget (TIER-004); the effective
+    /// tolerance is `max(this, 0.10 × budget)`.
+    pub budget_tolerance_bytes: ByteSize,
 }
 
 impl Default for MemoryConfig {
@@ -119,6 +126,8 @@ impl Default for MemoryConfig {
             budget: AutoOr::Auto,
             auto_fraction: 0.5,
             auto_floor_bytes: ByteSize(MIN_MEMORY_BUDGET),
+            bufferpool_fraction: 0.8,
+            budget_tolerance_bytes: ByteSize(64 << 20),
         }
     }
 }
@@ -146,10 +155,18 @@ pub struct StorageConfig {
     pub commit_log_dir: PathBuf,
     /// Checkpoint directory.
     pub checkpoint_dir: PathBuf,
+    /// Cold-tier page-file directory (TIER-023).
+    pub page_dir: PathBuf,
+    /// Logical page size in bytes: 4096 | 8192 | 16384 (TIER-022, OQ-7).
+    pub page_size: u32,
     /// Checkpoint cadence in committed transactions.
     pub checkpoint_interval_tx: u64,
     /// Page compression codec.
     pub page_compression: PageCompression,
+    /// Pool-occupancy fraction that wakes eviction (TIER-031).
+    pub evictor_high_watermark: f64,
+    /// Pool-occupancy fraction eviction reclaims down to (TIER-031).
+    pub evictor_low_watermark: f64,
     /// Commit-log write buffer; `auto` = `clamp(effective_memory / 1024, 64KiB, 4MiB)`.
     pub commit_log_write_buffer_bytes: AutoOr<ByteSize>,
 }
@@ -160,8 +177,12 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("./data"),
             commit_log_dir: PathBuf::from("./data/log"),
             checkpoint_dir: PathBuf::from("./data/checkpoints"),
+            page_dir: PathBuf::from("./data/pages"),
+            page_size: 8192,
             checkpoint_interval_tx: 10_000,
             page_compression: PageCompression::default(),
+            evictor_high_watermark: 0.95,
+            evictor_low_watermark: 0.90,
             commit_log_write_buffer_bytes: AutoOr::Auto,
         }
     }
@@ -491,10 +512,32 @@ impl Config {
                 ByteSize(MIN_MEMORY_BUDGET)
             )));
         }
+        if !(self.memory.bufferpool_fraction > 0.0 && self.memory.bufferpool_fraction <= 1.0) {
+            return Err(FluxumError::config(format!(
+                "memory.bufferpool_fraction: must be in (0.0, 1.0], got {}",
+                self.memory.bufferpool_fraction
+            )));
+        }
         if self.storage.checkpoint_interval_tx == 0 {
             return Err(FluxumError::config(
                 "storage.checkpoint_interval_tx: must be >= 1",
             ));
+        }
+        if !matches!(self.storage.page_size, 4096 | 8192 | 16384) {
+            return Err(FluxumError::config(format!(
+                "storage.page_size: must be 4096, 8192, or 16384 (SPEC-015 TIER-022), got {}",
+                self.storage.page_size
+            )));
+        }
+        let (low, high) = (
+            self.storage.evictor_low_watermark,
+            self.storage.evictor_high_watermark,
+        );
+        if !(low > 0.0 && low < high && high <= 1.0) {
+            return Err(FluxumError::config(format!(
+                "storage.evictor_low_watermark/evictor_high_watermark: need \
+                 0 < low < high <= 1, got low={low} high={high}"
+            )));
         }
         if let Some(fanout) = self.subscriptions.fanout_concurrency.explicit()
             && *fanout == 0

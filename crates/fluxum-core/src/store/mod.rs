@@ -63,6 +63,12 @@
 //!   consumed by rolled-back transactions are not returned — gaps are normal
 //!   and documented; IDs are unique and monotonic, never dense.
 //!
+//! T2.8 layers the paged cold tier under this same logical API: [`pager`]
+//! owns the on-disk page format, the buffer pool, and the paged evictable
+//! B-trees (SPEC-015) — see [`pager::ColdTable::spill_snapshot`] for how a
+//! published snapshot materializes as pages without changing any MVCC
+//! semantics defined here.
+//!
 //! [`Snapshot`]: committed::Snapshot
 //! [`CommittedState`]: committed::CommittedState
 //! [`TxState`]: tx::TxState
@@ -71,6 +77,7 @@
 
 pub mod committed;
 pub mod memstore;
+pub mod pager;
 pub mod row;
 pub mod tx;
 
