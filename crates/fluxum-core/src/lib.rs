@@ -13,12 +13,15 @@
 //!   `none` providers, server-peer registry ([`Authenticator`], SPEC-009)
 //! - [`schema`] — [`schema::TableSchema`] introspection, the [`schema::Table`]
 //!   trait, and the link-time registry behind `#[fluxum::table]` (SPEC-001)
+//! - [`store`] — [`store::MemStore`]: MVCC committed/tx state, lock-free
+//!   snapshot reads, single-writer commit/rollback (SPEC-002 §2, T2.1)
 
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod hw;
 pub mod schema;
+pub mod store;
 pub mod types;
 
 pub use auth::{AuthClaims, AuthOutcome, AuthProvider, Authenticator};

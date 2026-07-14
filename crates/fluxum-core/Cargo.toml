@@ -7,6 +7,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+arc-swap.workspace = true
+fluxum-protocol.workspace = true
 hmac.workspace = true
 inventory.workspace = true
 jsonwebtoken.workspace = true
@@ -19,7 +21,12 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "memstore"
+harness = false

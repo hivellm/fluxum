@@ -11,6 +11,8 @@ repository = "https://github.com/hivellm/fluxum"
 # Centralized dependency versions — crates inherit with `dep.workspace = true`.
 # Kept minimal for T0.1; external deps land here as phases need them.
 [workspace.dependencies]
+arc-swap = "1"
+criterion = "0.5"
 fluxum-core = { path = "crates/fluxum-core", version = "0.1.0" }
 fluxum-macros = { path = "crates/fluxum-macros", version = "0.1.0" }
 fluxum-protocol = { path = "crates/fluxum-protocol", version = "0.1.0" }
