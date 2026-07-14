@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Runtime data
+/data/
+*.log
+
+# Local config overrides
+config.local.yml
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Coverage / profiling
+*.profraw
+lcov.info
+/coverage/
+
+# SDK build artifacts
+sdks/typescript/node_modules/
+sdks/typescript/dist/

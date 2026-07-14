@@ -10,64 +10,73 @@
 
 ## Core premise
 
-Fluxum is a **database that is also a server**, designed for MMORPG backends.
-There is no intermediate application server. Game logic (reducers) runs inside the database.
-Clients connect directly to Fluxum and receive real-time state updates via push subscriptions.
+Fluxum is a **database that is also a server**, designed for realtime applications.
+There is no intermediate application server. Application logic (reducers) runs inside the
+database. Clients connect directly to Fluxum and receive real-time state updates via push
+subscriptions.
 
-### Responsibility split: three-layer engine stack
+### Where Fluxum sits
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  C++ Game Server (engine layer)                                 │
-│  - Combat resolution & damage calculation                       │
-│  - Loot table generation, crafting validation                   │
-│  - AI / pathfinding / spawn logic                                │
-│  - netudp: position, rotation, animation (UDP, ~20-60 Hz)       │
-│  - FluxRPC client: calls Fluxum for persistent state mutations  │
+│  Clients                                                        │
+│  - Web / mobile apps (Streamable HTTP + JS/TS SDK)              │
+│  - Trusted backend services (FluxRPC/TCP, often loopback):      │
+│    ingestion pipelines, pricing engines, schedulers, bots       │
+│  - Admin tooling (HTTP/JSON)                                    │
 └──────────────────┬──────────────────────────────────────────────┘
-                   │ FluxRPC (TCP, same machine ~0.1-0.3 ms RTT)
+                   │ FluxRPC (TCP / Streamable HTTP)
                    │ multiplexed: bulk calls are parallel, not serial
 ┌──────────────────▼──────────────────────────────────────────────┐
-│  Fluxum (persistence layer)                                     │
-│  - Inventory & items, player stats, skills, quests              │
-│  - Chat, economy, trades, guilds                                │
-│  - World events & zone state, session management                │
-│  - Subscriptions: push state changes to clients                 │
+│  Fluxum (the entire backend)                                    │
+│  - State: users, sessions, documents, orders, telemetry, …      │
+│  - Reducers: all mutations, validated and atomic                │
+│  - Subscriptions: push every committed change to interested     │
+│    clients as incremental diffs                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Rule:** changes every frame, loss-tolerant → netudp.
-Must survive a crash, transactional → Fluxum.
-Game rules, validation, loot logic → C++ game server.
+**Rule:** state that must survive a crash and be observed live by many clients → Fluxum.
+Heavy computation that only *produces* state changes (ML inference, media processing,
+third-party API calls) → a trusted service that feeds Fluxum through reducers.
 
 ### RPC latency model
 
-On the same host (loopback TCP), a FluxRPC round trip costs ~0.1–0.3 ms. For item drops and
-crafting this is imperceptible. Two patterns keep it off the critical path:
+On the same host (loopback TCP), a FluxRPC round trip costs ~0.1–0.3 ms. Two patterns keep it
+off the critical path for high-rate writers:
 
-- **Fire-and-forget for drops:** the C++ server sends `ReducerCall("create_item_batch", …)`
-  without awaiting; only the authoritative pick-up call is awaited.
+- **Fire-and-forget:** an ingestion service sends `ReducerCall("update_reading", …)` without
+  awaiting; only calls whose result gates further work are awaited.
 - **Batch reducers:** one call, one atomic transaction —
-  `ReducerCall("create_item_batch", [player_id, [(sword,1),(gold,50),(potion,3)]])`.
+  `ReducerCall("ingest_batch", [[r1, r2, r3, …]])`.
 
-FluxRPC multiplexing (per-message `id`) lets the game server pipeline many in-flight calls on a
-single connection.
+FluxRPC multiplexing (per-message `id`) lets a client pipeline many in-flight calls on a single
+connection.
 
-### Memory model vs. the SQLite-in-memory pattern
+### Memory model: tiered, budgeted, PostgreSQL-like envelope
+
+SpacetimeDB requires the whole dataset in RAM. Fluxum does not — it works like PostgreSQL's
+buffer-pool model, with a realtime-first hot path:
 
 ```
-SQLite in-memory + 5 min snapshot    Fluxum MemStore + CommitLog
-─────────────────────────────────    ───────────────────────────────
-All data in RAM                      All data in RAM (CommittedState)
-Write to memory first                CommittedState merge (microseconds)
-Async flush queue to disk            CommitLog async append (no fsync)
-Snapshot every 5 minutes             Every tx logged continuously
-Crash: lose up to 5 minutes          Crash: lose < ~50 ms (log buffer)
-Manual sync complexity               MVCC guarantees consistency
+PostgreSQL                            Fluxum
+─────────────────────────────────     ───────────────────────────────────
+shared_buffers page cache             Buffer pool under memory.budget
+Heap pages on disk                    Paged cold tier (own format, LZ4)
+WAL, fsync per commit (default)       CommitLog async append (no fsync)
+LISTEN/NOTIFY + app fan-out           Native subscriptions on every commit
+Reads: SQL round trip (~0.1–1 ms)     Hot reads in-process (< 1 µs)
 ```
 
-Spatial indexes apply only to persistent world geometry (terrain chunks, spawn points) —
-never to real-time entity positions.
+- **Hot working set** lives in the buffer pool → microsecond reads, zero disk I/O (NFR-07).
+- **Cold data** lives in a paged, compressed on-disk store; pages fault in on demand and are
+  evicted under the configured memory budget — datasets are bounded by disk, not RAM
+  ([SPEC-015](specs/SPEC-015-tiered-storage.md)).
+- **Durability** is the commit log's job in both worlds; crash loses < ~50 ms (log buffer),
+  never integrity.
+
+The permanent performance baseline is a functionally identical app on app-server + PostgreSQL,
+run by the `fluxum-bench` parity harness on equal hardware (PRD NFR-11).
 
 ---
 
@@ -87,27 +96,36 @@ fluxum/
 │   │       ├── error.rs        # FluxumError (thiserror) + Result<T>
 │   │       ├── types.rs        # Identity, ConnectionId, EntityId, Timestamp newtypes
 │   │       ├── schema/         # TableSchema registry (populated by fluxum-macros at link time)
-│   │       ├── store/          # MemStore — CommittedState + TxState (MVCC)
+│   │       ├── store/          # MemStore — CommittedState + TxState (MVCC), buffer pool
+│   │       ├── pager/          # Paged cold tier: page format, eviction, compression (LZ4/zstd)
 │   │       ├── commitlog/      # Append-only log (u32 LE + MsgPack + CRC32), async writer
-│   │       ├── snapshot/       # SnapshotRepo — periodic dumps + recovery
+│   │       ├── snapshot/       # Checkpoints — periodic dumps + recovery + log truncation
 │   │       ├── index/          # btree.rs, quadtree.rs, rtree.rs
 │   │       ├── tx/             # Transaction pipeline, constraints, TxHandle
 │   │       ├── runtime/        # ReducerExecutor, tick scheduler, schedule worker, rate limiter
 │   │       ├── subscriptions/  # SQL compiler → CompiledPlan, SubscriptionManager, fan-out,
 │   │       │                   #   backpressure, visibility (RLS)
 │   │       ├── shard/          # ShardHost, ShardCoord, handoff protocol, global replication
+│   │       ├── replication/    # Replica sets: log streaming, election, failover, backup/PITR
+│   │       ├── simd/           # SIMD kernels + runtime dispatch (x86/aarch64/scalar)
+│   │       ├── hw/             # Hardware probe (cores, RAM, cgroups) + adaptive tuning
 │   │       └── migration/      # Schema diff + #[migration] runner, __schema_meta__
 │   ├── fluxum-macros/          # Proc macros: #[table], #[reducer], #[tick], #[schedule],
 │   │                           #   lifecycle hooks, #[view], #[procedure], #[migration]
 │   ├── fluxum-protocol/        # Pure wire layer (no storage deps): FluxValue, FluxBIN codec,
 │   │                           #   FluxRPC framing + message types — shared with SDKs
-│   ├── fluxum-server/          # Presentation: FluxRPC TCP, WebSocket, HTTP admin (axum),
+│   ├── fluxum-server/          # Presentation: FluxRPC TCP, Streamable HTTP /rpc + admin (axum),
 │   │                           #   auth providers, metrics, ServerBuilder + reference binary
-│   └── fluxum-cli/             # `fluxum` binary: generate, schema export, admin commands
+│   ├── fluxum-cli/             # `fluxum` binary: generate, schema export, backup, admin
+│   └── fluxum-bench/           # Parity harness: identical app on Fluxum vs app-server+PostgreSQL
+│                               #   (and SQLite); comparative report per release (NFR-11)
 ├── sdks/
 │   ├── rust/                   # fluxum-sdk (workspace member; reuses fluxum-protocol)
-│   ├── typescript/             # generated runtime + hand-written transport
-│   └── cpp/                    # generated headers + minimal transport
+│   ├── typescript/             # browser-native JS/TS: binary FluxRPC over WS (ArrayBuffer),
+│   │                           #   plain-JS consumable (ESM/CJS + .d.ts, zero deps) + Node TCP
+│   ├── python/                 # asyncio-first client (0.2.0)
+│   ├── go/                     # context-aware client (0.2.0)
+│   └── csharp/                 # async/await client, NuGet (0.2.0)
 ├── config/
 │   ├── config.yml              # base config
 │   ├── config.example.yml
@@ -117,11 +135,12 @@ fluxum/
 
 ### The native module model (key decision)
 
-SpacetimeDB isolates game logic in WASM modules and pays FFI marshaling on every reducer call.
-The UzDB design eliminated that with native TML compilation; Fluxum preserves the property in Rust:
+SpacetimeDB isolates application logic in WASM modules and pays FFI marshaling on every reducer
+call. The UzDB design eliminated that with native TML compilation; Fluxum preserves the property
+in Rust:
 
-- A **game module is a plain Rust crate** that depends on `fluxum` and declares tables and
-  reducers with proc-macros.
+- An **application module is a plain Rust crate** that depends on `fluxum` and declares tables
+  and reducers with proc-macros.
 - `#[fluxum::table]` / `#[fluxum::reducer]` register schema and dispatch entries in a link-time
   registry (`inventory`-style collection — OQ-1 tracks the exact mechanism).
 - The developer's `main.rs` is three lines:
@@ -132,9 +151,9 @@ fn main() -> fluxum::Result<()> {
 }
 ```
 
-- The output is **one binary** containing the storage engine, the transports, and the game logic —
-  zero sandbox, zero FFI, zero startup JIT. Reducer calls are plain function calls through a
-  dispatch table.
+- The output is **one binary** containing the storage engine, the transports, and the application
+  logic — zero sandbox, zero FFI, zero startup JIT. Reducer calls are plain function calls through
+  a dispatch table.
 - Isolation is provided by the transaction layer, not a sandbox: reducers receive `&ReducerContext`
   and can only mutate state through `TxHandle`; panics are caught (`catch_unwind`), roll the
   transaction back, and never take the shard down.
@@ -150,16 +169,16 @@ deployment is a binary restart (fast: snapshot + log replay). Schema evolution i
 ```
 ┌──────────────────────────────────────────────────────────────────┐
 │                        CLIENT LAYER                              │
-│  C++ game server (FluxRPC/TCP, loopback)                         │
-│  Browser clients (WebSocket, TypeScript SDK)                     │
-│  Rust services (fluxum-sdk) · Admin tools (HTTP + JSON)          │
+│  Backend services (FluxRPC/TCP, fluxum-sdk)                      │
+│  Web & mobile clients (Streamable HTTP, JS/TS SDK)               │
+│  Admin tools (HTTP + JSON)                                       │
 └─────────────────────┬────────────────────────────────────────────┘
                       │
 ┌─────────────────────▼────────────────────────────────────────────┐
 │                     TRANSPORT LAYER          (fluxum-server)     │
-│  TCP :15801 (FluxRPC)   WS :15802 (FluxRPC over WS,              │
-│                          subprotocol v1.bin.fluxum)              │
-│  HTTP :15800 (JSON admin: health, metrics, schema, query)        │
+│  TCP :15801 (FluxRPC binary)                                     │
+│  HTTP :15800 — /rpc (FluxRPC over Streamable HTTP: POST frames   │
+│           + GET binary push stream)  ·  JSON admin endpoints     │
 └─────────────────────┬────────────────────────────────────────────┘
                       │
 ┌─────────────────────▼────────────────────────────────────────────┐
@@ -175,8 +194,8 @@ deployment is a binary restart (fast: snapshot + log replay). Schema evolution i
 ┌─────────────────────▼────────────────────────────────────────────┐
 │                     RUNTIME LAYER              (fluxum-core)     │
 │  ┌─────────────────┐    ┌──────────────────────────────────┐     │
-│  │  ShardCoord     │    │  ShardHost (one per world region)│     │
-│  │  - world map    │    │  - ReducerExecutor               │     │
+│  │  ShardCoord     │    │  ShardHost (one per partition)   │     │
+│  │  - partition map│    │  - ReducerExecutor               │     │
 │  │  - route req    │    │  - TickScheduler + ScheduleWorker│     │
 │  │  - handoff      │    │  - SubscriptionManager           │     │
 │  │  - global repl. │    │  - commit_and_broadcast()        │     │
@@ -262,14 +281,11 @@ pub enum FluxValue {
     Str(String),
     Array(Vec<FluxValue>),
     Map(Vec<(FluxValue, FluxValue)>),
-    Identity([u8; 32]),   // stable 256-bit player identity
-    EntityId(u64),        // entity primary key
+    Identity([u8; 32]),   // stable 256-bit client identity
+    EntityId(u64),        // row/entity primary key
     Timestamp(i64),       // microseconds since Unix epoch
 }
 ```
-
-Real-time positions are **not** a `FluxValue` concern — they live in the UDP layer of the game
-server. Fluxum stores only persistent geometry (as typed table columns).
 
 ### Messages
 
@@ -290,8 +306,9 @@ server. Fluxum stores only persistent geometry (as typed table columns).
 | `TxUpdate` | `tx_id: u64, timestamp: i64, reducer_name: String, caller: [u8; 32], duration_us: u32, tables: Vec<TableUpdate>` |
 | `Error` | `id, code: u16, message: String` |
 
-`TxUpdate` enrichment: `caller` drives "Player X attacked you" UI; `reducer_name` drives
-client-side event routing; `timestamp` orders events; `duration_us` enables client-side profiling.
+`TxUpdate` enrichment: `caller` lets clients attribute changes ("Alice edited this document");
+`reducer_name` drives client-side event routing; `timestamp` orders events; `duration_us` enables
+client-side profiling.
 
 ```
 TableUpdate {
@@ -307,13 +324,39 @@ TableUpdate {
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/v1/health` | Server and shard status (< 50 ms, no storage locks) |
-| `GET` | `/v1/metrics` | Prometheus text format |
-| `GET` | `/v1/schema` | Full schema JSON (tables, reducers, types) |
-| `POST` | `/v1/reducer/:name` | Call a reducer (JSON body) |
-| `POST` | `/v1/query` | One-off read-only SQL query |
-| `GET` | `/v1/view/:name` | Call a `#[fluxum::view]` function |
-| `POST` | `/v1/procedure/:name` | Call a `#[fluxum::procedure]` function (admin, P2) |
+| `POST`/`GET` | `/rpc` | **FluxRPC over Streamable HTTP** (binary — see below) |
+| `GET` | `/health` | Server and shard status (< 50 ms, no storage locks) |
+| `GET` | `/metrics` | Prometheus text format |
+| `GET` | `/schema` | Full schema JSON (tables, reducers, types) |
+| `POST` | `/reducer/:name` | Call a reducer (JSON body) |
+| `POST` | `/query` | One-off read-only SQL query |
+| `GET` | `/view/:name` | Call a `#[fluxum::view]` function |
+| `POST` | `/procedure/:name` | Call a `#[fluxum::procedure]` function (admin, P2) |
+
+Paths are unversioned by design — no `/v1` prefix; compatibility is governed by the format
+freezes (G5/T6.1) and additive evolution, not by path versioning.
+
+### Browser transport: FluxRPC over Streamable HTTP
+
+Browsers speak the same binary protocol through standard HTTP (the modern pattern MCP adopted;
+the family already ships Streamable HTTP in Synap and Vectorizer) — **no WebSocket, no SSE, no
+JSON on the hot path**:
+
+```
+POST /rpc   Content-Type: application/x-fluxum
+            body: one or more FluxRPC frames (u32 LE + MessagePack)
+            response: the matching response frames, streamed as they complete
+
+GET /rpc    Fluxum-Session: <id>
+            response: long-lived binary stream of server-initiated frames
+            (InitialData, TxUpdate) — consumed via fetch ReadableStream
+```
+
+The first `Authenticate` returns an opaque session id (`Fluxum-Session` header) binding identity
+and subscriptions; on connection loss the SDK re-authenticates and resubscribes automatically.
+Same framing, FluxBIN rows, multiplexing, and limits as TCP — only the carrier differs. Works
+through ordinary proxies/load balancers, multiplexes over HTTP/2, and upgrades naturally to
+WebTransport/HTTP-3 later (FR-88, P2).
 
 ---
 
@@ -321,25 +364,25 @@ TableUpdate {
 
 ### ShardCoord
 
-Owns the world map; routes incoming connections and calls to the correct shard.
+Owns the partition map; routes incoming connections and calls to the correct shard.
 
 ```rust
 pub struct ShardCoord {
-    world_bounds: Rect,
+    partitioning: PartitionScheme,     // hash | range | region, per partitioned table
     shards: BTreeMap<ShardId, ShardHandle>,
-    routing_table: HashMap<RegionKey, ShardId>,
+    routing_table: HashMap<PartitionKey, ShardId>,
 }
 ```
 
-Responsibilities: accept all TCP/WS connections; route reducer calls by world position or entity
-ownership; coordinate player handoff across shard boundaries; replicate `#[table(global)]` tables
-read-only to every shard; aggregate cross-shard subscriptions.
+Responsibilities: accept all TCP/WS connections; route reducer calls by partition key; coordinate
+entity handoff when a row set changes partition; replicate `#[table(global)]` tables read-only to
+every shard; aggregate cross-shard subscriptions.
 
 ### ShardHost
 
-One instance per world region — fully independent: owns its `MemStore`, `CommitLog`,
-`SnapshotRepo`, and `SubscriptionManager`. Runs as a tokio task with a single-writer command
-queue (OQ-2 tracks process-per-shard as an alternative deployment).
+One instance per partition — fully independent: owns its `MemStore`, `CommitLog`, `SnapshotRepo`,
+and `SubscriptionManager`. Runs as a tokio task with a single-writer command queue (OQ-2 tracks
+process-per-shard as an alternative deployment).
 
 Reducer execution flow per shard:
 
@@ -357,13 +400,17 @@ Reducer execution flow per shard:
 
 ---
 
-## Storage: MemStore
+## Storage: MemStore + tiered pager
 
-In-memory transactional store with MVCC isolation ([SPEC-002](specs/SPEC-002-storage-engine.md)).
+Transactional store with MVCC isolation ([SPEC-002](specs/SPEC-002-storage-engine.md)). The
+committed state is **tiered** ([SPEC-015](specs/SPEC-015-tiered-storage.md)): hot rows live
+uncompressed in the buffer pool; cold rows live in a paged, compressed on-disk store and fault in
+on demand. The transaction and subscription layers see one logical `CommittedState` — tiering is
+invisible above the storage API.
 
 ```rust
 pub struct MemStore {
-    committed: CommittedState,      // stable snapshot, lock-free reads
+    committed: CommittedState,      // logical committed state (buffer pool + cold pager)
     tx: Option<TxState>,            // in-flight mutations (one at a time per shard)
 }
 
@@ -374,7 +421,7 @@ pub struct CommittedState {
 pub struct Table {
     rows: BTreeMap<PrimaryKey, Row>,          // O(log n) pk lookup
     indexes: HashMap<IndexId, BTreeIndex>,    // secondary indexes
-    spatial: Option<SpatialIndex>,            // QuadTree / R-tree (persistent geometry only)
+    spatial: Option<SpatialIndex>,            // QuadTree / R-tree
 }
 
 pub struct TxState {
@@ -395,20 +442,45 @@ TableMutation { table_id: u32, inserts: Vec<Row>, deletes: Vec<PrimaryKey> }
 ```
 
 Using the same `u32 LE + MessagePack` framing as FluxRPC keeps the stack homogeneous — the commit
-log is effectively "recorded wire messages"; one codec, one decoder, one debugging tool.
+log is effectively "recorded wire messages"; one codec, one decoder, one debugging tool. It is
+also the **replication stream** (see Replication below) and, archived, the basis for point-in-time
+recovery.
+
+### Storage tiers & memory budget
+
+```
+                      memory.budget (auto = f(RAM, cgroup limits))
+        ┌─────────────────────────────────────────────┐
+        │                BUFFER POOL                  │   hot: < 1 µs reads
+        │   uncompressed pages, clock-LRU eviction    │
+        └───────────────▲───────────────┬─────────────┘
+                 fault in │              │ evict (compress)
+        ┌───────────────┴───────────────▼─────────────┐
+        │              PAGED COLD TIER                │   cold: one page-in
+        │   fixed-size pages, FluxBIN rows, CRC32,    │
+        │   LZ4 per page (zstd for checkpoints)       │
+        └─────────────────────────────────────────────┘
+```
+
+- **One knob:** `memory.budget: auto | <bytes>`. `auto` derives from detected RAM and container
+  limits. The process never grows unbounded with dataset size (PRD FR-110, NFR-12).
+- Pages are the unit of I/O, eviction, compression, and checksums; indexes are paged too.
+  Datasets are bounded by disk — billions of rows per deployment when combined with sharding
+  (NFR-13).
+- Writes always land in the hot tier + commit log; eviction is asynchronous and never blocks the
+  writer. Full design: [SPEC-015](specs/SPEC-015-tiered-storage.md).
 
 ---
 
 ## Reducers
 
-Game logic is written as Rust functions registered by `#[fluxum::reducer]`
+Application logic is written as Rust functions registered by `#[fluxum::reducer]`
 ([SPEC-004](specs/SPEC-004-reducers.md)):
 
 ```rust
 pub struct ReducerContext {
     pub identity: Identity,               // 256-bit caller identity
     pub connection_id: ConnectionId,
-    pub entity_id: Option<EntityId>,      // caller's entity, if bound
     pub timestamp: Timestamp,             // call timestamp (µs)
     pub shard_id: u32,
     pub tx: TxHandle,                     // the only mutation path
@@ -417,17 +489,20 @@ pub struct ReducerContext {
 
 ```rust
 #[fluxum::reducer]
-fn move_player(ctx: &ReducerContext, dx: f32, dy: f32) -> Result<(), String> {
-    let pos = ctx.tx.query_pk::<Position>(ctx.entity_id.ok_or("no entity")?)
-        .ok_or("position not found")?;
-    ctx.tx.upsert::<Position>(Position { entity_id: pos.entity_id, x: pos.x + dx, y: pos.y + dy })?;
+fn complete_task(ctx: &ReducerContext, task_id: u64) -> Result<(), String> {
+    let task = ctx.tx.query_pk::<Task>(task_id).ok_or("task not found")?;
+    if task.owner != ctx.identity {
+        return Err("not your task".into());
+    }
+    ctx.tx.upsert::<Task>(Task { done: true, ..task })?;
     Ok(())
 }
 
-#[fluxum::tick(rate = 60)]
-fn physics_tick(ctx: &ReducerContext) {
-    for body in ctx.tx.scan_where::<PhysicsBody>(|b| b.dirty) {
-        integrate_and_update(ctx, body);
+#[fluxum::tick(rate = 1)]
+fn purge_expired_sessions(ctx: &ReducerContext) {
+    let cutoff = ctx.timestamp - Duration::from_mins(30);
+    for s in ctx.tx.scan_where::<OnlineUser>(|s| s.connected_at < cutoff) {
+        ctx.tx.delete::<OnlineUser>(s.identity).ok();
     }
 }
 ```
@@ -454,9 +529,9 @@ evaluated against the delta rows of every commit ([SPEC-005](specs/SPEC-005-subs
 pub struct CompiledPlan {
     query_id: u32,
     table_id: TableId,
-    filter: Option<FilterExpr>,        // compiled predicate
+    filter: Option<FilterExpr>,         // compiled predicate
     spatial: Option<SpatialConstraint>, // IN REGION / WITHIN RADIUS
-    rls: Option<VisibilityRule>,       // row-level security
+    rls: Option<VisibilityRule>,        // row-level security
 }
 ```
 
@@ -466,11 +541,11 @@ loop never blocks on any individual client — the 3-tier backpressure policy (N
 Full) protects the broadcast path from slow consumers, the same lesson Synap's pub/sub encodes
 with bounded per-subscriber channels.
 
-Spatial subscriptions apply only to persistent world geometry:
+Geospatial subscriptions:
 
 ```sql
-SELECT * FROM TerrainChunk IN REGION (0, 0, 4000, 4000)
-SELECT * FROM SpawnPoint WITHIN RADIUS 500 OF (1200, 800)
+SELECT * FROM Sensor IN REGION (0, 0, 4000, 4000)
+SELECT * FROM Vehicle WITHIN RADIUS 500 OF (1200, 800)
 ```
 
 ---
@@ -479,12 +554,68 @@ SELECT * FROM SpawnPoint WITHIN RADIUS 500 OF (1200, 800)
 
 ```
 Identity = SHA-256(token bytes)          — 256-bit, stable across reconnects
-ServerIdentity = SHA-256("SERVER:" + name) — privileged peers, bypass RLS
+ServerIdentity = SHA-256("SERVER:" + name) — privileged service peers, bypass RLS
 ConnectionId = random u128               — ephemeral, per connection
 ```
 
 Tokens are opaque bytes; the `AuthProvider` trait (`token` / `jwt` / `none` built-ins) validates
 them ([SPEC-009](specs/SPEC-009-authentication.md)). No mandatory OIDC.
+
+---
+
+## Replication & backup (replica sets)
+
+Per shard, a **replica set**: one primary + N replicas ([SPEC-014](specs/SPEC-014-replication.md)).
+
+```
+            writes                    commit-log stream
+Clients ──────────────▶ PRIMARY ═══════════════════════▶ REPLICA 1
+            reads /                   (async | semi-sync)      │
+            subscriptions ─────────────────────────────▶ REPLICA 2
+                                                          serve reads +
+                                                          subscription fan-out
+```
+
+- **The commit log is the replication protocol.** Full sync = checkpoint transfer; partial sync =
+  stream from a log offset. No second wire format to maintain.
+- **Modes:** async by default (lowest latency); semi-sync quorum acknowledgment for
+  zero-committed-loss guarantees.
+- **Failover:** consensus-based primary election (OQ-8: `openraft` vs custom Raft — both have
+  family precedent); epoch numbers in the stream fence stale primaries. SDKs reconnect and
+  resubscribe transparently.
+- **Read offload:** replicas serve one-off reads and **subscription fan-out**, taking broadcast
+  work off the primary's write path (staleness bounded and observable via
+  `fluxum_replication_lag`).
+- **Backup:** `fluxum backup create / restore / verify` — hot backup (checkpoint + archived log
+  segments, zstd), no writer stall; **PITR** replays archived segments to a target timestamp or
+  `tx_id`.
+
+---
+
+## SIMD & hardware adaptivity
+
+Fluxum adapts to the machine instead of assuming one ([SPEC-016](specs/SPEC-016-hardware-adaptivity.md)).
+
+**Boot-time probe** — cores, total/available RAM, cgroup/container limits → derives buffer-pool
+size, tokio worker counts, fan-out concurrency, WAL buffer, checkpoint cadence. Effective values
+are logged at boot and exposed in `/health`. The same binary is correct on a 1 vCPU / 512 MB
+droplet and fast on a 64-core server; config can override any derived value.
+
+**SIMD with runtime dispatch** (family precedent: Nexus `simd/`, Vectorizer SIMD matrix CI) —
+selected once at startup per kernel: AVX-512 / AVX2 / SSE4.2 on x86-64, NEON on aarch64, scalar
+fallback everywhere. Hot kernels:
+
+| Kernel | Used by |
+|---|---|
+| CRC32 (hw / PCLMUL) | Commit log, page checksums |
+| xxHash-class hashing | Partition routing, index hashing |
+| FluxBIN batch encode/decode | Fan-out serialization, page materialization |
+| Batched predicate evaluation | Subscription filters over row batches, scans |
+| LZ4 / zstd block paths | Page compression, checkpoints, backups |
+
+Correctness rule (PRD FR-112): every SIMD kernel is **bit-identical to its scalar reference**,
+enforced by property tests on an ISA matrix in CI. Performance claims come from the parity
+harness, not microbenchmarks alone.
 
 ---
 
@@ -496,26 +627,36 @@ YAML with `FLUXUM_*` environment overrides (family pattern):
 # config.yml
 server:
   tcp_host: "127.0.0.1"
-  http_port: 15800        # HTTP/JSON admin
-  tcp_port: 15801         # FluxRPC binary
-  ws_port: 15802          # FluxRPC over WebSocket
+  http_port: 15800        # HTTP: admin API + /rpc (FluxRPC over Streamable HTTP)
+  tcp_port: 15801         # FluxRPC binary TCP
 
-world:
-  bounds: { x: 0, y: 0, width: 16000, height: 16000 }
-  shard_size: 4000        # 4000×4000 units per shard → 4×4 = 16 shards
-  shards: auto
+sharding:
+  shards: 1               # or N, or "auto"
+  strategy: hash          # hash | range | region (per partitioned table override)
+
+memory:
+  budget: auto            # auto = f(detected RAM, cgroup limits) | absolute bytes ("2GiB")
 
 storage:
+  data_dir: ./data
   commit_log_dir: ./data/log
-  snapshot_dir: ./data/snapshots
-  snapshot_interval_tx: 10000
+  checkpoint_dir: ./data/checkpoints
+  checkpoint_interval_tx: 10000
+  page_compression: lz4    # lz4 | zstd | none
+
+replication:
+  role: primary            # primary | replica (auto after election)
+  mode: async              # async | semi_sync
+  peers: []                # replica set members
+
+simd: auto                 # auto | avx512 | avx2 | neon | scalar (force for debugging)
 
 auth:
   provider: token          # token | jwt | none (dev only)
   secret: ${FLUXUM_AUTH_SECRET}
   server_peers:
-    - name: "game_server"
-      token: ${FLUXUM_GAME_SERVER_TOKEN}
+    - name: "ingest_service"
+      token: ${FLUXUM_INGEST_TOKEN}
 
 subscriptions:
   send_buffer_bytes: 2097152        # 2 MB per client
@@ -538,12 +679,19 @@ logging:
 | **Row data = FluxBIN** (BSATN-equivalent, not MsgPack) | Schema-driven encoding is ~40% smaller; at 100k tx/s × 1,000 subscribers the difference compounds |
 | Native static Rust modules (no WASM) | Eliminates FFI marshaling, startup JIT, and sandbox complexity — reducers are function calls |
 | Transaction layer = isolation boundary (`catch_unwind`) | Panic ⇒ rollback; `CommittedState` untouched mid-transaction; shard never dies |
-| Single-writer per shard, multi-shard world | Maximizes per-shard throughput without lock contention; scales horizontally by region |
-| Composite primary keys | Terrain chunks need `(cx, cy)`; SpacetimeDB lacks this |
-| `TxUpdate` carries caller + reducer_name + timestamp + duration | Clients need context for UI, sound, VFX, event routing, and profiling |
+| Single-writer per shard, partitioned keyspace | Maximizes per-shard throughput without lock contention; scales horizontally by partition |
+| Composite primary keys | Natural keys like `(tenant, key)` or `(grid_x, grid_y)`; SpacetimeDB lacks this |
+| `TxUpdate` carries caller + reducer_name + timestamp + duration | Clients need context for attribution, event routing, ordering, and profiling |
 | Fan-out backpressure (3-tier per-client buffer) | One slow client must not stall the broadcast loop (DoS vector otherwise) |
 | Declarative `max_rate` limiting | Token bucket per (identity, reducer) beats SpacetimeDB's energy accounting |
-| Server-to-server identity namespace | The C++ game server is a privileged peer that bypasses RLS |
-| Spatial index as first-class primitive | SpacetimeDB's O(n) AoI filter is the main scalability ceiling; solved at the DB level |
-| HTTP = JSON admin only; TCP/WS = binary game traffic | Each transport optimized for its consumer; prevents protocol bloat |
-| Ports 15800–15802 | HiveLLM 15xxx port family (Nexus 15474–6, Synap 15500–2, Vectorizer 15002/15503) |
+| Server-to-server identity namespace | Trusted services are privileged peers that bypass RLS |
+| Geospatial index as first-class primitive | SpacetimeDB's O(n) location filter is a scalability ceiling; solved at the DB level |
+| Browser transport = **Streamable HTTP** (`/rpc`), not WebSocket | Modern standard (MCP pattern, family precedent in Synap/Vectorizer); binary end-to-end via fetch streams; proxy/LB-friendly; natural HTTP/3-WebTransport path |
+| Unversioned HTTP paths (no `/v1`) | Compatibility via format freezes + additive evolution, not path versioning |
+| **Tiered storage under one memory budget** (vs SpacetimeDB's all-in-RAM) | PostgreSQL-like memory envelope; datasets bounded by disk; small-droplet viable (NFR-12); billions of rows with sharding (NFR-13) |
+| Own paged store — no RocksDB/LMDB/SQLite dependency | The performance envelope *is* the product; one codec/framing across wire, log, and pages |
+| Commit log doubles as replication stream and PITR source | One format to test; full sync = checkpoint, partial sync = offset; backups replay the same segments |
+| Replica sets: single primary per shard, consensus election | MongoDB-style operational model; semi-sync mode gives zero-committed-loss failover |
+| SIMD via runtime dispatch, scalar-parity enforced | Portable binary, maximum per-machine performance, correctness provable (family precedent) |
+| Parity benchmark vs app-server + PostgreSQL in-repo | The product's reason to exist is measured, not asserted (NFR-11); published every release |
+| Ports 15800 (HTTP) + 15801 (TCP) | HiveLLM 15xxx port family (Nexus 15474–6, Synap 15500–2, Vectorizer 15002/15503) |
