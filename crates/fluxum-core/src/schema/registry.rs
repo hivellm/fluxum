@@ -229,8 +229,8 @@ mod tests {
     use super::*;
     use crate::schema::ColumnSchema;
 
-    // Hand-built statics standing in for macro output; the end-to-end macro →
-    // registry path is covered by the fluxum-macros integration tests.
+    // Hand-built static schemas standing in for macro output; the end-to-end
+    // macro → registry path is covered by the fluxum-macros integration tests.
     static USER_COLS: &[ColumnSchema] = &[
         ColumnSchema {
             name: "id",
