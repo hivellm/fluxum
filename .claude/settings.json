@@ -16,6 +16,8 @@
       "Bash(rustc *)",
       "Bash(ls *)",
       "Bash(cat *)",
+      "Bash(cat)",
+      "PowerShell(cat *)",
       "Bash(head *)",
       "Bash(tail *)",
       "Bash(wc *)",
