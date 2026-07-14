@@ -511,10 +511,12 @@ fn concurrent_readers_see_pre_commit_state_until_the_merge_and_never_a_partial_t
     let sid = store.table_id("Sensor").unwrap();
 
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (ready_tx, ready_rx) = mpsc::channel();
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let store = std::sync::Arc::clone(&store);
             let stop = std::sync::Arc::clone(&stop);
+            let ready = ready_tx.clone();
             thread::spawn(move || {
                 let mut observed_states = 0u64;
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
@@ -529,11 +531,23 @@ fn concurrent_readers_see_pre_commit_state_until_the_merge_and_never_a_partial_t
                         "reader observed a partial transaction: {users} users vs {sensors} sensors"
                     );
                     observed_states += 1;
+                    if observed_states == 1 {
+                        ready.send(()).expect("main thread is waiting");
+                    }
                 }
                 observed_states
             })
         })
         .collect();
+    drop(ready_tx);
+    // Don't start committing until every reader has observed at least one
+    // state — otherwise a fast writer can finish all 500 commits before a
+    // reader thread is even scheduled (seen on Windows CI).
+    for _ in 0..readers.len() {
+        ready_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("all readers observe the initial state");
+    }
 
     for i in 0..500 {
         let mut tx = store.begin();
