@@ -1,16 +1,16 @@
 # Proposal: phase2_memstore-mvcc
 
 ## Why
-The in-memory store is the hot path of the whole database; MVCC separation of committed vs in-flight state is what makes lock-free reads and clean rollback possible.
+MemStore is the hot tier every transaction, index, and subscription reads through; MVCC with a single writer per shard is what makes lock-free reads and clean rollback possible.
 
 ## What Changes
-Implement MemStore: CommittedState (BTreeMap per table) + TxState (in-flight inserts/deletes), MVCC merge on commit, discard on rollback, and lock-free committed reads.
+Implement `CommittedState` + `TxState` with MVCC merge-on-commit / discard-on-rollback, lock-free committed reads, and the rollback correctness rules (delete-then-reinsert cancellation, index rebuild equivalence).
 
 ## Impact
 - DAG task: T2.1
 - Affected specs: SPEC-002 (storage engine)
-- PRD requirements: FR-10, FR-12
-- Affected code: crates/fluxum-server (storage module)
+- PRD requirements: FR-10, FR-12, NFR-02
+- Affected code: crates/fluxum-core (storage)
 - Depends on: G1
 - Breaking change: NO
-- User benefit: sub-millisecond reads that never block behind writers
+- User benefit: sub-microsecond hot reads with ACID semantics

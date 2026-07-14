@@ -1,10 +1,11 @@
 ## 1. Implementation
-- [ ] 1.1 Implement full sync: checkpoint transfer to a cold replica, then switch to log streaming
-- [ ] 1.2 Implement partial sync: resume streaming from a replica-provided log offset
-- [ ] 1.3 Stream commit-log entries in the frozen G5 format with replica-side CRC verification and apply
-- [ ] 1.4 Implement async mode and semi-sync quorum mode (commit acked after quorum of replicas persist)
-- [ ] 1.5 Implement epoch fencing so entries from a deposed primary are rejected
-- [ ] 1.6 Verification (DAG exit test): replica converges from cold and from an offset; semi-sync ack test green
+- [ ] 1.1 Implement commit-log streaming as the replication protocol (log format = stream format, frozen at G5): batches with epoch numbers (FR-100, REP-010..)
+- [ ] 1.2 Full sync: empty replica converges via checkpoint transfer + log tail (REP-012); partial sync: rejoining replica converges from its log offset (REP-013)
+- [ ] 1.3 Async mode (default) + semi-synchronous quorum acknowledgment mode; semi-sync visibility barrier - no ReducerResult and no TxUpdate delivered before quorum append confirmed (REP-020/REP-021)
+- [ ] 1.4 Epoch fencing: a partitioned stale primary's batches are rejected, it demotes and truncates its diverged suffix; fluxum_replication_fenced_total increments (REP-031)
+- [ ] 1.5 Replication config surface: replica-set membership, mode (async|semi_sync), quorum size, max_staleness_ms - documented in the config reference
+- [ ] 1.6 Replication metrics: fluxum_replication_offset/lag/semi_sync_wait_us and peers gauges (FR-105 with T7.2)
+- [ ] 1.7 Verification (DAG exit test): replica converges from cold AND from offset (CommittedState equal, log byte-identical over shared tx_id range); semi-sync ack test; fencing test
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
 - [ ] 2.1 Update or create documentation covering the implementation

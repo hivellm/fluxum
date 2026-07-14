@@ -1,10 +1,10 @@
 ## 1. Implementation
-- [ ] 1.1 Implement the FluxBIN/FluxRPC codec and frame layer in Go
-- [ ] 1.2 Implement the client with context.Context on every operation: connect, authenticate, reducer calls, OneOffQuery
-- [ ] 1.3 Implement subscriptions with a typed local cache applying InitialData + TxUpdate diffs and channel-based change delivery
-- [ ] 1.4 Implement fluxum generate --lang go emitting typed bindings from the /schema JSON; publish as a Go module
-- [ ] 1.5 Verification (DAG exit test): shared conformance corpus green in Go CI
-- [ ] 1.6 Gate G7 input: PRD section 12.2 all green - failover + PITR + 5 SDKs + 1B-row soak + parity report v2 (release 0.2.0)
+- [ ] 1.1 Implement `fluxum generate --lang go` bindings + the idiomatic Go runtime over FluxRPC (FR-85, SDK-062)
+- [ ] 1.2 All blocking calls take context.Context; subscriptions deliver over channels; errors are idiomatic wrapped values
+- [ ] 1.3 Client cache + reconnect/resubscribe/reconcile semantics per SDK-04x (shared behavior rules)
+- [ ] 1.4 Go CI job running the shared conformance corpus (phase6_sdk-conformance-corpus)
+- [ ] 1.5 Verification (DAG exit test): corpus green in Go CI
+- [ ] 1.6 Gate G7 input (five-SDK conformance, SDK-064)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
 - [ ] 2.1 Update or create documentation covering the implementation
