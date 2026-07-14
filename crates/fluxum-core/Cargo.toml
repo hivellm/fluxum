@@ -25,14 +25,20 @@ tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 
 [dev-dependencies]
+crc.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+xxhash-rust.workspace = true
 
 [lints]
 workspace = true
 
 [[bench]]
 name = "memstore"
+harness = false
+
+[[bench]]
+name = "simd_kernels"
 harness = false

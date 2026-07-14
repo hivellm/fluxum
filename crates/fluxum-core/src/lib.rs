@@ -21,6 +21,8 @@
 //! - [`index`] — [`index::BTreeIndex`]: secondary B-tree indexes over
 //!   memcomparable keys, maintained inside the commit merge (SPEC-001 §5,
 //!   T2.4)
+//! - [`simd`] — runtime-dispatched SIMD kernels with scalar oracles
+//!   ([`simd::Dispatch`], SPEC-016 §5–§8, T2.10)
 
 pub mod auth;
 pub mod commitlog;
@@ -29,6 +31,7 @@ pub mod error;
 pub mod hw;
 pub mod index;
 pub mod schema;
+pub mod simd;
 pub mod store;
 pub mod types;
 
