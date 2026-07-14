@@ -92,7 +92,9 @@ fn hex_decode(hex: &[u8]) -> Option<Vec<u8>> {
     if !hex.len().is_multiple_of(2) {
         return None;
     }
-    hex.chunks_exact(2)
+    let (pairs, _) = hex.as_chunks::<2>();
+    pairs
+        .iter()
         .map(|pair| Some((hex_val(pair[0])? << 4) | hex_val(pair[1])?))
         .collect()
 }
