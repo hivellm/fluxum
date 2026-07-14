@@ -180,32 +180,74 @@ per-shard mechanism.
   }
   ```
 
+  **Query deduplication.** Compiled plans SHALL be deduplicated across clients: the server
+  computes a `QueryHash` over the *normalized* query text (whitespace- and case-normalized),
+  combined with the caller's `Identity` when — and only when — the plan is caller-parameterized
+  (its `rls` filter depends on the caller, SUB-030). All subscriptions with an identical
+  `QueryHash` SHALL share exactly ONE `CompiledPlan`; per-connection `query_id`s are handles onto
+  the shared plan. Per commit, each shared plan is evaluated exactly once regardless of how many
+  clients subscribe to it (SUB-021), and its results are encoded once and distributed to every
+  subscriber of that query (SUB-024). *(adopted from SpacetimeDB analysis, file 05)*
+
 - **SUB-021** [P0] **Plan evaluation on commit.** After every commit, the `SubscriptionManager`
-  SHALL evaluate each registered plan against the delta rows (inserts and deletes in the committed
-  `TxState`). The evaluation algorithm SHALL be:
+  SHALL evaluate the candidate set of **unique plans** (never per-client copies) against the delta
+  rows (inserts and deletes in the committed `TxState`). The evaluation algorithm SHALL be:
+  *(amended per SpacetimeDB analysis, file 05)*
 
   ```text
-  for each plan registered by connected clients:        // candidates via table_watchers (SUB-040)
+  candidates = plans selected by value-level pruning (SUB-023)
+             ∪ plans in the table_watchers fallback tier (SUB-040)
+             // unique plans deduped by QueryHash (SUB-020) — never one entry per client
+
+  for each unique plan in candidates:
       if plan.table_ids ∩ tx_state.mutated_tables == ∅:
           skip                                          // fast path — no relevant table changed
-      matching_inserts = []
-      matching_deletes = []
-      for row in tx_state.inserts[plan.table_ids]:
-          if plan.filter(row) && plan.rls(row, client_identity):
-              matching_inserts.push(row)
-      for pk in tx_state.deletes[plan.table_ids]:
-          // deletes are always sent if the client was subscribed to the row
-          // (checked by looking up the pre-commit CommittedState)
-          if client_was_subscribed_to(pk, plan, client_identity):
-              matching_deletes.push(pk)
-      if !matching_inserts.is_empty() || !matching_deletes.is_empty():
-          enqueue TxUpdate for this client              // delivery subject to SUB-041/SUB-042
+      matching_inserts = rows in tx_state.inserts[plan.table_ids] where plan.filter(row)
+      matching_deletes = rows in tx_state.deletes[plan.table_ids] where plan.filter(old_row)
+          // deletes are matched by running the SAME filter (and RLS) over the deleted rows'
+          // pre-commit values — no separate "was the client subscribed to this row?"
+          // bookkeeping is needed; correctness falls out of evaluating the query itself
+          // against the delta, and is provably consistent with InitialData
+      if matching_inserts.is_empty() && matching_deletes.is_empty():
+          continue
+      encode the matched delta ONCE per (plan, commit) into FluxBIN bytes (SUB-024)
+      for each subscriber of this plan:                 // caller-parameterized plans are already
+          enqueue TxUpdate (shared bytes)               // per-identity via QueryHash (SUB-020);
+                                                        // delivery subject to SUB-041/SUB-042
   ```
 
-- **SUB-022** [P0] **Fan-out complexity.** The worst-case fan-out per commit SHALL be O(C × R),
-  where C is the number of subscribed clients and R is the number of delta rows in the commit. For
-  geospatial queries, the QuadTree/R-tree index SHALL reduce R to only nearby rows, bounding
-  practical fan-out to O(C_local × R_local).
+- **SUB-022** [P0] **Fan-out cost model.** The per-commit fan-out cost MUST be
+  O(P_matched + S_matched), where P_matched is the number of unique plans selected by the pruning
+  indexes (SUB-023, SUB-040) for the commit's delta rows and S_matched is the number of
+  subscribers of those matched plans. It MUST NOT be O(all connected clients) or O(all registered
+  plans): plans not selected by pruning and clients not subscribed to a matched plan SHALL incur
+  no per-commit work. For geospatial queries, the QuadTree/R-tree index (SPEC-008) SHALL reduce
+  the delta rows considered to only nearby rows, bounding practical fan-out to
+  O(P_local + S_local). *(adopted from SpacetimeDB analysis, file 05)*
+
+- **SUB-023** [P0] **Value-level plan pruning.** A plan whose predicate contains a top-level
+  single-column equality against a constant (`WHERE col = <value>`) SHALL be registered in a
+  value index — `search_args: (TableId, ColId, Value) → set<QueryHash>` (SUB-040) — instead of
+  (not in addition to) the per-table fallback tier. On commit, for each delta row the manager
+  projects the row's value for every registered `(table, column)` pair and selects only the plans
+  whose filter value matches exactly. Candidate plans are thereby selected by the commit's delta
+  row *values* — never by a linear scan over all registered plans. Example: 1,000 clients each
+  subscribed to `SELECT * FROM t WHERE id = ?` with 1,000 distinct values — a 1-row commit
+  selects and evaluates exactly 1 plan, O(1) instead of O(clients). Plans without a usable
+  equality value fall back to the `table_watchers` tier (SUB-040) and are evaluated on every
+  commit touching their table. Spatial subscriptions (SUB-011) SHALL use the spatial analogue: an
+  index over subscribed regions (served by the SPEC-008 quadtree/R-tree) so that a moved row
+  prunes to only the plans whose region contains it. *(adopted from SpacetimeDB analysis,
+  file 05)*
+
+- **SUB-024** [P0] **Shared row encoding at fan-out.** The FluxBIN encoding (SPEC-006 §6) of a
+  matched delta SHALL be performed exactly once per (query, delta) and the encoded bytes shared
+  across all subscribers of that query via a reference-counted buffer (e.g. `bytes::Bytes` —
+  the per-subscriber "copy" is a refcount bump). Per-client work at fan-out SHALL be limited to
+  queueing the shared bytes plus optional per-connection compression, which runs in each
+  client's send path off the commit path (SPEC-006 RPC-008); per-client re-evaluation or
+  re-encoding of rows is prohibited, and compression SHALL never be shared across subscribers
+  while holding the commit path. *(adopted from SpacetimeDB analysis, files 05/06)*
 
 ## 5. Row-level security (visibility)
 
@@ -244,19 +286,31 @@ per-shard mechanism.
 
 ## 6. SubscriptionManager structure
 
-- **SUB-040** [P0] **SubscriptionManager layout.**
+- **SUB-040** [P0] **SubscriptionManager layout.** *(amended per SpacetimeDB analysis, file 05 —
+  plans are keyed by `QueryHash`, not per connection)*
 
   ```rust
   pub struct SubscriptionManager {
-      /// Registered plans per client connection.
-      plans: HashMap<ConnectionId, Vec<CompiledPlan>>,
-      /// Index: table_id → set of ConnectionIds with plans touching that table.
-      table_watchers: HashMap<TableId, BTreeSet<ConnectionId>>,
+      /// One entry per UNIQUE query (SUB-020): the shared compiled plan and its subscribers.
+      queries: HashMap<QueryHash, QueryState>,
+      /// Per-connection handles: server-assigned query_id → QueryHash (for Unsubscribe/cleanup).
+      connections: HashMap<ConnectionId, HashMap<u32, QueryHash>>,
+      /// Value-level pruning index (SUB-023): equality-filtered plans keyed by filter value.
+      search_args: BTreeMap<(TableId, ColId, Value), HashSet<QueryHash>>,
+      /// Fallback tier: table_id → plans on that table WITHOUT a usable search argument.
+      table_watchers: HashMap<TableId, HashSet<QueryHash>>,
+  }
+
+  pub struct QueryState {
+      plan: Arc<CompiledPlan>,             // compiled once, shared by all subscribers
+      subscribers: HashSet<ConnectionId>,  // fan-out targets for this query
   }
   ```
 
-  The `table_watchers` index enables the fast-path skip in SUB-021: only clients watching a
-  mutated table need plan evaluation.
+  `search_args` and `table_watchers` together drive candidate selection in SUB-021: a plan lives
+  in exactly one of the two tiers, and only plans selected by these indexes are evaluated for a
+  commit. A query's entry is removed when its last subscriber unsubscribes or disconnects
+  (SUB-004/SUB-005).
 
 - **SUB-041** [P0] **Thread safety and non-blocking commit path.** The `SubscriptionManager` SHALL
   be protected by an async mutex (`tokio::sync::Mutex`). `on_subscribe`, `on_unsubscribe`, and
@@ -306,6 +360,17 @@ per-shard mechanism.
   pub struct ChatMessage { /* ... */ }
   ```
 
+- **SUB-044** [P1] **Subscription admission control.** The server SHALL enforce two configurable
+  caps at subscribe time (`config.yml`): `max_subscriptions_per_connection` (default: 1,000) and
+  `max_compiled_plans` — the total number of unique `QueryState` entries across all connections
+  (default: 100,000). A `Subscribe`/`SubscribeSingle` that would exceed either cap SHALL be
+  rejected with the typed error `Error { code: 429, message: "subscription limit exceeded:
+  <which limit>" }` (error type per SPEC-006) without registering any plan or sending
+  `InitialData`; already-registered subscriptions on the connection are unaffected. Rationale:
+  SpacetimeDB ships no such admission control — an unbounded number of registered plans is an
+  identified operational risk (memory growth and per-commit pruning-index bloat under hostile or
+  buggy clients); Fluxum closes it. *(adopted from SpacetimeDB analysis, file 05)*
+
 ## 7. Materialized views (subscribable computed views)
 
 - **SUB-050** [P2] **`#[fluxum::materialized_view]`.** A Rust function annotated with
@@ -350,10 +415,20 @@ per-shard mechanism.
    (non-blocking guarantee); the blocked client is dropped after 5 s, the WARN line is logged, and
    `fluxum_subscriber_drops_total` increments.
 7. **Fast-path skip** (SUB-021/SUB-040): a commit touching no watched tables performs no plan
-   evaluation (verified via the `table_watchers` index).
+   evaluation (verified via the `search_args` and `table_watchers` indexes).
 8. **Subscription correctness property test** (NFR-10; runs under
    [SPEC-013](SPEC-013-testing-conformance.md), DAG T4.5): generate 10,000 random mutations
    (inserts/updates/deletes across random tables, including `owner_only` tables) against a
    population of clients holding random subscriptions; every client cache — initialized from
    `InitialData` and maintained solely by applying `TxUpdate` diffs — MUST equal the server-side
    query result for its subscriptions after every commit. Required accuracy: 100%.
+9. **Dedup and value-level pruning** (SUB-020/SUB-023/SUB-024) *(adopted from SpacetimeDB
+   analysis, file 05)*: (a) N clients subscribing to the identical (normalized) query text share
+   exactly one `CompiledPlan` (`queries` map size = 1); (b) with 1,000 clients each subscribed to
+   `SELECT * FROM t WHERE id = ?` for 1,000 distinct values, a 1-row commit evaluates exactly one
+   plan and performs exactly one FluxBIN delta encode (verified via evaluation and encode
+   counters); (c) commit-path profiling shows per-subscriber fan-out work is limited to a
+   refcounted-buffer enqueue — no per-client row re-encoding.
+10. **Admission control** (SUB-044): the (`max_subscriptions_per_connection` + 1)-th subscription
+    on one connection, and the subscribe that would exceed `max_compiled_plans` globally, are each
+    rejected with the typed 429 error, register no plan, and leave existing subscriptions intact.

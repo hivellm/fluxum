@@ -314,10 +314,17 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   }
   ```
 
-  Cache keys are the table's primary key. Non-integer primary keys (e.g. `Identity` in
-  `OnlineUser`) SHALL be encoded to a stable string key; composite primary keys
-  (`primary_key(a, b)`) SHALL be encoded as a stable tuple key in column declaration order.
-  Per SPEC-006, `deletes` entries carry primary-key fields only.
+  Row **identity** in the client cache SHALL be the row's full FluxBIN-encoded bytes — the
+  buffer as received on the wire (SDK-041). Byte-keying provides map semantics even for column
+  types that are not hashable/equatable in the target language (e.g. `F32`/`F64` columns) and
+  makes row equality a cheap byte comparison; the cached row entry retains the raw bytes
+  alongside the decoded value. The typed per-table accessors shown above (keyed by primary
+  key) are **projections** over the byte-keyed store, derived at generation time from the
+  schema's `pk` columns; non-integer primary keys (e.g. `Identity`) SHALL be encoded to a
+  stable string key and composite primary keys (`primary_key(a, b)`) to a stable tuple key in
+  column declaration order. Per SPEC-006, `deletes` entries carry primary-key fields only; the
+  SDK resolves them to the cached row (and its bytes) via the primary-key projection before
+  removal. *(adopted from SpacetimeDB analysis, file 07)*
 
 - **SDK-041** [P0] Rows in `InitialData` and `TxUpdate` arrive as FluxBIN-encoded buffers
   (SPEC-006). For each table, generated SDKs SHALL include a FluxBIN row decoder — full row for
@@ -351,6 +358,50 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   `SchemaMismatch` error/event so the application can prompt for regeneration
   (`fluxum generate`) instead of operating on mistyped rows.
 
+- **SDK-044** [P0] **Per-row reference counting for overlapping subscriptions.** Every cached
+  row entry SHALL carry a reference count equal to the number of active subscription queries
+  through which the row is currently visible: a row visible through N queries has refcount N.
+  An insert arriving for an already-cached identity SHALL increment the count without firing a
+  callback; a delete SHALL decrement it. Semantic `insert` events fire only on the 0→1
+  transition and semantic `delete` events only on the 1→0 transition, so N overlapping
+  queries covering the same row dedupe into one cached row and exactly one callback pair over
+  its lifetime. This rule applies identically to ALL SDK runtimes (SDK-064).
+  *(adopted from SpacetimeDB analysis, file 07)*
+
+- **SDK-045** [P0] **Diff application order and callback visibility.** Within one `TxUpdate`,
+  the SDK SHALL apply all inserts **before** all deletes per table — this prevents a refcount
+  (SDK-044) from transiently hitting zero and lets a byte-identical delete+insert pair for the
+  same row (legitimate under join semantics) cancel without firing spurious callbacks. All
+  cache mutation for the transaction SHALL complete **before** any callback runs, so callbacks
+  always observe the full post-commit state — never a half-applied transaction. Callback
+  dispatch order within one update is: inserts, then deletes, then updates (updates being the
+  primary-key-coalesced pairs of SDK-042). This rule applies identically to ALL SDK runtimes
+  (SDK-064). *(adopted from SpacetimeDB analysis, file 07)*
+
+- **SDK-046** [P0] **Bounded internal queues.** Every internal channel or queue in an SDK
+  runtime — receive/parse pipeline, decoded-message queue, mutation/callback-registration
+  queue, outbound send queue — MUST be bounded with a documented capacity; unbounded queues
+  are prohibited. Overflow behavior: on a full inbound queue the runtime SHALL apply
+  backpressure to the transport (stop reading from the socket/stream) rather than drop
+  messages or grow without bound; on a full outbound queue the pending call SHALL block (or
+  await) the caller. If backpressure cannot be applied within the configured timeout, the
+  connection SHALL be failed with a typed queue-overflow error — never silent message loss.
+  *(adopted from SpacetimeDB analysis, file 07)*
+
+- **SDK-047** [P0] **Automatic reconnection with cache reconciliation.** Every P0/P1 SDK
+  runtime SHALL implement, in the core runtime (not an optional framework layer), automatic
+  session re-establishment with exponential backoff, re-authentication (SPEC-009), and
+  resubscription of all active subscriptions (SPEC-006 session semantics). While disconnected,
+  the cache SHALL be retained but marked stale and no row callbacks fire. On reconnect, the
+  runtime SHALL reconcile the cache from the fresh `InitialData`: refcounts (SDK-044) are
+  rebuilt from the fresh data, and the SDK SHALL emit only **net-difference** semantic
+  callbacks — deletes for rows absent from the fresh state, inserts for rows newly present,
+  updates for rows whose bytes changed under the same primary key — never a full
+  delete-everything/reinsert-everything storm and never stale rows surviving unreconciled.
+  Prior art note: no SpacetimeDB SDK auto-reconnects at the core layer, and none clears or
+  reconciles the cache on disconnect — this requirement is claimed as a Fluxum
+  differentiator. *(adopted from SpacetimeDB analysis, file 07)*
+
 ## 7. Rust client SDK — `fluxum-sdk`
 
 - **SDK-050** [P1] The workspace crate `sdks/rust` (`fluxum-sdk`) SHALL provide the Rust client
@@ -358,8 +409,8 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   (`fluxum://host:15801`) or Streamable HTTP (`http(s)://host:15800`, `/rpc` — SPEC-006),
   authenticates (SPEC-009), calls reducers, manages subscriptions
   (`Subscribe`/`SubscribeSingle`/`Unsubscribe`/`OneOffQuery`), and maintains the local cache
-  with the same diff-application, update-coalescing, and schema-version-check semantics as
-  SDK-040–SDK-043. It SHALL reuse `fluxum-protocol` for FluxValue, the FluxBIN codec, message
+  with the same diff-application, update-coalescing, refcounting, bounded-queue,
+  reconnection, and schema-version-check semantics as SDK-040–SDK-047. It SHALL reuse `fluxum-protocol` for FluxValue, the FluxBIN codec, message
   types, and the `Identity`/`ConnectionId`/`EntityId`/`Timestamp` newtypes — no duplicated wire
   code. Trusted backend services (privileged server peers) use this same SDK with a
   server-to-server identity (SPEC-009).
@@ -378,7 +429,8 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
 ## 8. Language targets & idioms
 
 Each SDK MUST feel native in its language while preserving identical semantics (types per
-SDK-020/021, reducer wrappers per SDK-030/031, cache/events/schema check per SDK-040–SDK-043).
+SDK-020/021, reducer wrappers per SDK-030/031, cache/events/reconnection/schema check per
+SDK-040–SDK-047).
 
 **JavaScript/TypeScript (P0, T6.2, FR-82)** — the reference target: typed event callbacks
 (SDK-042), Promise-based reducer and connection API (SDK-030, SDK-040), typed local cache
@@ -405,8 +457,9 @@ to the database**; there is no JSON fallback and no intermediate gateway.
   via `http(s)://host:15800`). Transport selection follows the URI scheme; using `fluxum://`
   (TCP) in a browser SHALL fail fast with an actionable error naming the `http(s)://` endpoint
   form. Session re-establishment with exponential backoff and automatic re-authentication +
-  resubscription (SPEC-006 session semantics, SPEC-014 client behavior) apply identically in
-  both environments.
+  resubscription, with the cache reconciled from fresh `InitialData` per SDK-047 (SPEC-006
+  session semantics, SPEC-014 client behavior), apply identically in both environments.
+  *(amended per SpacetimeDB analysis, file 07)*
 
 - **SDK-083** [P1] **Footprint.** The hand-written runtime (excluding generated code) SHALL be
   tree-shakeable (side-effect-free ESM) and ≤ 50 KB minified + gzipped; the size is asserted in
@@ -455,7 +508,7 @@ to the database**; there is no JSON fallback and no intermediate gateway.
 
 - **SDK-063** [P2] **C++ target (FR-87).** `fluxum generate --lang cpp` SHALL emit typed
   structs and reducer helpers only (`Fluxum.h`/`Fluxum.cpp` per SDK-020/021/030). A full C++
-  client runtime (cache, events, schema check per SDK-040–SDK-043) is out of scope for 0.2.0;
+  client runtime (cache, events, schema check per SDK-040–SDK-047) is out of scope for 0.2.0;
   the C++ target is not part of the five-SDK conformance gate. Post-0.2.0, unscheduled.
 
 - **SDK-064** [P1] **Shared conformance corpus.** Every P0/P1 SDK (TypeScript, Python, Go,
@@ -529,7 +582,11 @@ to the database**; there is no JSON fallback and no intermediate gateway.
    generated TypeScript SDK: a `send_chat` reducer call produces a `TxUpdate`, the local cache
    reflects the new `ChatMessage` row, and the `ChatMessage:insert` callback fires with a fully
    typed row decoded from FluxBIN. A delete+insert of the same `Task` primary key within one
-   `TxUpdate` fires exactly one `Task:update` callback.
+   `TxUpdate` fires exactly one `Task:update` callback. Two overlapping subscriptions covering
+   the same row produce one cached row with refcount 2 and a single `insert` callback;
+   dropping one of the two queries fires no callback, and a byte-identical delete+insert pair
+   in one `TxUpdate` fires none (SDK-044, SDK-045). *(adopted from SpacetimeDB analysis,
+   file 07)*
 9. **Schema-mismatch drill:** bump the server `schema_version` (SPEC-010 migration); a client
    built from the previous schema detects the mismatch on `InitialData.schema_version`,
    refreshes the schema and reconnects, and surfaces a typed `SchemaMismatch` error without
@@ -541,3 +598,11 @@ to the database**; there is no JSON fallback and no intermediate gateway.
     generated file carries the "generated — do not edit" header with the source `schema_version`.
 12. **C++ target (P2, post-0.2.0):** when scheduled, generated `Fluxum.h`/`Fluxum.cpp` (typed
     structs + reducer helpers only, SDK-063) compile cleanly in the C++ test harness.
+13. **Reconnection drill:** with an active subscription and populated cache, the server
+    connection is severed and rows are mutated before the server becomes reachable again. The
+    SDK reconnects with exponential backoff, re-authenticates, resubscribes, and reconciles
+    the cache from the fresh `InitialData`, emitting only net-difference callbacks (SDK-047);
+    no stale rows survive and no delete-all/reinsert-all callback storm occurs. Bounded-queue
+    behavior (SDK-046) is asserted by a slow-consumer variant: the inbound queue fills,
+    transport backpressure engages, and no message is silently dropped. *(adopted from
+    SpacetimeDB analysis, file 07)*

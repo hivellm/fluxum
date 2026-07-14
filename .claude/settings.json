@@ -1,0 +1,58 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Read",
+      "Glob",
+      "Grep",
+      "Agent",
+      "TodoWrite",
+      "WebFetch",
+      "WebSearch",
+      "Bash(git *)",
+      "Bash(gh *)",
+      "Bash(cargo *)",
+      "Bash(rustup *)",
+      "Bash(rustc *)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(sort *)",
+      "Bash(diff *)",
+      "Bash(echo *)",
+      "Bash(cd *)",
+      "Bash(mkdir *)",
+      "Bash(cp *)",
+      "Bash(mv *)",
+      "Bash(touch *)",
+      "Bash(node *)",
+      "Bash(npm *)",
+      "Bash(pnpm *)",
+      "Bash(npx *)",
+      "Bash(python *)",
+      "Bash(jq *)",
+      "Bash(curl *)",
+      "PowerShell(git *)",
+      "PowerShell(gh *)",
+      "PowerShell(cargo *)",
+      "PowerShell(Get-ChildItem *)",
+      "PowerShell(Get-Content *)"
+    ],
+    "ask": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)"
+    ],
+    "additionalDirectories": [
+      "E:\\HiveLLM",
+      "E:\\UzmiGames"
+    ]
+  }
+}

@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Adopted performance/stability findings from the SpacetimeDB source dossier into the specs**:
+  scalable fan-out via query-hash dedup + value-level plan pruning (SPEC-005, T4.2 — never
+  O(clients)); flat row lists, compression negotiation (none/gzip/brotli), `tx_updates: full|light`
+  opt-out, bounded per-connection queues (SPEC-006); CRC32C + epoch framing, group-commit flush
+  actor, non-destructive torn-tail repair, incremental content-addressed checkpoints,
+  rollback/undelete + blob-GC correctness rules (SPEC-002); paged evictable indexes + per-page
+  checksums (SPEC-015); refcounted client cache with FluxBIN-byte row identity and
+  mutate-then-callback ordering, bounded SDK channels, auto-reconnect reaffirmed (SPEC-011);
+  deterministic simulation testing (DST) + process-level restart harness (SPEC-013, T2.7);
+  rollback-safe at-least-once scheduling with restart rescan, schedule-only reducers reject
+  client calls by default (SPEC-004); JWT identity derived from stable claims — token rotation
+  never changes Identity (SPEC-009, FR-70); enriched TxUpdate kept as default with light opt-out
+  (FR-43).
+
+### Added
+- SpacetimeDB **source-code dossier** (`docs/analysis/spacetimedb-code/`, 11 files): deep
+  implementation analysis of the real v2.7.0 codebase (~237k LOC Rust, 45 crates,
+  commit `1a8df2a`), subsystem-by-subsystem, each mapped to Fluxum's specs and DAG tasks;
+  synthesis of ranked hard problems, adopt/avoid list, and roadmap impact in
+  `10-hard-problems.md`. Headline findings: replication absent from their OSS (SPEC-014 is a
+  differentiator), no published PostgreSQL parity benchmarks (NFR-11 uncontested), subscription
+  fan-out must use query-hash dedup + value-level pruning (SPEC-005 impact), paged indexes are
+  the novel part of tiered storage (SPEC-015).
+
 ## [0.1.0-alpha] - 2026-07-14
 
 > Design phase — complete documentation set; implementation starts at DAG Phase 0.

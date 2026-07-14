@@ -278,6 +278,47 @@ are specializations of the reducer form.
   row SHALL be removed from `__schedule__`. Because `__schedule__` is a persisted table, pending
   scheduled calls survive crash recovery.
 
+  **Rollback safety SHALL be enforced at fire time**: when a timer fires, the `ScheduleWorker`
+  SHALL re-read the committed `__schedule__` row before executing. If the row is absent — because
+  the scheduling transaction rolled back, or the entry was deleted since — the firing SHALL be a
+  no-op. Scheduling a deferred reducer inside a transaction that subsequently fails MUST have no
+  effect: the committed row is the sole source of truth, and cancellation requires no timer
+  unhooking — deleting the row cancels the schedule.
+  *(adopted from SpacetimeDB analysis, file 08)*
+
+- **RED-023** Delivery semantics: at-least-once, restart rescan, no backfill [P0] — Scheduled
+  reducers SHALL have at-least-once delivery semantics. The `__schedule__` row SHALL be deleted
+  (or, for recurring entries, rescheduled) only AFTER the scheduled reducer transaction has
+  executed successfully; the removal SHALL be part of the same transaction as the execution, so
+  that on success delivery is exactly-once, while a crash before the fired transaction commits
+  leaves the row in place for re-delivery. On shard restart, the `ScheduleWorker` SHALL rescan
+  all `__schedule__` entries and re-enqueue every row, deduplicating on re-enqueue (a schedule
+  `id` already in the in-memory timer queue SHALL NOT be enqueued twice). Past-due entries
+  (`execute_at_us < now` at recovery time) SHALL fire once, immediately — the system SHALL NOT
+  backfill missed interval occurrences (no catch-up burst of missed ticks).
+  *(adopted from SpacetimeDB analysis, file 08)*
+
+- **RED-024** Interval rescheduling is anti-drift [P0] — When a recurring scheduled entry is
+  rescheduled after execution, the next `execute_at_us` SHALL be computed from the INTENDED tick
+  time of the entry that just fired (`intended_time + period`), NOT from the completion time of
+  the handler. This keeps recurring schedules drift-free and is consistent with the
+  fixed-timestep, absolute-target clock of `#[fluxum::tick]` (RED-020). The no-backfill rule of
+  RED-023 still applies: if the intended time is already in the past by more than one period at
+  reschedule time, the next occurrence SHALL be rebased to the present rather than accumulating
+  a backlog. *(adopted from SpacetimeDB analysis, file 08)*
+
+- **RED-025** Scheduled execution context and client-call rejection [P0] — Executions triggered
+  by `#[fluxum::tick]` (RED-020) or by the `__schedule__` scheduler (RED-021..024) SHALL run
+  under the server (database) identity ([SPEC-009](SPEC-009-authentication.md) §8) with a nil
+  `ConnectionId` (`ConnectionId(0)`, reserved — never assigned to a real connection). Reducers
+  that are schedule-only — declared with `#[fluxum::tick]` or `#[fluxum::schedule]` — SHALL NOT
+  be callable by clients via `ReducerCall`: such calls SHALL be rejected with
+  `Error { code: 403, message: "schedule-only reducer" }` before any transaction is started,
+  unless the reducer explicitly opts in to client calls (e.g.
+  `#[fluxum::schedule(..., client_callable = true)]`). Default rejection is a deliberate
+  improvement over SpacetimeDB, where scheduled reducers remain client-callable unless module
+  code checks the caller. *(adopted from SpacetimeDB analysis, file 08)*
+
 - **RED-022** Recurring schedule [P0] — A reducer MAY reschedule itself to create a recurring
   pattern. This is the manual alternative to `#[fluxum::tick]` for low-frequency periodic work.
 
@@ -457,10 +498,14 @@ are specializations of the reducer form.
    cumulative drift (absolute-target clock); an injected stall of 1–3 periods causes an immediate
    re-fire with no warning; a stall > 3 periods logs exactly one warning and resets the clock
    with no catch-up burst; the same tick function never runs concurrently with itself on a shard.
-6. **Scheduling** (RED-021/022): `ctx.schedule_after` fires once after the delay and removes its
-   `__schedule__` row; scheduling inside a rolled-back transaction never fires; pending entries
-   survive `kill -9` + recovery; the self-rescheduling `purge_expired_sessions` example runs for
-   at least 10 consecutive cycles.
+6. **Scheduling** (RED-021/022/023): `ctx.schedule_after` fires once after the delay and removes
+   its `__schedule__` row in the same transaction as the execution; scheduling inside a
+   rolled-back transaction never fires — the worker re-reads the committed row at fire time and
+   an absent row is a no-op; pending entries survive `kill -9` + recovery: on restart every
+   `__schedule__` row is re-enqueued exactly once (no duplicate enqueue for the same id), and a
+   past-due entry fires once immediately with no backfill of missed occurrences; the
+   self-rescheduling `purge_expired_sessions` example runs for at least 10 consecutive cycles.
+   *(adopted from SpacetimeDB analysis, file 08)*
 7. **Rate limiting** (RED-050/051): a 10-call burst against `max_rate = "5/s"` yields 5 accepted
    calls and 5 rejections with code 429 and zero `TxState` allocations; buckets are independent
    per `(Identity, reducer)`; refill restores capacity after the window; server-to-server
@@ -475,6 +520,15 @@ are specializations of the reducer form.
     error; a `ReducerCall` naming an unknown reducer returns an error without starting a
     transaction; a call with `version: 1` invokes the v1 implementation while an unversioned call
     invokes the latest.
-11. **Views and procedures** (RED-030/031/040): `ReadOnlyTxHandle` exposes no write methods
+11. **Recurring anti-drift** (RED-024): a recurring 1 s schedule whose handler takes 300 ms
+    fires at t+1s, t+2s, t+3s (intended-time rebase, no 300 ms/cycle drift); a handler stalled
+    past its intended slot rebases to the present without a catch-up burst.
+    *(adopted from SpacetimeDB analysis, file 08)*
+12. **Scheduled execution context** (RED-025): a fired schedule/tick observes
+    `ctx.identity == server identity` and `ctx.connection_id == ConnectionId(0)`; a client
+    `ReducerCall` naming a schedule-only reducer is rejected with code 403 and no transaction,
+    while one marked `client_callable = true` is accepted.
+    *(adopted from SpacetimeDB analysis, file 08)*
+13. **Views and procedures** (RED-030/031/040): `ReadOnlyTxHandle` exposes no write methods
     (compile-fail test); `GET /view/:name` returns computed results; procedures execute via
     `POST /procedure/:name` and are rejected when invoked as FluxRPC `ReducerCall`s.

@@ -30,7 +30,7 @@ in the mold of PostgreSQL's buffer-pool model but with a realtime-first hot path
                 fault in │              │ evict (spill, compress)
         ┌───────────────┴───────────────▼─────────────┐
         │              PAGED COLD TIER                │   cold: one page-in
-        │   fixed-size pages, FluxBIN rows, CRC32,    │
+        │   fixed-size pages, FluxBIN rows, CRC32C,   │
         │   LZ4 per page (zstd for checkpoints)       │
         └─────────────────────────────────────────────┘
 ```
@@ -184,8 +184,14 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
   | 20 | 2 | `flags: u16` | see below |
   | 22 | 2 | `reserved: u16` | zero; MUST be ignored on read |
   | 24 | 4 | `payload_len: u32` | stored payload bytes (post-compression) |
-  | 28 | 4 | `crc32: u32` | over bytes 0..32 (this field zeroed) + payload (`crc32fast`) |
+  | 28 | 4 | `crc32c: u32` | over bytes 0..32 (this field zeroed) + payload — CRC32C (Castagnoli), hardware-accelerated |
   | 32 | … | payload | FluxBIN rows / index entries, possibly compressed |
+
+  The `crc32c` field is the **per-page integrity hash**: a fast, hardware-accelerated hash
+  (CRC32C via SSE4.2/ARMv8 CRC instructions; a BLAKE3-class hash MAY additionally be
+  maintained per page for content addressing, TIER-063) that MUST be verified on every
+  fault-in (TIER-032) before the page's contents are served. *(adopted from SpacetimeDB
+  analysis, files 02/03)*
 
   `flags` bit assignments: bits 0–1 = compression codec (`0` none, `1` LZ4, `2` zstd,
   `3` reserved); bit 2 = index page (interior/leaf B-tree node rather than data leaf); bit 3 =
@@ -202,10 +208,18 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
   budget accounting exact, whereas mmap hands residency control to the OS page cache. Any
   future mmap mode MUST preserve TIER-004 accounting and the TIER-014 invariant.
 
+  *Evidence for OQ-7 (recorded, decision still open):* SpacetimeDB uses **64 KiB** in-RAM
+  pages (`u16` intra-page offsets, chosen for RAM locality and amortized per-page overhead —
+  it has no disk tier); disk spill favors smaller pages for random fault-in, since a fault
+  reads the whole page and a smaller page reads fewer bytes per served row and pollutes the
+  pool less. 16-bit intra-page offsets cap a page at 64 KiB, so the same offset scheme works
+  at 4/8/16 KB with headroom. This evidence informs but does not resolve the 4/8/16 KB
+  benchmark decision tracked by OQ-7. *(adopted from SpacetimeDB analysis, file 02)*
+
 - **TIER-023** [P0] **Page files per table per shard.** Cold pages SHALL be stored under
   `storage.page_dir` (default `./data/pages`) as one page file per table per shard:
   `shard-<shard_id>/table-<table_id>.pages`. Each page file SHALL begin with a superblock
-  (magic `"FLXS"`, format version, `page_size`, `shard_id`, `table_id`, CRC32). Per-shard
+  (magic `"FLXS"`, format version, `page_size`, `shard_id`, `table_id`, CRC32C). Per-shard
   directories keep shard datasets independently movable (entity handoff and per-shard
   recovery, SPEC-007).
 
@@ -256,7 +270,8 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
 
 - **TIER-032** [P0] **Fault-in path.** A read miss SHALL be served by: (1) locate the page in
   the live page directory, (2) issue a **single** `pread` of the physical record, (3) verify
-  the CRC32, (4) decompress the payload if the codec flag says so, (5) insert the frame into
+  the per-page CRC32C integrity hash (TIER-021 — verification on fault-in is mandatory, never
+  skipped), (4) decompress the payload if the codec flag says so, (5) insert the frame into
   the pool (evicting per TIER-011 if at capacity), (6) pin and serve. Exactly one physical
   read per faulted page. Concurrent misses on the same page SHALL be coalesced single-flight
   (one I/O; all waiters share the resulting frame). A CRC mismatch is handled per TIER-062.
@@ -322,6 +337,18 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
   implements. Index pages participate in the pool, eviction, compression, and checkpoints
   exactly like data pages.
 
+  **Indexes MUST be paged and evictable under the same memory budget (TIER-001–TIER-004) as
+  data pages** — index memory counts against the pool, index pages fault in on demand and are
+  evicted under pressure, and index residency SHALL never be assumed by any code path. This
+  is explicitly called out as **the novel work in this spec**: SpacetimeDB's rows are
+  page-based, but its indexes (and pointer map, blob store) are conventional heap-allocated
+  `std` structures that are RAM-bound and cannot spill — there is no precedent to port, and
+  no fault-in seam exists in its engine to copy. Fluxum's paged-index design (including
+  eviction-safe row addressing: index entries reference logical primary keys or pinned
+  physical coordinates, never bare heap pointers, so an evicted-and-refaulted page reappears
+  at the same logical coordinates) must therefore be designed and validated from scratch.
+  *(adopted from SpacetimeDB analysis, file 02)*
+
 - **TIER-051** [P1] **Spatial indexes.** QuadTree and R-tree nodes (SPEC-008) SHALL likewise
   be stored as pages and faulted/evicted through the same pool. SPEC-008's linear-quadtree
   (BTreeMap-backed, no pointer chasing) representation maps directly onto the paged B-tree of
@@ -353,12 +380,24 @@ recovery fast path.
   cold-tier scan is performed; page CRCs are verified lazily on fault-in. The 30 s / 10 GB
   recovery target (STG-032, NFR-06) applies to the paged engine.
 
-- **TIER-062** [P1] **Page corruption handling.** A CRC32 mismatch on fault-in SHALL fail the
+- **TIER-062** [P1] **Page corruption handling.** A CRC32C mismatch on fault-in SHALL fail the
   read with `FluxumError::PageCorrupt { shard_id, table_id, page_id }`, roll back the
   affected transaction, and emit a structured operator notification (SPEC-012). Because
   retained checkpoints are immutable (TIER-024/025), the page SHALL be recoverable from an
   older retained root plus log replay. The crash suite (T2.7) SHALL include CRC bit-flip
   drills on page files, not just on the commit log.
+
+- **TIER-063** [P1] **Content-addressed pages — shared mechanism with SPEC-002 checkpoints.**
+  Each page SHALL maintain a lazily computed **content hash** (BLAKE3-class) over its
+  uncompressed image, invalidated on any mutation and recomputed on demand. This hash is the
+  object key under SPEC-002 STG-021's content-addressed checkpoint scheme: an unchanged page
+  (hash still valid, unmodified since the previous checkpoint) is recognized by hash and
+  **shared** with the previous checkpoint's object set rather than rewritten, making
+  checkpoint cost proportional to changed pages. The same mechanism SHALL serve replication
+  seeding and remote checkpoint sync (SPEC-014): objects are fetched/verified by content
+  hash and deduplicated against those already present locally. Page content hashing and
+  checkpoint object addressing SHALL be one shared implementation, not two parallel schemes.
+  *(adopted from SpacetimeDB analysis, files 02/03)*
 
 ## 9. Capacity
 
@@ -422,7 +461,11 @@ storage:
 1. **10× dataset on the droplet profile** (T2.8, gate G2): on the 1 vCPU / 512 MB CI profile
    (256 MiB auto budget), a dataset ≥ 10× the budget passes the full correctness suite —
    point reads, range scans, secondary-index and spatial queries, writes, and subscription
-   diffs all correct while pages fault and evict continuously (TIER-070, NFR-12).
+   diffs all correct while pages fault and evict continuously (TIER-070, NFR-12). The run
+   SHALL include an index-dominated workload whose index pages alone exceed the budget:
+   index pages demonstrably fault and evict (witnessed by `fluxum_page_reads_total` with the
+   index flag) while all index-backed queries stay correct (TIER-050). *(adopted from
+   SpacetimeDB analysis, file 02)*
 2. **Budget never exceeded**: throughout criterion 1's run and a one-hour random-read soak,
    process RSS never exceeds `budget + max(64 MiB, 10%)` (TIER-004), and
    `fluxum_bufferpool_bytes` never exceeds `fluxum_bufferpool_capacity_bytes` (TIER-003).
@@ -439,3 +482,9 @@ storage:
    instrumented run asserts `fluxum_page_reads_total` stays constant and no I/O syscalls are
    issued on the read path (strace/ETW harness), while the committed-state point-lookup
    benchmark stays < 1 µs on a pool hit (TIER-014).
+6. **Integrity and content addressing** (T2.8/T2.3): every fault-in verifies the per-page
+   CRC32C before serving (a page whose stored hash is tampered is never served — always
+   `PageCorrupt`; TIER-021, TIER-032, TIER-062); page content hashes round-trip through
+   evict/fault cycles unchanged, and two consecutive checkpoints over a mostly unchanged
+   dataset share unchanged page objects by content hash instead of rewriting them (TIER-063,
+   SPEC-002 STG-021). *(adopted from SpacetimeDB analysis, files 02/03)*

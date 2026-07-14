@@ -131,6 +131,27 @@ background work. These types live in `fluxum-core` and have no network dependenc
 
   No partial state SHALL be visible in `CommittedState` after a rollback.
 
+- **STG-007** [P0] **Rollback undoes eagerly applied effects atomically.** "Discard `TxState`"
+  (STG-006) is sufficient only for effects buffered in `TxState`. For any effect applied
+  eagerly to `CommittedState` structures during the transaction, rollback SHALL restore the
+  prior state atomically with the rollback, before the shard accepts the next transaction:
+
+  1. **Undelete:** rows deleted by the transaction SHALL be restored (delete marks reverted;
+     a delete-then-reinsert of the same committed row within one transaction cancels to a
+     no-op — the row's committed identity is preserved, not deleted and recreated).
+  2. **Index revert:** every index entry inserted or removed by the transaction — including
+     partially completed multi-index maintenance after a mid-flight constraint violation —
+     SHALL be reverted, restoring all secondary and spatial indexes to their pre-transaction
+     contents.
+  3. **Undo log for eager structural changes:** any structural change applied eagerly (e.g.
+     index creation/removal, future transactional DDL per SPEC-010) SHALL push an undo record
+     when applied; rollback SHALL replay undo records in reverse order.
+
+  Unique/PK constraint checks during a transaction SHALL evaluate against the overlay of
+  `CommittedState` and `TxState`: a committed row marked deleted by this transaction does not
+  count as a conflict, and uncommitted inserts in `TxState` do. *(adopted from SpacetimeDB
+  analysis, file 02)*
+
 ## 3. CommitLog
 
 - **STG-010** [P0] **Append-only log.** The system SHALL maintain an append-only commit log on
@@ -139,14 +160,24 @@ background work. These types live in `fluxum-core` and have no network dependenc
   system SHALL be able to reconstruct all committed state by replaying the log from the last
   checkpoint (§4).
 
-- **STG-011** [P0] **Log entry format.** Each log entry SHALL use the same framing as FluxRPC
-  (SPEC-006): a `u32` little-endian length prefix, a MessagePack body (`rmp-serde`), and a
-  trailing CRC32 checksum (`crc32fast`) over the body bytes:
+- **STG-011** [P0] **Log entry format.** Each log entry SHALL use the FluxRPC body encoding
+  (SPEC-006, MessagePack via `rmp-serde`) inside a fixed, checksummed frame: a `u32`
+  little-endian length prefix, a `u64` little-endian **epoch** number (the fencing term of the
+  shard's current leader lineage, SPEC-014 — recorded durably in every entry so that
+  divergence detection, PITR lineage, and checkpoint invalidation after failover need no
+  separate epoch→offset map), the MessagePack body, and a trailing **CRC32C** checksum
+  (hardware-accelerated; e.g. the `crc32c` crate using SSE4.2/ARMv8 CRC instructions). The
+  CRC32C SHALL cover the length prefix, the epoch, AND the body bytes — a corrupted length or
+  epoch field is detected as a checksum failure rather than mis-framing the rest of the
+  segment. Segment file headers SHALL likewise record the log format version, checksum
+  algorithm, and the epoch at segment creation. An append with an epoch lower than the last
+  durably written epoch SHALL be rejected. *(adopted from SpacetimeDB analysis, file 03)*
 
   ```
-  ┌──────────────────┬───────────────────────────────┬──────────────────┐
-  │ length: u32 (LE) │ TxRecord: MessagePack bytes   │ crc32: u32 (LE)  │
-  └──────────────────┴───────────────────────────────┴──────────────────┘
+  ┌──────────────────┬────────────────┬───────────────────────────────┬──────────────────┐
+  │ length: u32 (LE) │ epoch: u64 (LE)│ TxRecord: MessagePack bytes   │ crc32c: u32 (LE) │
+  └──────────────────┴────────────────┴───────────────────────────────┴──────────────────┘
+                       └── CRC32C covers length + epoch + body ──┘
   ```
 
   ```rust
@@ -169,19 +200,27 @@ background work. These types live in `fluxum-core` and have no network dependenc
   }
   ```
 
-  Using the same `u32 LE + MessagePack` framing as the wire protocol means a single codec
-  covers wire encoding, commit log, checkpoint, and replication-stream formats (STG-016).
-  This entry format freezes with the wire format at gate G5.
+  Using the same MessagePack body encoding as the wire protocol means a single codec covers
+  wire encoding, commit log, checkpoint, and replication-stream formats (STG-016). This entry
+  format freezes with the wire format at gate G5.
 
-- **STG-012** [P0] **Async log write (no fsync per transaction).** The CommitLog writer SHALL
-  run in a dedicated background thread. Log entries SHALL be appended asynchronously — the
-  runtime SHALL NOT call `fsync` after every transaction. The durability gap SHALL be bounded
-  by the OS write-behind buffer (typically < 50 ms; NFR-08). This is acceptable for realtime
-  application workloads (chat, presence, telemetry), which can tolerate losing the last few
-  milliseconds of state on a process crash.
+- **STG-012** [P0] **Group commit (async durability with a dedicated flush actor).** The
+  CommitLog writer SHALL be a dedicated background **fsync/flush actor** fed by a bounded
+  queue of committed-transaction entries. The actor SHALL drain all queued entries in one
+  batch, append them to the log, and perform **one `fsync` per batch** — amortizing fsync
+  cost to near zero per transaction under load while degrading to fsync-per-transaction when
+  idle. The runtime SHALL NOT call `fsync` inline on the commit path. After each successful
+  fsync, the actor SHALL publish the new **durable offset** (highest fsynced `tx_id`) via a
+  watch/observable channel: replication quorum acks (SPEC-014, REP-021) and optional
+  confirmed reads gate on it. The `ReducerResult` ack remains decoupled from durability
+  (sent at in-memory commit); the durability gap is bounded and deterministic — queue depth ×
+  fsync latency, within the < 50 ms NFR-08 bound — rather than dependent on OS write-behind
+  timing. An fsync failure SHALL be treated as fatal for the writer (no retry; the log state
+  on disk is undefined after a failed fsync). *(adopted from SpacetimeDB analysis, file 03)*
 
   **Rationale:** synchronous fsync per transaction would limit throughput to disk IOPS
-  (~1,000/s on HDD, ~10,000/s on SSD). Async append enables 100,000+ tx/s.
+  (~1,000/s on HDD, ~10,000/s on SSD). Group commit bounds p99 commit latency without
+  per-transaction fsync and enables 100,000+ tx/s.
 
 - **STG-013** [P1] **Log rotation and compaction.** The CommitLog SHALL rotate to a new file
   segment when the current segment reaches a configurable size threshold (`segment_max_bytes`,
@@ -212,7 +251,8 @@ background work. These types live in `fluxum-core` and have no network dependenc
 ## 4. Checkpoints (SnapshotRepo)
 
 - **STG-020** [P0] **Periodic checkpoints.** A `SnapshotWorker` SHALL periodically write a
-  full point-in-time dump of `CommittedState` — a **checkpoint** — to the `snapshot_dir`. The
+  point-in-time image of `CommittedState` — a **checkpoint** (incremental/content-addressed
+  per STG-021) — to the `snapshot_dir`. The
   default interval is every 10,000 committed transactions (`snapshot_interval_tx: 10000` in
   `config.yml`; FR-14). A snapshot file IS the checkpoint mechanism referenced by FR-13/FR-14;
   the `Snapshot*` type names and `snapshot_*` config keys are retained for continuity.
@@ -223,9 +263,25 @@ background work. These types live in `fluxum-core` and have no network dependenc
   truncated (STG-013, FR-14). The dump SHALL cover the full **logical** `CommittedState`,
   including rows resident only in the cold tier (SPEC-015).
 
-- **STG-021** [P0] **Checkpoint format.** Each checkpoint SHALL be a MessagePack-encoded file
-  containing the structure below. Checkpoint files are zstd-compressed per FR-19; the
-  compression envelope is specified in SPEC-015 (`TIER-` requirements).
+- **STG-021** [P0] **Checkpoint format — incremental and content-addressed.** Checkpoints
+  MUST be **incremental and content-addressed**: a checkpoint SHALL be a manifest plus a set
+  of objects (pages, per SPEC-015 TIER-060/TIER-063; large values, per STG-041) stored in an
+  object repository keyed by content hash (BLAKE3-class), so that objects unchanged since the
+  previous checkpoint are **shared** (referenced/hardlinked, not rewritten) between
+  checkpoints. A checkpoint SHALL cost only the changed objects — never a full dump whose
+  write cost scales with database size. The manifest SHALL record `shard_id`, `last_tx_id`,
+  the epoch (STG-011), the timestamp, and the content hashes of every referenced object, and
+  SHALL itself carry an **integrity hash** over its serialized bytes; restore SHALL verify
+  the manifest hash and every object hash before adopting the checkpoint, falling back to an
+  older retained checkpoint (STG-023) on permanent mismatch. Checkpoint creation SHALL be
+  two-phase crash-safe: objects written first, then the fsynced manifest written last as the
+  commit record — a checkpoint whose manifest is absent or fails verification does not exist.
+  *(adopted from SpacetimeDB analysis, files 02/03)*
+
+  The MessagePack-encoded structure below is retained as the portable **export** format
+  (backups, replica seeding; SPEC-015 §8); it is not the recovery fast path. Export files are
+  zstd-compressed per FR-19; the compression envelope is specified in SPEC-015 (`TIER-`
+  requirements).
 
   ```rust
   #[derive(Serialize, Deserialize)]
@@ -283,12 +339,20 @@ background work. These types live in `fluxum-core` and have no network dependenc
   time, and loading a large checkpoint MAY spill directly to the cold tier to stay within the
   memory budget.
 
-- **STG-031** [P1] **Corruption detection.** The system SHALL detect log entry corruption
-  using the CRC32 checksum carried by each entry (STG-011). A corrupted entry SHALL cause
-  recovery to stop at that point: the log is truncated at the first corrupt entry (the entry
-  and everything after it are discarded as a torn tail; FR-13), all entries before it are
-  kept, and the last successfully recovered `tx_id` SHALL be reported. The operator SHALL be
-  notified via structured log output (`tracing`, SPEC-012).
+- **STG-031** [P1] **Corruption detection and non-destructive torn-tail repair.** The system
+  SHALL detect log entry corruption using the CRC32C checksum carried by each entry (STG-011).
+  A corrupted entry SHALL cause replay to stop at that point: all entries before it are kept
+  and applied, and the last successfully recovered `tx_id` SHALL be reported. Repair SHALL be
+  **non-destructive**: the torn tail (the corrupt entry and everything after it) SHALL NOT be
+  truncated in place; it SHALL be preserved by quarantining the affected bytes into a sidecar
+  file (`<segment>.torn`, alongside the segment) before the writer resumes appending at the
+  last valid entry boundary. Preserving the tail keeps the evidence needed to distinguish a
+  torn local write from a diverged suffix under an old epoch once replication (SPEC-014)
+  lands. Destructive physical truncation SHALL exist only as an explicit `reset_to(tx_id)`
+  operation invoked by the replication layer for confirmed divergence (REP-013), never as an
+  implicit side effect of opening the log. The operator SHALL be notified of any quarantine
+  via structured log output (`tracing`, SPEC-012), including the quarantined byte range and
+  sidecar path. *(adopted from SpacetimeDB analysis, file 03)*
 
 - **STG-032** [P1] **Recovery time target.** Recovery of a shard with a 10 GB commit log and a
   recent checkpoint SHALL complete in under 30 seconds (NFR-06).
@@ -306,8 +370,17 @@ background work. These types live in `fluxum-core` and have no network dependenc
   4. Insert the row with the assigned ID into `TxState`
 
   The assigned ID SHALL be returned to the caller as part of the inserted row in the
-  `ReducerResult` (or via a return value from the reducer). Rolled-back transactions MAY
-  leave gaps in the ID sequence.
+  `ReducerResult` (or via a return value from the reducer).
+
+  **Batched allocation.** Counter values SHALL be handed out from a pre-allocated batch: the
+  counter's durable high-water mark advances by an allocation step (`auto_inc_allocation_step`,
+  default 4096) at a time, persisted through the commit log as an ordinary logged write, so a
+  durable write is needed only once per batch — never per insert. On recovery, generation
+  resumes from the persisted high-water mark. Consequently **gaps in the ID sequence are
+  normal and documented**: rolled-back transactions leave gaps (handed-out values are not
+  returned), and a crash MAY skip up to one unconsumed allocation batch. IDs SHALL remain
+  unique and monotonically increasing; they SHALL NOT be assumed dense. *(adopted from
+  SpacetimeDB analysis, file 02)*
 
   ```rust
   #[fluxum::reducer(max_rate = "5/s")]
@@ -322,6 +395,20 @@ background work. These types live in `fluxum-core` and have no network dependenc
       Ok(())
   }
   ```
+
+- **STG-041** [P1] **Refcounted blob store for large values.** Values whose encoded size
+  exceeds a configurable threshold (`blob_threshold_bytes`, default 4096 — at most a page
+  payload, SPEC-015 TIER-026) SHALL be stored out-of-row in a per-shard **content-addressed,
+  reference-counted blob store**: the row holds the value's content hash (BLAKE3-class); the
+  blob store maps hash → bytes with a refcount incremented on insert and decremented on
+  delete. Identical values share one stored copy, and row equality/comparison over large
+  values compares hashes, never blob bytes. In-flight transactions SHALL use a **tx-local
+  blob overlay** merged into the shard store on commit, so rollback drops the overlay without
+  walking rows to adjust refcounts (STG-006/STG-007). Physical reclamation (GC) of
+  zero-refcount blobs SHALL be **tied to checkpoint retention** (STG-023): a blob's bytes MAY
+  be deleted only when no retained checkpoint and no retained commit-log segment references
+  its hash. Blobs are checkpoint objects under STG-021's content-addressed scheme (their hash
+  IS their object key). *(adopted from SpacetimeDB analysis, file 02)*
 
 ## 7. TableId and IndexId assignment
 
@@ -345,6 +432,8 @@ storage:
   segment_max_bytes: 134217728         # 128 MB — STG-013
   snapshot_interval_tx: 10000          # checkpoint interval — STG-020
   snapshot_retention: 3                # checkpoint retention — STG-023
+  auto_inc_allocation_step: 4096       # STG-040 batched allocation
+  blob_threshold_bytes: 4096           # STG-041 out-of-row threshold
 ```
 
 Cold-tier keys (`memory.budget`, page size, compression codec) are specified in SPEC-015.
@@ -359,14 +448,20 @@ Cold-tier keys (`memory.budget`, page size, compression codec) are specified in 
    interleavings on the canonical demo schema (`User`, `ChatMessage`, `Task`, `Sensor`) —
    replayed state is identical to pre-crash committed state; `tx_id` sequence is strictly
    increasing across restart (STG-015); auto-inc counters resume without reuse (STG-040).
-3. **Corruption-truncation drills** (T2.7): CRC bit-flip and truncation injected at every
-   byte offset of the final log entry — recovery stops at the first corrupt entry, keeps all
-   prior entries, reports the last recovered `tx_id`, and emits the operator notification
-   (STG-031).
-4. **Checkpoint equivalence** (T2.3): checkpoint + replay recovery produces state identical
-   to full-log replay; checkpoint writes do not block reducer execution (STG-022 verified
-   under sustained write load); segments covered by a completed checkpoint are compacted and
-   recovery still succeeds afterwards (STG-013, FR-14).
+3. **Corruption / torn-tail drills** (T2.7): CRC32C bit-flip and truncation injected at every
+   byte offset of the final log entry — replay stops at the first corrupt entry, keeps all
+   prior entries, reports the last recovered `tx_id`, and emits the operator notification;
+   the torn tail is quarantined to the sidecar file (byte-identical to the pre-repair tail),
+   never destructively truncated, and subsequent appends resume at the last valid boundary
+   and recover cleanly (STG-031). *(adopted from SpacetimeDB analysis, file 03)*
+4. **Checkpoint equivalence and incrementality** (T2.3): checkpoint + replay recovery
+   produces state identical to full-log replay; checkpoint writes do not block reducer
+   execution (STG-022 verified under sustained write load); segments covered by a completed
+   checkpoint are compacted and recovery still succeeds afterwards (STG-013, FR-14). A
+   checkpoint taken after modifying a small fraction of a large dataset writes only the
+   changed objects (unchanged objects are shared with the previous checkpoint); a corrupted
+   manifest or object hash is detected on restore and recovery falls back to an older
+   retained checkpoint (STG-021). *(adopted from SpacetimeDB analysis, files 02/03)*
 5. **Recovery benchmark** (T2.7, gate G2): timed restart with a 10 GB commit log and a recent
    checkpoint completes in < 30 s (STG-032, NFR-06).
 6. **Tiered recovery equivalence** (T2.7, with SPEC-015): with a dataset larger than the
@@ -374,3 +469,14 @@ Cold-tier keys (`memory.budget`, page size, compression codec) are specified in 
    the all-hot case — same rows, indexes, `tx_id`, and auto-inc counters regardless of
    pre-crash residency (STG-030); a crash during cold-tier eviction never loses acknowledged
    transactions (cold pages are redundant with checkpoint + log).
+7. **Rollback correctness** (T2.2): property tests over interleaved insert/delete/rollback
+   sequences — after any rollback, deleted rows are restored, delete-then-reinsert cancels to
+   a no-op, and every secondary/spatial index is bit-identical to a freshly rebuilt index
+   over `CommittedState` (STG-007); unique-constraint checks correctly ignore committed rows
+   tx-deleted in the same transaction. *(adopted from SpacetimeDB analysis, file 02)*
+8. **Group-commit durability window** (T2.7): under sustained load, fsync count is far below
+   transaction count while the published durable offset advances monotonically; a confirmed
+   read gated on the durable offset never observes a transaction lost by a subsequent kill -9
+   (STG-012). Blob-store drills: identical large values are stored once; blob bytes are never
+   reclaimed while any retained checkpoint references their hash (STG-041). *(adopted from
+   SpacetimeDB analysis, files 02/03)*

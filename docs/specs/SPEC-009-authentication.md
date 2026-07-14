@@ -33,18 +33,41 @@ envelopes in [SPEC-006](SPEC-006-protocol-fluxrpc.md); per-reducer rate limiting
   ```
 
   where `canonical_token_bytes` is `AuthClaims.canonical_token` as returned by the
-  active `AuthProvider` (for the built-in `token` and `none` providers this is the raw
-  token bytes). The same token SHALL always produce the same `Identity`. Different
-  tokens SHALL produce different Identities (SHA-256 collision resistance). In Rust,
-  `Identity` is the `Identity([u8; 32])` newtype.
+  active `AuthProvider`. The canonical form MUST be a *stable* derivation — stable
+  across token rotation, refresh, and expiry — not necessarily the raw token bytes:
+
+  - For the built-in `jwt` provider, `canonical_token` MUST be derived from stable
+    claims, `"{issuer}|{subject}"` (the validated `iss` and `sub` claims joined by
+    `|`), NOT from the raw token bytes. Identity is therefore
+    `SHA-256(issuer || "|" || subject)` and survives token rotation, re-signing,
+    refresh, and expiry changes by construction — any number of distinct tokens with
+    the same `(iss, sub)` map to the same Identity. Hashing raw JWT bytes would break
+    identity on every rotation; SpacetimeDB moved to claims-based identity for
+    exactly this reason. `iss` and `sub` MUST be non-empty for the derivation to be
+    accepted. *(adopted from SpacetimeDB analysis, file 08)*
+  - For the built-in opaque `token` and `none` providers, `canonical_token` is the
+    raw token bytes (`Identity = SHA-256(token)`). This is acceptable because opaque
+    tokens are long-lived by definition there — the token value itself is the stable
+    identifier. Trade-off: if such a token is ever reissued with a different value,
+    the identity changes; applications needing rotation-proof identity with opaque
+    tokens must use a custom `AuthProvider`. *(adopted from SpacetimeDB analysis, file 08)*
+  - A custom `AuthProvider` (AUTH-032) chooses its own stable derivation and is
+    responsible for keeping `canonical_token` invariant across refreshes.
+
+  The same canonical form SHALL always produce the same `Identity`. Different
+  canonical forms SHALL produce different Identities (SHA-256 collision resistance).
+  In Rust, `Identity` is the `Identity([u8; 32])` newtype.
 
 - **AUTH-002** [P0] `Identity` SHALL be stable across:
   - Client reconnections (same token → same identity)
   - Server restarts
   - Shard migrations (entity handoff, [SPEC-007](SPEC-007-sharding.md))
-  - Token refresh (if the token value changes, identity changes — the auth provider
-    MUST preserve the canonical form in `AuthClaims.canonical_token` if identity
-    stability across refreshes is required)
+  - Token refresh, rotation, and expiry — **token refresh MUST NOT change `Identity`
+    for any provider** (invariant). For the `jwt` provider this holds by construction
+    (claims-based derivation, AUTH-001); for the `token`/`none` providers refresh
+    returns the same token (AUTH-022); a custom `AuthProvider` MUST keep
+    `AuthClaims.canonical_token` byte-identical across refreshes of the same
+    principal. *(adopted from SpacetimeDB analysis, file 08)*
 
 - **AUTH-003** [P0] Every `ReducerContext` SHALL carry the caller's `Identity`.
   Reducers MAY use `ctx.identity` to enforce ownership rules, filter data, and
@@ -96,7 +119,11 @@ envelopes in [SPEC-006](SPEC-006-protocol-fluxrpc.md); per-reducer rate limiting
 - **AUTH-022** [P1] The `AuthResult` MAY return a `token` field with a refreshed
   token value. For JWT providers, this is a new JWT with extended expiry.
   For non-expiring tokens (API keys), the returned token SHALL be identical to the
-  input. Token refresh SHALL NOT change the caller's `Identity` (AUTH-002).
+  input. Token refresh MUST NOT change the caller's `Identity` for any provider —
+  built-in or custom (invariant; AUTH-002). For the `jwt` provider this follows from
+  claims-based derivation (AUTH-001): the refreshed JWT carries the same
+  `(iss, sub)` and thus the same Identity even though the token bytes differ.
+  *(adopted from SpacetimeDB analysis, file 08)*
 
 ## 5. AuthProvider (pluggable auth)
 
@@ -126,8 +153,8 @@ envelopes in [SPEC-006](SPEC-006-protocol-fluxrpc.md); per-reducer rate limiting
 
   | Provider | Config | Description |
   |----------|--------|-------------|
-  | `token` | `secret: <bytes>` | HMAC-SHA256 signed opaque token |
-  | `jwt` | `secret: <str>` | HS256 JWT verification (`jsonwebtoken`) |
+  | `token` | `secret: <bytes>` | HMAC-SHA256 signed opaque token; `canonical_token` = raw token bytes (long-lived token, see AUTH-001) |
+  | `jwt` | `secret: <str>` | HS256 JWT verification (`jsonwebtoken`); `canonical_token` = `"{iss}|{sub}"` — identity is rotation-proof (AUTH-001) *(adopted from SpacetimeDB analysis, file 08)* |
   | `none` | — | Dev mode: any token is accepted; identity = SHA-256(token) |
 
   Configuration in `config.yml`:
@@ -275,7 +302,10 @@ not an end user.
 
 1. **Identity determinism** (AUTH-001): authenticating twice with the same token —
    across a reconnect and across a server restart — yields byte-identical 32-byte
-   Identities; two distinct tokens yield distinct Identities.
+   Identities; two distinct tokens yield distinct Identities (for the `jwt` provider:
+   two tokens with distinct `(iss, sub)` yield distinct Identities, while two
+   distinct tokens sharing the same `(iss, sub)` — e.g. different expiry or
+   signature — yield the SAME Identity). *(adopted from SpacetimeDB analysis, file 08)*
 2. **Identity stability across handoff** (AUTH-002): a client whose rows undergo
    entity handoff between shards observes an unchanged `ctx.identity` before and
    after the migration.
@@ -289,9 +319,13 @@ not an end user.
 5. **Auth failure is retryable** (AUTH-021): an invalid or expired token returns
    `Error { code: 401, message: "authentication failed: <reason>" }`; the same
    connection then authenticates successfully with a valid token.
-6. **Token refresh** (AUTH-022): with the `jwt` provider, `AuthResult.token` is a new
-   JWT with extended expiry and the identity is unchanged; with the `token` provider,
-   the returned token equals the input.
+6. **Token refresh never changes Identity** (AUTH-002, AUTH-022): with the `jwt`
+   provider, `AuthResult.token` is a new JWT with extended expiry (different token
+   bytes) and re-authenticating with the refreshed token yields a byte-identical
+   Identity to the original; with the `token` provider, the returned token equals the
+   input; a custom provider whose `canonical_token` is stable across refresh likewise
+   yields an unchanged Identity. This invariant holds for every provider.
+   *(adopted from SpacetimeDB analysis, file 08)*
 7. **Provider pluggability** (AUTH-030, AUTH-032): a custom `Arc<dyn AuthProvider>`
    registered via `fluxum::ServerBuilder` is invoked for `Authenticate` and its
    `AuthClaims.canonical_token` drives identity derivation.

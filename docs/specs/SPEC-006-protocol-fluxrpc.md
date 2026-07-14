@@ -133,6 +133,28 @@ hot path.
   automatically). Non-`Authenticate` frames on a POST without a valid session SHALL receive
   `Error { code: 401, message: "unauthenticated" }` (RPC-020).
 
+- **RPC-008** [P1] **Server→client compression negotiation.** The server SHALL support
+  per-connection compression of server→client frames, negotiated at connection setup with one of
+  three algorithms: `none` (default) | `gzip` | `brotli`. The client selects the algorithm via
+  the `compression` field of `Authenticate` (RPC-020) or, for Streamable HTTP, the
+  `?compression=` query parameter on `/rpc` (the `Authenticate` field wins if both are present).
+  Rules: *(adopted from SpacetimeDB analysis, file 06)*
+
+  - When any algorithm other than `none` is negotiated, every server→client frame body SHALL
+    begin with a 1-byte compression tag (`0x00` = uncompressed, `0x01` = gzip, `0x02` = brotli)
+    followed by the (possibly compressed) MessagePack envelope; the `u32 LE` length prefix
+    (RPC-001) counts tag + payload. The tag is written first into the uncompressed buffer so
+    that skipping compression requires no byte-shifting. When `none` is negotiated (or nothing
+    was negotiated), no tag byte is present and framing is exactly RPC-001.
+  - Compression SHALL be applied only to payloads whose uncompressed body size is at or above
+    `compression_threshold_bytes` (default: 1,024, configurable) — in practice large `TxUpdate`
+    and `InitialData` payloads; smaller frames are sent with tag `0x00`. Recommended encoder
+    setting: brotli quality 1 (measured 7–10× on large subscription updates).
+  - Client→server messages SHALL always be uncompressed.
+  - Compression SHALL execute in the per-connection send path, off the commit path, and SHALL
+    never be shared across subscribers (SPEC-005 SUB-024: share the row encoding, never the
+    compression).
+
 ---
 
 ## 3. Value type: FluxValue
@@ -188,9 +210,15 @@ hot path.
   ```rust
   pub struct Authenticate {
       pub id: u32,
-      pub token: Vec<u8>,   // opaque auth token (JWT, API key, or custom application token)
+      pub token: Vec<u8>,              // opaque auth token (JWT, API key, or custom token)
+      pub compression: Option<String>, // "none" | "gzip" | "brotli" — RPC-008; default "none"
+      pub tx_updates: Option<String>,  // "full" | "light" — RPC-035; default "full"
   }
   ```
+
+  The `compression` and `tx_updates` fields set the per-connection options of RPC-008 and
+  RPC-035; `None` means the default. An unrecognized value SHALL be rejected with
+  `Error { code: 400 }`. *(amended per SpacetimeDB analysis, file 06)*
 
   The server SHALL respond with `AuthResult`. The client MUST authenticate before sending any
   other message. Unauthenticated messages (except `Authenticate`) SHALL receive
@@ -298,10 +326,37 @@ hot path.
       pub table_id: u32,
       pub table_name: String,
       pub query_id: u32,              // server-assigned ID for this subscription query
-      pub inserts: Vec<Vec<u8>>,      // each entry is a FluxBIN-encoded row (see §6)
-      pub deletes: Vec<Vec<u8>>,      // each entry is FluxBIN-encoded PK field(s) only
+      pub inserts: RowList,           // FluxBIN-encoded rows, flat (see below and §6)
+      pub deletes: RowList,           // rows_data holds FluxBIN PK field(s) only (RPC-042)
+  }
+
+  /// Flat row list: one contiguous buffer + out-of-band boundaries — NOT Vec<Vec<u8>>.
+  pub struct RowList {
+      pub row_count: u32,
+      pub size_hint: RowSizeHint,     // how to slice rows_data into rows
+      pub rows_data: Vec<u8>,         // ALL rows' FluxBIN bytes, back-to-back (one bin field)
+  }
+
+  pub enum RowSizeHint {
+      /// Every row encodes to exactly n bytes: row i = rows_data[i*n .. (i+1)*n].
+      /// Zero per-row overhead, O(1) random access. row_count MUST equal len/n.
+      Fixed(u16),
+      /// Variable-size rows: start offset of each row into rows_data; a row's end is the
+      /// next row's start (or the end of rows_data for the last row).
+      Offsets(Vec<u64>),
   }
   ```
+
+  Row batches SHALL use this flat layout in both `InitialData` and `TxUpdate`: one allocation
+  per table update instead of one per row, no per-row MessagePack `bin` header, zero-copy
+  slicing on the server (refcounted buffer, SPEC-005 SUB-024) and on the client (one
+  `Uint8Array` subarray per row in browsers), and parallel-decode-friendly. Encoders SHALL emit
+  `Fixed(n)` whenever the table's schema yields a statically known row size, MAY start
+  optimistically from the first row's actual size otherwise, and SHALL degrade to `Offsets` on
+  the first size mismatch (retroactively synthesizing the offset table). Decoders SHALL reject a
+  `RowList` whose `row_count`, `size_hint`, and `rows_data` length are mutually inconsistent
+  with a 400 error (RPC-034). *(adopted from SpacetimeDB analysis, file 06 — their
+  `BsatnRowList` lesson; pre-G5-freeze wire change)*
 
   Clients SHALL use `TableUpdate.query_id` to correlate subscriptions with `Unsubscribe`
   messages.
@@ -348,8 +403,31 @@ hot path.
   | 401 | `unauthenticated` — message before successful `Authenticate` | RPC-020 |
   | 408 | `idle timeout` — sent before closing an idle connection | RPC-060 |
   | 413 | `frame too large` — frame exceeds `max_frame_bytes` | RPC-061 |
-  | 429 | rate limit exceeded — per-(Identity, reducer) token bucket (SPEC-004) | RPC-021 |
+  | 429 | rate limit exceeded — per-(Identity, reducer) token bucket (SPEC-004); also subscription admission control (SPEC-005 SUB-044) | RPC-021 |
   | 503 | shard unavailable (e.g. during entity handoff, SPEC-007) | — |
+
+- **RPC-035** [P1] **TxUpdate metadata mode (`tx_updates: full | light`).** The default remains
+  the enriched `TxUpdate` of RPC-033 (FR-43). A connection MAY opt out via the per-connection
+  option `tx_updates: light`, set in `Authenticate` (RPC-020) or, for Streamable HTTP, via the
+  `?tx_updates=` query parameter on `/rpc`. Under `light`, the server SHALL send `TxUpdateLight`
+  instead of `TxUpdate`, omitting `reducer_name`, `caller`, and `duration_us` for
+  bandwidth-critical clients:
+
+  ```rust
+  pub struct TxUpdateLight {
+      pub tx_id: u64,               // as RPC-033
+      pub timestamp: i64,           // as RPC-033
+      pub tables: Vec<TableUpdate>,
+  }
+  ```
+
+  `TxUpdateLight` carries identical row-diff semantics (SPEC-005 SUB-003) and the same `tx_id`
+  gap-detection contract (RPC-062). The mode affects only broadcast updates: the caller of a
+  reducer always receives its `ReducerResult` (RPC-031) regardless of mode. Lesson: SpacetimeDB
+  broadcast v1-style enriched updates, regretted the per-commit metadata fan-out cost (bandwidth
+  pressure even pushed users toward one-letter reducer names), and stripped metadata entirely in
+  its v2 protocol; Fluxum keeps enrichment as the default but makes it opt-out per connection
+  instead. *(adopted from SpacetimeDB analysis, file 06)*
 
 ---
 
@@ -382,8 +460,10 @@ hot path.
   ```
 
 - **RPC-041** [P0] **Insert row encoding.** Each insert row SHALL be encoded as sequential
-  FluxBIN field values in column declaration order, wrapped in a `bin` field of the MessagePack
-  envelope:
+  FluxBIN field values in column declaration order; the rows of a table update are concatenated
+  back-to-back into `RowList.rows_data` (RPC-032), which travels as a single `bin` field of the
+  MessagePack envelope — there is no per-row length header on the wire *(amended per SpacetimeDB
+  analysis, file 06)*:
 
   ```rust
   // #[fluxum::table(public, primary_key(grid_x, grid_y))]
@@ -494,6 +574,21 @@ hot path.
   on the HTTP port (FR-46), enabled via configuration. The Streamable HTTP transport then runs
   over `https://`; framing and messages are unchanged under TLS.
 
+- **RPC-064** [P0] **Bounded per-connection queues, kick on overflow.** Every per-connection (or
+  per-session, for Streamable HTTP) outgoing queue SHALL be bounded
+  (`outgoing_queue_frames` in `config.yml`, default: 16,384 frames) — an unbounded outgoing
+  queue is prohibited. When an enqueue would exceed the bound, the server SHALL disconnect
+  (kick) that client immediately — it SHALL NEVER block the subscription fan-out loop on a slow
+  consumer — logging `WARN "subscriber dropped: outgoing queue overflow"` and incrementing
+  `fluxum_subscriber_drops_total{shard, reason="queue_overflow"}` (SPEC-012). This is the
+  transport-level enforcement of the SPEC-005 SUB-042 backpressure tiers: the byte-based
+  three-tier policy operates within the bounded queue, and a frame-count overflow maps to the
+  Full tier's drop behavior. Inbound queues SHALL likewise be bounded
+  (`incoming_queue_frames`, default: 16,384); on inbound overflow the server SHALL send
+  `Error { code: 429, message: "too many requests" }` and close the connection. Lesson:
+  SpacetimeDB uses 16k bounded channels with disconnect-on-overflow on both directions —
+  fan-out must never wait on one client. *(adopted from SpacetimeDB analysis, file 06)*
+
 ---
 
 ## Acceptance criteria
@@ -506,7 +601,12 @@ green.
 2. **FluxBIN golden vectors** — for every FluxBIN type in RPC-040 (all primitives, `String`,
    `Vec<u8>`, `Vec<T>`, `Option<T>`, `Identity`, `ConnectionId`, `EntityId`, `Timestamp`, struct,
    enum), fixed input → fixed expected bytes; the RPC-041 `Sensor` row encodes to exactly the
-   32 bytes shown, and the RPC-042 delete examples to exactly 8 bytes each.
+   32 bytes shown, and the RPC-042 delete examples to exactly 8 bytes each. **Flat row list**
+   (RPC-032): three `Sensor` rows encode as `RowList { row_count: 3, size_hint: Fixed(32),
+   rows_data: 96 bytes }` with zero per-row overhead; a batch with variable-size rows (e.g.
+   `ChatMessage`) degrades to `Offsets` with correct start offsets; a `RowList` with
+   inconsistent `row_count`/`size_hint`/`rows_data` length is rejected with a 400 error.
+   *(adopted from SpacetimeDB analysis, file 06)*
 3. **FluxBIN size advantage** — encoding the canonical `Sensor` and `ChatMessage` rows in FluxBIN
    is measurably smaller than the equivalent self-describing MessagePack map (target ~40% for
    typed rows).
@@ -553,3 +653,22 @@ green.
     streamed `TxUpdate` delivery, keep-alives) works unmodified through a standard HTTP reverse
     proxy (e.g. nginx/HAProxy) with response buffering disabled for `/rpc`; the required proxy
     configuration is documented as a deployment note.
+16. **Compression negotiation** (RPC-008) *(adopted from SpacetimeDB analysis, file 06)* — a
+    connection negotiating `brotli` (via `Authenticate` field and, separately, via
+    `?compression=` on `/rpc`) receives large `TxUpdate`/`InitialData` frames tagged `0x02` and
+    correctly decompressed by the SDK; frames below `compression_threshold_bytes` arrive tagged
+    `0x00`; a `none` (default) connection sees no tag byte and byte-identical RPC-001 framing;
+    client→server frames are never compressed; an unrecognized algorithm is rejected with a 400
+    error.
+17. **TxUpdate light mode** (RPC-035) *(adopted from SpacetimeDB analysis, file 06)* — with two
+    subscribers to the same query, one `tx_updates: full` and one `tx_updates: light`, a
+    committed reducer call delivers the enriched `TxUpdate` (criterion 9) to the first and a
+    `TxUpdateLight` (same `tx_id`, `timestamp`, and row diffs; no `reducer_name`/`caller`/
+    `duration_us`) to the second; the reducer's caller receives its `ReducerResult` in both
+    modes.
+18. **Queue overflow kick** (RPC-064) *(adopted from SpacetimeDB analysis, file 06)* — a
+    subscriber whose outgoing queue is driven past `outgoing_queue_frames` is disconnected
+    without any measurable stall of fan-out to other subscribers (cross-checked against the
+    SPEC-005 acceptance criterion 6 stress test); the WARN line is logged and
+    `fluxum_subscriber_drops_total{reason="queue_overflow"}` increments; flooding the inbound
+    queue past `incoming_queue_frames` yields a 429 `Error` followed by connection close.

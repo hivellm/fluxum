@@ -11,13 +11,15 @@
 This spec is the acceptance machinery for every other spec: it defines the test taxonomy, the
 per-PR quality gates, and the named suites that the [DAG](../DAG.md) gates (G0–G7) reference.
 A gate **MUST NOT** be declared green unless every suite mapped to it in
-[§14](#14-acceptance-criteria) passes.
+[§16](#16-acceptance-criteria) passes.
 
 Repository layout: unit tests inline per crate; integration tests in `crates/<crate>/tests/`;
 criterion benches in `crates/<crate>/benches/`; cross-SDK conformance and injection corpora as
 data files under `tests/conformance/`; crash-harness, load-test, profile, soak, and
-replication-drill drivers under `tests/`; the PostgreSQL parity harness as its own crate,
-`crates/fluxum-bench`.
+replication-drill drivers under `tests/`; the deterministic-simulation suites and their
+runtime abstraction as their own crate, `crates/fluxum-dst` (§14); the process-level
+smoketest harness under `tests/smoketests/` with its guard utility in `crates/fluxum-testing`
+(§15); the PostgreSQL parity harness as its own crate, `crates/fluxum-bench`.
 
 ## 1. Test taxonomy & tooling
 
@@ -38,6 +40,8 @@ replication-drill drivers under `tests/`; the PostgreSQL parity harness as its o
 | Tiered-storage & droplet profile | cgroup-limited CI profile | `tests/profile/` | G2, then nightly |
 | Billion-row soak | soak driver + report | `tests/soak/` | G7 |
 | Replication & backup drills | multi-process drill harness | `tests/replication/` | G7; backup/PITR round-trip in CI |
+| Deterministic simulation (DST) | seeded sim runtime + model oracle + fault injection | `crates/fluxum-dst` | G2 (storage/commitlog), G7 (replication); nightly long runs |
+| Process-level smoketests | guard harness spawning the real server binary | `tests/smoketests/` + `crates/fluxum-testing` | G6; restart/persistence drills at G2 |
 
 - **TST-001** [P0] Unit tests **MUST** live inline in `#[cfg(test)]` modules next to the code
   they exercise; integration tests **MUST** live in `crates/<crate>/tests/`. Test-only code
@@ -75,7 +79,7 @@ replication-drill drivers under `tests/`; the PostgreSQL parity harness as its o
 - **TST-012** [P0] **Zero `#[ignore]` growth**: CI **MUST** enforce a committed baseline count of
   ignored tests; the count **MUST NOT** increase, and every `#[ignore]` **MUST** reference a
   tracking issue in its attribute comment. Shrinking the baseline is always allowed.
-- **TST-013** [P0] Deleting or weakening a test that a gate in [§14](#14-acceptance-criteria)
+- **TST-013** [P0] Deleting or weakening a test that a gate in [§16](#16-acceptance-criteria)
   depends on **MUST** update this spec and the [DAG](../DAG.md) in the same PR; a gate **MUST
   NOT** be weakened without a PRD change (DAG §5 change control).
 
@@ -393,7 +397,77 @@ Validates FR-100–FR-105 against [SPEC-014](SPEC-014-replication.md).
   replay archived commit-log segments to a target timestamp / `tx_id` and match the known
   historical state at that point exactly.
 
-## 14. Acceptance criteria
+## 14. Deterministic simulation testing (DST)
+
+The DST suites validate the storage engine, commitlog, and replication layers
+([SPEC-002](SPEC-002-storage-engine.md), [SPEC-014](SPEC-014-replication.md)) under a seeded,
+fully deterministic runtime, complementing the OS-level crash harness of §3 (which remains the
+non-simulated backstop). *(section adopted from SpacetimeDB analysis, file 09 — their `dst`
+crate exists but is engine-only and not in CI; Fluxum goes further by covering replication and
+gating CI on it.)*
+
+- **TST-130** [P0] **Deterministic runtime seam**: the workspace **MUST** provide a runtime
+  abstraction (`crates/fluxum-dst` plus a `simulation` feature on the runtime crate) over
+  time, task scheduling, randomness, and file/network IO, such that storage, commitlog, and
+  replication code runs **unmodified** on either the production executor (tokio) or a seeded
+  deterministic simulated executor with simulated time. The simulator **MUST** maintain a
+  determinism log of checkpoints and **MUST** fail loudly ("non-determinism detected for seed
+  N at checkpoint M") if two runs of the same seed diverge; the same-seed ⇒ identical-trace
+  property is itself a CI-checked property. *(adopted from SpacetimeDB analysis, file 09)*
+- **TST-131** [P0] **Fault injection ("buggify")**: the simulated runtime **MUST** expose
+  probabilistic fault-injection points (FoundationDB-style buggify) at, minimum: fsync and
+  write failures, partial writes, IO latency spikes and reordering, task-scheduling
+  perturbation, clock jumps, and (for replication) message loss, duplication, reordering, and
+  partitions. Fault probabilities are seed-derived so every failure reproduces from its seed
+  alone. *(adopted from SpacetimeDB analysis, file 09)*
+- **TST-132** [P0] **Model oracle**: each DST suite **MUST** drive the real engine and a
+  simple in-memory model with the same generated interaction stream (begin/insert/delete/
+  commit/abort, unique-constraint acceptance/rejection, snapshot, replay) and check every
+  observation against the model — acceptance/rejection parity per operation and full state
+  equality at commit and after replay. Divergence in either direction is a failure.
+  *(adopted from SpacetimeDB analysis, file 09)*
+- **TST-133** [P0] **Crash-replay property**: using an in-memory simulated durability/
+  commitlog implementation, the flagship property is crash-replay equivalence — at
+  seed-chosen points the suite drops the database and reopens it from the simulated commitlog
+  (with buggify faults active during both write and replay), and the recovered state **MUST**
+  be row-set-equal to the model's committed state. This is the simulated twin of the §3
+  kill-harness (TST-020/TST-025), which remains required. *(adopted from SpacetimeDB
+  analysis, file 09)*
+- **TST-134** [P0] **DST in CI**: the storage/commitlog DST suites **MUST** run in CI on every
+  PR touching the storage, commitlog, or replication crates (bounded interaction count), with
+  full-length multi-seed runs nightly; failing seeds are committed as regression cases
+  (TST-003). Storage/commitlog DST green is a **G2** exit requirement; the replication DST
+  suite **MUST** land with SPEC-014's implementation (not after) and is a **G7** exit
+  requirement. *(adopted from SpacetimeDB analysis, file 09)*
+
+## 15. Process-level smoketest harness
+
+An end-to-end harness that exercises the real shipped binary — modeled on SpacetimeDB's guard
+utility + smoketests architecture (one isolated server per test, driven through the real
+product surface). *(section adopted from SpacetimeDB analysis, file 09)*
+
+- **TST-140** [P0] **Guard utility**: `crates/fluxum-testing` **MUST** provide a guard that
+  spawns the **real server binary** (not an in-process harness) on a random free port with an
+  isolated temporary data directory and isolated CLI/client configuration per test, probes
+  readiness (health endpoint polling with timeout) before the test body runs, and guarantees
+  teardown (process kill + temp-dir removal) on success. On failure it **MUST** capture and
+  attach the server's stdout/stderr and log files to the test report. Tests acquire servers
+  only through the guard — no shared long-lived test server. *(adopted from SpacetimeDB
+  analysis, file 09)*
+- **TST-141** [P0] **Kill/restart with preserved data dir**: the guard **MUST** support
+  killing the server (both graceful shutdown and immediate termination) and restarting it on
+  the **same preserved data directory**, enabling restart/persistence drills as ordinary
+  smoketests: state written before the kill is asserted present and correct after restart,
+  and connected clients observe the documented disconnect/reconnect behavior (SDK-047).
+  *(adopted from SpacetimeDB analysis, file 09)*
+- **TST-142** [P1] **Harness ergonomics**: smoketests **MUST** default to precompiled fixture
+  modules (native modules compile once as normal Rust — no per-test module compilation tax);
+  the runner **MUST** hash-check the server binary under test against the current build to
+  prevent stale-binary runs; and the suite **MUST** support a `--server <url>` remote mode so
+  the same corpus runs unchanged against any deployment. *(adopted from SpacetimeDB analysis,
+  file 09)*
+
+## 16. Acceptance criteria
 
 Gate-to-suite mapping — a gate passes only when its full test set is green (on the CI matrix of
 TST-006 unless a suite states otherwise):
@@ -402,12 +476,12 @@ TST-006 unless a suite states otherwise):
 |---|---|---|
 | **G0** | `cargo test` green on 3 OS | TST-001, TST-002, TST-006; quality gates TST-010–TST-012 active in CI |
 | **G1** | Example schema compiles; codec roundtrip property tests green | TST-003, TST-005 (trybuild schema cases), TST-050; SPEC-001/SPEC-009 unit suites |
-| **G2** | Crash suite loses zero committed tx; recovery truncates at first corrupt entry; < 30 s / 10 GB; dataset 10× memory budget served on the droplet profile | TST-020–TST-026, TST-110, TST-111 |
+| **G2** | Crash suite loses zero committed tx; recovery truncates at first corrupt entry; < 30 s / 10 GB; dataset 10× memory budget served on the droplet profile; storage/commitlog DST green *(adopted from SpacetimeDB analysis, file 09)* | TST-020–TST-026, TST-110, TST-111; TST-130–TST-134 (storage/commitlog DST); TST-140–TST-141 (restart/persistence drills) |
 | **G3** | Rollback, tick-drift, rate-limit, migration suites green | TST-040–TST-044 |
 | **G4** | Subscription property suite + slow-consumer stress green | TST-030–TST-034 (full 10,000-mutation run per TST-034) |
 | **G5** | e2e flow (auth → subscribe → reducer → `TxUpdate`); 2-shard handoff; wire format frozen | TST-051, TST-054; SPEC-006 transport integration suites; SPEC-007 2-shard handoff test |
-| **G6** | PRD §12.1 MVP acceptance criteria all green, incl. parity report v1 — 0.1.0 | TST-052, TST-053, TST-060–TST-064, TST-070–TST-072, TST-080–TST-084, TST-090–TST-096 |
-| **G7** | PRD §12.2 all green — 0.2.0: failover + PITR + 5 SDK conformance + 1B-row soak + parity report v2 | TST-120–TST-122; TST-112; TST-052 corpus green for the Python, Go, and C# runners (T7.4–T7.6) in addition to the G6 set; TST-094 + TST-095 (parity report v2) |
+| **G6** | PRD §12.1 MVP acceptance criteria all green, incl. parity report v1 — 0.1.0 | TST-052, TST-053, TST-060–TST-064, TST-070–TST-072, TST-080–TST-084, TST-090–TST-096; TST-140–TST-142 (full smoketest suite) |
+| **G7** | PRD §12.2 all green — 0.2.0: failover + PITR + 5 SDK conformance + 1B-row soak + parity report v2 | TST-120–TST-122; TST-112; TST-052 corpus green for the Python, Go, and C# runners (T7.4–T7.6) in addition to the G6 set; TST-094 + TST-095 (parity report v2); replication DST green per TST-134 |
 
 Completeness checks for this spec itself:
 

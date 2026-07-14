@@ -208,7 +208,7 @@ Priority: **P0** = MVP (0.1.0) blocker, **P1** = required for competitive launch
 | FR-40 | FluxRPC binary protocol: `u32 LE length + MessagePack` envelope, multiplexed by per-message `id` (out-of-order responses supported). | P0 | SPEC-006 |
 | FR-41 | FluxBIN row encoding for `TableUpdate` rows: schema-driven, no field names/tags, ~40% smaller than MessagePack. | P0 | SPEC-006 |
 | FR-42 | Two transports carrying identical messages: FluxRPC TCP (:15801) and **FluxRPC over Streamable HTTP** (`POST /rpc` + `GET /rpc` binary push stream on :15800) — the browser transport; fully binary, consumed via fetch `ReadableStream`, no WebSocket. | P0 | SPEC-006 |
-| FR-43 | Enriched `TxUpdate`: `tx_id`, `timestamp`, `reducer_name`, `caller`, `duration_us`, `tables`. | P0 | SPEC-006 |
+| FR-43 | Enriched `TxUpdate` (`tx_id`, `timestamp`, `reducer_name`, `caller`, `duration_us`, `tables`) as the default, with a per-connection `tx_updates: full \| light` opt-out that omits metadata for bandwidth-critical clients (SpacetimeDB stripped metadata entirely in its v2 protocol for fan-out cost; Fluxum keeps it opt-out). | P0 | SPEC-006 |
 | FR-44 | HTTP/JSON admin API (:15800), unversioned paths: `/health`, `/metrics`, `/schema`, `POST /reducer/:name`, `POST /query`, `/view/:name`. | P0 | SPEC-006 |
 | FR-45 | Idle connection timeout and max frame size enforcement (default 16 MB, configurable). | P1 | SPEC-006 |
 | FR-46 | TLS on the TCP transport; HTTPS for the Streamable HTTP and admin surfaces. | P2 | SPEC-006 |
@@ -235,7 +235,7 @@ Priority: **P0** = MVP (0.1.0) blocker, **P1** = required for competitive launch
 
 | ID | Requirement | Priority | Spec |
 |---|---|---|---|
-| FR-70 | Stable 256-bit `Identity = SHA-256(token)`; same token ⇒ same identity across reconnects. Ephemeral `ConnectionId` (u128) per connection. | P0 | SPEC-009 |
+| FR-70 | Stable 256-bit `Identity`, stable across reconnects **and token rotation**: `jwt` provider derives it from stable claims (hash of issuer‖subject — token refresh never changes identity); opaque `token` provider uses SHA-256(token). Ephemeral `ConnectionId` (u128) per connection. | P0 | SPEC-009 |
 | FR-71 | Pluggable `AuthProvider` trait with `token`, `jwt`, and `none` (dev-only, loopback) built-ins. | P0 | SPEC-009 |
 | FR-72 | Server-to-server identity `SHA-256("SERVER:" + name)`: privileged service peers bypass row-level security. | P1 | SPEC-009 |
 | FR-73 | RBAC: `ctx.roles` from `AuthClaims`. | P2 | SPEC-009 |
