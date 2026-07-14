@@ -4,6 +4,7 @@
 skip = *.lock,*.json,*.map,*.yaml,*.yml,*.csv,*.bib,target,node_modules,.git,dist,venv,build,benchmarks,coverage
 # Proper nouns and intentional terms:
 #   UE (Unreal Engine), Dota (the game), retuned/retune (hardware re-tuning, SPEC-016),
-#   implementors (verbatim quote from SpacetimeDB source), FluxBIN/BSATN/SATS/UzDB/msgpack
-#   (format names), plus the rulebook defaults (crate, ser, deser, ...).
-ignore-words-list = crate,ser,deser,upToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack
+#   implementors (verbatim quote from SpacetimeDB source), statics (Rust plural of
+#   `static` items), FluxBIN/BSATN/SATS/UzDB/msgpack (format names), plus the rulebook
+#   defaults (crate, ser, deser, ...).
+ignore-words-list = crate,ser,deser,upToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,statics,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack
