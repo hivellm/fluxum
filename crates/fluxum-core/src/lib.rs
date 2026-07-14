@@ -1,7 +1,23 @@
 //! Fluxum core: storage engine, transactions, indexes, reducer runtime,
 //! subscriptions, sharding, and migration — no network dependencies.
 //!
-//! T0.1 skeleton crate; modules land per [`docs/DAG.md`] phase order.
+//! T0.2 foundation modules; further modules land per [`docs/DAG.md`] phase
+//! order:
+//!
+//! - [`error`] — the workspace-wide [`FluxumError`] / [`Result`] pair
+//! - [`types`] — [`Identity`], [`ConnectionId`], [`EntityId`], [`Timestamp`]
+//! - [`config`] — layered YAML + `FLUXUM_*` env configuration ([`Config`])
+//! - [`hw`] — boot-time hardware probe and adaptive-default derivation
+//!   ([`hw::HardwareProfile`], [`hw::EffectiveConfig`])
+
+pub mod config;
+pub mod error;
+pub mod hw;
+pub mod types;
+
+pub use config::Config;
+pub use error::{FluxumError, Result};
+pub use types::{ConnectionId, EntityId, Identity, Timestamp};
 
 #[cfg(test)]
 mod tests {

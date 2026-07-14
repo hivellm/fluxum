@@ -1,0 +1,66 @@
+# Fluxum configuration — every key with its built-in default.
+#
+# Layering (SPEC-012 OBS-080): FLUXUM_* env var > this file > profile
+# defaults > built-in default. Every key maps to an env var by upper-casing
+# its path and joining with "_": server.tcp_port -> FLUXUM_SERVER_TCP_PORT.
+# Values of the exact form ${VAR} are expanded from the environment.
+#
+# Keys accepting "auto" are derived from the boot-time hardware probe
+# (SPEC-016); an explicit value always wins over the derivation.
+
+# Deployment profile: production | development (SPEC-012 OBS-081).
+# development = single shard, auth "none", pretty logs.
+profile: production
+
+server:
+  tcp_host: "127.0.0.1"      # bind address for both listeners
+  http_port: 15800           # HTTP: admin API + /rpc (FluxRPC over Streamable HTTP)
+  tcp_port: 15801            # FluxRPC binary TCP
+
+runtime:
+  worker_threads: auto       # auto = effective cores (min 1)
+
+sharding:
+  shards: auto               # auto = clamp(effective_cores / 2, 1, 16)
+  strategy: hash             # hash | range | region (per-table override later)
+
+memory:
+  budget: auto               # auto = max(floor, fraction × effective memory);
+                             # explicit bytes ("2GiB", "512MiB", or an integer);
+                             # explicit values below 128MiB are rejected
+  auto_fraction: 0.5         # fraction of effective memory used by "auto"
+  auto_floor_bytes: 134217728 # 128 MiB floor for the "auto" derivation
+
+storage:
+  data_dir: ./data
+  commit_log_dir: ./data/log
+  checkpoint_dir: ./data/checkpoints
+  checkpoint_interval_tx: 10000    # checkpoint cadence in committed transactions
+  page_compression: lz4            # lz4 | zstd | none
+  commit_log_write_buffer_bytes: auto  # auto = clamp(memory / 1024, 64KiB, 4MiB)
+
+replication:
+  role: primary              # primary | replica (auto after election)
+  mode: async                # async | semi_sync
+  peers: []                  # replica-set member addresses
+
+simd: auto                   # auto | avx512 | avx2 | neon | scalar (force for debugging)
+
+auth:
+  provider: token            # token | jwt | none (dev only)
+  secret: ${FLUXUM_AUTH_SECRET}  # required for token/jwt
+  server_peers: []           # trusted peers; identity = SHA-256("SERVER:" + name)
+  # server_peers:
+  #   - name: "ingest_service"
+  #     token: ${FLUXUM_INGEST_TOKEN}
+
+subscriptions:
+  send_buffer_bytes: 2097152 # 2 MiB per client
+  fanout_concurrency: auto   # auto = clamp(2 × effective_cores, 2, 64)
+
+observability:
+  slow_reducer_threshold_us: 5000  # WARN threshold for slow reducers
+
+logging:
+  level: info                # error|warn|info|debug|trace or an env-filter directive
+  format: json               # json | pretty

@@ -1,0 +1,15 @@
+# Fluxum development configuration (SPEC-012 OBS-081, FR-04).
+#
+# The development profile flips the dev defaults by itself: single shard,
+# auth "none", pretty logs. Everything else stays adaptive ("auto") or at
+# built-in defaults; see config.example.yml for the full key reference.
+
+profile: development
+
+server:
+  tcp_host: "127.0.0.1"
+  http_port: 15800
+  tcp_port: 15801
+
+logging:
+  level: debug
