@@ -1,16 +1,16 @@
 # Proposal: phase2_paged-cold-tier-buffer-pool
 
 ## Why
-Serving datasets far larger than RAM under a hard memory.budget is a core differentiator (SpacetimeDB is RAM-bound); paged evictable indexes are the novel piece.
+Datasets bounded by disk instead of RAM is a core pillar vs SpacetimeDB; the own page format, buffer pool, and paged evictable indexes are the novel storage work, and the page format freezes at G5.
 
 ## What Changes
-Implement the paged cold tier + buffer pool: on-disk page format (FluxBIN rows + per-page checksum), clock-LRU eviction, memory.budget enforcement, fault-in/evict paths, and paged evictable indexes.
+Implement the page format (FluxBIN rows + per-page CRC32C), clock-LRU buffer pool with pin/unpin and fault-in, `memory.budget` enforcement, and paged evictable indexes, plus the 10x-dataset correctness suite.
 
 ## Impact
 - DAG task: T2.8
-- Affected specs: SPEC-015 (tiered storage); page format freezes at G5
-- PRD requirements: FR-18, FR-110, NFR-12
-- Affected code: crates/fluxum-server (storage/tier)
-- Depends on: T2.1 (phase2_memstore-mvcc)
+- Affected specs: SPEC-015 (TIER-*), SPEC-016 (budget from probe)
+- PRD requirements: FR-18, FR-110, NFR-02, NFR-07, NFR-12
+- Affected code: crates/fluxum-core (pager, bufferpool)
+- Depends on: T2.1
 - Breaking change: NO
-- User benefit: datasets 10x beyond RAM served correctly on small machines, memory budget never exceeded
+- User benefit: a 200 GB dataset runs on a 4 GB VM without OOM

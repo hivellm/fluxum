@@ -1,0 +1,5 @@
+error: duplicate `#[primary_key]`: a table has exactly one primary key; for a composite key use the table-level `primary_key(col1, col2, ...)` argument (DM-002/DM-003)
+  --> tests/ui/fail/two_pk_fields.rs:10:5
+   |
+10 |     #[primary_key]
+   |     ^^^^^^^^^^^^^^

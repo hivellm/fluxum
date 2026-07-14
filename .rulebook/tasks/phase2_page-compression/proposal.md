@@ -1,16 +1,16 @@
 # Proposal: phase2_page-compression
 
 ## Why
-Cold pages and checkpoints dominate disk footprint; LZ4 for latency-sensitive page I/O and zstd for checkpoints/backups cut storage cost roughly 3x with negligible CPU impact.
+Compression multiplies effective disk capacity and cuts checkpoint/backup sizes; a 3x ratio target is part of the tiered-storage value proposition.
 
 ## What Changes
-Implement page compression: LZ4 per cold page (above a threshold), zstd for checkpoints and backups, plus a compression-ratio benchmark.
+Implement LZ4 cold-page compression (threshold-gated, zstd optional), zstd checkpoint/backup compression, bit-identical roundtrip property tests, and the published ratio benchmark.
 
 ## Impact
 - DAG task: T2.9
-- Affected specs: SPEC-015 (tiered storage)
+- Affected specs: SPEC-015 (TIER-040..044)
 - PRD requirements: FR-19
-- Affected code: crates/fluxum-server (storage/tier, storage/checkpoint)
-- Depends on: T2.8 (phase2_paged-cold-tier-buffer-pool)
+- Affected code: crates/fluxum-core (pager/checkpoint compression)
+- Depends on: T2.8
 - Breaking change: NO
-- User benefit: roughly 3x smaller cold data and checkpoints without hot-path cost
+- User benefit: at least 3x smaller cold data, checkpoints, and backups

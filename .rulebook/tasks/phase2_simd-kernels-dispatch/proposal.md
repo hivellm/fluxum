@@ -1,16 +1,16 @@
 # Proposal: phase2_simd-kernels-dispatch
 
 ## Why
-CRC, hashing, row codec, and predicate scans dominate CPU on hot paths; SIMD kernels behind runtime dispatch exploit whatever ISA the host has without changing behavior (FR-112: scalar parity).
+SIMD on CRC, hashing, codec, and predicate scans is the hardware-adaptivity pillar; runtime dispatch lets one binary exploit AVX-512 or NEON while staying bit-identical to scalar.
 
 ## What Changes
-Implement SIMD kernels with runtime dispatch (AVX-512/AVX2/SSE4.2/NEON/scalar) for CRC32, hashing, FluxBIN batch codec, and batched predicate evaluation; scalar reference implementations land first and remain the oracle.
+Land scalar reference kernels, the runtime dispatch layer with FLUXUM_SIMD override, SIMD variants behind it, and the ISA-matrix scalar-parity CI.
 
 ## Impact
 - DAG task: T2.10
-- Affected specs: SPEC-016 (hardware adaptivity and SIMD)
+- Affected specs: SPEC-016 (HWA-030..053), SPEC-013 (TST-100/101)
 - PRD requirements: FR-111, FR-112, NFR-14
-- Affected code: crates/fluxum-core (simd/dispatch module), consumed by fluxum-server
-- Depends on: T2.1 (phase2_memstore-mvcc); parallel track behind the dispatch layer
+- Affected code: crates/fluxum-core (simd), .github/workflows (ISA matrix)
+- Depends on: T2.1
 - Breaking change: NO
-- User benefit: hot paths automatically use the fastest instruction set available, identical results everywhere
+- User benefit: hot-path speedups with provable correctness on every ISA

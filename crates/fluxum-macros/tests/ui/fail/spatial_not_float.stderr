@@ -1,0 +1,5 @@
+error: spatial index column `grid_x` must be `f32` or `f64` (DM-032)
+ --> tests/ui/fail/spatial_not_float.rs:6:20
+  |
+6 | #[spatial(quadtree(grid_x, grid_y))]
+  |                    ^^^^^^

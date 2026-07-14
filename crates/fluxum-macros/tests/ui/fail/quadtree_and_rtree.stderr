@@ -1,0 +1,5 @@
+error: a table cannot declare both `quadtree` and `rtree` spatial indexes (DM-033)
+ --> tests/ui/fail/quadtree_and_rtree.rs:7:1
+  |
+7 | #[spatial(rtree(min_x, min_y, max_x, max_y))]
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

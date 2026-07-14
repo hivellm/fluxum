@@ -1,16 +1,16 @@
 # Proposal: phase3_reducer-context-txhandle
 
 ## Why
-ReducerContext + TxHandle is the entire data API reducers see; intra-tx reads (scan_pending/scan_all) are what let reducers act on their own uncommitted writes.
+ReducerContext/TxHandle is the API every module author touches; intra-transaction reads (scan_pending/scan_all) are a differentiator SpacetimeDB lacks.
 
 ## What Changes
-Implement ReducerContext + TxHandle: insert/delete/upsert/query_pk/scan/scan_where plus intra-tx scan_pending/scan_all/count_pending.
+Implement ReducerContext, the full TxHandle write/read surface, intra-tx visibility, and nested reducer calls sharing one transaction.
 
 ## Impact
 - DAG task: T3.2
-- Affected specs: SPEC-004 (reducers)
+- Affected specs: SPEC-004 (RED-001..005), SPEC-003 (TXN-050/051)
 - PRD requirements: FR-17, FR-20
-- Affected code: crates/fluxum-server (reducer module), crates/fluxum-core (context types)
-- Depends on: T3.1 (phase3_transactions)
+- Affected code: crates/fluxum-core (reducer api)
+- Depends on: T3.1
 - Breaking change: NO
-- User benefit: a complete, typed data API inside reducers including reads of pending writes
+- User benefit: ergonomic, fully transactional module API

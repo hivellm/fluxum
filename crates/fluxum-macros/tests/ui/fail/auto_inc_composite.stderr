@@ -1,0 +1,5 @@
+error: `#[auto_inc]` is not supported on composite primary keys (DM-004)
+ --> tests/ui/fail/auto_inc_composite.rs:9:5
+  |
+9 |     #[auto_inc]
+  |     ^^^^^^^^^^^

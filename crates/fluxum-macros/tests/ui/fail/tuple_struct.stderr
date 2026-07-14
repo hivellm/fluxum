@@ -1,0 +1,5 @@
+error: #[fluxum::table] requires a struct with named fields (DM-001)
+ --> tests/ui/fail/tuple_struct.rs:6:17
+  |
+6 | pub struct Point(pub f32, pub f32);
+  |                 ^^^^^^^^^^^^^^^^^^

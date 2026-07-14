@@ -37,6 +37,11 @@ pub enum FluxumError {
     #[error("auth error: {0}")]
     Auth(String),
 
+    /// Invalid assembled schema — duplicate table names or a declaration the
+    /// proc macro could not reject at compile time (SPEC-001 DM-040).
+    #[error("schema error: {0}")]
+    Schema(String),
+
     /// Hardware probe / derivation failure that must abort boot
     /// (e.g. SPEC-016 HWA-015 memory shortfall).
     #[error("hardware error: {0}")]

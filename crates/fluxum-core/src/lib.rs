@@ -11,11 +11,14 @@
 //!   ([`hw::HardwareProfile`], [`hw::EffectiveConfig`])
 //! - [`auth`] — pluggable [`AuthProvider`] trait, built-in `token`/`jwt`/
 //!   `none` providers, server-peer registry ([`Authenticator`], SPEC-009)
+//! - [`schema`] — [`schema::TableSchema`] introspection, the [`schema::Table`]
+//!   trait, and the link-time registry behind `#[fluxum::table]` (SPEC-001)
 
 pub mod auth;
 pub mod config;
 pub mod error;
 pub mod hw;
+pub mod schema;
 pub mod types;
 
 pub use auth::{AuthClaims, AuthOutcome, AuthProvider, Authenticator};

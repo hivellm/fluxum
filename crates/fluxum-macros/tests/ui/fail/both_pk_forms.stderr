@@ -1,0 +1,5 @@
+error: table declares both a `#[primary_key]` field and a table-level `primary_key(...)` argument; declare exactly one (DM-003)
+ --> tests/ui/fail/both_pk_forms.rs:5:25
+  |
+5 | #[fluxum::table(public, primary_key(grid_x, grid_y))]
+  |                         ^^^^^^^^^^^^^^^^^^^^^^^^^^^

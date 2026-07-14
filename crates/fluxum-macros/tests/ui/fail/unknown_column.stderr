@@ -1,0 +1,5 @@
+error: unknown column `owner_id` referenced in `#[index(btree(...))]` (DM-030)
+ --> tests/ui/fail/unknown_column.rs:6:15
+  |
+6 | #[index(btree(owner_id))]
+  |               ^^^^^^^^

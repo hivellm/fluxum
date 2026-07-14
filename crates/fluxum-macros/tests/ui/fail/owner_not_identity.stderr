@@ -1,0 +1,5 @@
+error: `owner_only` column `owner` must be of type `Identity` (DM-060)
+ --> tests/ui/fail/owner_not_identity.rs:6:25
+  |
+6 | #[visibility(owner_only(owner))]
+  |                         ^^^^^

@@ -1,0 +1,5 @@
+error: table has no primary key: annotate one field with `#[primary_key]` or use the table-level `primary_key(col, ...)` argument (DM-002)
+ --> tests/ui/fail/no_pk.rs:6:12
+  |
+6 | pub struct Orphan {
+  |            ^^^^^^

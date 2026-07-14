@@ -1,0 +1,5 @@
+error: duplicate `btree` index on the same column set: a column set cannot be indexed twice with the same index type (DM-033)
+ --> tests/ui/fail/duplicate_index.rs:7:1
+  |
+7 | #[index(btree(owner))]
+  | ^^^^^^^^^^^^^^^^^^^^^^

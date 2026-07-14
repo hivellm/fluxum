@@ -1,0 +1,5 @@
+error: unsupported column type `Address`: column types are the closed SPEC-001 §3 universe (bool, i8..i64, u8..u64, f32/f64, String, Vec<u8>, Identity, ConnectionId, EntityId, Timestamp, Option<T>, Vec<T>) (DM-010..DM-012)
+  --> tests/ui/fail/nested_table_struct.rs:17:18
+   |
+17 |     pub address: Address,
+   |                  ^^^^^^^

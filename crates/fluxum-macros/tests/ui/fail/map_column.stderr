@@ -1,0 +1,5 @@
+error: map types are not valid column types (DM-012): model the relationship with a separate table keyed by an EntityId/u64 column
+ --> tests/ui/fail/map_column.rs:9:16
+  |
+9 |     pub items: std::collections::HashMap<String, u32>,
+  |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

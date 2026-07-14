@@ -1,16 +1,16 @@
 # Proposal: phase2_crash-suite-dst
 
 ## Why
-Durability claims are worthless without adversarial proof; the crash suite and deterministic simulation are the permanent evidence that no committed transaction is ever lost.
+Crash safety is the product's non-negotiable (PRD design philosophy 4); the kill -9 matrix, corruption drills, and deterministic simulation are what prove zero committed-tx loss before anything is built on top.
 
 ## What Changes
-Build the crash suite: kill -9 harness at every commit boundary, CRC bit-flip drills (log and pages), a 10 GB recovery benchmark, and a deterministic simulation (DST) suite for storage/commitlog with seeded runtime, fault injection, and a model oracle.
+Build the kill -9 harness across all commit and checkpoint boundaries, CRC bit-flip drills on log and pages, the 10 GB recovery benchmark, the seeded DST suite with model oracle, and process-level restart drills.
 
 ## Impact
 - DAG task: T2.7
-- Affected specs: SPEC-013 (testing and conformance)
-- PRD requirements: FR-13, NFR-06
-- Affected code: crates/fluxum-server tests, CI workflows
-- Depends on: T2.2 (phase2_commitlog), T2.3 (phase2_checkpoints), T2.8 (phase2_paged-cold-tier-buffer-pool)
+- Affected specs: SPEC-013 (TST-020..026, TST-130..141), SPEC-002, SPEC-015
+- PRD requirements: FR-13, NFR-06, NFR-08
+- Affected code: crates/fluxum-core tests, test harness crates
+- Depends on: T2.2, T2.3, T2.8
 - Breaking change: NO
-- User benefit: proven zero-loss durability and bounded recovery time
+- User benefit: provable durability - the G2 gate blocks everything downstream until this is green

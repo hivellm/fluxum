@@ -1,0 +1,5 @@
+error: `#[auto_inc]` requires the primary-key column to be `u64` (DM-004)
+ --> tests/ui/fail/auto_inc_not_u64.rs:8:5
+  |
+8 |     #[auto_inc]
+  |     ^^^^^^^^^^^

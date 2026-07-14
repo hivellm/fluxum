@@ -15,18 +15,23 @@ fluxum-core = { path = "crates/fluxum-core", version = "0.1.0" }
 fluxum-macros = { path = "crates/fluxum-macros", version = "0.1.0" }
 fluxum-protocol = { path = "crates/fluxum-protocol", version = "0.1.0" }
 hmac = "0.12"
+inventory = "0.3"
 jsonwebtoken = "9"
+proc-macro2 = "1"
 proptest = "1"
+quote = "1"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
+syn = { version = "2", features = ["full"] }
 sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = "3"
 thiserror = "2"
 tracing = "0.1"
+trybuild = "1"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

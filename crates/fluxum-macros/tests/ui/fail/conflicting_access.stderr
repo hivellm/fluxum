@@ -1,0 +1,5 @@
+error: at most one of `public`, `private`, `global` (DM-005/DM-007)
+ --> tests/ui/fail/conflicting_access.rs:5:25
+  |
+5 | #[fluxum::table(public, global)]
+  |                         ^^^^^^

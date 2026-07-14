@@ -1,0 +1,5 @@
+error: `partition_by` cannot be combined with `global`: global tables are replicated to every shard, not partitioned (DM-008)
+ --> tests/ui/fail/partition_by_global.rs:5:38
+  |
+5 | #[fluxum::table(global, partition_by(region))]
+  |                                      ^^^^^^
