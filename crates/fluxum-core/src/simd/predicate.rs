@@ -158,9 +158,9 @@ mod arm {
     use super::PredOp;
 
     /// NEON `i64` comparisons, 2 lanes per step, scalar tail per 64-row
-    /// word. NEON is baseline on aarch64 (HWA-030), so these are plain safe
-    /// functions.
-    pub(super) fn eval_i64_neon(op: PredOp, values: &[i64], rhs: i64, out: &mut [u64]) {
+    /// word.
+    #[target_feature(enable = "neon")]
+    fn eval_i64(op: PredOp, values: &[i64], rhs: i64, out: &mut [u64]) {
         let rhs_v = vdupq_n_s64(rhs);
         let ptr = values.as_ptr();
         let n = values.len();
@@ -198,7 +198,8 @@ mod arm {
 
     /// NEON `f64` comparisons — `vceqq`/`vcltq`/`vcgtq` implement IEEE
     /// ordered semantics, matching scalar Rust operators (HWA-044).
-    pub(super) fn eval_f64_neon(op: PredOp, values: &[f64], rhs: f64, out: &mut [u64]) {
+    #[target_feature(enable = "neon")]
+    fn eval_f64(op: PredOp, values: &[f64], rhs: f64, out: &mut [u64]) {
         let rhs_v = vdupq_n_f64(rhs);
         let ptr = values.as_ptr();
         let n = values.len();
@@ -232,6 +233,18 @@ mod arm {
             *word = bits;
             idx = end;
         }
+    }
+
+    pub(super) fn eval_i64_neon(op: PredOp, values: &[i64], rhs: i64, out: &mut [u64]) {
+        // SAFETY: `variant_i64` hands this wrapper out only after runtime
+        // detection proved NEON support (HWA-031/HWA-054).
+        unsafe { eval_i64(op, values, rhs, out) }
+    }
+
+    pub(super) fn eval_f64_neon(op: PredOp, values: &[f64], rhs: f64, out: &mut [u64]) {
+        // SAFETY: `variant_f64` hands this wrapper out only after runtime
+        // detection proved NEON support (HWA-031/HWA-054).
+        unsafe { eval_f64(op, values, rhs, out) }
     }
 }
 
