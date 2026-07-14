@@ -2,12 +2,14 @@
 //! STG-003..STG-007, STG-040). See [`super`] for the design decisions.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::ops::Bound;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arc_swap::ArcSwap;
 
 use crate::error::{FluxumError, Result};
-use crate::schema::{Schema, TableSchema};
+use crate::index::{BTreeIndex, IndexId};
+use crate::schema::{IndexSchema, Schema, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
 use crate::store::row::{
@@ -143,6 +145,7 @@ impl MemStore {
                 Arc::new(TableState {
                     schema: table,
                     rows: BTreeMap::new(),
+                    indexes: build_btree_indexes(table)?,
                     auto_inc_high_water: 0,
                 }),
             );
@@ -166,6 +169,23 @@ impl MemStore {
     pub fn table_id(&self, name: &str) -> Option<TableId> {
         let id = TableId::of(name);
         self.catalog.contains_key(&id).then_some(id)
+    }
+
+    /// The [`IndexId`] of the B-tree index declared on table `name` over
+    /// exactly `columns` (names in declared key order), if one exists.
+    pub fn index_id(&self, name: &str, columns: &[&str]) -> Option<IndexId> {
+        let schema = self.catalog.get(&TableId::of(name))?;
+        let declared = schema.indexes.iter().any(|index| {
+            let IndexSchema::BTree { columns: ordinals } = index else {
+                return false;
+            };
+            ordinals.len() == columns.len()
+                && ordinals
+                    .iter()
+                    .zip(columns)
+                    .all(|(&ordinal, &want)| schema.column(ordinal).is_some_and(|c| c.name == want))
+        });
+        declared.then(|| IndexId::of(name, columns))
     }
 
     /// A lock-free, consistent point-in-time view of the committed state
@@ -328,6 +348,33 @@ impl Tx<'_> {
         Ok(self.base.table(table)?.rows.values())
     }
 
+    /// Scan a B-tree index of the committed snapshot captured at `begin`
+    /// (STG-004: pending writes are never visible). Same shapes and
+    /// ordering as [`super::Snapshot::index_scan`].
+    pub fn index_scan(
+        &self,
+        table: TableId,
+        index: IndexId,
+        prefix: &[RowValue],
+        lower: Bound<&RowValue>,
+        upper: Bound<&RowValue>,
+    ) -> Result<impl Iterator<Item = &Row>> {
+        self.base
+            .table(table)?
+            .index_scan(index, prefix, lower, upper)
+    }
+
+    /// Equality lookup on a B-tree index of the committed snapshot captured
+    /// at `begin` (see [`super::Snapshot::index_eq`]).
+    pub fn index_eq(
+        &self,
+        table: TableId,
+        index: IndexId,
+        key: &[RowValue],
+    ) -> Result<impl Iterator<Item = &Row>> {
+        self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
+    }
+
     /// Commit: merge `TxState` into a new `CommittedState` and swap it in
     /// atomically (STG-005). Constraints were enforced eagerly at write
     /// time, so the merge itself is infallible under the single-writer
@@ -355,14 +402,24 @@ impl Tx<'_> {
                 inserts: Vec::new(),
                 deletes: Vec::new(),
             };
+            // Rows and secondary indexes are updated together on this
+            // private pre-swap copy (STG-005 steps 2–4), so the published
+            // snapshot's rows and indexes are mutually consistent and
+            // rollback never has index state to revert (STG-007 rule 2).
             for (pk, op) in ops {
                 match op {
                     PendingOp::Insert(row) => {
+                        for index in table.indexes.values_mut() {
+                            index.insert(&row, pk.clone())?;
+                        }
                         table.rows.insert(pk, row.clone());
                         diff.inserts.push(row);
                     }
                     PendingOp::Delete => {
                         let old = table.rows.remove(&pk).ok_or_else(invariant_missing_row)?;
+                        for index in table.indexes.values_mut() {
+                            index.remove(&old, &pk)?;
+                        }
                         diff.deletes.push((pk, old));
                     }
                     PendingOp::Update(row) => {
@@ -370,6 +427,10 @@ impl Tx<'_> {
                             .rows
                             .insert(pk.clone(), row.clone())
                             .ok_or_else(invariant_missing_row)?;
+                        for index in table.indexes.values_mut() {
+                            index.remove(&old, &pk)?;
+                            index.insert(&row, pk.clone())?;
+                        }
                         diff.deletes.push((pk, old));
                         diff.inserts.push(row);
                     }
@@ -473,4 +534,36 @@ fn invariant_missing_row() -> FluxumError {
     FluxumError::Storage(
         "internal invariant violated: Delete/Update op for pk absent from CommittedState".into(),
     )
+}
+
+/// Empty secondary B-tree indexes for `table`, keyed by stable [`IndexId`]
+/// (STG-051), one per `#[index(btree(...))]` declaration. Spatial
+/// declarations are SPEC-008 (T2.5) surface and are skipped here.
+fn build_btree_indexes(table: &'static TableSchema) -> Result<BTreeMap<IndexId, BTreeIndex>> {
+    let mut indexes = BTreeMap::new();
+    for index in table.indexes {
+        let IndexSchema::BTree { columns } = index else {
+            continue;
+        };
+        let mut names = Vec::with_capacity(columns.len());
+        for &ordinal in *columns {
+            let column = table.column(ordinal).ok_or_else(|| {
+                FluxumError::Schema(format!(
+                    "table `{}`: #[index(btree)] ordinal {ordinal} out of range (the \
+                     registry should have rejected this schema)",
+                    table.name
+                ))
+            })?;
+            names.push(column.name);
+        }
+        let id = IndexId::of(table.name, &names);
+        if indexes.insert(id, BTreeIndex::new(columns)).is_some() {
+            return Err(FluxumError::Schema(format!(
+                "IndexId collision: two #[index(btree(...))] declarations on table `{}` \
+                 hash to {id} (STG-051)",
+                table.name
+            )));
+        }
+    }
+    Ok(indexes)
 }

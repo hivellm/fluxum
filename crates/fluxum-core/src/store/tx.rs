@@ -53,16 +53,19 @@ impl TxState {
 
     /// Roll back every eagerly applied effect, newest first (STG-007).
     ///
-    /// T2.1 applies nothing eagerly — buffered writes cover everything — so
-    /// the log is empty and rollback is pure discard (STG-006). T2.4's index
-    /// maintenance and SPEC-010's transactional DDL push their revert
-    /// records here; the reverse replay order is already the contract.
+    /// Nothing is applied eagerly — buffered writes cover row effects
+    /// (T2.1), and T2.4's secondary-index maintenance rides the commit
+    /// merge on the private pre-swap copy (see [`crate::index`] for why
+    /// eager maintenance would violate STG-004/FR-10) — so the log is empty
+    /// and rollback is pure discard (STG-006). SPEC-010's transactional DDL
+    /// pushes its revert records here; the reverse replay order is already
+    /// the contract.
     pub(crate) fn revert_eager_effects(&mut self) {
-        // `UndoRecord` is uninhabited until T2.4 adds eager index
-        // maintenance: dispatching one (impossible) record proves the empty
-        // match diverges, so no loop is needed yet. When variants land,
-        // replay MUST pop newest-first (`while let Some(...) = pop()`) — the
-        // reverse order is the load-bearing part of the STG-007 contract.
+        // `UndoRecord` is uninhabited: dispatching one (impossible) record
+        // proves the empty match diverges, so no loop is needed yet. When
+        // variants land, replay MUST pop newest-first
+        // (`while let Some(...) = pop()`) — the reverse order is the
+        // load-bearing part of the STG-007 contract.
         if let Some(record) = self.undo_log.pop() {
             match record {} // no eager effects exist yet (see UndoRecord)
         }
@@ -72,9 +75,12 @@ impl TxState {
 /// One undo record for an effect applied eagerly to `CommittedState`
 /// structures during a transaction (STG-007 rule 3).
 ///
-/// Currently uninhabited: every T2.1 effect is buffered in [`TxState`] and
-/// therefore discarded for free. T2.4 (secondary/spatial index maintenance)
-/// and SPEC-010 (transactional DDL) add variants; rollback replays them in
+/// Currently uninhabited: every row effect is buffered in [`TxState`]
+/// (T2.1) and secondary-index maintenance happens inside the commit merge
+/// on the private pre-swap state (T2.4 decision, [`crate::index`]) — both
+/// are discarded for free on rollback, which the T2.4 property suite
+/// verifies against a fresh index rebuild (STG-007 rule 2). SPEC-010
+/// (transactional DDL) adds the first variants; rollback replays them in
 /// reverse push order via [`TxState::revert_eager_effects`].
 #[derive(Debug)]
 #[non_exhaustive]

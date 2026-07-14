@@ -29,18 +29,22 @@
 //!   commit log (T2.2) and wire diffs (SPEC-005/006) share one byte-identical
 //!   PK form with the store. Note: FluxBIN integers are little-endian, so
 //!   `BTreeMap` iteration order over [`PkBytes`] is deterministic byte order,
-//!   **not** numeric order — PK-ordered range scans arrive with the index
-//!   work (T2.4), which adds a memcomparable key transform.
+//!   **not** numeric order — value-ordered range scans go through the T2.4
+//!   secondary indexes ([`crate::index`]), whose keys use the memcomparable
+//!   transform.
 //! - **Single writer**: [`MemStore::begin`] takes a `Mutex` whose guard is
 //!   held by the [`Tx`] handle; a second `begin` on the same shard blocks
 //!   until the first commits or rolls back (STG-003).
 //! - **Rollback** (STG-006/STG-007): nothing is applied eagerly to committed
-//!   structures in T2.1, so discarding `TxState` is exact by construction —
-//!   deleted rows were never removed from the snapshot (undelete is free) and
-//!   there are no secondary indexes to revert yet. The hook for eager effects
-//!   is in place: [`UndoRecord`] entries are replayed in reverse on rollback
-//!   (STG-007 rule 3); T2.4's index maintenance pushes its revert records
-//!   there.
+//!   structures, so discarding `TxState` is exact by construction — deleted
+//!   rows were never removed from the snapshot (undelete is free), and
+//!   secondary indexes (T2.4) are maintained during the commit merge on the
+//!   private pre-swap copy, never eagerly, so after any rollback every index
+//!   is bit-identical to a fresh rebuild over `CommittedState` (STG-007
+//!   rule 2 — see [`crate::index`] for why eager maintenance would break
+//!   STG-004/FR-10). The hook for genuinely eager effects remains in place:
+//!   [`UndoRecord`] entries are replayed in reverse on rollback (STG-007
+//!   rule 3); SPEC-010's transactional DDL is its expected first user.
 //! - **Delete-then-reinsert cancellation** (STG-007 rule 1): `TxState` keys
 //!   pending operations by PK as `Insert` / `Delete` / `Update`, so
 //!   reinserting a tx-deleted committed row with identical content cancels to
@@ -106,9 +110,10 @@ impl std::fmt::Display for TableId {
 }
 
 /// CRC32 (IEEE 802.3, reflected, polynomial `0xEDB88320`) — the standard
-/// `crc32` most tools compute. Bitwise (table-free): runs once per table at
-/// startup, so throughput is irrelevant.
-const fn crc32(bytes: &[u8]) -> u32 {
+/// `crc32` most tools compute. Bitwise (table-free): runs once per table or
+/// index at startup, so throughput is irrelevant. Shared with
+/// [`crate::index::IndexId`] (STG-051).
+pub(crate) const fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     let mut i = 0;
     while i < bytes.len() {

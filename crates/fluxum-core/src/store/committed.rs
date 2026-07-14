@@ -2,9 +2,12 @@
 //! and [`Snapshot`], the lock-free reader handle over it.
 
 use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
+use crate::index::IndexId;
+use crate::index::btree::{self, BTreeIndex};
 use crate::schema::TableSchema;
 use crate::store::TableId;
 use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
@@ -12,15 +15,19 @@ use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
 /// One table's committed contents (STG-002).
 ///
 /// `rows` is the logical primary map (BTreeMap for O(log n) point lookup and
-/// deterministic iteration). Secondary/spatial index structures join this
-/// struct in T2.4; the rollback hook for their eager maintenance already
-/// exists ([`super::UndoRecord`]).
+/// deterministic iteration); `indexes` the secondary B-tree indexes (T2.4),
+/// maintained together with `rows` inside the commit merge so a published
+/// snapshot's rows and indexes are always mutually consistent. Spatial index
+/// structures join this struct with SPEC-008.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
     pub(crate) schema: &'static TableSchema,
     /// Primary row map, keyed by FluxBIN-encoded PK.
     pub(crate) rows: BTreeMap<PkBytes, Row>,
+    /// Secondary B-tree indexes by stable id (STG-051), one per
+    /// `#[index(btree(...))]` declaration (DM-030/DM-031).
+    pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
     /// Durable auto-inc high-water mark (STG-040): every value ≤ this has
     /// been covered by a batch allocation that a committed [`super::TxDiff`]
     /// carried (T2.2 persists it through the commit log).
@@ -36,6 +43,134 @@ impl TableState {
     /// Number of committed rows.
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Scan a B-tree index of this table: equality on `prefix` (0..=all
+    /// index columns, in declared key order), then `lower`/`upper` bounds
+    /// over the next index column. See [`Snapshot::index_scan`].
+    pub(crate) fn index_scan(
+        &self,
+        index_id: IndexId,
+        prefix: &[RowValue],
+        lower: Bound<&RowValue>,
+        upper: Bound<&RowValue>,
+    ) -> Result<impl Iterator<Item = &Row>> {
+        let index = self.indexes.get(&index_id).ok_or_else(|| {
+            FluxumError::Storage(format!(
+                "unknown index {index_id} on table `{}`",
+                self.schema.name
+            ))
+        })?;
+        let columns = index.columns();
+        if prefix.len() > columns.len() {
+            return Err(FluxumError::Storage(format!(
+                "table `{}`: index {index_id} scan prefix has {} value(s) but the index \
+                 has {} column(s)",
+                self.schema.name,
+                prefix.len(),
+                columns.len()
+            )));
+        }
+        let mut prefix_bytes = Vec::new();
+        for (value, &ordinal) in prefix.iter().zip(columns) {
+            btree::encode_value(
+                self.check_index_value(index_id, ordinal, value)?,
+                &mut prefix_bytes,
+            );
+        }
+        let ranged = !matches!((&lower, &upper), (Bound::Unbounded, Bound::Unbounded));
+        if ranged && prefix.len() == columns.len() {
+            return Err(FluxumError::Storage(format!(
+                "table `{}`: index {index_id} scan has range bounds but the equality prefix \
+                 already covers all {} index column(s)",
+                self.schema.name,
+                columns.len()
+            )));
+        }
+        let range_ordinal = columns.get(prefix.len()).copied();
+        let lower = self.encode_bound(index_id, range_ordinal, lower)?;
+        let upper = self.encode_bound(index_id, range_ordinal, upper)?;
+        let (start, end) = btree::plan_scan(prefix_bytes, lower, upper);
+        Ok(index.scan_pks(start, end).filter_map(move |pk| {
+            let row = self.rows.get(pk);
+            debug_assert!(
+                row.is_some(),
+                "index {index_id} points at a pk absent from the row map"
+            );
+            row
+        }))
+    }
+
+    /// Type-check `value` against the index column at `ordinal`.
+    fn check_index_value<'v>(
+        &self,
+        index_id: IndexId,
+        ordinal: u16,
+        value: &'v RowValue,
+    ) -> Result<&'v RowValue> {
+        let column = self.schema.column(ordinal).ok_or_else(|| {
+            FluxumError::Storage(format!(
+                "internal invariant violated: index {index_id} ordinal {ordinal} out of \
+                 range for table `{}`",
+                self.schema.name
+            ))
+        })?;
+        if !value.matches_type(&column.ty) {
+            return Err(FluxumError::Storage(format!(
+                "table `{}`: index column `{}` expects {:?}, got {value}",
+                self.schema.name, column.name, column.ty
+            )));
+        }
+        Ok(value)
+    }
+
+    /// Memcomparable-encode one scan bound over the index column at
+    /// `range_ordinal`.
+    fn encode_bound(
+        &self,
+        index_id: IndexId,
+        range_ordinal: Option<u16>,
+        bound: Bound<&RowValue>,
+    ) -> Result<Bound<Vec<u8>>> {
+        let encode = |value: &RowValue| -> Result<Vec<u8>> {
+            let ordinal = range_ordinal.ok_or_else(|| {
+                FluxumError::Storage(format!(
+                    "internal invariant violated: range bound without a range column \
+                     (index {index_id}, table `{}`)",
+                    self.schema.name
+                ))
+            })?;
+            let mut bytes = Vec::new();
+            btree::encode_value(
+                self.check_index_value(index_id, ordinal, value)?,
+                &mut bytes,
+            );
+            Ok(bytes)
+        };
+        Ok(match bound {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(value) => Bound::Included(encode(value)?),
+            Bound::Excluded(value) => Bound::Excluded(encode(value)?),
+        })
+    }
+
+    /// STG-007 rule 2 check: every secondary index equals (bit-identically)
+    /// a freshly built index over this table's committed rows.
+    pub(crate) fn verify_index_integrity(&self, table_id: TableId) -> Result<()> {
+        for (index_id, index) in &self.indexes {
+            let mut rebuilt = BTreeIndex::new(index.columns());
+            for (pk, row) in &self.rows {
+                rebuilt.insert(row, pk.clone())?;
+            }
+            if rebuilt != *index {
+                return Err(FluxumError::Storage(format!(
+                    "index {index_id} on table `{}` ({table_id}) diverged from a fresh \
+                     rebuild over CommittedState (STG-007)",
+                    self.schema.name
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -83,6 +218,50 @@ impl Snapshot {
     /// Iterate all committed rows of `table` in encoded-PK byte order.
     pub fn scan(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
         Ok(self.state.table(table)?.rows.values())
+    }
+
+    /// Scan a B-tree index (DM-030/DM-031), lock-free over this snapshot.
+    ///
+    /// `prefix` gives equality values for the leading index columns (0..=all,
+    /// in declared key order); `lower`/`upper` bound the *next* index column.
+    /// Rows come back in index order — ascending by the indexed values
+    /// (memcomparable order == natural value order), then by encoded PK
+    /// within one index key. Scan shapes:
+    ///
+    /// - point lookup: full `prefix`, both bounds `Unbounded`;
+    /// - range scan: empty `prefix`, bounds over the first column;
+    /// - composite prefix scan (DM-031): equality prefix + bounds over the
+    ///   following column (e.g. `channel` equality, `sent_at` range).
+    pub fn index_scan(
+        &self,
+        table: TableId,
+        index: IndexId,
+        prefix: &[RowValue],
+        lower: Bound<&RowValue>,
+        upper: Bound<&RowValue>,
+    ) -> Result<impl Iterator<Item = &Row>> {
+        self.state
+            .table(table)?
+            .index_scan(index, prefix, lower, upper)
+    }
+
+    /// Equality lookup on a B-tree index: all rows whose leading index
+    /// columns equal `key` (a full key for point lookups, a shorter prefix
+    /// for DM-031 prefix equality).
+    pub fn index_eq(
+        &self,
+        table: TableId,
+        index: IndexId,
+        key: &[RowValue],
+    ) -> Result<impl Iterator<Item = &Row>> {
+        self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
+    }
+
+    /// Verify STG-007 rule 2 for `table`: every secondary index is
+    /// bit-identical to a freshly rebuilt index over the committed rows.
+    /// Diagnostic surface for tests and DST (SPEC-013).
+    pub fn verify_index_integrity(&self, table: TableId) -> Result<()> {
+        self.state.table(table)?.verify_index_integrity(table)
     }
 
     /// Number of committed rows in `table`.
