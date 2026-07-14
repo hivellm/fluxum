@@ -89,8 +89,9 @@ impl FromStr for Identity {
             ));
         }
         let mut bytes = [0u8; 32];
-        for (i, chunk) in s.as_bytes().chunks_exact(2).enumerate() {
-            let hex = std::str::from_utf8(chunk).map_err(|_| "identity is not ASCII hex")?;
+        let (pairs, _) = s.as_bytes().as_chunks::<2>();
+        for (i, pair) in pairs.iter().enumerate() {
+            let hex = std::str::from_utf8(pair).map_err(|_| "identity is not ASCII hex")?;
             bytes[i] =
                 u8::from_str_radix(hex, 16).map_err(|_| format!("invalid hex byte '{hex}'"))?;
         }
