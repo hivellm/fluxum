@@ -1,0 +1,38 @@
+{
+  "version": "7.0.0",
+  "installedAt": "2026-07-14T09:18:26.623Z",
+  "updatedAt": "2026-07-14T09:18:26.624Z",
+  "projectId": "74d5c0a0-f801-4fb9-9302-392e826daadb",
+  "mode": "full",
+  "features": {
+    "logging": true,
+    "gitHooks": false,
+    "templates": false,
+    "context": false,
+    "health": false,
+    "parallel": false,
+    "smartContinue": false
+  },
+  "coverageThreshold": 95,
+  "language": "en",
+  "outputLanguage": "en",
+  "cliTools": [],
+  "maxParallelTasks": 1,
+  "timeouts": {
+    "taskExecution": 300000,
+    "cliResponse": 60000,
+    "testRun": 120000
+  },
+  "agentsMode": "lean",
+  "monorepo": {
+    "detected": false,
+    "tool": null,
+    "packages": []
+  },
+  "languages": [
+    "rust"
+  ],
+  "modules": [],
+  "modular": true,
+  "rulebookDir": ".rulebook"
+}

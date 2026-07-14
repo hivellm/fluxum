@@ -26,3 +26,25 @@ lcov.info
 # SDK build artifacts
 sdks/typescript/node_modules/
 sdks/typescript/dist/
+
+# Rulebook - ignore runtime data, keep specs and tasks
+/.rulebook/*
+!/.rulebook/specs/
+!/.rulebook/tasks/
+!/.rulebook/tasks/**/*.md
+!/.rulebook/rulebook.json
+
+# Patterns added by @hivellm/rulebook
+# Added at: 2026-07-14T09:18:26.649Z
+
+*.swo
+*~
+.cache/
+.env.*.local
+.env.local
+logs/
+temp/
+tmp/
+
+CLAUDE.local.md
+.rulebook/backup/

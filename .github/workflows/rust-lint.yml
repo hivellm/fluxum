@@ -1,0 +1,54 @@
+name: Rust Lint
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ '**' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Install minimal nightly (for fmt)
+      uses: dtolnay/rust-toolchain@nightly
+      with:
+        components: rustfmt
+    
+    - name: Install minimal stable
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    
+    - uses: actions/checkout@v5
+    
+    - uses: Swatinem/rust-cache@v2
+      # MONOREPO: Uncomment and set workspaces if in subdirectory
+      # with:
+      #   workspaces: 'subdirectory'
+      #   key: clippy
+    
+    - name: Check code formatting
+      # MONOREPO: Add working-directory if in subdirectory
+      # working-directory: ./subdirectory
+      run: cargo fmt --all -- --check  # Use stable rustfmt (nightly not required for edition 2024)
+    
+    - name: Check cargo clippy warnings
+      # MONOREPO: Add working-directory if in subdirectory
+      # working-directory: ./subdirectory
+      run: cargo clippy --workspace -- -D warnings
+    
+    - name: Check cargo clippy warnings for all targets
+      # MONOREPO: Add working-directory if in subdirectory
+      # working-directory: ./subdirectory
+      run: cargo clippy --workspace --all-targets -- -D warnings
+    
+    - name: Check cargo clippy warnings for all targets and features
+      # MONOREPO: Add working-directory if in subdirectory
+      # working-directory: ./subdirectory
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
