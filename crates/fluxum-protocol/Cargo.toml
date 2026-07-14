@@ -1,0 +1,12 @@
+[package]
+name = "fluxum-protocol"
+description = "Fluxum pure wire layer: FluxValue, FluxBIN codec, FluxRPC framing and message types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

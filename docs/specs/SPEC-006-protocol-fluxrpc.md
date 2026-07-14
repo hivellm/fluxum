@@ -650,7 +650,7 @@ green.
     re-subscribes, receives a fresh `InitialData` snapshot, and detects a missed update via the
     `tx_id` gap.
 15. **Proxy compatibility** — the full Streamable HTTP flow (POST authenticate, GET stream,
-    streamed `TxUpdate` delivery, keep-alives) works unmodified through a standard HTTP reverse
+    streamed `TxUpdate` delivery, keep-alive messages) works unmodified through a standard HTTP reverse
     proxy (e.g. nginx/HAProxy) with response buffering disabled for `/rpc`; the required proxy
     configuration is documented as a deployment note.
 16. **Compression negotiation** (RPC-008) *(adopted from SpacetimeDB analysis, file 06)* — a

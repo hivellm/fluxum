@@ -1,0 +1,12 @@
+[package]
+name = "fluxum-server"
+description = "Fluxum server: FluxRPC TCP, Streamable HTTP /rpc + admin, auth providers, metrics, ServerBuilder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

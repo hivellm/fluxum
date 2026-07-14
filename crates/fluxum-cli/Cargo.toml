@@ -1,0 +1,16 @@
+[package]
+name = "fluxum-cli"
+description = "fluxum binary: generate, schema export, backup, admin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fluxum"
+path = "src/main.rs"
+
+[dependencies]
+
+[lints]
+workspace = true

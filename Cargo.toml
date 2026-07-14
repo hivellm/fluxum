@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/hivellm/fluxum"
+
+# Centralized dependency versions — crates inherit with `dep.workspace = true`.
+# Kept minimal for T0.1; external deps land here as phases need them.
+[workspace.dependencies]
+fluxum-core = { path = "crates/fluxum-core", version = "0.1.0" }
+fluxum-macros = { path = "crates/fluxum-macros", version = "0.1.0" }
+fluxum-protocol = { path = "crates/fluxum-protocol", version = "0.1.0" }
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+strip = true

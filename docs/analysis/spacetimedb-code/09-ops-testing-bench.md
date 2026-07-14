@@ -99,7 +99,7 @@ one node and one replica:
   - `crates/engine/src/relational_db.rs:254`: the `DiskSizeFn` "must report zero if this
     database is a follower instance"; `:677`: replay "may be lifted in the future to allow for
     'live' followers".
-  - `crates/engine/src/snapshot.rs:58`: `SnapshotWorker` is designed to be re-used across
+  - `crates/engine/src/snapshot.rs:58`: `SnapshotWorker` is designed to be reused across
     `RelationalDB::open` calls "for replicated databases when transitioning between the leader
     and follower states, to preserve event subscriptions".
   - `crates/engine/src/persistence.rs:85`: durability may be "exclusively remote" — the

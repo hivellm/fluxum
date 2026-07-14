@@ -163,7 +163,7 @@ per-shard mechanism.
 ## 4. CompiledPlan
 
 - **SUB-020** [P0] **Query compilation.** At subscription time, the server SHALL compile each SQL
-  query string into a `CompiledPlan` exactly once. Subsequent transaction commits SHALL re-use the
+  query string into a `CompiledPlan` exactly once. Subsequent transaction commits SHALL reuse the
   compiled plan rather than re-parsing the SQL.
 
   ```rust
