@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use arc_swap::ArcSwap;
 
 use crate::error::{FluxumError, Result};
-use crate::index::{BTreeIndex, IndexId, Rect, SpatialIndexState};
+use crate::index::{BTreeIndex, IndexId, Rect, SpatialIndexState, SpatialPredicate};
 use crate::schema::{IndexSchema, Schema, SpatialKind, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
@@ -25,9 +25,10 @@ pub struct StoreOptions {
     /// advances per durable allocation (`auto_inc_allocation_step`,
     /// default 4096). Must be ≥ 1.
     pub auto_inc_allocation_step: u64,
-    /// SPX-003 QuadTree leaf bucket size (max entries per leaf before it
-    /// splits), default 8. Must be ≥ 1. Any value produces identical query
-    /// results — this only tunes tree height vs in-bucket scan.
+    /// SPX-003 spatial node capacity: the QuadTree leaf bucket size (max
+    /// entries per leaf before it splits) and the R-tree node fan-out,
+    /// default 8. Must be ≥ 1 (≥ 2 effective for R-trees). Any value
+    /// produces identical query results — this only tunes tree shape.
     pub spatial_bucket_size: usize,
     /// SPX-004 root bounds for this shard's spatial indexes: the shard's
     /// assigned region under geospatial partitioning (SPEC-007), or the
@@ -227,6 +228,57 @@ impl MemStore {
         }
     }
 
+    /// SPX-031, step 1: put every spatial index into the **rebuilding**
+    /// state — emptied, not ready. From this point spatial queries answer
+    /// `503 spatial index not ready` (SPX-023) until
+    /// [`MemStore::rebuild_spatial_indexes`] completes; the server assembly
+    /// gates `ReducerCall` admission on [`MemStore::spatial_ready`] so the
+    /// rebuild always finishes before the shard serves writes. Called by the
+    /// recovery path when spatial state must be reconstructed asynchronously
+    /// (spatial indexes are not persisted).
+    pub fn mark_spatial_rebuilding(&self) {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tables = self.committed.load_full().tables.clone();
+        for slot in tables.values_mut() {
+            if let Some(spatial) = &slot.spatial {
+                let rebuilding = spatial.rebuilding_like();
+                Arc::make_mut(slot).spatial = Some(rebuilding);
+            }
+        }
+        self.committed.store(Arc::new(CommittedState { tables }));
+    }
+
+    /// SPX-031, step 2: rebuild every spatial index from the committed rows
+    /// and publish the ready state atomically. After this returns, spatial
+    /// query results are identical to a never-crashed store's.
+    pub fn rebuild_spatial_indexes(&self) -> Result<()> {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tables = self.committed.load_full().tables.clone();
+        for slot in tables.values_mut() {
+            let Some(spatial) = &slot.spatial else {
+                continue;
+            };
+            let mut rebuilt = spatial.fresh_like();
+            for (pk, row) in &slot.rows {
+                rebuilt.insert_row(row, pk.clone())?;
+            }
+            Arc::make_mut(slot).spatial = Some(rebuilt);
+        }
+        self.committed.store(Arc::new(CommittedState { tables }));
+        Ok(())
+    }
+
+    /// Whether every spatial index of this store is ready to serve queries
+    /// (SPX-031). The server assembly defers `ReducerCall` admission until
+    /// this reports `true` after recovery.
+    pub fn spatial_ready(&self) -> bool {
+        self.committed
+            .load()
+            .tables
+            .values()
+            .all(|t| t.spatial.as_ref().is_none_or(SpatialIndexState::is_ready))
+    }
+
     /// Begin a transaction. Blocks until any in-flight transaction on this
     /// shard commits or rolls back (single-writer guarantee, STG-003).
     pub fn begin(&self) -> Tx<'_> {
@@ -330,6 +382,12 @@ impl Tx<'_> {
     pub fn insert(&mut self, table: TableId, mut values: Vec<RowValue>) -> Result<Row> {
         let schema = self.store.schema_of(table)?;
         check_row(schema, &values)?;
+        // SPX-010 eager constraint (like PK uniqueness below): an R-tree row
+        // must satisfy min <= max per axis, so the commit merge stays
+        // infallible.
+        if let Some(spatial) = &self.base.table(table)?.spatial {
+            spatial.check_insert(schema.name, &values)?;
+        }
         self.assign_auto_inc(table, schema, &mut values)?;
         let pk = encode_pk_of_row(schema, &values)?;
 
@@ -467,6 +525,13 @@ impl Tx<'_> {
     /// See [`super::Snapshot::spatial_point`].
     pub fn spatial_point(&self, table: TableId, x: f64, y: f64) -> Result<Vec<Row>> {
         self.base.table(table)?.spatial_point(x, y)
+    }
+
+    /// Evaluate an `IN REGION` / `WITHIN RADIUS` predicate over the
+    /// committed snapshot captured at `begin` (SPX-020/021). See
+    /// [`super::Snapshot::eval_spatial`] for the 400/503 error contract.
+    pub fn eval_spatial(&self, table: TableId, predicate: &SpatialPredicate) -> Result<Vec<Row>> {
+        self.base.table(table)?.eval_spatial(predicate)
     }
 
     /// Commit: merge `TxState` into a new `CommittedState` and swap it in
@@ -647,7 +712,7 @@ fn invariant_missing_row() -> FluxumError {
 ///
 /// At most one `#[spatial(...)]` declaration per table: SPEC-008 models "the
 /// table's spatial index" (SPX-020/021 route by table alone), so a second
-/// declaration is rejected here. The R-tree variant lands with T2.6.
+/// declaration is rejected here.
 fn build_spatial_index(
     table: &'static TableSchema,
     options: &StoreOptions,
@@ -670,13 +735,7 @@ fn build_spatial_index(
                 options.spatial_bounds,
                 options.spatial_bucket_size,
             ),
-            SpatialKind::RTree => {
-                return Err(FluxumError::Schema(format!(
-                    "table `{}`: R-tree spatial indexes land with T2.6 (SPEC-008 SPX-010); \
-                     declare #[spatial(quadtree(x, y))] for point data",
-                    table.name
-                )));
-            }
+            SpatialKind::RTree => SpatialIndexState::rtree(columns, options.spatial_bucket_size),
         });
     }
     Ok(spatial)

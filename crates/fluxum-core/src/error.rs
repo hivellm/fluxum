@@ -70,6 +70,18 @@ pub enum FluxumError {
     #[error("schema error: {0}")]
     Schema(String),
 
+    /// Query rejected with a wire error code (SPEC-006 RPC-034 registry) —
+    /// e.g. SPEC-008's `400 table 'X' has no spatial index` (SPX-022) and
+    /// `503 spatial index not ready` (SPX-023). The server layer forwards
+    /// `code`/`message` verbatim as the wire `Error` payload.
+    #[error("query error {code}: {message}")]
+    Query {
+        /// HTTP-compatible wire error code (`fluxum_protocol::codes`).
+        code: u16,
+        /// Human-readable message, sent verbatim to the client.
+        message: String,
+    },
+
     /// Hardware probe / derivation failure that must abort boot
     /// (e.g. SPEC-016 HWA-015 memory shortfall).
     #[error("hardware error: {0}")]
@@ -80,6 +92,22 @@ impl FluxumError {
     /// Build a [`FluxumError::Config`] from anything displayable.
     pub fn config(msg: impl std::fmt::Display) -> Self {
         Self::Config(msg.to_string())
+    }
+
+    /// Build a [`FluxumError::Query`] carrying a wire error code.
+    pub fn query(code: u16, message: impl std::fmt::Display) -> Self {
+        Self::Query {
+            code,
+            message: message.to_string(),
+        }
+    }
+
+    /// The wire error code of a [`FluxumError::Query`], if this is one.
+    pub fn query_code(&self) -> Option<u16> {
+        match self {
+            Self::Query { code, .. } => Some(*code),
+            _ => None,
+        }
     }
 
     /// Build a [`FluxumError::Hardware`] from anything displayable.

@@ -27,8 +27,10 @@
 //!   an archival hook (SPEC-002 §4/§5, T2.3)
 //! - [`index`] — [`index::BTreeIndex`]: secondary B-tree indexes over
 //!   memcomparable keys, maintained inside the commit merge (SPEC-001 §5,
-//!   T2.4); [`index::QuadTree`]: the SPEC-008 spatial point index behind
-//!   `#[spatial(quadtree(x, y))]` (T2.5)
+//!   T2.4); [`index::QuadTree`] / [`index::RTree`]: the SPEC-008 spatial
+//!   indexes behind `#[spatial(...)]`, queried through
+//!   [`index::SpatialPredicate`] (`IN REGION` / `WITHIN RADIUS`) with the
+//!   400/503 error contract (T2.5/T2.6)
 //! - [`simd`] — runtime-dispatched SIMD kernels with scalar oracles
 //!   ([`simd::Dispatch`], SPEC-016 §5–§8, T2.10)
 

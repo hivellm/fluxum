@@ -40,5 +40,9 @@ name = "memstore"
 harness = false
 
 [[bench]]
+name = "spatial"
+harness = false
+
+[[bench]]
 name = "simd_kernels"
 harness = false

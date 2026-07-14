@@ -2,9 +2,11 @@
 //!
 //! [`BTreeIndex`] implements `#[index(btree(...))]` declarations — single
 //! and composite column — over the store's committed rows. [`QuadTree`]
-//! implements `#[spatial(quadtree(x, y))]` (SPEC-008), registered per table
-//! through [`SpatialIndexState`] and maintained by the same commit-merge
-//! pipeline.
+//! implements `#[spatial(quadtree(x, y))]` and [`RTree`]
+//! `#[spatial(rtree(...))]` (SPEC-008), registered per table through
+//! [`SpatialIndexState`] and maintained by the same commit-merge pipeline;
+//! [`SpatialPredicate`] is the typed `IN REGION` / `WITHIN RADIUS` surface
+//! (SPX-020/021) the T4.1 SQL compiler lowers to.
 //!
 //! # Design decisions (T2.4)
 //!
@@ -41,9 +43,11 @@
 
 pub mod btree;
 pub mod quadtree;
+pub mod rtree;
 
 pub use btree::BTreeIndex;
 pub use quadtree::{QuadTree, Rect};
+pub use rtree::{Aabb, RTree};
 
 use crate::error::{FluxumError, Result};
 use crate::store::row::{PkBytes, Row, RowValue};
@@ -98,18 +102,34 @@ impl std::fmt::Display for IndexId {
 /// visible to the index and rollback leaves it untouched by construction
 /// (SPX-032 update coherence follows from the delete-old + insert-new merge
 /// of `PendingOp::Update`).
+///
+/// # Readiness (SPX-031)
+///
+/// Spatial indexes are not persisted; after crash recovery they are rebuilt
+/// from the recovered rows. A slot in the **rebuilding** state (`ready ==
+/// false`, `MemStore::mark_spatial_rebuilding`) answers every query with the
+/// SPX-023 error `503 spatial index not ready` until
+/// `MemStore::rebuild_spatial_indexes` publishes the rebuilt state; the
+/// server assembly gates `ReducerCall` admission on
+/// `MemStore::spatial_ready` so rebuilding always completes before the shard
+/// serves writes.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpatialIndexState {
-    /// Coordinate column ordinals: `(x, y)` for a QuadTree (SPX-001).
+    /// Coordinate column ordinals: `(x, y)` for a QuadTree (SPX-001),
+    /// `(min_x, min_y, max_x, max_y)` for an R-tree (SPX-010).
     columns: &'static [u16],
     index: SpatialIndex,
+    /// SPX-031 gate: `false` while the index awaits its post-recovery
+    /// rebuild — queries return 503, commit-merge maintenance is skipped
+    /// (the rebuild recreates the index from the rows wholesale).
+    ready: bool,
 }
 
-/// The backing structure family (SPX-002 / SPX-010). The R-tree variant
-/// lands with T2.6.
+/// The backing structure family (SPX-002 / SPX-010).
 #[derive(Debug, Clone, PartialEq)]
 enum SpatialIndex {
     QuadTree(QuadTree),
+    RTree(RTree),
 }
 
 impl SpatialIndexState {
@@ -120,22 +140,61 @@ impl SpatialIndexState {
         Self {
             columns,
             index: SpatialIndex::QuadTree(QuadTree::new(bounds, bucket_size)),
+            ready: true,
+        }
+    }
+
+    /// An empty R-tree spatial index over the box columns
+    /// `(min_x, min_y, max_x, max_y)` (SPX-010) with node capacity
+    /// `max_entries`.
+    pub(crate) fn rtree(columns: &'static [u16], max_entries: usize) -> Self {
+        Self {
+            columns,
+            index: SpatialIndex::RTree(RTree::new(max_entries)),
+            ready: true,
         }
     }
 
     /// An empty index with this index's exact configuration — the rebuild
-    /// seed for the STG-007 rule-2 integrity check.
+    /// seed for the STG-007 rule-2 integrity check and for SPX-031 rebuilds.
     pub(crate) fn fresh_like(&self) -> Self {
         match &self.index {
             SpatialIndex::QuadTree(qt) => {
                 Self::quadtree(self.columns, qt.bounds(), qt.bucket_size())
             }
+            SpatialIndex::RTree(rt) => Self::rtree(self.columns, rt.max_entries()),
         }
     }
 
-    /// Read one coordinate column of `row`, widening `f32` to `f64`.
-    fn coord(&self, row: &Row, ordinal: u16) -> Result<f64> {
-        match row.value(ordinal) {
+    /// This configuration in the SPX-031 rebuilding state: empty, not
+    /// ready — every query answers `503 spatial index not ready`.
+    pub(crate) fn rebuilding_like(&self) -> Self {
+        Self {
+            ready: false,
+            ..self.fresh_like()
+        }
+    }
+
+    /// Whether the index serves queries (SPX-031).
+    pub(crate) fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// The SPX-023 not-ready guard.
+    fn check_ready(&self) -> Result<()> {
+        if self.ready {
+            Ok(())
+        } else {
+            Err(FluxumError::query(
+                fluxum_protocol::codes::SHARD_UNAVAILABLE,
+                "spatial index not ready",
+            ))
+        }
+    }
+
+    /// Read one coordinate column, widening `f32` to `f64`.
+    fn coord(values: &[RowValue], ordinal: u16) -> Result<f64> {
+        match values.get(usize::from(ordinal)) {
             Some(RowValue::F32(v)) => Ok(f64::from(*v)),
             Some(RowValue::F64(v)) => Ok(*v),
             other => Err(FluxumError::Storage(format!(
@@ -145,24 +204,69 @@ impl SpatialIndexState {
         }
     }
 
-    /// The point coordinates of `row` per the declared columns.
-    fn point_of(&self, row: &Row) -> Result<(f64, f64)> {
+    /// The bounding box of a row per the declared columns (R-tree).
+    fn box_of(&self, values: &[RowValue]) -> Result<Aabb> {
         match self.columns {
-            [x, y] => Ok((self.coord(row, *x)?, self.coord(row, *y)?)),
-            other => Err(FluxumError::Storage(format!(
-                "internal invariant violated: quadtree spatial index declares {} coordinate \
-                 column(s), expected 2 (DM-032)",
-                other.len()
-            ))),
+            [min_x, min_y, max_x, max_y] => Ok(Aabb::new(
+                Self::coord(values, *min_x)?,
+                Self::coord(values, *min_y)?,
+                Self::coord(values, *max_x)?,
+                Self::coord(values, *max_y)?,
+            )),
+            other => Err(arity_invariant("rtree", 4, other.len())),
+        }
+    }
+
+    /// SPX-010 insert constraint, enforced eagerly at `Tx::insert` time:
+    /// R-tree rows must satisfy `min_x <= max_x` and `min_y <= max_y`
+    /// (NaN coordinates fail the comparisons and are rejected too).
+    pub(crate) fn check_insert(&self, table_name: &str, values: &[RowValue]) -> Result<()> {
+        match &self.index {
+            SpatialIndex::QuadTree(_) => Ok(()),
+            SpatialIndex::RTree(_) => {
+                let b = self.box_of(values)?;
+                if b.min_x <= b.max_x && b.min_y <= b.max_y {
+                    Ok(())
+                } else {
+                    Err(FluxumError::Storage(format!(
+                        "table `{table_name}`: rtree constraint violated — min_x <= max_x and \
+                         min_y <= max_y must hold, got ({}, {}, {}, {}) (SPX-010)",
+                        b.min_x, b.min_y, b.max_x, b.max_y
+                    )))
+                }
+            }
         }
     }
 
     /// Add `row`'s spatial entry (commit merge, insert side — SPX-030).
+    /// Skipped while rebuilding: the SPX-031 rebuild recreates the index
+    /// from the committed rows wholesale.
     pub(crate) fn insert_row(&mut self, row: &Row, pk: PkBytes) -> Result<()> {
-        let (x, y) = self.point_of(row)?;
+        if !self.ready {
+            return Ok(());
+        }
         match &mut self.index {
             SpatialIndex::QuadTree(qt) => {
+                let (x, y) = match self.columns {
+                    [x, y] => (
+                        Self::coord(row.values(), *x)?,
+                        Self::coord(row.values(), *y)?,
+                    ),
+                    _ => return Err(arity_invariant("quadtree", 2, self.columns.len())),
+                };
                 qt.insert(x, y, pk);
+            }
+            SpatialIndex::RTree(rt) => {
+                let aabb = match self.columns {
+                    [a, b, c, d] => Aabb::new(
+                        Self::coord(row.values(), *a)?,
+                        Self::coord(row.values(), *b)?,
+                        Self::coord(row.values(), *c)?,
+                        Self::coord(row.values(), *d)?,
+                    ),
+                    _ => return Err(arity_invariant("rtree", 4, self.columns.len())),
+                };
+                rt.insert(aabb, pk);
             }
         }
         Ok(())
@@ -170,33 +274,140 @@ impl SpatialIndexState {
 
     /// Remove `row`'s spatial entry (commit merge, delete side — SPX-030).
     pub(crate) fn remove_row(&mut self, row: &Row, pk: &PkBytes) -> Result<()> {
-        let (x, y) = self.point_of(row)?;
+        if !self.ready {
+            return Ok(());
+        }
         match &mut self.index {
             SpatialIndex::QuadTree(qt) => {
+                let (x, y) = match self.columns {
+                    [x, y] => (
+                        Self::coord(row.values(), *x)?,
+                        Self::coord(row.values(), *y)?,
+                    ),
+                    _ => return Err(arity_invariant("quadtree", 2, self.columns.len())),
+                };
                 qt.remove(x, y, pk);
+            }
+            SpatialIndex::RTree(rt) => {
+                let aabb = match self.columns {
+                    [a, b, c, d] => Aabb::new(
+                        Self::coord(row.values(), *a)?,
+                        Self::coord(row.values(), *b)?,
+                        Self::coord(row.values(), *c)?,
+                        Self::coord(row.values(), *d)?,
+                    ),
+                    _ => return Err(arity_invariant("rtree", 4, self.columns.len())),
+                };
+                rt.remove(&aabb, pk);
             }
         }
         Ok(())
     }
 
-    /// PKs of the rows inside `region` (bounds inclusive, SPX-020).
-    pub(crate) fn query_region(&self, region: Rect) -> Vec<PkBytes> {
-        match &self.index {
+    /// PKs matching an `IN REGION` box (SPX-020): QuadTree — points inside
+    /// the closed box; R-tree — stored boxes **intersecting** it.
+    pub(crate) fn query_region(&self, region: Rect) -> Result<Vec<PkBytes>> {
+        self.check_ready()?;
+        Ok(match &self.index {
             SpatialIndex::QuadTree(qt) => qt.query_region(region),
-        }
+            SpatialIndex::RTree(rt) => rt.query_region(&Aabb::new(
+                region.x,
+                region.y,
+                region.x + region.w,
+                region.y + region.h,
+            )),
+        })
     }
 
-    /// PKs of the rows within Euclidean distance `r` of `(x, y)` (SPX-021).
-    pub(crate) fn query_radius(&self, x: f64, y: f64, r: f64) -> Vec<PkBytes> {
-        match &self.index {
+    /// PKs matching `WITHIN RADIUS r OF (x, y)` (SPX-021): QuadTree —
+    /// Euclidean point distance ≤ `r`; R-tree — minimum box distance ≤ `r`.
+    pub(crate) fn query_radius(&self, x: f64, y: f64, r: f64) -> Result<Vec<PkBytes>> {
+        self.check_ready()?;
+        Ok(match &self.index {
             SpatialIndex::QuadTree(qt) => qt.query_radius(x, y, r),
-        }
+            SpatialIndex::RTree(rt) => rt.query_radius(x, y, r),
+        })
     }
 
-    /// PKs of the rows at exactly `(x, y)` under IEEE `==`.
-    pub(crate) fn query_point(&self, x: f64, y: f64) -> Vec<PkBytes> {
-        match &self.index {
+    /// PKs at the point `(x, y)`: QuadTree — coordinates equal under IEEE
+    /// `==`; R-tree — stored boxes containing the point.
+    pub(crate) fn query_point(&self, x: f64, y: f64) -> Result<Vec<PkBytes>> {
+        self.check_ready()?;
+        Ok(match &self.index {
             SpatialIndex::QuadTree(qt) => qt.query_point(x, y),
+            SpatialIndex::RTree(rt) => rt.query_point(x, y),
+        })
+    }
+}
+
+/// Coordinate-arity invariant breach (the registry validates DM-032, so
+/// reaching this is a bug, surfaced as an error rather than a panic).
+fn arity_invariant(kind: &str, expected: usize, got: usize) -> FluxumError {
+    FluxumError::Storage(format!(
+        "internal invariant violated: {kind} spatial index declares {got} coordinate \
+         column(s), expected {expected} (DM-032)"
+    ))
+}
+
+/// A typed spatial predicate — the SPX-020/021 SQL surface
+/// (`IN REGION (x, y, w, h)` / `WITHIN RADIUS r OF (x, y)`) after parsing.
+///
+/// Evaluated through `Snapshot::eval_spatial` / `Tx::eval_spatial`, always
+/// via the table's spatial index — a full-table-scan fallback does not exist
+/// (SPX-023). Validation failures and missing spatial indexes surface as
+/// [`FluxumError::Query`] with the SPEC-008 wire codes (400/503).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SpatialPredicate {
+    /// `IN REGION (x, y, w, h)`: the closed box `[x, x+w] × [y, y+h]`
+    /// (SPX-020). `w`/`h` must be non-negative.
+    InRegion {
+        /// Bottom-left corner X.
+        x: f64,
+        /// Bottom-left corner Y.
+        y: f64,
+        /// Box width (non-negative).
+        w: f64,
+        /// Box height (non-negative).
+        h: f64,
+    },
+    /// `WITHIN RADIUS r OF (x, y)` (SPX-021). `r` must be non-negative;
+    /// rows at distance exactly `r` match.
+    WithinRadius {
+        /// Centre X.
+        x: f64,
+        /// Centre Y.
+        y: f64,
+        /// Radius (non-negative).
+        r: f64,
+    },
+}
+
+impl SpatialPredicate {
+    /// SPX-020/021 compile-time validation: negative (or NaN) `w`/`h`/`r`
+    /// are rejected with wire code 400.
+    pub fn validate(&self) -> Result<()> {
+        let reject = |what: &str, value: f64| {
+            Err(FluxumError::query(
+                fluxum_protocol::codes::MALFORMED,
+                format!("spatial predicate {what} must be non-negative, got {value}"),
+            ))
+        };
+        match *self {
+            Self::InRegion { w, h, .. } => {
+                if w.is_nan() || w < 0.0 {
+                    return reject("width", w);
+                }
+                if h.is_nan() || h < 0.0 {
+                    return reject("height", h);
+                }
+                Ok(())
+            }
+            Self::WithinRadius { r, .. } => {
+                if r.is_nan() || r < 0.0 {
+                    return reject("radius", r);
+                }
+                Ok(())
+            }
         }
     }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
 use crate::index::btree::{self, BTreeIndex};
-use crate::index::{IndexId, Rect, SpatialIndexState};
+use crate::index::{IndexId, Rect, SpatialIndexState, SpatialPredicate};
 use crate::schema::TableSchema;
 use crate::store::TableId;
 use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
@@ -156,11 +156,14 @@ impl TableState {
         })
     }
 
-    /// The table's spatial index, or the SPX-022 error when none is
-    /// declared.
+    /// The table's spatial index, or the SPX-022 error (wire code 400)
+    /// when none is declared.
     pub(crate) fn spatial(&self) -> Result<&SpatialIndexState> {
         self.spatial.as_ref().ok_or_else(|| {
-            FluxumError::Storage(format!("table '{}' has no spatial index", self.schema.name))
+            FluxumError::query(
+                fluxum_protocol::codes::MALFORMED,
+                format!("table '{}' has no spatial index", self.schema.name),
+            )
         })
     }
 
@@ -181,19 +184,31 @@ impl TableState {
 
     /// Rows inside `region` via the spatial index (SPX-020). Never a scan.
     pub(crate) fn spatial_region(&self, region: Rect) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_region(region)))
+        Ok(self.rows_of(self.spatial()?.query_region(region)?))
     }
 
     /// Rows within Euclidean distance `r` of `(x, y)` via the spatial index
     /// (SPX-021): bbox prefilter + exact circle filter, distance exactly `r`
-    /// included.
+    /// included (minimum box distance for R-tree tables).
     pub(crate) fn spatial_radius(&self, x: f64, y: f64, r: f64) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_radius(x, y, r)))
+        Ok(self.rows_of(self.spatial()?.query_radius(x, y, r)?))
     }
 
-    /// Rows at exactly `(x, y)` (IEEE `==`) via the spatial index.
+    /// Rows at the point `(x, y)` via the spatial index (IEEE `==` for
+    /// QuadTree points; box containment for R-tree extents).
     pub(crate) fn spatial_point(&self, x: f64, y: f64) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_point(x, y)))
+        Ok(self.rows_of(self.spatial()?.query_point(x, y)?))
+    }
+
+    /// Evaluate a typed spatial predicate via the spatial index — never a
+    /// table scan (SPX-023). 400 on invalid parameters or a table without
+    /// `#[spatial]`; 503 while the index is rebuilding.
+    pub(crate) fn eval_spatial(&self, predicate: &SpatialPredicate) -> Result<Vec<Row>> {
+        predicate.validate()?;
+        match *predicate {
+            SpatialPredicate::InRegion { x, y, w, h } => self.spatial_region(Rect::new(x, y, w, h)),
+            SpatialPredicate::WithinRadius { x, y, r } => self.spatial_radius(x, y, r),
+        }
     }
 
     /// STG-007 rule 2 check: every secondary index equals (bit-identically)
@@ -212,7 +227,9 @@ impl TableState {
                 )));
             }
         }
-        if let Some(spatial) = &self.spatial {
+        if let Some(spatial) = &self.spatial
+            && spatial.is_ready()
+        {
             let mut rebuilt = spatial.fresh_like();
             for (pk, row) in &self.rows {
                 rebuilt.insert_row(row, pk.clone())?;
@@ -326,10 +343,35 @@ impl Snapshot {
         self.state.table(table)?.spatial_radius(x, y, r)
     }
 
-    /// Rows of `table` at exactly `(x, y)` (IEEE `==`) via the spatial
-    /// index. Errors when the table has no spatial index (SPX-022).
+    /// Rows of `table` at the point `(x, y)` via the spatial index (IEEE
+    /// `==` for QuadTree points; box containment for R-tree extents).
+    /// Errors when the table has no spatial index (SPX-022).
     pub fn spatial_point(&self, table: TableId, x: f64, y: f64) -> Result<Vec<Row>> {
         self.state.table(table)?.spatial_point(x, y)
+    }
+
+    /// Evaluate an `IN REGION` / `WITHIN RADIUS` predicate (SPX-020/021)
+    /// over `table`, resolved via the spatial index — a full-table-scan
+    /// fallback does not exist (SPX-023).
+    ///
+    /// Errors, all [`FluxumError::Query`] with SPEC-008 wire codes:
+    /// - 400 — negative `w`/`h`/`r`, or the table has no `#[spatial]`
+    ///   index (SPX-022);
+    /// - 503 — `spatial index not ready` during a post-recovery rebuild
+    ///   (SPX-023/SPX-031).
+    pub fn eval_spatial(&self, table: TableId, predicate: &SpatialPredicate) -> Result<Vec<Row>> {
+        self.state.table(table)?.eval_spatial(predicate)
+    }
+
+    /// Whether `table`'s spatial index (if any) is ready to serve queries
+    /// (SPX-031). Tables without a spatial index report `true`.
+    pub fn spatial_ready(&self, table: TableId) -> Result<bool> {
+        Ok(self
+            .state
+            .table(table)?
+            .spatial
+            .as_ref()
+            .is_none_or(SpatialIndexState::is_ready))
     }
 
     /// Verify STG-007 rule 2 for `table`: every secondary index is
