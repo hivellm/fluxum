@@ -245,6 +245,50 @@ impl MemStore {
         }
     }
 
+    /// T2.3 recovery seam (STG-030 steps 2/5/7): atomically install a
+    /// recovered `CommittedState`, resume tx-id assignment at `next_tx_id`
+    /// (STG-015), and resume every auto-inc counter from its recovered
+    /// high-water mark (STG-040 — generation continues at `high_water + 1`,
+    /// never reusing an id).
+    ///
+    /// Recovery-only: must run before the first transaction on this store
+    /// (the checkpoint module's `recover` is the sole caller).
+    pub(crate) fn install_recovered(&self, state: CommittedState, next_tx_id: u64) -> Result<()> {
+        if next_tx_id == 0 {
+            return Err(FluxumError::Storage(
+                "recovered next_tx_id must be >= 1 (there is no tx 0)".into(),
+            ));
+        }
+        if state.tables.len() != self.catalog.len()
+            || !self.catalog.keys().all(|id| state.tables.contains_key(id))
+        {
+            return Err(FluxumError::Storage(
+                "recovered state does not cover exactly the assembled schema (STG-030)".into(),
+            ));
+        }
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if writer.next_tx_id != 1 {
+            return Err(FluxumError::Storage(
+                "recovery must run before the first transaction (STG-030)".into(),
+            ));
+        }
+        for (id, table) in &state.tables {
+            if table.schema.auto_inc.is_some() {
+                let high_water = table.auto_inc_high_water;
+                writer.counters.insert(
+                    *id,
+                    AutoIncCounter {
+                        next: high_water.saturating_add(1),
+                        high_water,
+                    },
+                );
+            }
+        }
+        writer.next_tx_id = next_tx_id;
+        self.committed.store(Arc::new(state));
+        Ok(())
+    }
+
     fn schema_of(&self, table: TableId) -> Result<&'static TableSchema> {
         self.catalog.get(&table).copied().ok_or_else(|| {
             FluxumError::Storage(format!(

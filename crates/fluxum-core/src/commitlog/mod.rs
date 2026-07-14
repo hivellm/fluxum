@@ -53,7 +53,8 @@
 //! why it stopped.
 
 mod format;
-mod segment;
+
+pub(crate) mod segment;
 
 pub mod blob;
 pub mod record;

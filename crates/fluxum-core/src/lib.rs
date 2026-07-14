@@ -18,6 +18,10 @@
 //! - [`commitlog`] — [`commitlog::CommitLog`]: append-only durability log
 //!   with group-commit flush actor, rotation, replay, and non-destructive
 //!   torn-tail quarantine (SPEC-002 §3/§5, T2.2)
+//! - [`checkpoint`] — incremental content-addressed checkpoints
+//!   ([`checkpoint::CheckpointRepo`], [`checkpoint::SnapshotWorker`]),
+//!   checkpoint+replay recovery with fallback, and log truncation through
+//!   an archival hook (SPEC-002 §4/§5, T2.3)
 //! - [`index`] — [`index::BTreeIndex`]: secondary B-tree indexes over
 //!   memcomparable keys, maintained inside the commit merge (SPEC-001 §5,
 //!   T2.4); [`index::QuadTree`]: the SPEC-008 spatial point index behind
@@ -26,6 +30,7 @@
 //!   ([`simd::Dispatch`], SPEC-016 §5–§8, T2.10)
 
 pub mod auth;
+pub mod checkpoint;
 pub mod commitlog;
 pub mod config;
 pub mod error;
