@@ -53,10 +53,13 @@ real time.
 ### Storage & Transactions
 - **Tiered storage** — hot working set in a buffer pool (< 1 µs reads); cold data in a paged,
   LZ4-compressed on-disk tier under a single `memory.budget` knob — datasets bounded by disk, not RAM
-- **Commit log** — durability via append-only log (CRC32 per entry, async writer, no fsync per tx)
-- **ACID transactions** — every reducer call is one atomic transaction; full rollback on error or panic
+- **Commit log** — durability via append-only log (CRC32C + epoch per entry, group-commit flush
+  actor: batched fsync, bounded p99, no per-tx fsync)
+- **ACID transactions** — every reducer call is one atomic transaction; full rollback (with index
+  revert and undelete) on error or panic
 - **MVCC snapshot isolation** — single writer per shard, lock-free reads from committed state
-- **Crash recovery** — checkpoint + log replay; recovers a 10 GB log in < 30 s; checkpoints compact the log
+- **Crash recovery** — incremental content-addressed checkpoints + log replay; recovers a 10 GB
+  log in < 30 s; torn tails are quarantined, never silently truncated
 
 ### Reducers (Application Logic — native Rust)
 - **`#[fluxum::reducer]`** — atomic mutation functions callable over FluxRPC
@@ -70,7 +73,10 @@ real time.
 - **SQL push subscriptions** — `SELECT * FROM ChatMessage WHERE channel = 5` → auto-diff on every commit
 - **Geospatial SQL** — `SELECT * FROM Sensor IN REGION (0, 0, 4000, 4000)` at O(log n + k)
 - **`#[visibility(owner_only(owner))]`** — declarative row-level security, no imperative filters
-- **Backpressure** — 3-tier per-client send buffer; one slow client never stalls the fan-out
+- **Scalable fan-out** — query-hash dedup (shared query = one evaluation + one encoding for all
+  subscribers) + value-level plan pruning: cost scales with matching plans, never with client count
+- **Backpressure** — 3-tier per-client send buffer, bounded queues with kick-on-overflow; one
+  slow client never stalls the fan-out
 
 ### Sharding & Replication
 - **Horizontal partitions** — tables declare a partition key (hash/range/region); each shard owns
@@ -366,7 +372,8 @@ Rust implementation starts at [DAG Phase 0](docs/DAG.md).
 - [Implementation DAG](docs/DAG.md) — dependency graph, 8 phases, gates, critical path
 - [Roadmap](docs/ROADMAP.md) — milestones to 0.1.0 and 0.2.0, parallel tracks, post-launch backlog
 - [Spec index](docs/specs/README.md) — 16 normative implementation specs (SPEC-001…SPEC-016)
-- [Reference analysis](docs/analysis/README.md) — SpacetimeDB (10 files), Convex, SurrealDB studies
+- [SpacetimeDB source dossier](docs/analysis/spacetimedb-code/README.md) — deep analysis of the real v2.7.0 codebase (~237k LOC); hard problems + adoptions in [10-hard-problems](docs/analysis/spacetimedb-code/10-hard-problems.md)
+- [Reference analysis](docs/analysis/README.md) — SpacetimeDB, Convex, SurrealDB design studies
 - [Contributing](CONTRIBUTING.md) — setup, conventions, spec-driven development
 - [Security](SECURITY.md) — security model, vulnerability reporting
 

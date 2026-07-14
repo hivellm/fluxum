@@ -69,12 +69,12 @@ codec roundtrip and auth suites green.
 | `MemStore` | Committed state (hot tier in buffer pool) + `TxState` (in-flight writes), MVCC |
 | **Paged cold tier** | Own page format (FluxBIN rows + CRC32), clock-LRU eviction, `memory.budget: auto` enforcement — datasets bounded by disk, not RAM |
 | **Compression** | LZ4 per cold page, zstd for checkpoints/backups; ≥ 3× target ratio |
-| `CommitLog` | Append-only `u32 LE + MessagePack + CRC32`; async writer, rotation, replay; doubles as replication stream later |
-| Checkpoints | Periodic dumps; recovery = checkpoint + log replay; log truncation (compaction) |
-| B-tree indexes | Single + composite secondary indexes (paged) |
+| `CommitLog` | Append-only `u32 LE + MessagePack + CRC32C` with epoch; **group-commit flush actor**; rotation; replay with **non-destructive torn-tail repair**; doubles as replication stream later |
+| Checkpoints | **Incremental, content-addressed** (unchanged pages shared between checkpoints, manifest integrity hash); recovery = checkpoint + log replay; log truncation (compaction) |
+| B-tree indexes | Single + composite secondary indexes — **paged and evictable** under the memory budget (the novel work vs SpacetimeDB's RAM-bound indexes) |
 | QuadTree / R-tree | Geospatial indexes + `IN REGION` / `WITHIN RADIUS` predicates |
 | **SIMD kernels** | Runtime dispatch (AVX-512/AVX2/SSE4.2/NEON/scalar): CRC32, hashing, FluxBIN batch codec, predicate eval — scalar-parity enforced in CI |
-| Crash suite | kill -9 harness, CRC corruption drills (log **and** pages), 10 GB recovery benchmark |
+| Crash suite + DST | kill -9 harness, CRC corruption drills (log **and** pages), 10 GB recovery benchmark, **deterministic simulation suite** (seeded runtime, fault injection, model oracle) in CI |
 
 **Definition of done:** crash + replay suite loses zero committed transactions; recovery < 30 s
 for a 10 GB log; a dataset 10× the memory budget is served correctly on the small-droplet profile.
@@ -104,7 +104,7 @@ for a 10 GB log; a dataset 10× the memory budget is served correctly on the sma
 | Component | Description |
 |-----------|-------------|
 | SQL compiler | `SELECT * FROM T [WHERE …] [IN REGION …]` → `CompiledPlan` |
-| `SubscriptionManager` | Register/unsubscribe plans; post-commit fan-out of `TxUpdate` diffs |
+| `SubscriptionManager` | Register/unsubscribe plans; post-commit fan-out with **query-hash dedup** (shared query = one evaluation + one encoding) and **value-level plan pruning** — cost O(matching plans), never O(clients); admission control |
 | `#[visibility]` RLS | `owner_only` filter per subscriber identity; server-peer bypass |
 | Backpressure | 3-tier send buffer (Normal / Pressured / Full); slow client disconnected |
 

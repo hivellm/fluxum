@@ -446,6 +446,13 @@ log is effectively "recorded wire messages"; one codec, one decoder, one debuggi
 also the **replication stream** (see Replication below) and, archived, the basis for point-in-time
 recovery.
 
+Durability engineering (adopted from the SpacetimeDB source analysis): entries carry **CRC32C**
+(hardware-accelerated) and an **epoch** number; a **group-commit flush actor** batches many
+transactions per write to bound p99 without per-tx fsync; recovery performs **non-destructive
+torn-tail repair** (the damaged tail is quarantined, never silently truncated); checkpoints are
+**incremental and content-addressed** — unchanged pages are shared between checkpoints, so
+checkpoint cost tracks the write rate, not the dataset size.
+
 ### Storage tiers & memory budget
 
 ```
@@ -535,11 +542,17 @@ pub struct CompiledPlan {
 }
 ```
 
-After each commit: for every plan touching the mutated tables, filter the delta through
-predicate + spatial constraint + RLS, and emit a per-client `TxUpdate` if non-empty. The fan-out
-loop never blocks on any individual client — the 3-tier backpressure policy (Normal / Pressured /
-Full) protects the broadcast path from slow consumers, the same lesson Synap's pub/sub encodes
-with bounded per-subscriber channels.
+Fan-out is designed to scale with *matching plans*, never with client count (adopted from the
+SpacetimeDB source analysis):
+
+- **Query dedup** — identical queries share one `CompiledPlan`: evaluated once per commit and
+  encoded once (FluxBIN), then distributed to every subscriber of that query.
+- **Value-level pruning** — plans are indexed by their equality-filter values, so a commit's
+  delta rows select only the plans whose values match; there is no linear scan over all plans.
+- **Per-client work** is limited to queueing (+ optional compression). The broadcast loop never
+  blocks on any individual client — the 3-tier backpressure policy (Normal / Pressured / Full)
+  with bounded queues and kick-on-overflow protects it from slow consumers.
+- **Admission control** caps subscriptions per connection and total compiled plans.
 
 Geospatial subscriptions:
 
@@ -553,10 +566,14 @@ SELECT * FROM Vehicle WITHIN RADIUS 500 OF (1200, 800)
 ## Authentication & identity
 
 ```
-Identity = SHA-256(token bytes)          — 256-bit, stable across reconnects
-ServerIdentity = SHA-256("SERVER:" + name) — privileged service peers, bypass RLS
-ConnectionId = random u128               — ephemeral, per connection
+Identity (jwt provider)   = SHA-256(issuer ‖ subject)  — stable across token rotation/refresh
+Identity (token provider) = SHA-256(token bytes)       — opaque long-lived tokens
+ServerIdentity            = SHA-256("SERVER:" + name)  — privileged service peers, bypass RLS
+ConnectionId              = random u128                — ephemeral, per connection
 ```
+
+Identity never changes on token refresh (adopted from the SpacetimeDB analysis: claims-based
+derivation is what keeps identity stable when tokens rotate).
 
 Tokens are opaque bytes; the `AuthProvider` trait (`token` / `jwt` / `none` built-ins) validates
 them ([SPEC-009](specs/SPEC-009-authentication.md)). No mandatory OIDC.
@@ -694,4 +711,7 @@ logging:
 | Replica sets: single primary per shard, consensus election | MongoDB-style operational model; semi-sync mode gives zero-committed-loss failover |
 | SIMD via runtime dispatch, scalar-parity enforced | Portable binary, maximum per-machine performance, correctness provable (family precedent) |
 | Parity benchmark vs app-server + PostgreSQL in-repo | The product's reason to exist is measured, not asserted (NFR-11); published every release |
+| Fan-out = query dedup + value-level pruning (never O(clients)) | Adopted from SpacetimeDB source analysis — the proven way subscriptions scale (SPEC-005) |
+| Incremental content-addressed checkpoints + group-commit + torn-tail quarantine | Adopted — avoids their full-dump scaling cliff; bounded p99; recovery never destroys evidence (SPEC-002) |
+| Deterministic simulation testing (DST) in CI for storage/replication | Adopted and extended — seeded runtime, fault injection, model oracle (SPEC-013) |
 | Ports 15800 (HTTP) + 15801 (TCP) | HiveLLM 15xxx port family (Nexus 15474–6, Synap 15500–2, Vectorizer 15002/15503) |
