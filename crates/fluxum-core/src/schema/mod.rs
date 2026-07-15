@@ -19,6 +19,9 @@ pub mod registry;
 
 pub use registry::{Schema, TableDef, spatial_stream_advisory};
 
+use crate::error::Result;
+use crate::store::RowValue;
+
 // Re-export so macro-generated code can register via
 // `::fluxum_core::schema::inventory::submit!` without the user crate
 // depending on `inventory` directly (verified in the OQ-1 spike).
@@ -173,10 +176,11 @@ pub enum VisibilityRule {
 
 /// Generated for each table struct by `#[fluxum::table]` (DM-043).
 ///
-/// Consumed by the storage engine (SPEC-002) and the `TxHandle` typed
-/// accessors (SPEC-004). The FluxBIN `encode_row`/`decode_row` methods of
-/// DM-043 are added together with the FluxBIN codec integration (T1.2+,
-/// SPEC-006) — T1.1 keeps this trait codec-free.
+/// Consumed by the storage engine (SPEC-002) and the typed
+/// [`crate::reducer::TxHandle`] accessors (SPEC-004, T3.2): the value
+/// conversions bridge the typed struct and the store's dynamic
+/// [`RowValue`] row representation. Wire-level FluxBIN encoding stays on
+/// the storage side ([`crate::store`]) — this trait never sees bytes.
 pub trait Table: Sized + 'static {
     /// Primary key type; a tuple for composite PKs, e.g. `(i32, i32)`.
     type Pk: Ord + Clone + Send;
@@ -186,4 +190,20 @@ pub trait Table: Sized + 'static {
 
     /// This row's primary key (cloned out of the row).
     fn primary_key(&self) -> Self::Pk;
+
+    /// This row's column values in declaration order (consumes the row) —
+    /// the exact shape [`crate::store::Tx::insert`] takes.
+    fn into_values(self) -> Vec<RowValue>;
+
+    /// Rebuild a typed row from stored column values (declaration order).
+    ///
+    /// Errors on arity or column-type mismatch — unreachable for rows the
+    /// store accepted for this same schema, but surfaced (not panicked) so
+    /// the reducer path stays panic-free (RED-061).
+    fn from_values(values: &[RowValue]) -> Result<Self>;
+
+    /// The column values of `pk`, in `TableSchema::primary_key` declaration
+    /// order — the exact shape [`crate::store::Tx::query_pk`] and
+    /// [`crate::store::Tx::delete`] take.
+    fn pk_values(pk: &Self::Pk) -> Vec<RowValue>;
 }

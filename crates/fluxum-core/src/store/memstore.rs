@@ -647,6 +647,56 @@ impl Tx<'_> {
         self.base.table(table)?.eval_spatial(predicate)
     }
 
+    /// Rows written by THIS transaction — pending inserts and the new
+    /// content of upsert replacements — in encoded-PK byte order. Pending
+    /// deletes contribute nothing. This is the explicit TXN-051
+    /// read-your-own-writes seam that SPEC-004 surfaces to reducers as
+    /// `scan_pending` (FR-17); the default reads above never see these rows
+    /// (TXN-050).
+    pub fn scan_pending(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
+        // Unknown-table error parity with `scan`.
+        self.base.table(table)?;
+        Ok(self
+            .state
+            .tables
+            .get(&table)
+            .into_iter()
+            .flat_map(|ops| ops.values())
+            .filter_map(|op| match op {
+                PendingOp::Insert(row) | PendingOp::Update(row) => Some(row),
+                PendingOp::Delete => None,
+            }))
+    }
+
+    /// Combined view (TXN-051): the committed snapshot overlaid with this
+    /// transaction's pending effects, deduplicated by primary key — a
+    /// pending insert or upsert replacement wins over the committed row
+    /// with the same key, and a pending delete removes it. Order: committed
+    /// keys in encoded-PK byte order (replacements in place), followed by
+    /// the rows newly inserted by this transaction in encoded-PK byte order.
+    pub fn scan_all(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
+        let committed = &self.base.table(table)?.rows;
+        let pending = self.state.tables.get(&table);
+        let overlaid = committed.iter().filter_map(move |(pk, row)| {
+            match pending.and_then(|ops| ops.get(pk)) {
+                None => Some(row),
+                Some(PendingOp::Update(replacement)) => Some(replacement),
+                // Delete: shadowed. Insert over a committed key cannot
+                // happen (the write path turns it into Update/Delete), but
+                // yielding it from the pending pass below keeps the
+                // dedup-by-PK contract even then.
+                Some(PendingOp::Delete | PendingOp::Insert(_)) => None,
+            }
+        });
+        let inserted = pending.into_iter().flat_map(|ops| {
+            ops.values().filter_map(|op| match op {
+                PendingOp::Insert(row) => Some(row),
+                PendingOp::Update(_) | PendingOp::Delete => None,
+            })
+        });
+        Ok(overlaid.chain(inserted))
+    }
+
     /// Commit: merge `TxState` into a new `CommittedState` and swap it in
     /// atomically (STG-005). Constraints were enforced eagerly at write
     /// time, so the merge itself is infallible under the single-writer

@@ -37,6 +37,11 @@
 //!   (validate → merge → append → respond), bounded reducer queue with
 //!   immediate `503 "shard busy"` backpressure, panic-isolated rollback
 //!   (SPEC-003, T3.1)
+//! - [`reducer`] — [`reducer::ReducerContext`] + the typed
+//!   [`reducer::TxHandle`] every reducer uses: committed-snapshot reads,
+//!   explicit intra-transaction reads (`scan_pending`/`scan_all`, FR-17),
+//!   and same-transaction nested reducer calls via
+//!   [`reducer::ReducerRegistry`] (SPEC-004 §2, T3.2)
 
 pub mod auth;
 pub mod checkpoint;
@@ -45,6 +50,7 @@ pub mod config;
 pub mod error;
 pub mod hw;
 pub mod index;
+pub mod reducer;
 pub mod schema;
 pub mod simd;
 pub mod store;
@@ -54,6 +60,7 @@ pub mod types;
 pub use auth::{AuthClaims, AuthOutcome, AuthProvider, Authenticator};
 pub use config::Config;
 pub use error::{FluxumError, Result};
+pub use reducer::{ReducerCaller, ReducerContext, ReducerRegistry, TxHandle};
 pub use types::{ConnectionId, EntityId, Identity, Timestamp};
 
 #[cfg(test)]

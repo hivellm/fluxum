@@ -566,6 +566,28 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         )
     };
 
+    // Typed ⇄ dynamic row conversions (DM-043, SPEC-004 T3.2): the bridge
+    // the `TxHandle` typed accessors use to reach the RowValue-based store.
+    let ncols = columns.len();
+    let into_exprs = columns.iter().map(|c| {
+        let ident = &c.ident;
+        to_row_value(&c.flux, quote!(self.#ident))
+    });
+    let field_idents = columns.iter().map(|c| &c.ident);
+    let from_exprs = columns.iter().enumerate().map(|(i, c)| {
+        let column_name = c.ident.to_string();
+        from_row_value(&c.flux, quote!((&values[#i])), &name_str, &column_name)
+    });
+    let pk_value_exprs = pk_fields.iter().enumerate().map(|(i, c)| {
+        let component = if pk_fields.len() == 1 {
+            quote!(::core::clone::Clone::clone(pk))
+        } else {
+            let member = syn::Index::from(i);
+            quote!(::core::clone::Clone::clone(&pk.#member))
+        };
+        to_row_value(&c.flux, component)
+    });
+
     Ok(quote! {
         #item
 
@@ -592,6 +614,35 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
                 fn primary_key(&self) -> Self::Pk {
                     #pk_expr
+                }
+
+                fn into_values(self) -> ::std::vec::Vec<::fluxum_core::store::RowValue> {
+                    ::std::vec![#(#into_exprs),*]
+                }
+
+                fn from_values(
+                    values: &[::fluxum_core::store::RowValue],
+                ) -> ::fluxum_core::error::Result<Self> {
+                    if values.len() != #ncols {
+                        return ::core::result::Result::Err(
+                            ::fluxum_core::FluxumError::Storage(::std::format!(
+                                "table `{}`: row has {} values but the schema declares \
+                                 {} columns",
+                                #name_str,
+                                values.len(),
+                                #ncols,
+                            )),
+                        );
+                    }
+                    ::core::result::Result::Ok(Self {
+                        #(#field_idents: #from_exprs),*
+                    })
+                }
+
+                fn pk_values(
+                    pk: &Self::Pk,
+                ) -> ::std::vec::Vec<::fluxum_core::store::RowValue> {
+                    ::std::vec![#(#pk_value_exprs),*]
                 }
             }
 
@@ -757,6 +808,133 @@ fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
              a separate table keyed by an EntityId/u64 column",
         )),
         _ => Err(unsupported()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Typed ⇄ dynamic row conversion codegen (DM-043, SPEC-004 T3.2)
+// ---------------------------------------------------------------------------
+
+/// An expression converting `expr` (a field value of type `flux`, by value)
+/// into the matching `fluxum_core::store::RowValue` variant. Recursive for
+/// `Option<T>` / `Vec<T>`.
+fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
+    let rv = quote!(::fluxum_core::store::RowValue);
+    match flux {
+        FluxTy::Bool => quote!(#rv::Bool(#expr)),
+        FluxTy::I8 => quote!(#rv::I8(#expr)),
+        FluxTy::I16 => quote!(#rv::I16(#expr)),
+        FluxTy::I32 => quote!(#rv::I32(#expr)),
+        FluxTy::I64 => quote!(#rv::I64(#expr)),
+        FluxTy::U8 => quote!(#rv::U8(#expr)),
+        FluxTy::U16 => quote!(#rv::U16(#expr)),
+        FluxTy::U32 => quote!(#rv::U32(#expr)),
+        FluxTy::U64 => quote!(#rv::U64(#expr)),
+        FluxTy::F32 => quote!(#rv::F32(#expr)),
+        FluxTy::F64 => quote!(#rv::F64(#expr)),
+        FluxTy::Str => quote!(#rv::Str(#expr)),
+        FluxTy::Bytes => quote!(#rv::Bytes(#expr)),
+        FluxTy::Identity => quote!(#rv::Identity(#expr)),
+        FluxTy::ConnectionId => quote!(#rv::ConnectionId(#expr)),
+        FluxTy::EntityId => quote!(#rv::EntityId(#expr)),
+        FluxTy::Timestamp => quote!(#rv::Timestamp(#expr)),
+        FluxTy::Opt(inner) => {
+            let inner = to_row_value(inner, quote!(__fx_inner));
+            quote! {
+                match #expr {
+                    ::core::option::Option::Some(__fx_inner) => #rv::Optional(
+                        ::core::option::Option::Some(::std::boxed::Box::new(#inner)),
+                    ),
+                    ::core::option::Option::None => #rv::Optional(::core::option::Option::None),
+                }
+            }
+        }
+        FluxTy::List(inner) => {
+            let inner = to_row_value(inner, quote!(__fx_item));
+            quote! {
+                #rv::List(#expr.into_iter().map(|__fx_item| #inner).collect())
+            }
+        }
+    }
+}
+
+/// An expression extracting a typed field value from `src`
+/// (a `&fluxum_core::store::RowValue`), cloning payloads out of the shared
+/// row. A variant mismatch `return`s a descriptive `FluxumError::Storage`
+/// from the enclosing `from_values` — unreachable for rows the store
+/// accepted, but never a panic (RED-061 keeps the reducer path unwind-free).
+fn from_row_value(flux: &FluxTy, src: TokenStream, table: &str, column: &str) -> TokenStream {
+    let rv = quote!(::fluxum_core::store::RowValue);
+    let mismatch = quote! {
+        return ::core::result::Result::Err(::fluxum_core::FluxumError::Storage(
+            ::std::format!(
+                "table `{}`: column `{}` does not inhabit its declared column type (DM-043)",
+                #table,
+                #column,
+            ),
+        ))
+    };
+    let copied = |variant: TokenStream| {
+        quote! {
+            match #src {
+                #rv::#variant(__fx_v) => *__fx_v,
+                _ => #mismatch,
+            }
+        }
+    };
+    let cloned = |variant: TokenStream| {
+        quote! {
+            match #src {
+                #rv::#variant(__fx_v) => ::core::clone::Clone::clone(__fx_v),
+                _ => #mismatch,
+            }
+        }
+    };
+    match flux {
+        FluxTy::Bool => copied(quote!(Bool)),
+        FluxTy::I8 => copied(quote!(I8)),
+        FluxTy::I16 => copied(quote!(I16)),
+        FluxTy::I32 => copied(quote!(I32)),
+        FluxTy::I64 => copied(quote!(I64)),
+        FluxTy::U8 => copied(quote!(U8)),
+        FluxTy::U16 => copied(quote!(U16)),
+        FluxTy::U32 => copied(quote!(U32)),
+        FluxTy::U64 => copied(quote!(U64)),
+        FluxTy::F32 => copied(quote!(F32)),
+        FluxTy::F64 => copied(quote!(F64)),
+        FluxTy::Str => cloned(quote!(Str)),
+        FluxTy::Bytes => cloned(quote!(Bytes)),
+        FluxTy::Identity => copied(quote!(Identity)),
+        FluxTy::ConnectionId => copied(quote!(ConnectionId)),
+        FluxTy::EntityId => copied(quote!(EntityId)),
+        FluxTy::Timestamp => copied(quote!(Timestamp)),
+        FluxTy::Opt(inner) => {
+            let inner = from_row_value(inner, quote!((&**__fx_opt)), table, column);
+            quote! {
+                match #src {
+                    #rv::Optional(::core::option::Option::None) => ::core::option::Option::None,
+                    #rv::Optional(::core::option::Option::Some(__fx_opt)) => {
+                        ::core::option::Option::Some(#inner)
+                    }
+                    _ => #mismatch,
+                }
+            }
+        }
+        FluxTy::List(inner) => {
+            let inner = from_row_value(inner, quote!(__fx_item), table, column);
+            quote! {
+                match #src {
+                    #rv::List(__fx_items) => {
+                        let mut __fx_out = ::std::vec::Vec::with_capacity(__fx_items.len());
+                        for __fx_item in __fx_items {
+                            __fx_out.push(#inner);
+                        }
+                        __fx_out
+                    }
+                    _ => #mismatch,
+                }
+            }
+        }
     }
 }
 
