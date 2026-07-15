@@ -350,6 +350,16 @@ impl MemStore {
             ))
         })
     }
+
+    /// Whether `table` is an ephemeral (memory-only) table (SPEC-023 DMX-010):
+    /// its mutations bypass the commit log, checkpoints, and replication.
+    /// Unknown table ids are treated as non-ephemeral (durable) — the safe
+    /// default for the WAL path.
+    pub fn is_ephemeral(&self, table: TableId) -> bool {
+        self.catalog
+            .get(&table)
+            .is_some_and(|schema| schema.is_ephemeral())
+    }
 }
 
 /// A single in-flight transaction (holds the shard's writer lock).

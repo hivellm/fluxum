@@ -126,6 +126,8 @@ enum Access {
     Private,
     Public,
     Global,
+    /// Memory-only, client-visible, non-durable (SPEC-023 DMX-010).
+    Ephemeral,
 }
 
 enum Visibility {
@@ -171,19 +173,21 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(args)?;
     for meta in metas {
         let span = meta.span();
-        let access_arg = ["private", "public", "global"]
+        let access_arg = ["private", "public", "global", "ephemeral"]
             .iter()
             .position(|name| meta.path().is_ident(name));
         if let Some(which) = access_arg {
             let this = match which {
                 1 => Access::Public,
                 2 => Access::Global,
+                3 => Access::Ephemeral,
                 _ => Access::Private,
             };
             if access.is_some() {
                 return Err(syn::Error::new(
                     span,
-                    "at most one of `public`, `private`, `global` (DM-005/DM-007)",
+                    "at most one of `public`, `private`, `global`, `ephemeral` — an ephemeral \
+                     table is never global/replicated (DM-005/DM-007, SPEC-023 DMX-012)",
                 ));
             }
             access = Some((this, span));
@@ -216,7 +220,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             return Err(syn::Error::new(
                 span,
                 "unknown #[fluxum::table] argument: expected `public`, `private`, `global`, \
-                 `primary_key(col, ...)`, or `partition_by(col)` (DM-020)",
+                 `ephemeral`, `primary_key(col, ...)`, or `partition_by(col)` (DM-020)",
             ));
         }
     }
@@ -645,6 +649,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         Access::Private => quote!(::fluxum_core::schema::TableAccess::Private),
         Access::Public => quote!(::fluxum_core::schema::TableAccess::Public),
         Access::Global => quote!(::fluxum_core::schema::TableAccess::Global),
+        Access::Ephemeral => quote!(::fluxum_core::schema::TableAccess::Ephemeral),
     };
     let auto_inc_tokens = match auto_inc {
         Some(ord) => quote!(::core::option::Option::Some(#ord)),

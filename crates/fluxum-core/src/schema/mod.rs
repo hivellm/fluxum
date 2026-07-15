@@ -56,6 +56,11 @@ impl TableSchema {
     pub fn column(&self, ordinal: u16) -> Option<&'static ColumnSchema> {
         self.columns.get(usize::from(ordinal))
     }
+
+    /// Whether this is an ephemeral (memory-only) table (SPEC-023 DMX-010).
+    pub const fn is_ephemeral(&self) -> bool {
+        self.access.is_ephemeral()
+    }
 }
 
 /// One column of a [`TableSchema`] (DM-042).
@@ -218,7 +223,7 @@ pub enum SpatialKind {
     RTree,
 }
 
-/// Table access class (DM-005/DM-007).
+/// Table access class (DM-005/DM-007, SPEC-023 DMX-010).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TableAccess {
     /// Server-internal only — never sent to clients (default).
@@ -228,6 +233,25 @@ pub enum TableAccess {
     Public,
     /// Replicated read-only to all shards (SPEC-007).
     Global,
+    /// Memory-only and client-visible: rows fan out to subscribers like a
+    /// `Public` table but bypass the commit log, checkpoints, and replication,
+    /// and start empty after a restart (SPEC-023 DMX-010/012). Never durable,
+    /// never replicated.
+    Ephemeral,
+}
+
+impl TableAccess {
+    /// Whether rows of this table are delivered to client subscriptions
+    /// (`Public` or `Ephemeral`).
+    pub const fn is_client_visible(self) -> bool {
+        matches!(self, Self::Public | Self::Ephemeral)
+    }
+
+    /// Whether this table is ephemeral: memory-only, non-durable, and
+    /// non-replicated (SPEC-023 DMX-010).
+    pub const fn is_ephemeral(self) -> bool {
+        matches!(self, Self::Ephemeral)
+    }
 }
 
 /// Row-level visibility rule (DM-060/DM-061, SPEC-005).

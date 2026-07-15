@@ -200,6 +200,11 @@ impl CheckpointRepo {
         let mut tables = Vec::with_capacity(table_ids.len());
         for table_id in table_ids {
             let table = snapshot.state.table(table_id)?;
+            // SPEC-023 DMX-010/012: ephemeral tables are memory-only — never
+            // written to a checkpoint, so recovery restores them empty.
+            if table.schema.is_ephemeral() {
+                continue;
+            }
             let mut chunks = Vec::new();
             let mut current: Vec<Vec<LogValue>> = Vec::new();
             for (pk, row) in &table.rows {

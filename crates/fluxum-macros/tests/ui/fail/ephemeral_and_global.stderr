@@ -1,5 +1,5 @@
 error: at most one of `public`, `private`, `global`, `ephemeral` — an ephemeral table is never global/replicated (DM-005/DM-007, SPEC-023 DMX-012)
- --> tests/ui/fail/conflicting_access.rs:5:25
+ --> tests/ui/fail/ephemeral_and_global.rs:6:28
   |
-5 | #[fluxum::table(public, global)]
-  |                         ^^^^^^
+6 | #[fluxum::table(ephemeral, global)]
+  |                            ^^^^^^

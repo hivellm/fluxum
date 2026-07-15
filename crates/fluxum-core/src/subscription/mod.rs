@@ -47,7 +47,7 @@ use fluxum_protocol::codes;
 use fluxum_protocol::{InitialData, RowList, RowListBuilder, TableUpdate, TxUpdate};
 
 use crate::error::{FluxumError, Result};
-use crate::schema::{Schema, TableAccess, TableSchema};
+use crate::schema::{Schema, TableSchema};
 use crate::sql::{CompiledPlan, QueryHash, SpatialConstraint, compile};
 use crate::store::committed::Snapshot;
 use crate::store::row::{encode_pk_of_row, encode_row};
@@ -231,7 +231,7 @@ impl SubscriptionManager {
         // messages. Server peers are still bound to this — private tables
         // are server-internal, reached through reducers, not subscriptions.
         let schema = self.table_schema(table_id)?;
-        if schema.access != TableAccess::Public {
+        if !schema.access.is_client_visible() {
             return Err(FluxumError::query(
                 codes::FORBIDDEN,
                 format!(
@@ -359,7 +359,7 @@ impl SubscriptionManager {
     ) -> Result<InitialData> {
         let plan = compile(&self.schema, sql)?;
         let schema = self.table_schema(plan.table_ids[0])?;
-        if schema.access != TableAccess::Public {
+        if !schema.access.is_client_visible() {
             return Err(FluxumError::query(
                 codes::FORBIDDEN,
                 format!(
@@ -384,7 +384,7 @@ impl SubscriptionManager {
     ) -> Result<serde_json::Value> {
         let plan = compile(&self.schema, sql)?;
         let table = self.table_schema(plan.table_ids[0])?;
-        if table.access != TableAccess::Public {
+        if !table.access.is_client_visible() {
             return Err(FluxumError::query(
                 codes::FORBIDDEN,
                 format!("table `{}` is not public", table.name),

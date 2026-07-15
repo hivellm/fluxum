@@ -230,7 +230,40 @@ impl TxPipelineWorker {
         // log writer died (fatal per STG-012): the error is reported and
         // every subsequent commit will fail the same way — memory and log
         // never silently diverge.
-        self.log.append_diff(&diff, timestamp).await?;
+        // SPEC-023 DMX-010: ephemeral-table mutations never reach the commit
+        // log (nor, downstream, checkpoints or replication). The full `diff`
+        // still drives subscription fan-out below — only the *logged* view is
+        // filtered. An ephemeral-only transaction still appends a (row-data-
+        // free) record, so the durable `tx_id` sequence stays gap-free
+        // (TXN-030); the zero-append optimization is a documented follow-up.
+        let has_ephemeral = diff
+            .tables
+            .iter()
+            .any(|t| self.store.is_ephemeral(t.table_id))
+            || diff
+                .auto_inc
+                .iter()
+                .any(|(table, _)| self.store.is_ephemeral(*table));
+        if has_ephemeral {
+            let durable = TxDiff {
+                tx_id: diff.tx_id,
+                tables: diff
+                    .tables
+                    .iter()
+                    .filter(|t| !self.store.is_ephemeral(t.table_id))
+                    .cloned()
+                    .collect(),
+                auto_inc: diff
+                    .auto_inc
+                    .iter()
+                    .copied()
+                    .filter(|(table, _)| !self.store.is_ephemeral(*table))
+                    .collect(),
+            };
+            self.log.append_diff(&durable, timestamp).await?;
+        } else {
+            self.log.append_diff(&diff, timestamp).await?;
+        }
         Ok(CommitReceipt { tx_id, diff })
     }
 }
