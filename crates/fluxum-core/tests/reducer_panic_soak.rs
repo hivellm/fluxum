@@ -116,11 +116,13 @@ static BUGGY: ReducerDef = ReducerDef {
     name: "buggy",
     handler: buggy,
     check_args: check_none,
+    client_callable: true,
 };
 static BUMP: ReducerDef = ReducerDef {
     name: "bump",
     handler: bump,
     check_args: check_none,
+    client_callable: true,
 };
 
 /// Resident set size of this process in bytes.

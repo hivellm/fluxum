@@ -187,6 +187,7 @@ static RECORD_EVENT: ReducerDef = ReducerDef {
     name: "record_event",
     handler: record_event,
     check_args: check_record_event,
+    client_callable: true,
 };
 
 fn explode(ctx: &ReducerContext<'_, '_, '_>, _args: &[FluxValue]) -> Result<()> {
@@ -206,17 +207,20 @@ static EXPLODE: ReducerDef = ReducerDef {
     name: "explode",
     handler: explode,
     check_args: check_none,
+    client_callable: true,
 };
 
 static DUPLICATE_A: ReducerDef = ReducerDef {
     name: "dup",
     handler: record_event,
     check_args: check_none,
+    client_callable: true,
 };
 static DUPLICATE_B: ReducerDef = ReducerDef {
     name: "dup",
     handler: record_event,
     check_args: check_none,
+    client_callable: true,
 };
 
 static INIT_RUNS: AtomicU64 = AtomicU64::new(0);

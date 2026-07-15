@@ -173,6 +173,32 @@ pub fn on_disconnect(args: TokenStream, input: TokenStream) -> TokenStream {
     reducer::expand_lifecycle(reducer::Hook::Disconnect, args.into(), input.into()).into()
 }
 
+/// Declares a fixed-timestep periodic reducer (SPEC-004 RED-020, FR-21):
+/// `#[fluxum::tick(rate = N)]` runs the function N times per second on an
+/// absolute-target clock — a 1–3-period stall re-fires immediately, a
+/// longer stall logs one warning and resets with no catch-up burst, and
+/// the function never runs concurrently with itself on a shard. Signature:
+/// `fn(ctx: &ReducerContext) -> Result<(), String>`; each firing is a full
+/// reducer transaction under the server identity (RED-025). Ticks are
+/// schedule-only — clients get 403 — unless `client_callable = true`.
+#[proc_macro_attribute]
+pub fn tick(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_tick(args.into(), input.into()).into()
+}
+
+/// Declares a deferred reducer persisted in `__schedule__` (SPEC-004
+/// RED-021..RED-024, FR-22): `#[fluxum::schedule(delay_ms = N)]` enqueues a
+/// one-shot firing N ms after shard start; adding `every_ms = M` makes it
+/// recurring with drift-free intended-time rescheduling. Rows survive crash
+/// recovery (at-least-once; removal or reschedule commits atomically with
+/// the execution). Schedule-only for clients (403) unless
+/// `client_callable = true`; dynamic one-shots go through
+/// `ctx.schedule_after(delay, reducer, args)`.
+#[proc_macro_attribute]
+pub fn schedule(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_schedule(args.into(), input.into()).into()
+}
+
 /// Declares a read-only view for the HTTP admin API (`GET /view/:name`,
 /// SPEC-004 RED-030). The function receives a `&ViewContext` — whose
 /// `ReadOnlyTxHandle` has **no write methods**, so a view that tries to

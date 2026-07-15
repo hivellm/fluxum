@@ -9,6 +9,10 @@ pub const MALFORMED: u16 = 400;
 /// (RPC-020).
 pub const UNAUTHENTICATED: u16 = 401;
 
+/// 403 — forbidden, e.g. a client `ReducerCall` naming a schedule-only
+/// reducer (SPEC-004 RED-025).
+pub const FORBIDDEN: u16 = 403;
+
 /// 404 — unknown resource, e.g. an expired Streamable-HTTP session (RPC-007).
 pub const NOT_FOUND: u16 = 404;
 

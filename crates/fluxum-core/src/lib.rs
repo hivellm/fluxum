@@ -47,6 +47,9 @@
 //!   ordered `#[fluxum::migration]` execution, automatic schema diff with
 //!   safe auto-apply, and fail-closed aborts for incompatible changes
 //!   (T3.6)
+//! - [`scheduler`] — the SPEC-004 §4 scheduled-execution runtime
+//!   ([`scheduler::Scheduler`]): `#[fluxum::tick]` fixed-timestep clocks
+//!   and the durable `__schedule__` deferred-reducer worker (T3.4)
 
 pub mod auth;
 pub mod checkpoint;
@@ -57,6 +60,7 @@ pub mod hw;
 pub mod index;
 pub mod migration;
 pub mod reducer;
+pub mod scheduler;
 pub mod schema;
 pub mod simd;
 pub mod store;

@@ -22,7 +22,7 @@ serde_yaml.workspace = true
 sha2.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
 zstd.workspace = true
 
@@ -31,7 +31,7 @@ crc.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 xxhash-rust.workspace = true
 
 [lints]

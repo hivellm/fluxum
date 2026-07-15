@@ -136,6 +136,12 @@ pub struct ReducerDef {
     pub handler: ReducerFnPtr,
     /// The macro-generated pre-transaction argument check (RED-001).
     pub check_args: ArgCheckFn,
+    /// Whether clients may invoke this reducer via `ReducerCall` (RED-025).
+    /// `#[fluxum::reducer]` emits `true`; `#[fluxum::tick]` /
+    /// `#[fluxum::schedule]` emit `false` unless the declaration opts in
+    /// with `client_callable = true` — schedule-only reducers answer
+    /// clients with a wire-ready 403 before any transaction.
+    pub client_callable: bool,
 }
 
 inventory::collect!(ReducerDef);
@@ -148,10 +154,12 @@ pub fn registered_reducers() -> impl Iterator<Item = &'static ReducerDef> {
 
 /// One registered reducer: the dispatch body plus the optional
 /// pre-transaction argument check (absent for closure-registered reducers,
-/// which have no declared signature to check against).
+/// which have no declared signature to check against) and the RED-025
+/// client-callability flag.
 struct Registered {
     handler: ReducerHandler,
     check_args: Option<ArgCheckFn>,
+    client_callable: bool,
 }
 
 /// Name → reducer map (RED-006): populated at startup — from the link-time
@@ -202,16 +210,17 @@ impl ReducerRegistry {
             def.name.to_owned(),
             Box::new(def.handler),
             Some(def.check_args),
+            def.client_callable,
         )
     }
 
     /// Register a reducer under `name`. A duplicate name is a startup error
     /// (RED-006) — [`FluxumError::Schema`], which must abort boot. Closure
     /// registrations carry no argument check (there is no declared
-    /// signature); [`ReducerRegistry::check_call`] then validates the name
-    /// only.
+    /// signature) and are client-callable; [`ReducerRegistry::check_call`]
+    /// then validates the name only.
     pub fn register(&mut self, name: impl Into<String>, handler: ReducerHandler) -> Result<()> {
-        self.insert(name.into(), handler, None)
+        self.insert(name.into(), handler, None, true)
     }
 
     fn insert(
@@ -219,6 +228,7 @@ impl ReducerRegistry {
         name: String,
         handler: ReducerHandler,
         check_args: Option<ArgCheckFn>,
+        client_callable: bool,
     ) -> Result<()> {
         if self.handlers.contains_key(&name) {
             return Err(FluxumError::Schema(format!(
@@ -230,6 +240,7 @@ impl ReducerRegistry {
             Registered {
                 handler,
                 check_args,
+                client_callable,
             },
         );
         Ok(())
@@ -246,15 +257,25 @@ impl ReducerRegistry {
     }
 
     /// Admission check the engine runs **before** submitting to the
-    /// transaction pipeline (RED-001/RED-006): unknown names are a
-    /// wire-ready 404, and a `#[fluxum::reducer]`-declared signature
-    /// validates arity and argument types — all without a transaction or
-    /// `TxState` ever existing.
+    /// transaction pipeline (RED-001/RED-006/RED-025): unknown names are a
+    /// wire-ready 404, a schedule-only reducer answers clients 403, and a
+    /// `#[fluxum::reducer]`-declared signature validates arity and argument
+    /// types — all without a transaction or `TxState` ever existing.
+    ///
+    /// This is the **client** admission path; scheduled executions
+    /// ([`crate::scheduler`]) dispatch directly and are exempt from the
+    /// callability check.
     pub fn check_call(&self, name: &str, args: &[FluxValue]) -> Result<()> {
         let registered = self
             .handlers
             .get(name)
             .ok_or_else(|| unknown_reducer(name))?;
+        if !registered.client_callable {
+            return Err(FluxumError::query(
+                codes::FORBIDDEN,
+                format!("schedule-only reducer `{name}` (RED-025)"),
+            ));
+        }
         if let Some(check) = registered.check_args {
             check(args)?;
         }
@@ -343,6 +364,43 @@ pub struct ReducerContext<'e, 't, 's> {
     pub shard_id: u32,
     /// Read/write handle bound to this call's transaction (RED-003).
     pub tx: TxHandle<'e, 't, 's>,
+}
+
+impl ReducerContext<'_, '_, '_> {
+    /// Enqueue `reducer` for execution after `delay` (RED-021, FR-22).
+    ///
+    /// The enqueue is a `__schedule__` insert **inside this call's
+    /// transaction**: if the transaction rolls back, the scheduled call is
+    /// discarded with it — the [`crate::scheduler::ScheduleWorker`] re-reads
+    /// the committed row at fire time, so a rolled-back enqueue can never
+    /// fire. Re-arming from inside the fired reducer creates a recurring
+    /// pattern (RED-022). The target must be a registered reducer; the
+    /// shard's schema must include [`crate::scheduler::SCHEDULE_TABLE`].
+    pub fn schedule_after(
+        &self,
+        delay: std::time::Duration,
+        reducer: &str,
+        args: &[FluxValue],
+    ) -> Result<()> {
+        if !self.tx.env.registry.contains(reducer) {
+            return Err(unknown_reducer(reducer));
+        }
+        let delay_us = i64::try_from(delay.as_micros()).map_err(|_| {
+            FluxumError::query(
+                codes::MALFORMED,
+                format!("schedule_after delay {delay:?} overflows the µs clock"),
+            )
+        })?;
+        self.tx.insert(crate::scheduler::ScheduleEntry {
+            id: 0,
+            reducer_name: reducer.to_owned(),
+            args: crate::scheduler::encode_args(args)?,
+            execute_at_us: self.timestamp.as_micros().saturating_add(delay_us),
+            period_us: 0,
+            shard_id: self.shard_id,
+        })?;
+        Ok(())
+    }
 }
 
 /// Typed read/write surface of one reducer transaction (RED-003, FR-20).
