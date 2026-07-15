@@ -143,9 +143,7 @@ fn reducer_result_outcome_round_trips_both_arms() {
 #[test]
 fn fluxvalue_rejects_big_u64_outside_entity_id() {
     // [u64::MAX] — a plain array carrying an integer above i64::MAX.
-    let bytes = [
-        0x91, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
-    ];
+    let bytes = [0x91, 0xCF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
     let err = rmp_serde::from_slice::<FluxValue>(&bytes)
         .unwrap_err()
         .to_string();

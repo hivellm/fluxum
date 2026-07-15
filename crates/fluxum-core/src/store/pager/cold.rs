@@ -336,9 +336,7 @@ mod tests {
     use super::super::PagerOptions;
     use super::*;
     use crate::config::PageCompression;
-    use crate::schema::{
-        ColumnSchema, FluxType, IndexSchema, Schema, TableAccess, VisibilityRule,
-    };
+    use crate::schema::{ColumnSchema, FluxType, IndexSchema, Schema, TableAccess, VisibilityRule};
     use crate::store::MemStore;
 
     static ITEM_COLS: &[ColumnSchema] = &[

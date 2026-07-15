@@ -667,8 +667,8 @@ mod tests {
         // The PK encoding of the u64 column doubles as an all-types witness
         // for the key-values form.
         let pk = encode_pk_of_row(&UNIVERSE, &row).unwrap_or_else(|e| panic!("{e}"));
-        let same = encode_pk_values(&UNIVERSE, &[RowValue::U64(64)])
-            .unwrap_or_else(|e| panic!("{e}"));
+        let same =
+            encode_pk_values(&UNIVERSE, &[RowValue::U64(64)]).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(pk, same);
     }
 

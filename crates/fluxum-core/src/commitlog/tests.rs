@@ -559,7 +559,11 @@ mod segment_faults {
         fs::write(path, bytes).unwrap();
     }
 
-    fn scan(path: &Path, prev_tx: Option<u64>, min_epoch: u64) -> super::super::segment::SegmentScan {
+    fn scan(
+        path: &Path,
+        prev_tx: Option<u64>,
+        min_epoch: u64,
+    ) -> super::super::segment::SegmentScan {
         match scan_segment(path, SHARD, prev_tx, min_epoch, &mut |_, _| Ok(())).unwrap() {
             ScanOutcome::Scanned(scan) => scan,
             ScanOutcome::HeaderCorrupt(reason) => panic!("header corrupt: {reason}"),
@@ -587,7 +591,11 @@ mod segment_faults {
         let scan = scan(&path, None, 5);
         let fault = scan.fault.expect("epoch regression must fault");
         assert_eq!(fault.offset, 0);
-        assert!(fault.reason.contains("regresses below 5"), "{}", fault.reason);
+        assert!(
+            fault.reason.contains("regresses below 5"),
+            "{}",
+            fault.reason
+        );
         assert_eq!(scan.entries, 0);
     }
 

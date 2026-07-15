@@ -182,7 +182,10 @@ mod tests {
     #[test]
     fn unknown_arguments_are_rejected() {
         let err = expand_err(quote::quote!(target = 2), good_fn());
-        assert!(err.contains("unknown #[fluxum::migration] argument"), "{err}");
+        assert!(
+            err.contains("unknown #[fluxum::migration] argument"),
+            "{err}"
+        );
     }
 
     #[test]
