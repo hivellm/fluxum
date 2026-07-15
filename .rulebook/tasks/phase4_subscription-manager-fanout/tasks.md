@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Implement `SubscriptionManager`: register/unsubscribe CompiledPlans with server-assigned query_ids; `Subscribe` (batch), `SubscribeSingle`, `Unsubscribe` (FR-30, FR-31, SUB-001..SUB-006)
-- [ ] 1.2 Post-commit fan-out loop producing incremental TxUpdate diffs; InitialData identical to a direct CommittedState query
-- [ ] 1.3 Query-hash dedup: N identical (normalized) queries share exactly one CompiledPlan - one evaluation + one FluxBIN encoding for all subscribers; per-subscriber work limited to a refcounted-buffer enqueue (SUB-020/SUB-023)
-- [ ] 1.4 Value-level plan pruning via `search_args` (plans indexed by equality-filter values) + `table_watchers` fast-path skip for commits touching no watched tables - cost O(matching plans), never O(clients) (SUB-021/SUB-024/SUB-040)
-- [ ] 1.5 ORDER BY / LIMIT applied to InitialData only; diffs unordered and unlimited (FR-34, SUB-013)
-- [ ] 1.6 Admission control: max_subscriptions_per_connection and max_compiled_plans rejections with typed 429, leaving existing subscriptions intact (SUB-044)
-- [ ] 1.7 Verification (DAG exit test): fan-out correctness + dedup/pruning perf tests (1000 clients x 1000 distinct values = 1 plan evaluation, 1 encode per commit; compile-once profiling shows zero SQL parsing after registration)
+- [x] 1.1 Implement `SubscriptionManager`: register/unsubscribe CompiledPlans with server-assigned query_ids; `Subscribe` (batch), `SubscribeSingle`, `Unsubscribe` (FR-30, FR-31, SUB-001..SUB-006) — `crate::subscription::SubscriptionManager`: `subscribe` (one call = one plan; batch is the caller looping), `unsubscribe(conn, query_id)`, `disconnect(conn)`; monotonic per-connection query_ids; QueryState keyed by QueryHash with an Arc<CompiledPlan> shared across subscribers
+- [x] 1.2 Post-commit fan-out loop producing incremental TxUpdate diffs; InitialData identical to a direct CommittedState query — `on_commit(&TxDiff)` matches inserts + deletes (deletes via the SAME predicate over pre-commit values, SUB-021) into a `TableUpdate`; `subscribe` returns `InitialData` from a filtered committed scan (spatial via the index), byte-identical to a direct query (test-verified)
+- [x] 1.3 Query-hash dedup: N identical (normalized) queries share exactly one CompiledPlan - one evaluation + one FluxBIN encoding for all subscribers; per-subscriber work limited to a refcounted-buffer enqueue (SUB-020/SUB-023) — 1,000 identical (whitespace/case-varied) subscribers → plan_count == 1, one QueryDelta with an Arc<TableUpdate> (strong_count witnesses sharing, not copying)
+- [x] 1.4 Value-level plan pruning via `search_args` (plans indexed by equality-filter values) + `table_watchers` fast-path skip for commits touching no watched tables - cost O(matching plans), never O(clients) (SUB-021/SUB-024/SUB-040) — `search_args: (TableId, ColId, FluxBIN value) → plans` + `indexed_columns` refcount for O(indexed cols) per-row probing; no-equality plans fall to `table_watchers`; a commit on an untouched table produces zero deltas
+- [x] 1.5 ORDER BY / LIMIT applied to InitialData only; diffs unordered and unlimited (FR-34, SUB-013) — sort+truncate in `initial_data`; `evaluate` (commit path) never orders or limits (test: 3-row commit past a LIMIT 2 subscription yields all 3 in the diff)
+- [x] 1.6 Admission control: max_subscriptions_per_connection and max_compiled_plans rejections with typed 429, leaving existing subscriptions intact (SUB-044) — checked before any mutation; re-subscribing to an existing plan does not count against the plan cap
+- [x] 1.7 Verification (DAG exit test): fan-out correctness + dedup/pruning perf tests (1000 clients x 1000 distinct values = 1 plan evaluation, 1 encode per commit; compile-once profiling shows zero SQL parsing after registration) — `tests/subscription_fanout.rs` (10 tests): 1,000-distinct-value pruning selects exactly 1 plan; SQL is compiled once at subscribe and `on_commit` only evaluates the stored closure (no re-parse)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `crate::subscription` incl. the SUB-022 cost model and the T4.3/T4.4 boundary; per-item rustdoc)
+- [x] 2.2 Write tests covering the new behavior (fan-out suite: lifecycle, dedup, pruning, fast-path, ORDER BY/LIMIT, spatial InitialData, admission caps)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean; 91.71% line coverage) — CI deferred per the no-Actions directive

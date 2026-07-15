@@ -362,6 +362,13 @@ fn coerce(table: &TableSchema, column: &str, lit: &Lit, ty: &FluxType) -> Result
     }
 }
 
+/// Total order between two same-variant [`RowValue`]s; `None` across
+/// variants or for NaN floats. Shared with the subscription manager's
+/// SUB-013 `ORDER BY` (which is why it is `pub(crate)`).
+pub(crate) fn cmp_row_values(a: &RowValue, b: &RowValue) -> Option<Ordering> {
+    cmp_values(a, b)
+}
+
 /// Total order between two same-variant values (BETWEEN evaluation);
 /// `None` across variants or for NaN floats.
 fn cmp_values(a: &RowValue, b: &RowValue) -> Option<Ordering> {
