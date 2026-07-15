@@ -38,12 +38,44 @@ use fluxum_protocol::codes;
 use fluxum_protocol::{InitialData, RowList, RowListBuilder, TableUpdate, TxUpdate};
 
 use crate::error::{FluxumError, Result};
-use crate::schema::{Schema, TableSchema};
+use crate::schema::{Schema, TableAccess, TableSchema};
 use crate::sql::{CompiledPlan, QueryHash, SpatialConstraint, compile};
 use crate::store::committed::Snapshot;
 use crate::store::row::{encode_pk_of_row, encode_row};
 use crate::store::{Row, TableId, TxDiff};
 use crate::types::Identity;
+
+/// Who is subscribing (SUB-030/031): the caller's stable identity and
+/// whether the auth layer resolved it as a server-to-server peer
+/// (`SHA-256("SERVER:" + name)`, AUTH-061). Server peers bypass every
+/// `#[visibility]` filter; the manager cannot tell a server identity from
+/// its bytes alone, so the transport (which holds the
+/// [`crate::auth::Authenticator`]) supplies this flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Subscriber {
+    /// The caller's 256-bit identity (SPEC-009).
+    pub identity: Identity,
+    /// Whether this identity is a trusted server peer (RLS bypass, SUB-031).
+    pub is_server_peer: bool,
+}
+
+impl Subscriber {
+    /// A regular client subscriber (RLS applies).
+    pub fn client(identity: Identity) -> Self {
+        Self {
+            identity,
+            is_server_peer: false,
+        }
+    }
+
+    /// A server-peer subscriber (RLS bypass, SUB-031).
+    pub fn server_peer(identity: Identity) -> Self {
+        Self {
+            identity,
+            is_server_peer: true,
+        }
+    }
+}
 
 /// The `search_args` value key: the FluxBIN encoding of one equality value
 /// ([`RowValue`] is not `Ord`/`Hash` because of floats, but its byte
@@ -69,10 +101,19 @@ impl Default for SubscriptionLimits {
     }
 }
 
-/// One unique query (SUB-040): the shared plan and its subscriber set.
+/// One unique query bucket (SUB-040): the shared plan, its subscriber set,
+/// and the viewer identity the RLS filter is bound to.
+///
+/// For a caller-parameterized query (an `owner_only` table, SUB-030) the
+/// bucket is per-identity — the dedup key folds the identity in — so
+/// `viewer` is `Some(id)` and the plan's `rls` filter runs with it. For a
+/// public query, or a server-peer bypass (SUB-031), `viewer` is `None` and
+/// no row-level filter is applied; the shared encoding is then correct for
+/// every subscriber in the bucket because they all see the same rows.
 struct QueryState {
     plan: Arc<CompiledPlan>,
     subscribers: HashSet<u128>,
+    viewer: Option<Identity>,
 }
 
 /// One shared, pre-encoded per-query delta produced by the fan-out
@@ -149,23 +190,49 @@ impl SubscriptionManager {
         self.connections.get(&connection).map_or(0, HashMap::len)
     }
 
-    /// Register one subscription `sql` for `connection`, evaluated for
-    /// `caller` (SUB-001/002/020/044): compile (or reuse the shared plan by
-    /// [`QueryHash`]), enforce the admission caps, assign a `query_id`, and
-    /// return the `InitialData` snapshot. A compile error is a wire-ready
-    /// 400; a cap breach is a 429 — neither registers anything.
+    /// Register one subscription `sql` for `connection` on behalf of
+    /// `subscriber` (SUB-001/002/020/030/044): compile, enforce the
+    /// public-table and admission policies, dedup (or reuse) the plan under
+    /// its **effective** [`QueryHash`], assign a `query_id`, and return the
+    /// `InitialData` snapshot filtered for this subscriber. A compile error
+    /// or a subscription to a non-public table is a wire-ready 400/403; a cap
+    /// breach is a 429 — none of them register anything.
+    ///
+    /// For an `owner_only` table the effective hash folds in the caller
+    /// identity (or a shared server-peer tag for the RLS bypass), so
+    /// different viewers get distinct buckets while identical viewers still
+    /// share one plan and one encoding (SUB-020/031).
     pub fn subscribe(
         &mut self,
         connection: u128,
-        caller: &Identity,
+        subscriber: Subscriber,
         sql: &str,
         snapshot: &Snapshot,
     ) -> Result<Subscribed> {
         let plan = compile(&self.schema, sql)?;
-        let hash = plan.query_hash;
+        let table_id = plan.table_ids[0];
+
+        // A client may only subscribe to a `public` table (SPEC-001
+        // acceptance 9): private/global tables never appear in client
+        // messages. Server peers are still bound to this — private tables
+        // are server-internal, reached through reducers, not subscriptions.
+        let schema = self.table_schema(table_id)?;
+        if schema.access != TableAccess::Public {
+            return Err(FluxumError::query(
+                codes::FORBIDDEN,
+                format!(
+                    "table `{}` is not public and cannot be subscribed",
+                    schema.name
+                ),
+            ));
+        }
+
+        // Caller-parameterization (SUB-030/031): an `owner_only` plan is
+        // per-viewer unless the caller is a server peer (bypass).
+        let (hash, viewer) = self.effective_key(&plan, subscriber);
 
         // Admission (SUB-044): reject before any mutation. A brand-new query
-        // adds a plan; re-subscribing to an existing one does not.
+        // bucket adds a plan; re-subscribing to an existing one does not.
         let live = self.subscription_count(connection);
         if live >= self.limits.max_subscriptions_per_connection {
             return Err(limit_exceeded("max_subscriptions_per_connection"));
@@ -175,26 +242,25 @@ impl SubscriptionManager {
             return Err(limit_exceeded("max_compiled_plans"));
         }
 
-        let initial = self.initial_data(&plan, caller, snapshot)?;
+        let initial = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
 
         // Register: shared plan + pruning-index membership on first sighting.
-        let plan = if let Some(state) = self.queries.get_mut(&hash) {
+        if let Some(state) = self.queries.get_mut(&hash) {
             state.subscribers.insert(connection);
-            Arc::clone(&state.plan)
         } else {
             let plan = Arc::new(plan);
-            self.index_plan(&plan);
+            self.index_plan(hash, &plan);
             let mut subscribers = HashSet::new();
             subscribers.insert(connection);
             self.queries.insert(
                 hash,
                 QueryState {
-                    plan: Arc::clone(&plan),
+                    plan,
                     subscribers,
+                    viewer,
                 },
             );
-            plan
-        };
+        }
 
         let query_id = self.assign_query_id(connection);
         self.connections
@@ -206,8 +272,34 @@ impl SubscriptionManager {
         for table in &mut initial.tables {
             table.query_id = query_id;
         }
-        let _ = &plan; // plan kept alive by `queries`
         Ok(Subscribed { query_id, initial })
+    }
+
+    /// The effective dedup key and viewer for a subscription (SUB-020/030/
+    /// 031). A public (non-caller-parameterized) plan keeps its plaintext
+    /// hash and no viewer; an `owner_only` plan folds the caller identity
+    /// (client) or a shared server-peer tag (bypass) into the hash.
+    fn effective_key(
+        &self,
+        plan: &CompiledPlan,
+        subscriber: Subscriber,
+    ) -> (QueryHash, Option<Identity>) {
+        if plan.rls.is_none() {
+            return (plan.query_hash, None);
+        }
+        if subscriber.is_server_peer {
+            // Server peers bypass RLS and share one bucket that sees all
+            // rows matching the predicate (SUB-031).
+            let hash = QueryHash(
+                crate::simd::global().hash64(b"__fluxum_server_peer__", plan.query_hash.0),
+            );
+            (hash, None)
+        } else {
+            let hash = QueryHash(
+                crate::simd::global().hash64(subscriber.identity.as_bytes(), plan.query_hash.0),
+            );
+            (hash, Some(subscriber.identity))
+        }
     }
 
     /// Drop the subscription `query_id` on `connection` (SUB-004). Returns
@@ -256,7 +348,7 @@ impl SubscriptionManager {
             if state.subscribers.is_empty() {
                 continue;
             }
-            let Some(update) = self.evaluate(&state.plan, diff)? else {
+            let Some(update) = self.evaluate(&state.plan, state.viewer.as_ref(), diff)? else {
                 continue;
             };
             let mut subscribers: Vec<u128> = state.subscribers.iter().copied().collect();
@@ -293,7 +385,7 @@ impl SubscriptionManager {
     fn initial_data(
         &self,
         plan: &CompiledPlan,
-        caller: &Identity,
+        viewer: Option<&Identity>,
         snapshot: &Snapshot,
     ) -> Result<InitialData> {
         let table_id = plan.table_ids[0];
@@ -301,8 +393,9 @@ impl SubscriptionManager {
 
         // Candidate rows: spatial clauses go through the index (SUB-022);
         // otherwise a full committed scan, filtered by the predicate and the
-        // row-level visibility slot (SUB-030 — `None` until T4.3 fills it).
-        let keep = |row: &Row| plan.matches(row) && visible(plan, row, caller);
+        // row-level visibility filter for this viewer (SUB-030). `viewer` is
+        // `None` for a public query or a server-peer bypass — no RLS.
+        let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
         let mut rows: Vec<Row> = match &plan.spatial {
             Some(constraint) => self
                 .spatial_candidates(snapshot, table_id, *constraint)?
@@ -348,26 +441,30 @@ impl SubscriptionManager {
     // --- Commit evaluation (SUB-021) ----------------------------------------
 
     /// Matched inserts + deletes for one plan against a commit, encoded once
-    /// (SUB-024). `None` when nothing matched.
-    fn evaluate(&self, plan: &CompiledPlan, diff: &TxDiff) -> Result<Option<TableUpdate>> {
+    /// (SUB-024). `None` when nothing matched. `viewer` applies the RLS
+    /// filter (SUB-030) to both inserts and deletes — a delete of a row the
+    /// viewer could never see is correctly not delivered.
+    fn evaluate(
+        &self,
+        plan: &CompiledPlan,
+        viewer: Option<&Identity>,
+        diff: &TxDiff,
+    ) -> Result<Option<TableUpdate>> {
         let table_id = plan.table_ids[0];
         let Some(table_diff) = diff.tables.iter().find(|t| t.table_id == table_id) else {
             return Ok(None); // fast path: this plan's table did not change
         };
 
-        let matched_inserts: Vec<&Row> = table_diff
-            .inserts
-            .iter()
-            .filter(|row| plan.matches(row))
-            .collect();
-        // Deletes are matched by running the SAME predicate over the deleted
-        // rows' pre-commit values (SUB-021) — no per-row subscription
-        // bookkeeping is needed.
+        let keep = |row: &&Row| plan.matches(row) && visible(plan, row, viewer);
+        let matched_inserts: Vec<&Row> = table_diff.inserts.iter().filter(keep).collect();
+        // Deletes are matched by running the SAME predicate + RLS over the
+        // deleted rows' pre-commit values (SUB-021) — no per-row
+        // subscription bookkeeping is needed.
         let matched_deletes: Vec<&Row> = table_diff
             .deletes
             .iter()
             .map(|(_, old)| old)
-            .filter(|row| plan.matches(row))
+            .filter(keep)
             .collect();
 
         if matched_inserts.is_empty() && matched_deletes.is_empty() {
@@ -439,11 +536,11 @@ impl SubscriptionManager {
         Some((table_id, *column, encoded))
     }
 
-    /// Place a plan in exactly one pruning tier (SUB-023/040): the value
-    /// index when it has a top-level single-column equality, else the
-    /// per-table fallback.
-    fn index_plan(&mut self, plan: &Arc<CompiledPlan>) {
-        let hash = plan.query_hash;
+    /// Place a plan in exactly one pruning tier (SUB-023/040) under its
+    /// **effective** `hash` (the `queries` key, which folds in the viewer for
+    /// RLS plans): the value index when it has a top-level single-column
+    /// equality, else the per-table fallback.
+    fn index_plan(&mut self, hash: QueryHash, plan: &Arc<CompiledPlan>) {
         let table_id = plan.table_ids[0];
         if let Some(key) = Self::search_key(plan) {
             let column = key.1;
@@ -462,9 +559,9 @@ impl SubscriptionManager {
         }
     }
 
-    /// Remove a plan's pruning-index membership (last-subscriber eviction).
-    fn deindex_plan(&mut self, plan: &CompiledPlan) {
-        let hash = plan.query_hash;
+    /// Remove a plan's pruning-index membership under its effective `hash`
+    /// (last-subscriber eviction).
+    fn deindex_plan(&mut self, hash: QueryHash, plan: &CompiledPlan) {
         let table_id = plan.table_ids[0];
         if let Some(key) = Self::search_key(plan) {
             let column = key.1;
@@ -501,7 +598,7 @@ impl SubscriptionManager {
         if state.subscribers.is_empty() {
             let plan = Arc::clone(&state.plan);
             self.queries.remove(&hash);
-            self.deindex_plan(&plan);
+            self.deindex_plan(hash, &plan);
         }
     }
 
@@ -565,10 +662,15 @@ fn encode_pk_rows(schema: &TableSchema, rows: &[&Row]) -> Result<RowList> {
     Ok(builder.finish())
 }
 
-/// Apply a plan's row-level visibility slot (SUB-030): `true` when the plan
-/// has no `#[visibility]` filter (the T4.2 state — T4.3 compiles the slot).
-fn visible(plan: &CompiledPlan, row: &Row, caller: &Identity) -> bool {
-    plan.rls.as_ref().is_none_or(|rls| rls(row, caller))
+/// Apply a plan's row-level visibility filter for `viewer` (SUB-030):
+/// `true` when there is no viewer (public query or server-peer bypass) or
+/// the plan has no `#[visibility]` filter; otherwise the plan's `rls`
+/// closure decides.
+fn visible(plan: &CompiledPlan, row: &Row, viewer: Option<&Identity>) -> bool {
+    match (viewer, plan.rls.as_ref()) {
+        (Some(id), Some(rls)) => rls(row, id),
+        _ => true,
+    }
 }
 
 fn limit_exceeded(which: &str) -> FluxumError {

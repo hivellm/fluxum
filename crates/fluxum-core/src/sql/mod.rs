@@ -37,7 +37,7 @@ use fluxum_protocol::codes;
 
 use crate::error::{FluxumError, Result};
 use crate::index::Rect;
-use crate::schema::{FluxType, IndexSchema, Schema, TableSchema};
+use crate::schema::{FluxType, IndexSchema, Schema, TableSchema, VisibilityRule};
 use crate::store::{Row, RowValue, TableId};
 use crate::types::Identity;
 
@@ -194,11 +194,18 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         }))
     };
 
+    // Row-level visibility (SUB-030): compile the table's `#[visibility]`
+    // rule into the caller-parameterized `rls` slot. The closure takes the
+    // viewer identity as a parameter, so one plan is shared across every
+    // per-identity subscription bucket (the subscription manager folds the
+    // identity into the dedup key and carries the viewer per bucket).
+    let rls = compile_visibility(table);
+
     Ok(CompiledPlan {
         query_id: 0,
         table_ids: vec![table_id],
         filter,
-        rls: None,
+        rls,
         order_by,
         limit: ast.limit,
         equalities,
@@ -206,6 +213,22 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         query_hash,
         normalized,
     })
+}
+
+/// Compile a table's [`VisibilityRule`] into the [`RlsFn`] applied per
+/// subscriber (SUB-030). `None` means "no row-level filter" — the plan is
+/// not caller-parameterized. Only `owner_only` is enforced in T4.3;
+/// `shard_local` (needs the shard context of phase 5) and `custom` (SUB-032,
+/// P2) are documented gaps that currently impose no filter.
+fn compile_visibility(table: &TableSchema) -> Option<RlsFn> {
+    match table.visibility {
+        VisibilityRule::OwnerOnly { owner } => {
+            Some(Box::new(move |row: &Row, viewer: &Identity| {
+                row.value(owner) == Some(&RowValue::Identity(*viewer))
+            }))
+        }
+        VisibilityRule::PublicAll | VisibilityRule::ShardLocal | VisibilityRule::Custom(_) => None,
+    }
 }
 
 /// One compiled WHERE condition with literals already coerced to the

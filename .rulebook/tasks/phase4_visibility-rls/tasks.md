@@ -1,10 +1,10 @@
 ## 1. Implementation
-- [ ] 1.1 Evaluate `#[visibility(owner_only(field))]` per subscriber identity on InitialData AND every TxUpdate diff (FR-32, SUB-030)
-- [ ] 1.2 Server-peer bypass: server identities read rows hidden from other identities (FR-72, SUB-031, AUTH-061)
-- [ ] 1.3 Private tables (visibility private) never appear in any client message (SPEC-001 acceptance 9)
-- [ ] 1.4 Verification (DAG exit test): RLS matrix tests - {owner, other user, server peer} x {InitialData, TxUpdate}: owner sees own rows only, others see nothing, server peer sees all (SUB acceptance 5); joint two-client Task test with SPEC-001
+- [x] 1.1 Evaluate `#[visibility(owner_only(field))]` per subscriber identity on InitialData AND every TxUpdate diff (FR-32, SUB-030) — `sql::compile_visibility` compiles the table's `VisibilityRule::OwnerOnly` into the plan's `rls` slot (`Fn(&Row, &Identity) -> bool`); the subscription manager applies it in `initial_data` and `evaluate` (inserts AND deletes) via the bucket's viewer identity
+- [x] 1.2 Server-peer bypass: server identities read rows hidden from other identities (FR-72, SUB-031, AUTH-061) — `Subscriber { identity, is_server_peer }` (the transport sets the flag from the `Authenticator`); a server peer gets a dedicated bucket with `viewer = None` → no RLS filter, sees all predicate-matching rows
+- [x] 1.3 Private tables (visibility private) never appear in any client message (SPEC-001 acceptance 9) — `subscribe` rejects any non-`Public` table with a wire-ready 403, for clients AND server peers (private tables are reached through reducers, never subscriptions)
+- [x] 1.4 Verification (DAG exit test): RLS matrix tests - {owner, other user, server peer} x {InitialData, TxUpdate}: owner sees own rows only, others see nothing, server peer sees all (SUB acceptance 5); joint two-client Task test with SPEC-001 — `tests/subscription_rls.rs` (5 tests) + the `owner_only` RLS-slot compile test in `sql_compiler.rs`; caller-parameterization gives one bucket per distinct viewer (dedup preserved for identical viewer+query)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (rustdoc on `sql::compile_visibility`, `Subscriber`, `QueryState.viewer`, and the effective-hash / caller-parameterization design)
+- [x] 2.2 Write tests covering the new behavior (RLS matrix suite; the T4.2 fan-out suite migrated to the `Subscriber` API and still green)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean) — CI deferred per the no-Actions directive

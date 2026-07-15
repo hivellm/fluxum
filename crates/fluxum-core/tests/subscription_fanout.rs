@@ -13,7 +13,7 @@ use fluxum_core::schema::{
     VisibilityRule,
 };
 use fluxum_core::store::{MemStore, RowValue, TableId, Tx};
-use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
+use fluxum_core::subscription::{Subscriber, SubscriptionLimits, SubscriptionManager};
 use fluxum_core::types::Identity;
 
 // --- Schema --------------------------------------------------------------------
@@ -126,7 +126,7 @@ fn subscribe_returns_initialdata_matching_a_direct_query() {
     let sub = mgr
         .subscribe(
             1,
-            &client(1),
+            Subscriber::client(client(1)),
             "SELECT * FROM Sensor WHERE channel = 7",
             &store.snapshot(),
         )
@@ -160,7 +160,7 @@ fn commit_produces_incremental_insert_and_delete_diffs() {
     let mut mgr = manager();
     mgr.subscribe(
         1,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE channel = 7",
         &store.snapshot(),
     )
@@ -201,10 +201,20 @@ fn unsubscribe_and_disconnect_stop_delivery() {
     let mut mgr = manager();
 
     let a = mgr
-        .subscribe(1, &client(1), "SELECT * FROM Sensor", &store.snapshot())
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "SELECT * FROM Sensor",
+            &store.snapshot(),
+        )
         .unwrap();
-    mgr.subscribe(2, &client(2), "SELECT * FROM Sensor", &store.snapshot())
-        .unwrap();
+    mgr.subscribe(
+        2,
+        Subscriber::client(client(2)),
+        "SELECT * FROM Sensor",
+        &store.snapshot(),
+    )
+    .unwrap();
     assert_eq!(mgr.plan_count(), 1, "dedup: one shared plan");
 
     // Unsubscribe connection 1: its query_id stops, connection 2 remains.
@@ -243,7 +253,7 @@ fn identical_queries_share_one_plan_and_one_encoding() {
         } else {
             "select  *  from Sensor where channel=7"
         };
-        mgr.subscribe(conn, &client(1), sql, &store.snapshot())
+        mgr.subscribe(conn, Subscriber::client(client(1)), sql, &store.snapshot())
             .unwrap();
     }
     assert_eq!(mgr.plan_count(), 1, "one shared CompiledPlan for all 1,000");
@@ -276,7 +286,7 @@ fn value_level_pruning_selects_only_the_matching_value_plan() {
     // 1,000 clients each on a DISTINCT id value.
     for id in 0..1_000u128 {
         let sql = format!("SELECT * FROM Sensor WHERE id = {id}");
-        mgr.subscribe(id, &client(1), &sql, &store.snapshot())
+        mgr.subscribe(id, Subscriber::client(client(1)), &sql, &store.snapshot())
             .unwrap();
     }
     assert_eq!(mgr.plan_count(), 1_000, "1,000 distinct plans");
@@ -302,8 +312,13 @@ fn table_watchers_fast_path_skips_untouched_tables() {
     let mut mgr = manager();
 
     // A no-equality plan lands in the table_watchers tier.
-    mgr.subscribe(1, &client(1), "SELECT * FROM Sensor", &store.snapshot())
-        .unwrap();
+    mgr.subscribe(
+        1,
+        Subscriber::client(client(1)),
+        "SELECT * FROM Sensor",
+        &store.snapshot(),
+    )
+    .unwrap();
 
     // A commit touching only `Other` produces no Sensor delta (fast path).
     let diff = commit(&store, |tx| {
@@ -329,7 +344,7 @@ fn order_by_limit_apply_to_initialdata_not_diffs() {
     let sub = mgr
         .subscribe(
             1,
-            &client(1),
+            Subscriber::client(client(1)),
             "SELECT * FROM Sensor WHERE channel = 7 ORDER BY reading DESC LIMIT 2",
             &store.snapshot(),
         )
@@ -368,7 +383,7 @@ fn spatial_initialdata_uses_the_index() {
     let sub = mgr
         .subscribe(
             1,
-            &client(1),
+            Subscriber::client(client(1)),
             "SELECT * FROM Sensor IN REGION (0, 0, 100, 100)",
             &store.snapshot(),
         )
@@ -391,14 +406,14 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     // Per-connection cap: 2 subscriptions on connection 1, third is 429.
     mgr.subscribe(
         1,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE id = 1",
         &store.snapshot(),
     )
     .unwrap();
     mgr.subscribe(
         1,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE id = 2",
         &store.snapshot(),
     )
@@ -406,7 +421,7 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     let err = mgr
         .subscribe(
             1,
-            &client(1),
+            Subscriber::client(client(1)),
             "SELECT * FROM Sensor WHERE id = 3",
             &store.snapshot(),
         )
@@ -423,7 +438,7 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     // pushes past max_compiled_plans = 3.
     mgr.subscribe(
         2,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE id = 4",
         &store.snapshot(),
     )
@@ -431,7 +446,7 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     let err = mgr
         .subscribe(
             3,
-            &client(1),
+            Subscriber::client(client(1)),
             "SELECT * FROM Sensor WHERE id = 5",
             &store.snapshot(),
         )
@@ -442,7 +457,7 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     // Subscribing to an EXISTING plan does not count against the plan cap.
     mgr.subscribe(
         2,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE id = 1",
         &store.snapshot(),
     )
@@ -460,14 +475,14 @@ fn distinct_plans_on_one_table_fan_out_independently() {
 
     mgr.subscribe(
         1,
-        &client(1),
+        Subscriber::client(client(1)),
         "SELECT * FROM Sensor WHERE channel = 7",
         &store.snapshot(),
     )
     .unwrap();
     mgr.subscribe(
         2,
-        &client(2),
+        Subscriber::client(client(2)),
         "SELECT * FROM Sensor WHERE channel = 8",
         &store.snapshot(),
     )

@@ -290,6 +290,56 @@ fn equivalent_texts_normalize_to_one_hash() {
 }
 
 #[test]
+fn owner_only_tables_compile_a_caller_parameterized_rls_slot() {
+    // A public table has no RLS slot; an owner_only table does (T4.3).
+    static OWNED_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "owner",
+            ty: FluxType::Identity,
+        },
+    ];
+    static OWNED: TableSchema = TableSchema {
+        name: "Owned",
+        columns: OWNED_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[],
+        visibility: VisibilityRule::OwnerOnly { owner: 1 },
+    };
+    let owned_schema = Schema::from_tables([&OWNED]).unwrap();
+
+    let public_plan = compile(&schema(), "SELECT * FROM ChatMessage").unwrap();
+    assert!(public_plan.rls.is_none(), "PublicAll table: no RLS slot");
+
+    let owned_plan = compile(&owned_schema, "SELECT * FROM Owned").unwrap();
+    let rls = owned_plan
+        .rls
+        .as_ref()
+        .expect("owner_only compiles an RLS slot");
+
+    // The compiled closure passes a row only for its owner identity.
+    let owner = fluxum_core::types::Identity::from_bytes([9u8; 32]);
+    let other = fluxum_core::types::Identity::from_bytes([1u8; 32]);
+    let store = MemStore::new(&owned_schema).unwrap();
+    let owned_id = store.table_id("Owned").unwrap();
+    let mut tx = store.begin();
+    tx.insert(owned_id, vec![RowValue::U64(1), RowValue::Identity(owner)])
+        .unwrap();
+    tx.commit().unwrap();
+    let snapshot = store.snapshot();
+    let row = snapshot.scan(owned_id).unwrap().next().unwrap();
+    assert!(rls(row, &owner), "owner sees their row");
+    assert!(!rls(row, &other), "another identity does not");
+}
+
+#[test]
 fn normalization_covers_spatial_order_and_limit() {
     let a = plan_of("SELECT * FROM Vehicle  WITHIN  RADIUS  25.5  OF ( 10 , -4.25 )");
     let b = plan_of("select * from Vehicle within radius 25.5 of (10, -4.25)");
