@@ -55,6 +55,7 @@ static COUNTING: ReducerDef = ReducerDef {
     handler: counting_tick,
     check_args: check_none,
     client_callable: false,
+    max_rate_per_sec: 0,
 };
 
 static TICK_60HZ: TickDef = TickDef {

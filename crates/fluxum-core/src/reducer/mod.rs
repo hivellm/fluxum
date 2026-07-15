@@ -60,6 +60,7 @@
 
 pub mod args;
 pub mod engine;
+pub mod ratelimit;
 pub mod view;
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
@@ -77,6 +78,7 @@ use crate::store::{Row, TableId, Tx};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
 pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
+pub use ratelimit::{RateLimiter, RateLimiterOptions};
 pub use view::{ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry};
 
 /// Maximum reducer-calls-reducer nesting depth (RED-005 guard).
@@ -142,6 +144,9 @@ pub struct ReducerDef {
     /// with `client_callable = true` — schedule-only reducers answer
     /// clients with a wire-ready 403 before any transaction.
     pub client_callable: bool,
+    /// `#[fluxum::reducer(max_rate = "N/s")]` (RED-050): the per-
+    /// `(Identity, reducer)` admission rate; `0` = unlimited.
+    pub max_rate_per_sec: u32,
 }
 
 inventory::collect!(ReducerDef);
@@ -160,6 +165,7 @@ struct Registered {
     handler: ReducerHandler,
     check_args: Option<ArgCheckFn>,
     client_callable: bool,
+    max_rate_per_sec: u32,
 }
 
 /// Name → reducer map (RED-006): populated at startup — from the link-time
@@ -211,16 +217,17 @@ impl ReducerRegistry {
             Box::new(def.handler),
             Some(def.check_args),
             def.client_callable,
+            def.max_rate_per_sec,
         )
     }
 
     /// Register a reducer under `name`. A duplicate name is a startup error
     /// (RED-006) — [`FluxumError::Schema`], which must abort boot. Closure
     /// registrations carry no argument check (there is no declared
-    /// signature) and are client-callable; [`ReducerRegistry::check_call`]
-    /// then validates the name only.
+    /// signature), are client-callable, and declare no rate limit;
+    /// [`ReducerRegistry::check_call`] then validates the name only.
     pub fn register(&mut self, name: impl Into<String>, handler: ReducerHandler) -> Result<()> {
-        self.insert(name.into(), handler, None, true)
+        self.insert(name.into(), handler, None, true, 0)
     }
 
     fn insert(
@@ -229,6 +236,7 @@ impl ReducerRegistry {
         handler: ReducerHandler,
         check_args: Option<ArgCheckFn>,
         client_callable: bool,
+        max_rate_per_sec: u32,
     ) -> Result<()> {
         if self.handlers.contains_key(&name) {
             return Err(FluxumError::Schema(format!(
@@ -241,6 +249,7 @@ impl ReducerRegistry {
                 handler,
                 check_args,
                 client_callable,
+                max_rate_per_sec,
             },
         );
         Ok(())
@@ -256,16 +265,14 @@ impl ReducerRegistry {
         self.handlers.keys().map(String::as_str)
     }
 
-    /// Admission check the engine runs **before** submitting to the
-    /// transaction pipeline (RED-001/RED-006/RED-025): unknown names are a
-    /// wire-ready 404, a schedule-only reducer answers clients 403, and a
-    /// `#[fluxum::reducer]`-declared signature validates arity and argument
-    /// types — all without a transaction or `TxState` ever existing.
+    /// Client-path name admission (RED-006/RED-025): unknown names are a
+    /// wire-ready 404 and a schedule-only reducer answers clients 403 — no
+    /// transaction or `TxState` ever exists. Returns the reducer's declared
+    /// `max_rate` (RED-050; `0` = unlimited) for the engine's rate check.
     ///
-    /// This is the **client** admission path; scheduled executions
-    /// ([`crate::scheduler`]) dispatch directly and are exempt from the
-    /// callability check.
-    pub fn check_call(&self, name: &str, args: &[FluxValue]) -> Result<()> {
+    /// Scheduled executions ([`crate::scheduler`]) dispatch directly and
+    /// are exempt from admission entirely.
+    pub fn admission(&self, name: &str) -> Result<u32> {
         let registered = self
             .handlers
             .get(name)
@@ -276,10 +283,28 @@ impl ReducerRegistry {
                 format!("schedule-only reducer `{name}` (RED-025)"),
             ));
         }
+        Ok(registered.max_rate_per_sec)
+    }
+
+    /// Argument admission (RED-001): a `#[fluxum::reducer]`-declared
+    /// signature validates arity and argument types before any transaction.
+    pub fn check_args(&self, name: &str, args: &[FluxValue]) -> Result<()> {
+        let registered = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| unknown_reducer(name))?;
         if let Some(check) = registered.check_args {
             check(args)?;
         }
         Ok(())
+    }
+
+    /// Full client admission minus rate limiting: name + callability +
+    /// arguments ([`ReducerRegistry::admission`] then
+    /// [`ReducerRegistry::check_args`]).
+    pub fn check_call(&self, name: &str, args: &[FluxValue]) -> Result<()> {
+        self.admission(name)?;
+        self.check_args(name, args)
     }
 
     /// Execute reducer `name` against `tx` — the root dispatch the T3.3

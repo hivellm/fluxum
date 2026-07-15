@@ -192,30 +192,35 @@ static APPEND_MARK: ReducerDef = ReducerDef {
     handler: append_mark,
     check_args: check_one_str,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 static SLOW_MARK: ReducerDef = ReducerDef {
     name: "slow_mark",
     handler: slow_mark,
     check_args: check_none,
     client_callable: false, // schedule-only (RED-025)
+    max_rate_per_sec: 0,
 };
 static SCHEDULE_THEN_FAIL: ReducerDef = ReducerDef {
     name: "schedule_then_fail",
     handler: schedule_then_fail,
     check_args: check_none,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 static SCHEDULE_OK: ReducerDef = ReducerDef {
     name: "schedule_ok",
     handler: schedule_ok,
     check_args: check_one_str,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 static REARM: ReducerDef = ReducerDef {
     name: "rearm",
     handler: rearm,
     check_args: check_none,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 
 // --- Harness -------------------------------------------------------------------
@@ -599,6 +604,7 @@ static APPEND_MARK_STATIC: ReducerDef = ReducerDef {
     handler: append_mark_static,
     check_args: check_none,
     client_callable: false,
+    max_rate_per_sec: 0,
 };
 
 #[tokio::test(flavor = "multi_thread")]

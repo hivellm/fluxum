@@ -117,12 +117,14 @@ static BUGGY: ReducerDef = ReducerDef {
     handler: buggy,
     check_args: check_none,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 static BUMP: ReducerDef = ReducerDef {
     name: "bump",
     handler: bump,
     check_args: check_none,
     client_callable: true,
+    max_rate_per_sec: 0,
 };
 
 /// Resident set size of this process in bytes.

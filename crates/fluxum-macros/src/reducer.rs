@@ -152,12 +152,33 @@ fn reject_args(args: &TokenStream, attribute: &str, extra: &str) -> syn::Result<
     ))
 }
 
+/// Parse the RED-050 `max_rate = "N/s"` declaration into calls-per-second.
+fn parse_max_rate(lit: &syn::Lit) -> syn::Result<u32> {
+    let syn::Lit::Str(s) = lit else {
+        return Err(syn::Error::new(
+            lit.span(),
+            "`max_rate` is a string like \"5/s\" (RED-050)",
+        ));
+    };
+    let value = s.value();
+    let rate = value
+        .strip_suffix("/s")
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|n| *n >= 1);
+    rate.ok_or_else(|| {
+        syn::Error::new(
+            s.span(),
+            format!("invalid max_rate \"{value}\": expected \"N/s\" with N >= 1 (RED-050)"),
+        )
+    })
+}
+
 fn try_expand_reducer(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
-    reject_args(
-        &args,
-        "reducer",
-        " yet: `max_rate` lands with T3.5 (RED-050) and `version` with RED-007",
-    )?;
+    let parsed = ScheduleArgs::parse(args, "reducer", &["max_rate"])?;
+    let max_rate = match parsed.values.get("max_rate") {
+        Some(lit) => parse_max_rate(lit)?,
+        None => 0,
+    };
     let item: ItemFn = syn::parse2(input)?;
     let params = check_shape(&item, "reducer")?;
     if matches!(item.sig.output, ReturnType::Default) {
@@ -221,6 +242,7 @@ fn try_expand_reducer(args: TokenStream, input: TokenStream) -> syn::Result<Toke
                     handler: __fluxum_handler,
                     check_args: __fluxum_check_args,
                     client_callable: true,
+                    max_rate_per_sec: #max_rate,
                 }
             }
         };
@@ -458,6 +480,7 @@ fn scheduled_reducer_submission(
                 handler: __fluxum_handler,
                 check_args: __fluxum_check_args,
                 client_callable: #client_callable,
+                max_rate_per_sec: 0u32,
             }
         }
     };
@@ -589,13 +612,45 @@ mod tests {
     }
 
     #[test]
-    fn reducer_rejects_bad_shapes() {
-        let err = expand_err(try_expand_reducer(
+    fn reducer_parses_max_rate() {
+        let out = try_expand_reducer(
             quote!(max_rate = "5/s"),
             quote! { fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
-        ));
-        assert!(err.contains("T3.5"), "{err}");
+        )
+        .unwrap()
+        .to_string();
+        assert!(out.contains("max_rate_per_sec : 5u32"), "{out}");
 
+        // Undeclared: unlimited.
+        let out = try_expand_reducer(
+            TokenStream::new(),
+            quote! { fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        )
+        .unwrap()
+        .to_string();
+        assert!(out.contains("max_rate_per_sec : 0u32"), "{out}");
+
+        for bad in [quote!(max_rate = "5/min"), quote!(max_rate = "0/s")] {
+            let err = expand_err(try_expand_reducer(
+                bad,
+                quote! { fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+            ));
+            assert!(err.contains("N/s"), "{err}");
+        }
+        let err = expand_err(try_expand_reducer(
+            quote!(max_rate = 5),
+            quote! { fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        ));
+        assert!(err.contains("string like"), "{err}");
+        let err = expand_err(try_expand_reducer(
+            quote!(version = 2),
+            quote! { fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        ));
+        assert!(err.contains("unknown #[fluxum::reducer] argument"), "{err}");
+    }
+
+    #[test]
+    fn reducer_rejects_bad_shapes() {
         let err = expand_err(try_expand_reducer(
             TokenStream::new(),
             quote! { async fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },

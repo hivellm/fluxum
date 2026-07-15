@@ -6,7 +6,7 @@
 - [x] 1.5 Recurring anti-drift: intended-time rebase (1 s schedule with 300 ms handler fires at t+1s, t+2s, t+3s); stalled handler rebases to present without catch-up burst (RED-024) — `next = intended + period`, rebased to `now + period` only when already past; 500 ms/250 ms handler test pins ~500 ms cadence (vs 750 ms drifting)
 - [x] 1.6 Scheduled execution context: server identity + ConnectionId(0); schedule-only reducers reject client ReducerCalls with 403 unless client_callable = true (RED-025) — `ReducerDef.client_callable` + `check_call` 403 + new wire code `codes::FORBIDDEN`; context witnessed in fired rows
 - [x] 1.7 Verification (DAG exit test): tick-drift timing tests (60 Hz over 10 s = 600 +/- 1 executions, no cumulative drift); self-rescheduling example runs 10+ consecutive cycles — `tick_drift.rs` (600±1 real-time with host-stall retry) + `schedule_deferred.rs` (7 tests incl. 10-cycle re-arm chain)
-- [ ] 1.8 Gate G3 input: tick-drift suite green — tick after green 3-OS CI
+- [ ] 1.8 Gate G3 input: tick-drift suite green — full workspace suite green locally; CI validation pending (GitHub Actions quota exhausted this month — the 99f5ea9 run's jobs refused to start on billing); tick on the first green run after quota/billing recovers
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
 - [x] 2.1 Update or create documentation covering the implementation (module docs on `crate::scheduler` incl. OQ-4 decision and semantics; macro rustdoc for `#[tick]`/`#[schedule]`)

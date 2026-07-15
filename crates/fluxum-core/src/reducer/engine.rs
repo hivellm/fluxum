@@ -31,6 +31,7 @@ use crate::error::Result;
 use crate::txn::{CommitReceipt, TxPipeline};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
+use super::ratelimit::{RateLimiter, RateLimiterOptions};
 use super::{FluxValue, ReducerCaller, ReducerContext, ReducerRegistry, with_context};
 
 /// Which lifecycle moment a hook is registered for (SPEC-004 §3).
@@ -149,6 +150,7 @@ pub struct ReducerEngine {
     pipeline: TxPipeline,
     shard_id: u32,
     server_identity: Identity,
+    rate_limiter: RateLimiter,
 }
 
 impl ReducerEngine {
@@ -156,7 +158,10 @@ impl ReducerEngine {
     ///
     /// `server_identity` is the SPEC-009 §8 database identity lifecycle and
     /// scheduled executions run under (RED-025);
-    /// [`crate::auth::server_identity`] derives it.
+    /// [`crate::auth::server_identity`] derives it. Rate limiting starts
+    /// with [`RateLimiterOptions::default`] and only the shard's own server
+    /// identity exempt — [`ReducerEngine::with_rate_limiter`] installs the
+    /// assembly's limiter (server-peer exemptions, configured shard cap).
     pub fn new(
         pipeline: TxPipeline,
         registry: Arc<ReducerRegistry>,
@@ -170,7 +175,17 @@ impl ReducerEngine {
             pipeline,
             shard_id,
             server_identity,
+            rate_limiter: RateLimiter::new(RateLimiterOptions::default(), [server_identity]),
         }
+    }
+
+    /// Replace the admission rate limiter (RED-050..RED-052) — the server
+    /// assembly wires the configured `shard_max_reducers_per_sec` and the
+    /// AUTH-062 server-peer exemptions through here.
+    #[must_use]
+    pub fn with_rate_limiter(mut self, rate_limiter: RateLimiter) -> Self {
+        self.rate_limiter = rate_limiter;
+        self
     }
 
     /// The engine's reducer registry (dispatch and admission share it).
@@ -251,18 +266,22 @@ impl ReducerEngine {
     /// Execute reducer `name` for `caller` (FR-20).
     ///
     /// Admission runs first, with no transaction: an unregistered name is a
-    /// 404 (RED-006) and — for `#[fluxum::reducer]`-declared signatures —
-    /// an argument count or type mismatch is a 400 (RED-001). Admitted
-    /// calls execute on the shard's single writer; `Err` or panic rolls
-    /// back with no commit-log entry and no subscription events, and the
-    /// shard keeps serving (RED-004, RED-061).
+    /// 404 (RED-006), a schedule-only reducer is a 403 (RED-025), a
+    /// rate-limited caller is a 429 — or 503 past the shard cap — with zero
+    /// storage cost (RED-050/RED-052), and — for `#[fluxum::reducer]`-
+    /// declared signatures — an argument count or type mismatch is a 400
+    /// (RED-001). Admitted calls execute on the shard's single writer;
+    /// `Err` or panic rolls back with no commit-log entry and no
+    /// subscription events, and the shard keeps serving (RED-004, RED-061).
     pub async fn call(
         &self,
         caller: ReducerCaller,
         name: &str,
         args: Vec<FluxValue>,
     ) -> Result<CommitReceipt> {
-        self.registry.check_call(name, &args)?;
+        let max_rate = self.registry.admission(name)?;
+        self.rate_limiter.check(&caller.identity, name, max_rate)?;
+        self.registry.check_args(name, &args)?;
         let registry = Arc::clone(&self.registry);
         let name = name.to_owned();
         self.pipeline

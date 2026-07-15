@@ -121,6 +121,11 @@ pub fn migration(args: TokenStream, input: TokenStream) -> TokenStream {
 /// message to the caller (RED-060); a panic is caught by the engine,
 /// rolls back identically, and never takes the shard down (RED-061).
 ///
+/// `#[fluxum::reducer(max_rate = "N/s")]` declares a per-`(Identity,
+/// reducer)` token-bucket rate limit (RED-050): calls beyond N per second
+/// are rejected with a wire-ready 429 before any `TxState` exists.
+/// Server-to-server identities are exempt (AUTH-062).
+///
 /// # Example
 ///
 /// ```ignore
