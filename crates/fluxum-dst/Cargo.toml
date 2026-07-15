@@ -1,0 +1,15 @@
+[package]
+name = "fluxum-dst"
+description = "Deterministic simulation testing (DST) harness for the Fluxum storage/commitlog engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluxum-core.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[lints]
+workspace = true

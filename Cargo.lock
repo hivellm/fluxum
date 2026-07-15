@@ -351,6 +351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxum-dst"
+version = "0.1.0"
+dependencies = [
+ "fluxum-core",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fluxum-macros"
 version = "0.1.0"
 dependencies = [
