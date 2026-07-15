@@ -1,0 +1,5 @@
+error: #[derive(FluxType)] on a struct requires named fields (SPEC-023 DMX-030)
+ --> tests/ui/fail/derive_tuple_struct.rs:6:17
+  |
+6 | pub struct Point(i32, i32);
+  |                 ^^^^^^^^^^

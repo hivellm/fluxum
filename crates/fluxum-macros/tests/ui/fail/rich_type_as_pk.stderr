@@ -1,0 +1,5 @@
+error: column `kind` is a `#[derive(FluxType)]` enum/struct and cannot be a primary key, partition key, unique constraint, or index key — rich types support equality only (SPEC-023 DMX-031)
+  --> tests/ui/fail/rich_type_as_pk.rs:15:9
+   |
+15 |     pub kind: Kind,
+   |         ^^^^

@@ -189,6 +189,20 @@ pub(crate) fn encode_value(value: &RowValue, out: &mut Vec<u8>) {
             }
             out.push(0x00);
         }
+        // Enum/Struct are not valid B-tree/PK keys (rejected at macro
+        // expansion, SPEC-023 DMX-031 / `FluxType::is_keyable`); these arms
+        // exist only for match totality and emit a deterministic form.
+        RowValue::Enum { tag, payload } => {
+            out.extend_from_slice(&tag.to_be_bytes());
+            for item in payload {
+                encode_value(item, out);
+            }
+        }
+        RowValue::Struct(fields) => {
+            for item in fields {
+                encode_value(item, out);
+            }
+        }
     }
 }
 

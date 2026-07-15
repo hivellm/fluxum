@@ -177,6 +177,17 @@ pub enum LogValue {
     Opt(Option<Box<LogValue>>),
     /// `Vec<T>` column.
     List(Vec<LogValue>),
+    /// A `#[derive(FluxType)]` enum value (SPEC-023 DMX-030): variant tag +
+    /// payload.
+    Enum {
+        /// Variant ordinal (the FluxBIN `u8` tag, widened for storage).
+        tag: u32,
+        /// Payload values in the variant's declaration order.
+        payload: Vec<LogValue>,
+    },
+    /// A `#[derive(FluxType)]` nested-struct value (SPEC-023 DMX-030): field
+    /// values in declaration order.
+    Struct(Vec<LogValue>),
 }
 
 impl From<&RowValue> for LogValue {
@@ -209,6 +220,11 @@ impl From<&RowValue> for LogValue {
                 Self::Opt(v.as_ref().map(|inner| Box::new(Self::from(inner.as_ref()))))
             }
             RowValue::List(items) => Self::List(items.iter().map(Self::from).collect()),
+            RowValue::Enum { tag, payload } => Self::Enum {
+                tag: *tag,
+                payload: payload.iter().map(Self::from).collect(),
+            },
+            RowValue::Struct(fields) => Self::Struct(fields.iter().map(Self::from).collect()),
         }
     }
 }
@@ -269,6 +285,19 @@ impl LogValue {
                     .map(Self::to_row_value)
                     .collect::<Result<Vec<_>>>()?,
             ),
+            Self::Enum { tag, payload } => RowValue::Enum {
+                tag: *tag,
+                payload: payload
+                    .iter()
+                    .map(Self::to_row_value)
+                    .collect::<Result<Vec<_>>>()?,
+            },
+            Self::Struct(fields) => RowValue::Struct(
+                fields
+                    .iter()
+                    .map(Self::to_row_value)
+                    .collect::<Result<Vec<_>>>()?,
+            ),
         })
     }
 }
@@ -301,6 +330,16 @@ mod tests {
             RowValue::Optional(None),
             RowValue::Optional(Some(Box::new(RowValue::Str("inner".into())))),
             RowValue::List(vec![RowValue::U16(1), RowValue::U16(2)]),
+            // Rich types (SPEC-023 DMX-030): enum (payload + unit) and struct.
+            RowValue::Enum {
+                tag: 3,
+                payload: vec![RowValue::U16(7), RowValue::Str("x".into())],
+            },
+            RowValue::Enum {
+                tag: 0,
+                payload: vec![],
+            },
+            RowValue::Struct(vec![RowValue::I32(-1), RowValue::Bool(true)]),
         ]
     }
 

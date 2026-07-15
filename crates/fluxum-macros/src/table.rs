@@ -32,10 +32,10 @@ pub fn expand(args: TokenStream, input: TokenStream) -> TokenStream {
 // Model
 // ---------------------------------------------------------------------------
 
-/// Column type from the closed SPEC-001 §3 universe (mirror of
-/// `fluxum_core::schema::FluxType`, macro-side).
-#[derive(Clone, PartialEq, Eq)]
-enum FluxTy {
+/// Column type from the SPEC-001 §3 universe plus `#[derive(FluxType)]` rich
+/// types (mirror of `fluxum_core::schema::FluxType`, macro-side).
+#[derive(Clone)]
+pub(crate) enum FluxTy {
     Bool,
     I8,
     I16,
@@ -56,6 +56,9 @@ enum FluxTy {
     Decimal,
     Opt(Box<FluxTy>),
     List(Box<FluxTy>),
+    /// A `#[derive(FluxType)]` enum or nested struct used as a column
+    /// (SPEC-023 DMX-030); the payload is the field's Rust type.
+    Derived(Box<Type>),
 }
 
 impl FluxTy {
@@ -65,7 +68,7 @@ impl FluxTy {
 
     /// Tokens constructing the matching `fluxum_core::schema::FluxType`
     /// value in const context (nested references rely on static promotion).
-    fn tokens(&self) -> TokenStream {
+    pub(crate) fn tokens(&self) -> TokenStream {
         let path = quote!(::fluxum_core::schema::FluxType);
         match self {
             Self::Bool => quote!(#path::Bool),
@@ -93,6 +96,9 @@ impl FluxTy {
             Self::List(inner) => {
                 let inner = inner.tokens();
                 quote!(#path::List(&#inner))
+            }
+            Self::Derived(ty) => {
+                quote!(<#ty as ::fluxum_core::schema::FluxTypeDef>::FLUX_TYPE)
             }
         }
     }
@@ -452,7 +458,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                     "`#[auto_inc]` is only valid on the `#[primary_key]` field (DM-004)",
                 ));
             }
-            if col.flux != FluxTy::U64 {
+            if !matches!(col.flux, FluxTy::U64) {
                 return Err(syn::Error::new(
                     span,
                     "`#[auto_inc]` requires the primary-key column to be `u64` (DM-004)",
@@ -507,7 +513,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 // order-preserving memcomparable encoding across mixed scales
                 // is deferred (SPEC-017 CT-020).
                 for (col, ord) in decl.columns.iter().zip(&ords) {
-                    if columns[usize::from(*ord)].flux == FluxTy::Decimal {
+                    if matches!(columns[usize::from(*ord)].flux, FluxTy::Decimal) {
                         return Err(syn::Error::new(
                             col.span(),
                             format!(
@@ -573,6 +579,33 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         index_tokens.push(tokens);
     }
 
+    // -- rich-type key rejection (SPEC-023 DMX-031) ----------------------------
+    // Enum/struct columns support equality only; they cannot be a primary key,
+    // partition key, unique constraint, or B-tree index key (no derivable
+    // memcomparable ordering).
+    let mut key_ordinals: Vec<u16> = pk_ordinals.clone();
+    key_ordinals.extend(unique_ordinals.iter().flatten().copied());
+    key_ordinals.extend(partition_ordinal);
+    for (tag, ords) in &index_keys {
+        if *tag == "btree" {
+            key_ordinals.extend(ords.iter().copied());
+        }
+    }
+    for ord in key_ordinals {
+        let col = &columns[usize::from(ord)];
+        if matches!(col.flux, FluxTy::Derived(_)) {
+            return Err(syn::Error::new(
+                col.ident.span(),
+                format!(
+                    "column `{}` is a `#[derive(FluxType)]` enum/struct and cannot be a primary \
+                     key, partition key, unique constraint, or index key — rich types support \
+                     equality only (SPEC-023 DMX-031)",
+                    col.ident
+                ),
+            ));
+        }
+    }
+
     // -- visibility -------------------------------------------------------------
     let visibility_tokens = match &visibility {
         None => quote!(::fluxum_core::schema::VisibilityRule::PublicAll),
@@ -588,7 +621,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         }
         Some(Visibility::OwnerOnly(col)) => {
             let ord = ordinal_of(col, "`#[visibility(owner_only(...))]` (DM-060)")?;
-            if columns[usize::from(ord)].flux != FluxTy::Identity {
+            if !matches!(columns[usize::from(ord)].flux, FluxTy::Identity) {
                 return Err(syn::Error::new(
                     col.span(),
                     format!("`owner_only` column `{col}` must be of type `Identity` (DM-060)"),
@@ -919,14 +952,15 @@ fn parse_visibility(attr: &Attribute) -> syn::Result<Visibility> {
 
 /// Map a field type to the closed column type universe; anything else —
 /// including maps and nested table structs — is a compile error (DM-012).
-fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
+pub(crate) fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
     let unsupported = || {
         syn::Error::new(
             ty.span(),
             format!(
-                "unsupported column type `{}`: column types are the closed SPEC-001 §3 \
-                 universe (bool, i8..i64, u8..u64, f32/f64, String, Vec<u8>, Identity, \
-                 ConnectionId, EntityId, Timestamp, Option<T>, Vec<T>) (DM-010..DM-012)",
+                "unsupported column type `{}`: column types are the SPEC-001 §3 universe \
+                 (bool, i8..i64, u8..u64, f32/f64, String, Vec<u8>, Identity, ConnectionId, \
+                 EntityId, Timestamp, Option<T>, Vec<T>) or a `#[derive(FluxType)]` enum/struct \
+                 (SPEC-023 DMX-030)",
                 ty.to_token_stream()
             ),
         )
@@ -971,7 +1005,7 @@ fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
         "Vec" => {
             let inner = generic_inner(&segment.arguments).ok_or_else(unsupported)?;
             let inner = parse_flux_type(inner)?;
-            if inner == FluxTy::U8 {
+            if matches!(inner, FluxTy::U8) {
                 Ok(FluxTy::Bytes)
             } else {
                 Ok(FluxTy::List(Box::new(inner)))
@@ -986,7 +1020,11 @@ fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
             "map types are not valid column types (DM-012): model the relationship with \
              a separate table keyed by an EntityId/u64 column",
         )),
-        _ => Err(unsupported()),
+        // Any other path type is taken to be a `#[derive(FluxType)]` enum or
+        // nested struct (SPEC-023 DMX-030); generated code carries a
+        // `FluxTypeDef` bound, so a type that does not derive it fails with a
+        // clear trait-bound error at the use site.
+        _ => Ok(FluxTy::Derived(Box::new(ty.clone()))),
     }
 }
 
@@ -997,7 +1035,7 @@ fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
 /// An expression converting `expr` (a field value of type `flux`, by value)
 /// into the matching `fluxum_core::store::RowValue` variant. Recursive for
 /// `Option<T>` / `Vec<T>`.
-fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
+pub(crate) fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
     let rv = quote!(::fluxum_core::store::RowValue);
     match flux {
         FluxTy::Bool => quote!(#rv::Bool(#expr)),
@@ -1035,6 +1073,9 @@ fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
                 #rv::List(#expr.into_iter().map(|__fx_item| #inner).collect())
             }
         }
+        FluxTy::Derived(_) => {
+            quote!(::fluxum_core::schema::FluxTypeDef::to_row_value(#expr))
+        }
     }
 }
 
@@ -1043,7 +1084,12 @@ fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
 /// row. A variant mismatch `return`s a descriptive `FluxumError::Storage`
 /// from the enclosing `from_values` — unreachable for rows the store
 /// accepted, but never a panic (RED-061 keeps the reducer path unwind-free).
-fn from_row_value(flux: &FluxTy, src: TokenStream, table: &str, column: &str) -> TokenStream {
+pub(crate) fn from_row_value(
+    flux: &FluxTy,
+    src: TokenStream,
+    table: &str,
+    column: &str,
+) -> TokenStream {
     let rv = quote!(::fluxum_core::store::RowValue);
     let mismatch = quote! {
         return ::core::result::Result::Err(::fluxum_core::FluxumError::Storage(
@@ -1113,6 +1159,14 @@ fn from_row_value(flux: &FluxTy, src: TokenStream, table: &str, column: &str) ->
                         __fx_out
                     }
                     _ => #mismatch,
+                }
+            }
+        }
+        FluxTy::Derived(ty) => {
+            quote! {
+                match <#ty as ::fluxum_core::schema::FluxTypeDef>::from_row_value(#src) {
+                    ::core::result::Result::Ok(__fx_v) => __fx_v,
+                    ::core::result::Result::Err(_) => #mismatch,
                 }
             }
         }

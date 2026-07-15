@@ -66,6 +66,17 @@ pub enum RowValue {
     Optional(Option<Box<RowValue>>),
     /// `Vec<T>` column (DM-012).
     List(Vec<RowValue>),
+    /// A `#[derive(FluxType)]` tagged-union value (SPEC-023 DMX-030): the
+    /// variant ordinal (FluxBIN `u8` tag) plus its payload values.
+    Enum {
+        /// Variant ordinal — the FluxBIN tag; must fit in a `u8`.
+        tag: u32,
+        /// Payload values in the variant's declaration order.
+        payload: Vec<RowValue>,
+    },
+    /// A `#[derive(FluxType)]` nested-struct value (SPEC-023 DMX-030): field
+    /// values in declaration order.
+    Struct(Vec<RowValue>),
 }
 
 impl RowValue {
@@ -96,6 +107,25 @@ impl RowValue {
             }
             (Self::List(items), FluxType::List(inner_ty)) => {
                 items.iter().all(|item| item.matches_type(inner_ty))
+            }
+            (Self::Enum { tag, payload }, FluxType::Enum(schema)) => {
+                match schema.variants.get(*tag as usize) {
+                    Some(variant) => {
+                        variant.payload.len() == payload.len()
+                            && payload
+                                .iter()
+                                .zip(variant.payload)
+                                .all(|(value, ty)| value.matches_type(ty))
+                    }
+                    None => false,
+                }
+            }
+            (Self::Struct(fields), FluxType::Struct(schema)) => {
+                schema.fields.len() == fields.len()
+                    && fields
+                        .iter()
+                        .zip(schema.fields)
+                        .all(|(value, field)| value.matches_type(&field.ty))
             }
             _ => false,
         }
@@ -139,6 +169,22 @@ impl RowValue {
                     item.encode(w)?;
                 }
             }
+            Self::Enum { tag, payload } => {
+                let tag = u8::try_from(*tag).map_err(|_| {
+                    FluxumError::Storage(format!(
+                        "enum variant tag {tag} exceeds the u8 FluxBIN tag width"
+                    ))
+                })?;
+                w.write_u8(tag);
+                for item in payload {
+                    item.encode(w)?;
+                }
+            }
+            Self::Struct(fields) => {
+                for item in fields {
+                    item.encode(w)?;
+                }
+            }
         }
         Ok(())
     }
@@ -176,6 +222,30 @@ impl fmt::Display for RowValue {
                     write!(f, "{item}")?;
                 }
                 write!(f, "]")
+            }
+            Self::Enum { tag, payload } => {
+                write!(f, "#{tag}")?;
+                if !payload.is_empty() {
+                    write!(f, "(")?;
+                    for (i, item) in payload.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{item}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            Self::Struct(fields) => {
+                write!(f, "{{")?;
+                for (i, item) in fields.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{item}")?;
+                }
+                write!(f, "}}")
             }
         }
     }
@@ -387,6 +457,31 @@ fn decode_value(r: &mut FluxBinReader<'_>, ty: &FluxType) -> Result<RowValue> {
             }
             RowValue::List(items)
         }
+        FluxType::Enum(schema) => {
+            let tag = r.read_u8().map_err(map)?;
+            let variant = schema.variants.get(usize::from(tag)).ok_or_else(|| {
+                FluxumError::Storage(format!(
+                    "enum `{}`: variant tag {tag} out of range (0..{})",
+                    schema.name,
+                    schema.variants.len()
+                ))
+            })?;
+            let mut payload = Vec::with_capacity(variant.payload.len());
+            for ty in variant.payload {
+                payload.push(decode_value(r, ty)?);
+            }
+            RowValue::Enum {
+                tag: u32::from(tag),
+                payload,
+            }
+        }
+        FluxType::Struct(schema) => {
+            let mut fields = Vec::with_capacity(schema.fields.len());
+            for field in schema.fields {
+                fields.push(decode_value(r, &field.ty)?);
+            }
+            RowValue::Struct(fields)
+        }
     })
 }
 
@@ -405,7 +500,7 @@ pub(crate) fn display_pk_of_row(schema: &TableSchema, values: &[RowValue]) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::ColumnSchema;
+    use crate::schema::{ColumnSchema, EnumSchema, FieldSchema, StructSchema, VariantSchema};
 
     static SENSOR_COLS: &[ColumnSchema] = &[
         ColumnSchema {
@@ -723,5 +818,158 @@ mod tests {
             Ok(_) => panic!("ordinal 9 must be out of range"),
         };
         assert!(err.contains("ordinal 9 out of range"), "{err}");
+    }
+
+    // --- Rich column types: enum + nested struct (SPEC-023 DMX-030) ----------
+
+    static PRIORITY_VARIANTS: &[VariantSchema] = &[
+        VariantSchema {
+            name: "Low",
+            payload: &[],
+        },
+        VariantSchema {
+            name: "At",
+            payload: &[FluxType::Timestamp],
+        },
+        VariantSchema {
+            name: "Ranked",
+            payload: &[FluxType::U16, FluxType::Str],
+        },
+    ];
+    static PRIORITY_ENUM: EnumSchema = EnumSchema {
+        name: "Priority",
+        variants: PRIORITY_VARIANTS,
+    };
+    static POINT_FIELDS: &[FieldSchema] = &[
+        FieldSchema {
+            name: "x",
+            ty: FluxType::I32,
+        },
+        FieldSchema {
+            name: "y",
+            ty: FluxType::I32,
+        },
+    ];
+    static POINT_STRUCT: StructSchema = StructSchema {
+        name: "Point",
+        fields: POINT_FIELDS,
+    };
+    static RICH_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "priority",
+            ty: FluxType::Enum(&PRIORITY_ENUM),
+        },
+        ColumnSchema {
+            name: "origin",
+            ty: FluxType::Struct(&POINT_STRUCT),
+        },
+    ];
+    static RICH: TableSchema = TableSchema {
+        name: "Rich",
+        columns: RICH_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: crate::schema::TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[],
+        visibility: crate::schema::VisibilityRule::PublicAll,
+    };
+
+    #[test]
+    fn rich_types_round_trip_byte_exact_through_fluxbin() {
+        // Payload-carrying variant (Ranked) + nested struct.
+        let row = vec![
+            RowValue::U64(1),
+            RowValue::Enum {
+                tag: 2,
+                payload: vec![RowValue::U16(5), RowValue::Str("hi".into())],
+            },
+            RowValue::Struct(vec![RowValue::I32(-3), RowValue::I32(4)]),
+        ];
+        check_row(&RICH, &row).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = encode_row(&row).unwrap_or_else(|e| panic!("{e}"));
+        // u64 (8) + tag(1) + u16(2) + str(4 len + 2) + i32(4) + i32(4).
+        assert_eq!(bytes.len(), 8 + 1 + 2 + 6 + 4 + 4);
+        let decoded = decode_row(&RICH, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(decoded.values(), &row[..]);
+
+        // Unit variant (tag 0) with empty payload also round-trips.
+        let unit = vec![
+            RowValue::U64(2),
+            RowValue::Enum {
+                tag: 0,
+                payload: vec![],
+            },
+            RowValue::Struct(vec![RowValue::I32(0), RowValue::I32(0)]),
+        ];
+        let unit_bytes = encode_row(&unit).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            decode_row(&RICH, &unit_bytes)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .values(),
+            &unit[..]
+        );
+    }
+
+    #[test]
+    fn rich_types_type_checking_and_limits() {
+        // Tag out of the declared variant range is rejected.
+        let bad_tag = vec![
+            RowValue::U64(1),
+            RowValue::Enum {
+                tag: 9,
+                payload: vec![],
+            },
+            RowValue::Struct(vec![RowValue::I32(0), RowValue::I32(0)]),
+        ];
+        assert!(check_row(&RICH, &bad_tag).is_err());
+
+        // Wrong payload shape for the variant is rejected.
+        let bad_payload = vec![
+            RowValue::U64(1),
+            RowValue::Enum {
+                tag: 1, // At(Timestamp)
+                payload: vec![RowValue::U16(0)],
+            },
+            RowValue::Struct(vec![RowValue::I32(0), RowValue::I32(0)]),
+        ];
+        assert!(check_row(&RICH, &bad_payload).is_err());
+
+        // Wrong struct arity is rejected.
+        let bad_struct = vec![
+            RowValue::U64(1),
+            RowValue::Enum {
+                tag: 0,
+                payload: vec![],
+            },
+            RowValue::Struct(vec![RowValue::I32(0)]),
+        ];
+        assert!(check_row(&RICH, &bad_struct).is_err());
+
+        // A variant tag exceeding the u8 FluxBIN width fails to encode.
+        assert!(
+            encode_row(&[RowValue::Enum {
+                tag: 300,
+                payload: vec![],
+            }])
+            .is_err()
+        );
+
+        // Display never panics and renders both shapes.
+        let enum_display = RowValue::Enum {
+            tag: 1,
+            payload: vec![RowValue::Timestamp(Timestamp::from_micros(5))],
+        }
+        .to_string();
+        assert!(!enum_display.is_empty());
+        assert_eq!(
+            RowValue::Struct(vec![RowValue::I32(1), RowValue::I32(2)]).to_string(),
+            "{1, 2}"
+        );
     }
 }

@@ -111,6 +111,12 @@ pub enum FluxType {
     Option(&'static FluxType),
     /// `Vec<T>` — homogeneous list (DM-012).
     List(&'static FluxType),
+    /// A `#[derive(FluxType)]` tagged union (SPEC-023 DMX-030). FluxBIN:
+    /// a `u8` variant tag (the ordinal) followed by the variant's payload.
+    Enum(&'static EnumSchema),
+    /// A `#[derive(FluxType)]` nested struct (SPEC-023 DMX-030). FluxBIN:
+    /// its field values in declaration order, with no tag.
+    Struct(&'static StructSchema),
 }
 
 impl FluxType {
@@ -119,6 +125,71 @@ impl FluxType {
     pub const fn is_float(&self) -> bool {
         matches!(self, Self::F32 | Self::F64)
     }
+
+    /// Whether this type can serve as a B-tree / primary key or spatial key.
+    /// Rich types (enum/struct) and the variable/nested types are excluded —
+    /// index/PK support is limited to the derivable memcomparable encoding
+    /// (SPEC-023 DMX-031).
+    pub const fn is_keyable(&self) -> bool {
+        !matches!(
+            self,
+            Self::Enum(_) | Self::Struct(_) | Self::List(_) | Self::Option(_) | Self::Bytes
+        )
+    }
+}
+
+/// A derived tagged-union column type (SPEC-023 DMX-030). Variants are in
+/// declaration order; the FluxBIN tag is the variant ordinal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumSchema {
+    /// Enum type name.
+    pub name: &'static str,
+    /// Variants in declaration order (the FluxBIN tag equals the index).
+    pub variants: &'static [VariantSchema],
+}
+
+/// One variant of an [`EnumSchema`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VariantSchema {
+    /// Variant name.
+    pub name: &'static str,
+    /// Payload field types in declaration order; empty for a unit variant.
+    pub payload: &'static [FluxType],
+}
+
+/// A derived nested-struct column type (SPEC-023 DMX-030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StructSchema {
+    /// Struct type name.
+    pub name: &'static str,
+    /// Fields in declaration order.
+    pub fields: &'static [FieldSchema],
+}
+
+/// One field of a [`StructSchema`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldSchema {
+    /// Field name.
+    pub name: &'static str,
+    /// Field column type.
+    pub ty: FluxType,
+}
+
+/// A type usable as a rich column via `#[derive(FluxType)]` (SPEC-023
+/// DMX-030): tagged-union enums and nested structs. Generated code bridges
+/// the typed value and the dynamic [`RowValue`] the store holds — the trait
+/// never sees bytes (FluxBIN stays on the storage side, like [`Table`]).
+pub trait FluxTypeDef: Sized {
+    /// The column-type descriptor — an [`FluxType::Enum`] or
+    /// [`FluxType::Struct`].
+    const FLUX_TYPE: FluxType;
+
+    /// Convert into the dynamic row representation (consumes the value).
+    fn to_row_value(self) -> RowValue;
+
+    /// Rebuild from the dynamic row representation; errors on a shape or
+    /// variant mismatch, never panics (RED-061).
+    fn from_row_value(value: &RowValue) -> Result<Self>;
 }
 
 /// A secondary index declaration (DM-030…DM-032).

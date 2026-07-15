@@ -59,6 +59,29 @@ pub enum StoredType {
     Option(Box<StoredType>),
     /// `Vec<T>`.
     List(Box<StoredType>),
+    /// A `#[derive(FluxType)]` tagged union (SPEC-023 DMX-030).
+    Enum {
+        /// Enum type name.
+        name: String,
+        /// Variants in declaration order.
+        variants: Vec<StoredVariant>,
+    },
+    /// A `#[derive(FluxType)]` nested struct (SPEC-023 DMX-030).
+    Struct {
+        /// Struct type name.
+        name: String,
+        /// Fields in declaration order.
+        fields: Vec<StoredColumn>,
+    },
+}
+
+/// One variant of a stored [`StoredType::Enum`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredVariant {
+    /// Variant name.
+    pub name: String,
+    /// Payload field types in declaration order; empty for a unit variant.
+    pub payload: Vec<StoredType>,
 }
 
 impl From<&FluxType> for StoredType {
@@ -84,6 +107,28 @@ impl From<&FluxType> for StoredType {
             FluxType::Decimal => Self::Decimal,
             FluxType::Option(inner) => Self::Option(Box::new(Self::from(*inner))),
             FluxType::List(inner) => Self::List(Box::new(Self::from(*inner))),
+            FluxType::Enum(schema) => Self::Enum {
+                name: schema.name.to_owned(),
+                variants: schema
+                    .variants
+                    .iter()
+                    .map(|v| StoredVariant {
+                        name: v.name.to_owned(),
+                        payload: v.payload.iter().map(Self::from).collect(),
+                    })
+                    .collect(),
+            },
+            FluxType::Struct(schema) => Self::Struct {
+                name: schema.name.to_owned(),
+                fields: schema
+                    .fields
+                    .iter()
+                    .map(|f| StoredColumn {
+                        name: f.name.to_owned(),
+                        ty: Self::from(&f.ty),
+                    })
+                    .collect(),
+            },
         }
     }
 }
@@ -323,6 +368,68 @@ mod tests {
         assert_eq!(
             StoredType::from(&FluxType::List(&FluxType::Bool)),
             StoredType::List(Box::new(StoredType::Bool))
+        );
+
+        // Rich types (SPEC-023 DMX-030) map to structured stored shapes.
+        static POINT_FIELDS: &[crate::schema::FieldSchema] = &[
+            crate::schema::FieldSchema {
+                name: "x",
+                ty: FluxType::I32,
+            },
+            crate::schema::FieldSchema {
+                name: "y",
+                ty: FluxType::I32,
+            },
+        ];
+        static POINT: crate::schema::StructSchema = crate::schema::StructSchema {
+            name: "Point",
+            fields: POINT_FIELDS,
+        };
+        static STATUS_VARIANTS: &[crate::schema::VariantSchema] = &[
+            crate::schema::VariantSchema {
+                name: "Todo",
+                payload: &[],
+            },
+            crate::schema::VariantSchema {
+                name: "Done",
+                payload: &[FluxType::Identity],
+            },
+        ];
+        static STATUS: crate::schema::EnumSchema = crate::schema::EnumSchema {
+            name: "Status",
+            variants: STATUS_VARIANTS,
+        };
+        assert_eq!(
+            StoredType::from(&FluxType::Struct(&POINT)),
+            StoredType::Struct {
+                name: "Point".into(),
+                fields: vec![
+                    StoredColumn {
+                        name: "x".into(),
+                        ty: StoredType::I32,
+                    },
+                    StoredColumn {
+                        name: "y".into(),
+                        ty: StoredType::I32,
+                    },
+                ],
+            }
+        );
+        assert_eq!(
+            StoredType::from(&FluxType::Enum(&STATUS)),
+            StoredType::Enum {
+                name: "Status".into(),
+                variants: vec![
+                    StoredVariant {
+                        name: "Todo".into(),
+                        payload: vec![],
+                    },
+                    StoredVariant {
+                        name: "Done".into(),
+                        payload: vec![StoredType::Identity],
+                    },
+                ],
+            }
         );
     }
 

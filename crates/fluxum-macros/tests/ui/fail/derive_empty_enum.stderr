@@ -1,0 +1,5 @@
+error: #[derive(FluxType)] enum must have at least one variant (SPEC-023 DMX-030)
+ --> tests/ui/fail/derive_empty_enum.rs:6:5
+  |
+6 | pub enum Empty {}
+  |     ^^^^

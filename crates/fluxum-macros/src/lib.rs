@@ -9,6 +9,7 @@
 
 use proc_macro::TokenStream;
 
+mod flux_type;
 mod migration;
 mod reducer;
 mod table;
@@ -50,11 +51,11 @@ mod table;
 /// | `#[spatial(rtree(a, b, c, d))]` | R-tree spatial index over four `f32`/`f64` columns (DM-032) |
 /// | `#[visibility(rule)]` | `owner_only(col)` \| `public_all` \| `shard_local` \| `custom(f)` (DM-060/061) |
 ///
-/// Column types are the closed universe of SPEC-001 §3: `bool`, the sized
-/// ints, `f32`/`f64`, `String`, `Vec<u8>`, `Identity`, `ConnectionId`,
-/// `EntityId`, `Timestamp`, plus `Option<T>` and `Vec<T>` over those. Any
-/// other type — including maps and nested table structs — is a compile
-/// error (DM-012).
+/// Column types are the SPEC-001 §3 universe: `bool`, the sized ints,
+/// `f32`/`f64`, `String`, `Vec<u8>`, `Identity`, `ConnectionId`, `EntityId`,
+/// `Timestamp`, `Decimal`, plus `Option<T>` and `Vec<T>` over those — and any
+/// `#[derive(FluxType)]` enum or nested struct (SPEC-023 DMX-030). Maps are a
+/// compile error (DM-012); model relationships with a keyed table.
 ///
 /// # Example
 ///
@@ -75,6 +76,38 @@ mod table;
 #[proc_macro_attribute]
 pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
     table::expand(args.into(), input.into()).into()
+}
+
+/// Derives a rich column type — a tagged-union enum or nested struct — usable
+/// as a `#[fluxum::table]` column (SPEC-023 DMX-030).
+///
+/// The type's fields (or each variant's payload) must themselves be column
+/// types: the SPEC-001 §3 universe or other `#[derive(FluxType)]` types.
+/// FluxBIN encodes an enum as a `u8` variant tag (the declaration ordinal)
+/// followed by the variant payload, and a struct as its fields in declaration
+/// order. Rich columns support equality filtering only — they cannot be a
+/// primary key, partition key, unique constraint, or index key (DMX-031).
+///
+/// # Example
+///
+/// ```ignore
+/// #[derive(fluxum::FluxType)]
+/// pub enum Status {
+///     Todo,
+///     Doing,
+///     Done { by: fluxum::Identity },
+/// }
+///
+/// #[fluxum::table(public)]
+/// pub struct Task {
+///     #[primary_key]
+///     pub id: u64,
+///     pub status: Status,
+/// }
+/// ```
+#[proc_macro_derive(FluxType)]
+pub fn flux_type(input: TokenStream) -> TokenStream {
+    flux_type::expand(input.into()).into()
 }
 
 /// Declares a schema migration step (SPEC-010 MIG-010).

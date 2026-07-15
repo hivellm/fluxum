@@ -769,6 +769,16 @@ fn row_value_to_json(value: &crate::store::RowValue) -> serde_json::Value {
         V::Optional(None) => J::Null,
         V::Optional(Some(inner)) => row_value_to_json(inner),
         V::List(items) => J::Array(items.iter().map(row_value_to_json).collect()),
+        V::Enum { tag, payload } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("tag".to_owned(), J::from(*tag));
+            obj.insert(
+                "payload".to_owned(),
+                J::Array(payload.iter().map(row_value_to_json).collect()),
+            );
+            J::Object(obj)
+        }
+        V::Struct(fields) => J::Array(fields.iter().map(row_value_to_json).collect()),
     }
 }
 

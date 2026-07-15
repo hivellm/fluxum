@@ -1,0 +1,5 @@
+error: #[derive(FluxType)] does not support generic types (SPEC-023 DMX-030)
+ --> tests/ui/fail/derive_generic.rs:6:19
+  |
+6 | pub struct Wrapper<T> {
+  |                   ^^^
