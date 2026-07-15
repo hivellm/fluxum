@@ -290,3 +290,50 @@ Implications:
 - Post-launch candidates (TLS transports, RBAC, C++ codegen, shard split/merge tooling,
   multi-primary replication, multi-provider auth) are **not** in this DAG by design; see
   [ROADMAP §post-launch](ROADMAP.md#post-launch-backlog-).
+- **Backlog extension tasks** (SPEC-017–027) are additive work layered on the core graph; they are
+  tracked as rulebook tasks rather than `T<phase>.<n>` nodes and are indexed in §6 below.
+
+## 6. Backlog extension tasks (SPEC-021–027)
+
+These implement the Fluxum-native extension requirements in [PRD §6.13](PRD.md#613-backlog-extensions--fluxum-native-fr-12x-spec-021027)
+(FR-120–FR-148). They are **additive and off the critical path** — none gates a phase or blocks a
+release — and are attached to the phase whose subsystem they extend (the `phase<N>_` prefix on the
+rulebook task id). Wire-additive items (FR-121, FR-131) must land before the **G5** format freeze.
+Each is a rulebook task under `.rulebook/tasks/`; run them via `/rulebook-driver`.
+
+| Rulebook task | Phase | Spec | PRD FR | Priority |
+|---|---|---|---|---|
+| `phase6_sdk-optimistic-mutations-offline-queue` | 6 | SPEC-021 | FR-120 | P1 |
+| `phase5_resumable-subscriptions-delta-resync` | 5 | SPEC-021 | FR-121 | P1 · pre-G5 |
+| `phase5_reducer-idempotency-keys` | 5 | SPEC-021 | FR-122 | P1 |
+| `phase6_sdk-offline-local-persistence` | 6 | SPEC-021 | FR-123 | P2 |
+| `phase4_reactive-materialized-views` | 4 | SPEC-022 | FR-124 | P1 |
+| `phase4_temporal-as-of-queries` | 4 | SPEC-022 | FR-125 | P1 |
+| `phase3_declarative-constraints-triggers` | 3 | SPEC-022 | FR-126 | P1 |
+| `phase4_relational-row-visibility` | 4 | SPEC-022 | FR-127 | P1 |
+| `phase3_computed-generated-columns` | 3 | SPEC-022 | FR-128 | P1 |
+| `phase2_ephemeral-volatile-tables` | 2 | SPEC-023 | FR-129 | P1 |
+| `phase3_row-ttl-expiration` | 3 | SPEC-023 | FR-130 | P1 |
+| `phase1_rich-column-types-enums-structs` | 1 | SPEC-023 | FR-131 | P1 · pre-G5 |
+| `phase2_blob-large-object-store` | 2 | SPEC-023 | FR-132 | P1 |
+| `phase4_typed-edges-graph-traversal` | 4 | SPEC-023 | FR-133 | P2 |
+| `phase3_crdt-text-column` | 3 | SPEC-023 | FR-134 | P2 · research |
+| `phase6_fluxum-dev-inner-loop-cli` | 6 | SPEC-024 | FR-135 | P1 |
+| `phase6_reducer-test-simulation-kit` | 6 | SPEC-024 | FR-136 | P1 |
+| `phase6_admin-web-console` | 6 | SPEC-024 | FR-137 | P1 |
+| `phase6_seed-fixtures-migrate-plan` | 6 | SPEC-024 | FR-138 | P1 |
+| `phase7_backup-object-storage-archive` | 7 | SPEC-025 | FR-139 | P1 |
+| `phase5_audit-trail-event-sourcing` | 5 | SPEC-025 | FR-140 | P1 |
+| `phase5_graceful-drain-rolling-restart` | 5 | SPEC-025 | FR-141 | P1 |
+| `phase5_config-hot-reload` | 5 | SPEC-025 | FR-142 | P1 |
+| `phase5_database-namespaces-multitenancy` | 5 | SPEC-025 | FR-143 | P2 |
+| `phase5_per-tenant-resource-quotas` | 5 | SPEC-025 | FR-144 | P2 |
+| `phase2_encryption-at-rest` | 2 | SPEC-026 | FR-145 | P1 |
+| `phase3_deterministic-reducer-stdlib` | 3 | SPEC-026 | FR-146 | P1 |
+| `phase5_connection-abuse-protection` | 5 | SPEC-026 | FR-147 | P1 |
+| `phase7_pgwire-readonly-endpoint` | 7 | SPEC-027 | FR-148 | P2 |
+
+> The earlier backlog specs **SPEC-017–020** (column transforms, query planner, full-text, plugin
+> system) are likewise tracked as rulebook tasks (`phase1_column-transforms-type-surface`,
+> `phase4_index-aware-query-planner`, `phase2_fulltext-inverted-index`, `phase3_plugin-framework-core`,
+> and their siblings) rather than core DAG nodes.

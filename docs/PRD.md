@@ -285,6 +285,77 @@ Five SDKs are the minimum competitive surface: **TypeScript, Python, Go, Rust, C
 | FR-112 | SIMD correctness: every SIMD kernel is bit-identical to its scalar reference implementation; enforced by property tests on an ISA matrix in CI. | P0 | SPEC-016, SPEC-013 |
 | FR-113 | Adaptive tuning: worker-thread counts, fan-out concurrency, WAL buffer sizes, and checkpoint cadence derived from detected hardware; overridable in config; effective values logged at boot and exposed in `/health`. | P1 | SPEC-016 |
 
+### 6.13 Backlog extensions — Fluxum-native (FR-12x, SPEC-021–027)
+
+These are **post-core extension requirements** captured after the 0.1.0/0.2.0 plan was frozen.
+They are additive, off the critical path, and gate-blocking nothing; each is tracked as a rulebook
+backlog task (see [DAG §6](DAG.md#6-backlog-extension-tasks-spec-021027)) and governed by one of
+SPEC-021–027. Priority tags: **P1** competitive-launch candidate, **P2** post-launch.
+
+**Client sync & resilience** ([SPEC-021](specs/SPEC-021-client-sync-resilience.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-120 | Optimistic client mutations: apply locally, reconcile on `TxUpdate`, roll back on error | P1 |
+| FR-121 | Resumable subscriptions: delta resync from the last-seen `tx_offset`, not a full re-init | P1 |
+| FR-122 | Reducer idempotency keys: exactly-once submission via a bounded durable dedup window | P1 |
+| FR-123 | SDK offline local persistence of the cache + pending-mutation queue | P2 |
+
+**Reactive views & query extensions** ([SPEC-022](specs/SPEC-022-reactive-views-query-extensions.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-124 | Reactive materialized views: incrementally-maintained aggregates + live top-N pushed to subscribers | P1 |
+| FR-125 | Temporal `AS OF (tx_id \| timestamp)` reads over a retained MVCC window | P1 |
+| FR-126 | Declarative constraints (`CHECK`/`references`/`not_null`) + per-table triggers | P1 |
+| FR-127 | Relational row visibility (RLS predicated on another table) | P1 |
+| FR-128 | Computed/generated columns derived from sibling columns | P1 |
+
+**Data-model extensions** ([SPEC-023](specs/SPEC-023-data-model-extensions.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-129 | Ephemeral/volatile tables: no WAL, auto-expiry, presence-oriented | P1 |
+| FR-130 | Row TTL / automatic expiration | P1 |
+| FR-131 | Rich column types: enums/tagged-unions + nested structs | P1 |
+| FR-132 | First-class blob / large-object store | P1 |
+| FR-133 | Typed edges + point traversal (graph relations without a JOIN engine) | P2 |
+| FR-134 | Single-shard CRDT text column for collaborative editing | P2 |
+
+**Developer experience & tooling** ([SPEC-024](specs/SPEC-024-developer-experience-tooling.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-135 | `fluxum dev` inner loop + `fluxum init` scaffolding + `fluxum logs -f` | P1 |
+| FR-136 | Reducer test/simulation kit for module authors | P1 |
+| FR-137 | Built-in admin web console (data browser + live viewer) | P1 |
+| FR-138 | Data seeding + `fluxum migrate --plan` dry-run | P1 |
+
+**Operations & multitenancy** ([SPEC-025](specs/SPEC-025-operations-multitenancy.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-139 | Backup/archive to S3-compatible object storage (seekable-zstd) | P1 |
+| FR-140 | Audit trail / event-sourcing query over the commit log | P1 |
+| FR-141 | Graceful drain / zero-downtime rolling restart | P1 |
+| FR-142 | Config hot-reload for a defined subset without restart | P1 |
+| FR-143 | Database namespaces (multiple logical DBs per process) | P2 |
+| FR-144 | Per-tenant resource quotas | P2 |
+
+**Security hardening** ([SPEC-026](specs/SPEC-026-security-hardening.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-145 | Encryption at rest (cold pages, checkpoints, backups) | P1 |
+| FR-146 | Deterministic reducer stdlib (seeded RNG + logical clock) | P1 |
+| FR-147 | Connection-level abuse protection (per-IP caps, failed-auth throttle) | P1 |
+
+**Analytics interop** ([SPEC-027](specs/SPEC-027-analytics-interop.md))
+
+| ID | Requirement | Priority |
+|---|---|---|
+| FR-148 | Read-only Postgres-wire endpoint for BI tools (psql/Grafana/Metabase) | P2 |
+
 ## 7. Non-functional requirements
 
 | ID | Category | Requirement | Target |
@@ -319,6 +390,12 @@ Reference baseline: SpacetimeDB in production — 150,000 tx/s, single binary.
 | Search *platform* features (fuzzy/typo, synonyms, faceting, multi-field scoring DSL) | Out of scope — beyond a realtime DB's remit |
 | GraphQL API | FluxRPC + HTTP/JSON admin covers all client needs |
 | Multi-primary (active-active) replication | Replica sets are single-primary per shard; conflict-free multi-primary is a research project, not a launch feature |
+
+> **Backlog qualification (§6.13).** The extension specs qualify two rows above without repealing
+> them: reactive materialized views (FR-124) provide *bounded incremental* aggregates as a sanctioned
+> path — not ad-hoc SQL aggregates/JOINs; typed edges (FR-133) are *indexed point traversals*, not a
+> JOIN/graph-query engine. These non-goals stand for the 0.1.0/0.2.0 core; the backlog features are
+> additive and individually gated.
 
 ## 9. Constraints
 
