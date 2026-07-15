@@ -6,12 +6,24 @@ name: SIMD Matrix
 # selects a variant the matrix did not execute. The full workspace suite
 # additionally runs under forced scalar (HWA-034).
 # Family precedent: Vectorizer simd-matrix.yml.
-
+#
+# Quota discipline: runs when SIMD sources change, weekly, and on demand —
+# not on every push.
 on:
   push:
     branches: [ master, main, develop ]
-  pull_request:
-    branches: [ '**' ]
+    paths:
+      - 'crates/fluxum-core/src/simd/**'
+      - 'crates/fluxum-core/src/hw/**'
+      - 'crates/fluxum-core/tests/simd_parity.rs'
+      - '.github/workflows/simd-matrix.yml'
+  schedule:
+    - cron: '30 6 * * 1'  # weekly (Monday 06:30 UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: simd-matrix-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always

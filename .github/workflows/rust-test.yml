@@ -1,10 +1,27 @@
 name: Rust Tests
 
+# Quota discipline: pushes run ubuntu-only and only when Rust sources
+# change; the full 3-OS matrix (NFR-09) runs weekly and on demand
+# (workflow_dispatch) — Windows bills at 2x and macOS at 10x per minute.
 on:
   push:
     branches: [ master, main, develop ]
+    paths:
+      - 'crates/**'
+      - 'sdks/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/rust-test.yml'
   pull_request:
     branches: [ '**' ]
+  schedule:
+    - cron: '0 6 * * 1'  # weekly full-matrix run (Monday 06:00 UTC)
+  workflow_dispatch:
+
+concurrency:
+  group: rust-test-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -14,7 +31,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ ubuntu-latest, windows-latest, macos-latest ]
+        os: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["ubuntu-latest", "windows-latest", "macos-latest"]') || fromJSON('["ubuntu-latest"]') }}
 
     steps:
     - uses: actions/checkout@v5

@@ -1,10 +1,24 @@
 name: Rust Lint
 
+# Quota discipline: runs only when Rust sources change; one consolidated
+# clippy invocation (all targets + all features implies the default set).
 on:
   push:
     branches: [ master, main, develop ]
+    paths:
+      - 'crates/**'
+      - 'sdks/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/rust-lint.yml'
   pull_request:
     branches: [ '**' ]
+  workflow_dispatch:
+
+concurrency:
+  group: rust-lint-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,11 +42,5 @@ jobs:
     - name: Check code formatting
       run: cargo fmt --all -- --check
 
-    - name: Check cargo clippy warnings
-      run: cargo clippy --workspace -- -D warnings
-
-    - name: Check cargo clippy warnings for all targets
-      run: cargo clippy --workspace --all-targets -- -D warnings
-
-    - name: Check cargo clippy warnings for all targets and features
+    - name: Check cargo clippy warnings (all targets, all features)
       run: cargo clippy --workspace --all-targets --all-features -- -D warnings
