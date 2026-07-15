@@ -1,0 +1,12 @@
+[package]
+name = "fluxum-bench"
+description = "PostgreSQL/SQLite parity harness: same application on Fluxum vs app-server+DB, comparative report generator (SPEC-013 §15, NFR-11)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

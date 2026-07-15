@@ -1,0 +1,13 @@
+[package]
+name = "fluxum-sdk"
+description = "Fluxum Rust client SDK: typed tables, reducer calls, and live subscriptions over FluxRPC (SPEC-011 SDK-050)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+fluxum-protocol.workspace = true
+
+[lints]
+workspace = true
