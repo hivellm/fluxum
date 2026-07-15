@@ -63,6 +63,7 @@ pub mod reducer;
 pub mod scheduler;
 pub mod schema;
 pub mod simd;
+pub mod sql;
 pub mod store;
 pub mod txn;
 pub mod types;
