@@ -52,3 +52,7 @@ harness = false
 [[bench]]
 name = "compression"
 harness = false
+
+[[bench]]
+name = "txn_commit"
+harness = false

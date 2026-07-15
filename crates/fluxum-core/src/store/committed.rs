@@ -11,6 +11,7 @@ use crate::index::{IndexId, Rect, SpatialIndexState, SpatialPredicate};
 use crate::schema::TableSchema;
 use crate::store::TableId;
 use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
+use crate::store::unique::UniqueIndex;
 
 /// One table's committed contents (STG-002).
 ///
@@ -30,6 +31,10 @@ pub struct TableState {
     pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
     /// The `#[spatial(...)]` index, if declared (SPEC-008, SPX-030).
     pub(crate) spatial: Option<SpatialIndexState>,
+    /// One committed value map per `#[unique]` constraint, in declared
+    /// order (DM-006) — the TXN-041 eager-check lookup structure (T3.1),
+    /// maintained inside the commit merge like the B-tree indexes.
+    pub(crate) unique: Vec<UniqueIndex>,
     /// Durable auto-inc high-water mark (STG-040): every value ≤ this has
     /// been covered by a batch allocation that a committed [`super::TxDiff`]
     /// carried (T2.2 persists it through the commit log).
@@ -238,6 +243,19 @@ impl TableState {
                 return Err(FluxumError::Storage(format!(
                     "spatial index on table `{}` ({table_id}) diverged from a fresh rebuild \
                      over CommittedState (STG-007, SPX-030)",
+                    self.schema.name
+                )));
+            }
+        }
+        for constraint in &self.unique {
+            let mut rebuilt = UniqueIndex::new(constraint.columns());
+            for (pk, row) in &self.rows {
+                rebuilt.insert(row, pk.clone())?;
+            }
+            if rebuilt != *constraint {
+                return Err(FluxumError::Storage(format!(
+                    "#[unique] map on table `{}` ({table_id}) diverged from a fresh rebuild \
+                     over CommittedState (STG-007, TXN-041)",
                     self.schema.name
                 )));
             }

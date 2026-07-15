@@ -33,6 +33,10 @@
 //!   400/503 error contract (T2.5/T2.6)
 //! - [`simd`] — runtime-dispatched SIMD kernels with scalar oracles
 //!   ([`simd::Dispatch`], SPEC-016 §5–§8, T2.10)
+//! - [`txn`] — [`txn::TxPipeline`]: the per-shard transaction pipeline
+//!   (validate → merge → append → respond), bounded reducer queue with
+//!   immediate `503 "shard busy"` backpressure, panic-isolated rollback
+//!   (SPEC-003, T3.1)
 
 pub mod auth;
 pub mod checkpoint;
@@ -44,6 +48,7 @@ pub mod index;
 pub mod schema;
 pub mod simd;
 pub mod store;
+pub mod txn;
 pub mod types;
 
 pub use auth::{AuthClaims, AuthOutcome, AuthProvider, Authenticator};

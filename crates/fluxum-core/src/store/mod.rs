@@ -50,12 +50,14 @@
 //!   reinserting a tx-deleted committed row with identical content cancels to
 //!   a structural no-op (the committed `Arc<Row>` identity is preserved), and
 //!   insert-then-delete of a pending row vanishes entirely.
-//! - **Constraint overlay** (STG-007 tail): PK-uniqueness checks run eagerly
-//!   at `insert` time against `CommittedState` ⊕ `TxState` — a committed row
-//!   tx-deleted in the same transaction does not conflict, pending inserts
-//!   do. Because checks are eager and the writer is single, the commit merge
-//!   is validated by construction (TXN-021 step 1 happens at write time;
-//!   `#[unique]` secondary constraints land with T2.4/T3.1 index work).
+//! - **Constraint overlay** (STG-007 tail): PK-uniqueness (TXN-040) and
+//!   `#[unique]` checks (TXN-041, T3.1 — see [`unique`]) run eagerly at
+//!   `insert`/`upsert` time against `CommittedState` ⊕ `TxState` — a
+//!   committed row tx-deleted in the same transaction does not conflict,
+//!   pending inserts do. Because checks are eager and the writer is single,
+//!   the commit merge is validated by construction (TXN-021 step 1 happens
+//!   at write time). `upsert` is the TXN-040 exception: an occupied primary
+//!   key replaces instead of erroring.
 //! - **Auto-inc** (STG-040): per-table counters hand out values from a
 //!   pre-allocated batch (`auto_inc_allocation_step`, default 4096). The
 //!   high-water mark advances a batch at a time and rides the next commit's
@@ -80,6 +82,7 @@ pub mod memstore;
 pub mod pager;
 pub mod row;
 pub mod tx;
+pub(crate) mod unique;
 
 pub use committed::{CommittedState, Snapshot, TableState};
 pub use memstore::{MemStore, StoreOptions, Tx};

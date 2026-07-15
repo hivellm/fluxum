@@ -146,6 +146,7 @@ pub fn recover(
         let mut rows: BTreeMap<_, Row> = BTreeMap::new();
         let mut indexes = empty.indexes.clone();
         let mut spatial = empty.spatial.clone();
+        let mut unique = empty.unique.clone();
         for row in table.rows.into_values() {
             let pk = encode_pk_of_row(table.schema, row.values())?;
             for index in indexes.values_mut() {
@@ -153,6 +154,9 @@ pub fn recover(
             }
             if let Some(spatial) = &mut spatial {
                 spatial.insert_row(&row, pk.clone())?;
+            }
+            for constraint in &mut unique {
+                constraint.insert(&row, pk.clone())?;
             }
             rows.insert(pk, row);
         }
@@ -163,6 +167,7 @@ pub fn recover(
                 rows,
                 indexes,
                 spatial,
+                unique,
                 auto_inc_high_water: table.auto_inc_high_water,
             }),
         );

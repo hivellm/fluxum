@@ -13,9 +13,10 @@ use crate::schema::{IndexSchema, Schema, SpatialKind, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
 use crate::store::row::{
-    Row, RowValue, check_row, display_pk_of_row, encode_pk_of_row, encode_pk_values,
+    PkBytes, Row, RowValue, check_row, display_pk_of_row, encode_pk_of_row, encode_pk_values,
 };
 use crate::store::tx::{PendingOp, TableDiff, TxDiff, TxState};
+use crate::store::unique::{self, UniqueIndex};
 
 /// Tuning knobs for a [`MemStore`] (SPEC-002 §8; wired into `config.yml`
 /// with the server assembly).
@@ -178,6 +179,7 @@ impl MemStore {
                     rows: BTreeMap::new(),
                     indexes: build_btree_indexes(table)?,
                     spatial: build_spatial_index(table, &options)?,
+                    unique: table.unique.iter().map(|c| UniqueIndex::new(c)).collect(),
                     auto_inc_high_water: 0,
                 }),
             );
@@ -373,13 +375,29 @@ impl Tx<'_> {
 
     /// Insert a row (column values in declaration order).
     ///
-    /// Enforces PK uniqueness eagerly against the STG-007 overlay: committed
-    /// rows tx-deleted in this transaction do not conflict; pending inserts
-    /// do. For `#[auto_inc]` tables, a `0` placeholder in the auto-inc
-    /// column is replaced with the next counter value (TXN-042: assigned at
-    /// insert time); an explicit non-zero id is kept and the counter jumps
-    /// past it. Returns the row as stored, with the assigned id.
-    pub fn insert(&mut self, table: TableId, mut values: Vec<RowValue>) -> Result<Row> {
+    /// Enforces PK uniqueness (TXN-040) and every `#[unique]` constraint
+    /// (TXN-041) eagerly against the STG-007 overlay: committed rows
+    /// tx-deleted in this transaction do not conflict; pending inserts do.
+    /// For `#[auto_inc]` tables, a `0` placeholder in the auto-inc column is
+    /// replaced with the next counter value (TXN-042: assigned at insert
+    /// time); an explicit non-zero id is kept and the counter jumps past it.
+    /// Returns the row as stored, with the assigned id.
+    pub fn insert(&mut self, table: TableId, values: Vec<RowValue>) -> Result<Row> {
+        self.write(table, values, false)
+    }
+
+    /// Insert a row, replacing any existing row with the same primary key
+    /// (the TXN-040 exception: an occupied PK replaces instead of erroring).
+    /// `#[unique]` constraints against *other* rows still apply (TXN-041),
+    /// and auto-inc placeholders are assigned exactly as in [`Tx::insert`].
+    /// Returns the row as stored.
+    pub fn upsert(&mut self, table: TableId, values: Vec<RowValue>) -> Result<Row> {
+        self.write(table, values, true)
+    }
+
+    /// Shared insert/upsert path; `replace` selects the TXN-040 semantics
+    /// for an occupied primary key.
+    fn write(&mut self, table: TableId, mut values: Vec<RowValue>, replace: bool) -> Result<Row> {
         let schema = self.store.schema_of(table)?;
         check_row(schema, &values)?;
         // SPX-010 eager constraint (like PK uniqueness below): an R-tree row
@@ -392,17 +410,31 @@ impl Tx<'_> {
         let pk = encode_pk_of_row(schema, &values)?;
 
         let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
-        let ops = self.state.tables.entry(table).or_default();
-        let conflict = || {
-            Err(FluxumError::Storage(format!(
+        // Overlay occupancy (STG-007): a pending insert/reinsert holds the
+        // key; a committed row holds it unless tx-deleted. `PendingOp` rows
+        // are `Arc`-shared, so this clone is a pointer bump.
+        let pending = self
+            .state
+            .tables
+            .get(&table)
+            .and_then(|ops| ops.get(&pk))
+            .cloned();
+        let occupied = matches!(pending, Some(PendingOp::Insert(_) | PendingOp::Update(_)))
+            || (pending.is_none() && committed_row.is_some());
+        if occupied && !replace {
+            return Err(FluxumError::Storage(format!(
                 "primary key conflict: table={} pk={}",
                 schema.name,
                 display_pk_of_row(schema, &values)
-            )))
-        };
-        match ops.get(&pk) {
-            // Overlay rule: a pending insert (or reinsert) occupies the key.
-            Some(PendingOp::Insert(_) | PendingOp::Update(_)) => conflict(),
+            )));
+        }
+
+        // TXN-041: every `#[unique]` constraint, eagerly, over the same
+        // overlay — so the commit merge stays validated by construction.
+        self.check_unique(table, schema, &values, &pk)?;
+
+        let ops = self.state.tables.entry(table).or_default();
+        match pending {
             // Tx-deleted committed row: reinsert is allowed (STG-007).
             Some(PendingOp::Delete) => {
                 let committed = committed_row.ok_or_else(|| {
@@ -424,15 +456,96 @@ impl Tx<'_> {
                     Ok(row)
                 }
             }
-            None => {
-                if committed_row.is_some() {
-                    return conflict();
-                }
+            // Upsert over this transaction's own pending write: the pending
+            // row is replaced in place, keeping its Insert/Update flavor
+            // (the flavor records whether a *committed* row underlies the
+            // key, which has not changed).
+            Some(PendingOp::Insert(_)) => {
                 let row = Row::new(values);
                 ops.insert(pk, PendingOp::Insert(row.clone()));
                 Ok(row)
             }
+            Some(PendingOp::Update(_)) => {
+                let row = Row::new(values);
+                ops.insert(pk, PendingOp::Update(row.clone()));
+                Ok(row)
+            }
+            None => {
+                if let Some(committed) = committed_row {
+                    // Upsert over a committed row (TXN-040 exception).
+                    if committed.values() == values.as_slice() {
+                        // Identical content: structural no-op, committed row
+                        // identity preserved (STG-007 rule 1).
+                        return Ok(committed);
+                    }
+                    let row = Row::new(values);
+                    ops.insert(pk, PendingOp::Update(row.clone()));
+                    Ok(row)
+                } else {
+                    let row = Row::new(values);
+                    ops.insert(pk, PendingOp::Insert(row.clone()));
+                    Ok(row)
+                }
+            }
         }
+    }
+
+    /// TXN-041: reject `values` if any `#[unique]` constraint value is held
+    /// by a *visible* row other than the one at `pk` — visible per the
+    /// STG-007 overlay: pending inserts/replacements count, committed rows
+    /// count unless tx-deleted or tx-replaced, and the row being written
+    /// never conflicts with itself.
+    fn check_unique(
+        &self,
+        table: TableId,
+        schema: &'static TableSchema,
+        values: &[RowValue],
+        pk: &PkBytes,
+    ) -> Result<()> {
+        let base = self.base.table(table)?;
+        if base.unique.is_empty() {
+            return Ok(());
+        }
+        let ops = self.state.tables.get(&table);
+        for constraint in &base.unique {
+            let key = constraint.key_of_values(values)?;
+            // Pending overlay: another pending row carrying this value.
+            if let Some(ops) = ops {
+                for (other_pk, op) in ops {
+                    if other_pk == pk {
+                        continue;
+                    }
+                    let row = match op {
+                        PendingOp::Insert(row) | PendingOp::Update(row) => row,
+                        PendingOp::Delete => continue,
+                    };
+                    if constraint.key_of_values(row.values())? == key {
+                        return Err(unique::violation_error(
+                            schema,
+                            constraint.columns(),
+                            values,
+                        ));
+                    }
+                }
+            }
+            // Committed owner — unless it is the row being written, or this
+            // transaction tx-deleted/tx-replaced it (an Update whose new row
+            // still carries the value was already caught just above).
+            if let Some(owner) = constraint.owner(&key) {
+                let shadowed = owner == pk
+                    || ops
+                        .and_then(|m| m.get(owner))
+                        .is_some_and(|op| matches!(op, PendingOp::Delete | PendingOp::Update(_)));
+                if !shadowed {
+                    return Err(unique::violation_error(
+                        schema,
+                        constraint.columns(),
+                        values,
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Delete by primary key values (in `primary_key` declaration order).
@@ -561,6 +674,19 @@ impl Tx<'_> {
                 inserts: Vec::new(),
                 deletes: Vec::new(),
             };
+            // Unique-map maintenance is two-pass across the table's ops:
+            // every vacated value is released before any new value is
+            // claimed, so a transaction that moves a `#[unique]` value
+            // between rows (validated eagerly at write time, TXN-041)
+            // merges regardless of pk iteration order.
+            for (pk, op) in &ops {
+                if matches!(op, PendingOp::Delete | PendingOp::Update(_)) {
+                    let old = table.rows.get(pk).ok_or_else(invariant_missing_row)?;
+                    for constraint in &mut table.unique {
+                        constraint.remove(old, pk)?;
+                    }
+                }
+            }
             // Rows and secondary indexes are updated together on this
             // private pre-swap copy (STG-005 steps 2–4), so the published
             // snapshot's rows and indexes are mutually consistent and
@@ -573,6 +699,9 @@ impl Tx<'_> {
                         }
                         if let Some(spatial) = &mut table.spatial {
                             spatial.insert_row(&row, pk.clone())?;
+                        }
+                        for constraint in &mut table.unique {
+                            constraint.insert(&row, pk.clone())?;
                         }
                         table.rows.insert(pk, row.clone());
                         diff.inserts.push(row);
@@ -602,6 +731,11 @@ impl Tx<'_> {
                             // pre-swap copy, so no stale entry can publish.
                             spatial.remove_row(&old, &pk)?;
                             spatial.insert_row(&row, pk.clone())?;
+                        }
+                        // The old row's unique values were released in the
+                        // two-pass removal above; claim the new row's.
+                        for constraint in &mut table.unique {
+                            constraint.insert(&row, pk.clone())?;
                         }
                         diff.deletes.push((pk, old));
                         diff.inserts.push(row);
