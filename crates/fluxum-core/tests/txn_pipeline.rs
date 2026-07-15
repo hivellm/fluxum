@@ -834,10 +834,12 @@ async fn concurrent_readers_never_block_while_writes_serialize() {
     // consistent state — counter == committed increments == event rows
     // (each write transaction changes both together, atomically).
     let stop = Arc::new(AtomicBool::new(false));
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let readers: Vec<_> = (0..4)
         .map(|_| {
             let store = Arc::clone(&store);
             let stop = Arc::clone(&stop);
+            let ready = ready_tx.clone();
             thread::spawn(move || {
                 let mut observed = 0u64;
                 let mut last_value = 0u64;
@@ -857,11 +859,28 @@ async fn concurrent_readers_never_block_while_writes_serialize() {
                     assert!(value >= last_value, "committed history went backwards");
                     last_value = value;
                     observed += 1;
+                    if observed == 1 {
+                        ready.send(()).expect("main task is waiting");
+                    }
                 }
                 observed
             })
         })
         .collect();
+    drop(ready_tx);
+    // Don't start the clients until every reader has observed at least one
+    // state — otherwise a fast writer can finish the whole workload before
+    // a reader thread is even scheduled (seen on Windows CI; same guard as
+    // the store_acid harness).
+    tokio::task::spawn_blocking(move || {
+        for _ in 0..4 {
+            ready_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("all readers observe the initial state");
+        }
+    })
+    .await
+    .unwrap();
 
     // N concurrent clients firing read-modify-write reducers at the shard.
     let clients: Vec<_> = (0..CLIENTS)
