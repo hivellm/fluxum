@@ -1,12 +1,147 @@
-//! Fluxum server presentation layer: FluxRPC TCP transport, Streamable HTTP
-//! `/rpc` + admin endpoints, auth providers, metrics, and `ServerBuilder`.
+//! Fluxum server presentation layer (SPEC-006): the FluxRPC TCP transport
+//! (:15801), the per-connection session state machine, message routing, and
+//! the post-commit `TxUpdate` fan-out onto subscribed connections.
 //!
-//! T0.1 skeleton crate; transports land per [`docs/DAG.md`] Phase 5.
+//! # Layers
+//!
+//! - [`ShardContext`] — the shared per-shard state a connection needs: the
+//!   [`ReducerEngine`](fluxum_core::reducer::ReducerEngine), the
+//!   [`SubscriptionManager`](fluxum_core::subscription::SubscriptionManager)
+//!   behind its SUB-041 async mutex, the
+//!   [`Authenticator`](fluxum_core::auth::Authenticator), a connection
+//!   registry, and a commit broadcast that drives live updates.
+//! - [`session`] — the sans-socket router: turns one decoded
+//!   [`ClientMessage`](fluxum_protocol::ClientMessage) into the
+//!   [`ServerMessage`](fluxum_protocol::ServerMessage)s to send back,
+//!   enforcing the pre-auth `401` gate (AUTH-020) and the SPEC-006 error
+//!   mapping. Independent of any socket, so it is unit-testable directly.
+//! - [`tcp`] — the tokio listener that drives sessions over real sockets:
+//!   frame decode with the RPC-061 size limit (`413`), the RPC-060 idle
+//!   timeout (`408`), a per-connection writer that multiplexes responses by
+//!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn smoke() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "fluxum-server");
+pub mod session;
+pub mod tcp;
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use tokio::sync::{Mutex, Notify, broadcast, mpsc};
+
+use fluxum_core::auth::Authenticator;
+use fluxum_core::reducer::ReducerEngine;
+use fluxum_core::store::{MemStore, TxDiff};
+use fluxum_core::subscription::SubscriptionManager;
+
+/// One encoded, framed message ready for a connection's socket.
+pub type OutFrame = Arc<Vec<u8>>;
+
+/// A live connection's fan-out handle: a bounded outbound queue (drained by
+/// the connection's writer task) plus a shutdown signal. A full queue is the
+/// SUB-042 "Full" tier — the fan-out notifies shutdown and drops the
+/// connection rather than ever blocking the commit path.
+#[derive(Clone)]
+pub struct ConnHandle {
+    /// Outbound frame queue (bounded — the per-client send buffer, SUB-042).
+    pub sink: mpsc::Sender<OutFrame>,
+    /// Forces the connection to close (slow-consumer drop, SUB-042).
+    pub shutdown: Arc<Notify>,
+}
+
+/// Live connection registry: `connection_id` → its fan-out handle. The
+/// fan-out task looks a subscriber up here to push a `TxUpdate` without ever
+/// touching the connection's read/route path.
+#[derive(Default)]
+pub struct ConnectionRegistry {
+    handles: Mutex<HashMap<u128, ConnHandle>>,
+}
+
+impl ConnectionRegistry {
+    /// Register a connection's fan-out handle at authentication time.
+    pub async fn insert(&self, connection_id: u128, handle: ConnHandle) {
+        self.handles.lock().await.insert(connection_id, handle);
+    }
+
+    /// Remove a connection on disconnect.
+    pub async fn remove(&self, connection_id: u128) {
+        self.handles.lock().await.remove(&connection_id);
+    }
+
+    /// Handles for a set of subscriber ids (fan-out targets).
+    async fn handles_for(&self, connections: &[u128]) -> Vec<(u128, ConnHandle)> {
+        let guard = self.handles.lock().await;
+        connections
+            .iter()
+            .filter_map(|conn| guard.get(conn).map(|h| (*conn, h.clone())))
+            .collect()
+    }
+}
+
+/// The shared per-shard state every connection session reads from (SPEC-006
+/// server assembly; the full multi-shard `ShardHost` is T5.4).
+pub struct ShardContext {
+    /// The reducer engine (admission + dispatch through the T3.1 pipeline).
+    pub engine: ReducerEngine,
+    /// The subscription registry + fan-out, behind the SUB-041 async mutex.
+    pub subscriptions: Mutex<SubscriptionManager>,
+    /// The single authentication entry point (AUTH-020/021).
+    pub authenticator: Authenticator,
+    /// Live connections, for the commit fan-out.
+    pub connections: ConnectionRegistry,
+    /// This shard's id (carried in every `ReducerCaller`).
+    pub shard_id: u32,
+    /// Broadcast of every committed [`TxDiff`]; the fan-out task evaluates
+    /// subscriptions against each and pushes `TxUpdate`s (SUB-021).
+    commit_tx: broadcast::Sender<Arc<TxDiff>>,
+    /// Monotonic `ConnectionId` allocator (ephemeral, never reused within a
+    /// process; `0` is reserved for scheduled/system callers, RED-025).
+    next_connection_id: AtomicU64,
+}
+
+impl ShardContext {
+    /// Assemble a shard context. `commit_capacity` bounds the commit
+    /// broadcast backlog (a slow fan-out task lags, never blocks commits).
+    pub fn new(
+        engine: ReducerEngine,
+        subscriptions: SubscriptionManager,
+        authenticator: Authenticator,
+        shard_id: u32,
+        commit_capacity: usize,
+    ) -> Arc<Self> {
+        let (commit_tx, _) = broadcast::channel(commit_capacity.max(1));
+        Arc::new(Self {
+            engine,
+            subscriptions: Mutex::new(subscriptions),
+            authenticator,
+            connections: ConnectionRegistry::default(),
+            shard_id,
+            commit_tx,
+            next_connection_id: AtomicU64::new(1),
+        })
+    }
+
+    /// The shard's committed store (lock-free snapshots for InitialData /
+    /// one-off queries).
+    pub fn store(&self) -> &Arc<MemStore> {
+        self.engine.pipeline().store()
+    }
+
+    /// Allocate the next ephemeral `ConnectionId` (RPC-002).
+    pub fn allocate_connection_id(&self) -> u128 {
+        u128::from(self.next_connection_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Publish a committed diff to the fan-out (called after a reducer
+    /// commit). A lagging fan-out drops old diffs rather than block the
+    /// commit path — clients recover missed updates on reconnect via the
+    /// `tx_id` gap (SPEC-006 acceptance 14).
+    pub fn publish_commit(&self, diff: TxDiff) {
+        let _ = self.commit_tx.send(Arc::new(diff));
+    }
+
+    /// A receiver for the commit broadcast (one per fan-out task).
+    pub fn subscribe_commits(&self) -> broadcast::Receiver<Arc<TxDiff>> {
+        self.commit_tx.subscribe()
     }
 }

@@ -57,6 +57,12 @@ pub struct ServerConfig {
     pub http_port: u16,
     /// FluxRPC binary TCP.
     pub tcp_port: u16,
+    /// Idle-connection timeout, seconds (RPC-060): a connection with no
+    /// inbound frame for this long is sent `408` and closed. `0` disables.
+    pub idle_timeout_secs: u64,
+    /// Max inbound frame body size (RPC-061); frames above it are rejected
+    /// with `413` and the connection is closed.
+    pub max_frame_bytes: ByteSize,
 }
 
 impl Default for ServerConfig {
@@ -65,6 +71,8 @@ impl Default for ServerConfig {
             tcp_host: "127.0.0.1".to_owned(),
             http_port: 15800,
             tcp_port: 15801,
+            idle_timeout_secs: 60,
+            max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
         }
     }
 }

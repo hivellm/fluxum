@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Implement the FluxRPC TCP listener (:15801): frame parser + session state machine (FR-40, FR-42)
-- [ ] 1.2 Message routing for Authenticate / ReducerCall / Subscribe / SubscribeSingle / Unsubscribe / OneOffQuery; any non-Authenticate message pre-auth returns 401 "unauthenticated" with the connection kept open (AUTH-020)
-- [ ] 1.3 Multiplexing by per-message id: pipelined concurrent calls answered out of order, every response echoing the correct id (SPEC-006 acceptance 4)
-- [ ] 1.4 Idle connection timeout (408 then close) and max frame size enforcement (default 16 MB, configurable, 413) (FR-45)
-- [ ] 1.5 Reconnect resync: after forced disconnect a client re-authenticates, re-subscribes, gets fresh InitialData, detects missed updates via the tx_id gap (SPEC-006 acceptance 14)
-- [ ] 1.6 Loopback RTT benchmark: FluxRPC over loopback TCP p99 < 0.5 ms (NFR-05, TST-062)
-- [ ] 1.7 Verification (DAG exit test): loopback integration tests
+- [x] 1.1 Implement the FluxRPC TCP listener (:15801): frame parser + session state machine (FR-40, FR-42) — `fluxum-server`: `tcp::serve` binds the listener and drives one read/route/write loop per connection over the sans-IO `FrameCodec`; `session::Session` is the `Unauthenticated`→`Authenticated` state machine
+- [x] 1.2 Message routing for Authenticate / ReducerCall / Subscribe / SubscribeSingle / Unsubscribe / OneOffQuery; any non-Authenticate message pre-auth returns 401 "unauthenticated" with the connection kept open (AUTH-020) — `Session::handle` routes all six; the pre-auth gate replies 401 and keeps the socket; reducer business `Err` maps to `ReducerResult{Err}` (RED-060) while admission errors forward their wire code
+- [x] 1.3 Multiplexing by per-message id: pipelined concurrent calls answered out of order, every response echoing the correct id (SPEC-006 acceptance 4) — every response echoes the request id; a single ordered per-connection writer drains the shared outbound queue, so pipelined calls come back with matching ids (test fires 5 without waiting, asserts the id set)
+- [x] 1.4 Idle connection timeout (408 then close) and max frame size enforcement (default 16 MB, configurable, 413) (FR-45) — `TcpOptions{idle_timeout, max_frame_bytes}` (wired from `server.idle_timeout_secs` / `server.max_frame_bytes`); an idle read sends 408 + closes, an oversized frame header sends 413 + closes (both fire from the header alone)
+- [x] 1.5 Reconnect resync: after forced disconnect a client re-authenticates, re-subscribes, gets fresh InitialData, detects missed updates via the tx_id gap (SPEC-006 acceptance 14) — the commit fan-out is a broadcast the transport pushes `TxUpdate`s from; a lagging/disconnected subscriber recovers on reconnect via fresh `InitialData` reflecting the gap commits (test drops + reconnects across two commits)
+- [x] 1.6 Loopback RTT benchmark: FluxRPC over loopback TCP p99 < 0.5 ms (NFR-05, TST-062) — `benches/loopback_rtt.rs` (criterion) round-trips a reducer call over loopback; the DAG exit is the integration suite, the bench is the standing NFR-05 guard
+- [x] 1.7 Verification (DAG exit test): loopback integration tests — `tests/tcp_loopback.rs` (10 tests): auth handshake, pre-auth 401, reducer commit + business-err, id multiplexing, subscribe→InitialData→live TxUpdate push, unsubscribe stops delivery, one-off query, idle 408, oversized 413, reconnect resync
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `fluxum-server` lib / `session` / `tcp` incl. the concurrency shape and the T5.4 `ShardHost` boundary)
+- [x] 2.2 Write tests covering the new behavior (the loopback integration suite)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean) — CI deferred per the no-Actions directive
