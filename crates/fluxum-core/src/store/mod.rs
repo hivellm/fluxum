@@ -51,7 +51,7 @@
 //!   a structural no-op (the committed `Arc<Row>` identity is preserved), and
 //!   insert-then-delete of a pending row vanishes entirely.
 //! - **Constraint overlay** (STG-007 tail): PK-uniqueness (TXN-040) and
-//!   `#[unique]` checks (TXN-041, T3.1 — see [`unique`]) run eagerly at
+//!   `#[unique]` checks (TXN-041, T3.1 — the `unique` submodule) run eagerly at
 //!   `insert`/`upsert` time against `CommittedState` ⊕ `TxState` — a
 //!   committed row tx-deleted in the same transaction does not conflict,
 //!   pending inserts do. Because checks are eager and the writer is single,
