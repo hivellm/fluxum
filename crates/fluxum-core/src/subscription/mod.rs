@@ -31,6 +31,12 @@
 //! subscribed to a matched plan incur zero per-commit work — the manager
 //! never iterates all connected clients or all registered plans.
 
+pub mod sendbuffer;
+
+pub use sendbuffer::{
+    BLOCKED_DROP_AFTER, DropReason, Message, Offered, SubscriberBuffer, SubscriberDropCounter, Tier,
+};
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 

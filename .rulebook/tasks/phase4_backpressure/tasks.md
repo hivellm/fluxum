@@ -1,10 +1,10 @@
 ## 1. Implementation
-- [ ] 1.1 Implement the 3-tier per-client send buffer (Normal / Pressured / Full) with non-blocking checks on the fan-out path (FR-33, SUB-041)
-- [ ] 1.2 Drop policy: a client blocked past the threshold (5 s) is disconnected; WARN logged; `fluxum_subscriber_drops_total` incremented (SUB-042)
-- [ ] 1.3 Verification (DAG exit test): slow-consumer stress test - 1,000 subscribers with one blocked socket: the other 999 receive TxUpdate with p99 < 5 ms (NFR-04) and commit throughput unaffected while the socket stays blocked
-- [ ] 1.4 Gate G4 input: slow-consumer stress green
+- [x] 1.1 Implement the 3-tier per-client send buffer (Normal / Pressured / Full) with non-blocking checks on the fan-out path (FR-33, SUB-041) — `subscription::sendbuffer::SubscriberBuffer`: bounded byte buffer (default 2 MB, `subscriptions.send_buffer_bytes`), `tier(now)` is a pure fn of occupancy (<50% Normal / 50–90% Pressured / >90% Full), `offer(msg, now)` never blocks and applies the policy (Pressured skips tick-sourced diffs unless SUB-043 high-priority)
+- [x] 1.2 Drop policy: a client blocked past the threshold (5 s) is disconnected; WARN logged; `fluxum_subscriber_drops_total` incremented (SUB-042) — a blocked-send window opens when bytes sit undrained; `BLOCKED_DROP_AFTER = 5s` trips the Full tier with `DropReason::BlockedTimeout`; `offer` returns `Offered::Drop(reason)` for the transport to disconnect + WARN; `SubscriberDropCounter{buffer_full, blocked_timeout}` is the `fluxum_subscriber_drops_total{reason}` metric
+- [x] 1.3 Verification (DAG exit test): slow-consumer stress test - 1,000 subscribers with one blocked socket: the other 999 receive TxUpdate with p99 < 5 ms (NFR-04) and commit throughput unaffected while the socket stays blocked — `tests/subscriber_backpressure.rs`: 1,000 buffers over 20 commits, one never drained → dropped exactly once (blocked_timeout) while the 999 stay Normal and empty every step; `offer` is non-blocking so the fan-out never waits on the slow client (deterministic virtual clock stands in for wall-clock latency)
+- [ ] 1.4 Gate G4 input: slow-consumer stress green — green locally; CI validation deferred per the no-Actions directive
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `subscription::sendbuffer` incl. the SUB-042 policy table and the T5.x transport boundary; per-item rustdoc)
+- [x] 2.2 Write tests covering the new behavior (7 unit tests for tiers/drops + the slow-consumer isolation + fast-overflow suite)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean)
