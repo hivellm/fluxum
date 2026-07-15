@@ -17,6 +17,10 @@ syn.workspace = true
 [dev-dependencies]
 fluxum-core.workspace = true
 fluxum-testmod.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
 trybuild.workspace = true
 
 [lints]

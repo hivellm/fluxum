@@ -1,0 +1,8 @@
+error[E0599]: no method named `insert` found for struct `ReadOnlyTxHandle<'a>` in the current scope
+  --> tests/ui/fail/view_cannot_write.rs:20:10
+   |
+19 | /     ctx.tx
+20 | |         .insert(Task {
+   | |         -^^^^^^ method not found in `ReadOnlyTxHandle<'_>`
+   | |_________|
+   |

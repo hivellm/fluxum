@@ -1,13 +1,16 @@
-//! Fluxum procedural macros (SPEC-001, SPEC-010).
+//! Fluxum procedural macros (SPEC-001, SPEC-004, SPEC-010).
 //!
-//! Currently implemented: [`macro@table`] and [`macro@migration`]. The
-//! remaining function-item macros (`#[fluxum::reducer]`, `#[view]`,
-//! `#[procedure]`, `#[tick]`, `#[schedule]`, lifecycle hooks) land in
-//! phase 3+ per `docs/DAG.md`.
+//! Currently implemented: [`macro@table`], [`macro@migration`],
+//! [`macro@reducer`], the lifecycle hooks ([`macro@on_init`],
+//! [`macro@on_shard_start`], [`macro@on_connect`], [`macro@on_disconnect`]),
+//! and [`macro@view`]. The remaining function-item macros
+//! (`#[fluxum::procedure]`, `#[tick]`, `#[schedule]`) land with T3.4+ per
+//! `docs/DAG.md`.
 
 use proc_macro::TokenStream;
 
 mod migration;
+mod reducer;
 mod table;
 
 /// Declares a Rust struct as a Fluxum database table (SPEC-001 DM-001).
@@ -102,4 +105,80 @@ pub fn table(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn migration(args: TokenStream, input: TokenStream) -> TokenStream {
     migration::expand(args.into(), input.into()).into()
+}
+
+/// Declares a reducer — the primary mutation API (SPEC-004 RED-001).
+///
+/// The function keeps its exact signature (`&ReducerContext` first, then
+/// typed parameters, returning `Result<(), String>`); the macro submits it
+/// to the link-time reducer registry (RED-006) together with generated
+/// dispatch glue that decodes the `ReducerCall`'s `FluxValue` argument list
+/// into the declared parameter types, and an argument pre-check the engine
+/// runs **before** any transaction is started — an argument count or type
+/// mismatch never allocates a `TxState` (RED-001).
+///
+/// Returning `Err(message)` rolls the transaction back fully and sends the
+/// message to the caller (RED-060); a panic is caught by the engine,
+/// rolls back identically, and never takes the shard down (RED-061).
+///
+/// # Example
+///
+/// ```ignore
+/// #[fluxum::reducer]
+/// fn update_reading(ctx: &ReducerContext, grid_x: i32, grid_y: i32, value: f64)
+///     -> Result<(), String>
+/// {
+///     let sensor = ctx.tx.query_pk::<Sensor>((grid_x, grid_y))
+///         .map_err(|e| e.to_string())?
+///         .ok_or_else(|| "unknown sensor".to_string())?;
+///     ctx.tx.upsert::<Sensor>(Sensor { reading: value, ..sensor })
+///         .map_err(|e| e.to_string())?;
+///     Ok(())
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn reducer(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_reducer(args.into(), input.into()).into()
+}
+
+/// Declares the fresh-shard initializer (SPEC-004 RED-010): runs exactly
+/// once, the first time a shard starts with an empty `CommittedState` (no
+/// checkpoint, no commit log) — never on recovery restarts. Signature:
+/// `fn(ctx: &ReducerContext) -> Result<(), String>`.
+#[proc_macro_attribute]
+pub fn on_init(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_lifecycle(reducer::Hook::Init, args.into(), input.into()).into()
+}
+
+/// Declares a shard-start hook (SPEC-004 RED-013): runs on every startup —
+/// including recovery restarts — after `CommittedState` is recovered and
+/// before the shard accepts `ReducerCall`s.
+#[proc_macro_attribute]
+pub fn on_shard_start(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_lifecycle(reducer::Hook::ShardStart, args.into(), input.into()).into()
+}
+
+/// Declares a client-connect hook (SPEC-004 RED-011): runs in its own
+/// transaction when an authenticated client connects; the client's
+/// `Identity` and `ConnectionId` arrive through the context.
+#[proc_macro_attribute]
+pub fn on_connect(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_lifecycle(reducer::Hook::Connect, args.into(), input.into()).into()
+}
+
+/// Declares a client-disconnect hook (SPEC-004 RED-012): runs in its own
+/// transaction when a client's connection drops (clean close or timeout).
+#[proc_macro_attribute]
+pub fn on_disconnect(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_lifecycle(reducer::Hook::Disconnect, args.into(), input.into()).into()
+}
+
+/// Declares a read-only view for the HTTP admin API (`GET /view/:name`,
+/// SPEC-004 RED-030). The function receives a `&ViewContext` — whose
+/// `ReadOnlyTxHandle` has **no write methods**, so a view that tries to
+/// write does not compile (RED-031) — plus typed parameters, and returns
+/// any `serde::Serialize` value, delivered to the caller as JSON.
+#[proc_macro_attribute]
+pub fn view(args: TokenStream, input: TokenStream) -> TokenStream {
+    reducer::expand_view(args.into(), input.into()).into()
 }

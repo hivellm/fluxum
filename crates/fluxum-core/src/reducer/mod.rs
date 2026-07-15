@@ -58,16 +58,26 @@
 //!   until then reducers reach them through the engine-level seams on
 //!   [`Tx`] itself ([`Tx::index_eq`], [`Tx::spatial_radius`]).
 
+pub mod args;
+pub mod engine;
+pub mod view;
+
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
 use std::fmt;
 
-use fluxum_protocol::{FluxValue, codes};
+/// Re-exported for the `#[fluxum::reducer]` macro expansion (one stable
+/// root path) and for module authors passing raw argument lists.
+pub use fluxum_protocol::FluxValue;
+use fluxum_protocol::codes;
 
 use crate::error::{FluxumError, Result};
 use crate::schema::Table;
 use crate::store::{Row, TableId, Tx};
 use crate::types::{ConnectionId, Identity, Timestamp};
+
+pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
+pub use view::{ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry};
 
 /// Maximum reducer-calls-reducer nesting depth (RED-005 guard).
 ///
@@ -95,10 +105,17 @@ pub struct ReducerCaller {
 
 /// A registered reducer body: receives the context and the raw `FluxValue`
 /// argument list of the `ReducerCall` (RED-001; the `#[fluxum::reducer]`
-/// macro of T3.4 generates the decode glue that turns `args` into typed
-/// parameters).
+/// macro generates the decode glue that turns `args` into typed parameters).
 pub type ReducerHandler =
     Box<dyn Fn(&ReducerContext<'_, '_, '_>, &[FluxValue]) -> Result<()> + Send + Sync>;
+
+/// The static handler shape `#[fluxum::reducer]` emits (fn pointer, so a
+/// [`ReducerDef`] can live in the link-time registry).
+pub type ReducerFnPtr = fn(&ReducerContext<'_, '_, '_>, &[FluxValue]) -> Result<()>;
+
+/// Argument pre-validation (arity + per-parameter decode) run by the engine
+/// **before** any transaction is started (RED-001).
+pub type ArgCheckFn = fn(&[FluxValue]) -> Result<()>;
 
 /// Wrap a closure or fn as a [`ReducerHandler`] (helps closure inference
 /// across the higher-ranked context lifetimes).
@@ -109,12 +126,41 @@ where
     Box::new(f)
 }
 
-/// Name → reducer map (RED-006): populated at startup (`ServerBuilder`,
-/// link-time collection lands with T3.4's `#[fluxum::reducer]`), then read
-/// by every dispatch — including nested [`TxHandle::call`]s.
+/// One `#[fluxum::reducer]` in the link-time registry (RED-006): collected
+/// by [`ReducerRegistry::from_registered`] at startup, exactly like tables
+/// (DM-040) and migrations (MIG-010).
+pub struct ReducerDef {
+    /// Reducer function name — the `ReducerCall` dispatch key.
+    pub name: &'static str,
+    /// The macro-generated dispatch glue (decode args, call the function).
+    pub handler: ReducerFnPtr,
+    /// The macro-generated pre-transaction argument check (RED-001).
+    pub check_args: ArgCheckFn,
+}
+
+inventory::collect!(ReducerDef);
+
+/// Iterate every `#[fluxum::reducer]` registered in this binary, in linker
+/// order (the registry map is name-keyed; order is irrelevant).
+pub fn registered_reducers() -> impl Iterator<Item = &'static ReducerDef> {
+    inventory::iter::<ReducerDef>()
+}
+
+/// One registered reducer: the dispatch body plus the optional
+/// pre-transaction argument check (absent for closure-registered reducers,
+/// which have no declared signature to check against).
+struct Registered {
+    handler: ReducerHandler,
+    check_args: Option<ArgCheckFn>,
+}
+
+/// Name → reducer map (RED-006): populated at startup — from the link-time
+/// registry via [`ReducerRegistry::from_registered`], or programmatically
+/// via [`ReducerRegistry::register`] — then read by every dispatch,
+/// including nested [`TxHandle::call`]s.
 #[derive(Default)]
 pub struct ReducerRegistry {
-    handlers: HashMap<String, ReducerHandler>,
+    handlers: HashMap<String, Registered>,
 }
 
 impl fmt::Debug for ReducerRegistry {
@@ -133,16 +179,59 @@ impl ReducerRegistry {
         Self::default()
     }
 
+    /// Collect every `#[fluxum::reducer]` of this binary (RED-006). A
+    /// duplicate name aborts startup with a [`FluxumError::Schema`].
+    pub fn from_registered() -> Result<Self> {
+        Self::from_defs(registered_reducers())
+    }
+
+    /// [`ReducerRegistry::from_registered`] with explicit defs — the seam
+    /// tests and embedders use instead of the link-time registry.
+    pub fn from_defs(defs: impl IntoIterator<Item = &'static ReducerDef>) -> Result<Self> {
+        let mut registry = Self::new();
+        for def in defs {
+            registry.register_def(def)?;
+        }
+        Ok(registry)
+    }
+
+    /// Register one link-time [`ReducerDef`] (duplicate name = startup
+    /// error, RED-006).
+    pub fn register_def(&mut self, def: &'static ReducerDef) -> Result<()> {
+        self.insert(
+            def.name.to_owned(),
+            Box::new(def.handler),
+            Some(def.check_args),
+        )
+    }
+
     /// Register a reducer under `name`. A duplicate name is a startup error
-    /// (RED-006) — [`FluxumError::Schema`], which must abort boot.
+    /// (RED-006) — [`FluxumError::Schema`], which must abort boot. Closure
+    /// registrations carry no argument check (there is no declared
+    /// signature); [`ReducerRegistry::check_call`] then validates the name
+    /// only.
     pub fn register(&mut self, name: impl Into<String>, handler: ReducerHandler) -> Result<()> {
-        let name = name.into();
+        self.insert(name.into(), handler, None)
+    }
+
+    fn insert(
+        &mut self,
+        name: String,
+        handler: ReducerHandler,
+        check_args: Option<ArgCheckFn>,
+    ) -> Result<()> {
         if self.handlers.contains_key(&name) {
             return Err(FluxumError::Schema(format!(
                 "duplicate reducer name `{name}`: reducer names must be unique (RED-006)"
             )));
         }
-        self.handlers.insert(name, handler);
+        self.handlers.insert(
+            name,
+            Registered {
+                handler,
+                check_args,
+            },
+        );
         Ok(())
     }
 
@@ -154,6 +243,22 @@ impl ReducerRegistry {
     /// Registered reducer names (unordered).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.handlers.keys().map(String::as_str)
+    }
+
+    /// Admission check the engine runs **before** submitting to the
+    /// transaction pipeline (RED-001/RED-006): unknown names are a
+    /// wire-ready 404, and a `#[fluxum::reducer]`-declared signature
+    /// validates arity and argument types — all without a transaction or
+    /// `TxState` ever existing.
+    pub fn check_call(&self, name: &str, args: &[FluxValue]) -> Result<()> {
+        let registered = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| unknown_reducer(name))?;
+        if let Some(check) = registered.check_args {
+            check(args)?;
+        }
+        Ok(())
     }
 
     /// Execute reducer `name` against `tx` — the root dispatch the T3.3
@@ -170,11 +275,11 @@ impl ReducerRegistry {
         args: &[FluxValue],
         tx: &mut Tx<'_>,
     ) -> Result<()> {
-        let handler = self
+        let registered = self
             .handlers
             .get(name)
             .ok_or_else(|| unknown_reducer(name))?;
-        with_context(self, caller, tx, |ctx| handler(ctx, args))
+        with_context(self, caller, tx, |ctx| (registered.handler)(ctx, args))
     }
 }
 
@@ -383,7 +488,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     /// savepoints: writes the callee made before failing stay in the
     /// transaction if the error is handled and the transaction commits.
     pub fn call(&self, reducer: &str, args: &[FluxValue]) -> Result<()> {
-        let handler = self
+        let registered = self
             .env
             .registry
             .handlers
@@ -401,7 +506,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         }
         self.env.depth.set(depth + 1);
         let ctx = self.env.context();
-        let result = handler(&ctx, args);
+        let result = (registered.handler)(&ctx, args);
         self.env.depth.set(depth);
         result
     }

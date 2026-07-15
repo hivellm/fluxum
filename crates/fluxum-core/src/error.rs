@@ -70,6 +70,13 @@ pub enum FluxumError {
     #[error("schema error: {0}")]
     Schema(String),
 
+    /// A reducer body returned `Err(message)` (SPEC-004 RED-060): the
+    /// transaction was fully rolled back and the message travels verbatim to
+    /// the caller as `ReducerResult { outcome: Err(message) }` — unlike
+    /// [`FluxumError::Query`], which maps to a wire `Error` frame.
+    #[error("reducer error: {0}")]
+    Reducer(String),
+
     /// Query rejected with a wire error code (SPEC-006 RPC-034 registry) —
     /// e.g. SPEC-008's `400 table 'X' has no spatial index` (SPX-022) and
     /// `503 spatial index not ready` (SPX-023). The server layer forwards
