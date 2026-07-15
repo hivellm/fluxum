@@ -20,7 +20,7 @@ use serde_bytes::ByteBuf;
 use crate::error::{FluxumError, Result};
 use crate::store::row::{Row, RowValue};
 use crate::store::{TableId, TxDiff};
-use crate::types::{ConnectionId, EntityId, Identity, Timestamp};
+use crate::types::{ConnectionId, Decimal, EntityId, Identity, Timestamp};
 
 /// One committed transaction, as persisted in the commit log (STG-011) and
 /// consumed verbatim by the replication stream (STG-016).
@@ -166,6 +166,13 @@ pub enum LogValue {
     EntityId(u64),
     /// [`Timestamp`] column — microseconds since the Unix epoch.
     Timestamp(i64),
+    /// [`Decimal`] column — 16 little-endian bytes (`i128` unscaled) + scale.
+    Decimal {
+        /// The `i128` coefficient, little-endian (16 bytes).
+        unscaled: ByteBuf,
+        /// Fractional decimal digits.
+        scale: u8,
+    },
     /// `Option<T>` column.
     Opt(Option<Box<LogValue>>),
     /// `Vec<T>` column.
@@ -194,6 +201,10 @@ impl From<&RowValue> for LogValue {
             }
             RowValue::EntityId(v) => Self::EntityId(v.as_u64()),
             RowValue::Timestamp(v) => Self::Timestamp(v.as_micros()),
+            RowValue::Decimal(v) => Self::Decimal {
+                unscaled: ByteBuf::from(v.unscaled().to_le_bytes().to_vec()),
+                scale: v.scale(),
+            },
             RowValue::Optional(v) => {
                 Self::Opt(v.as_ref().map(|inner| Box::new(Self::from(inner.as_ref()))))
             }
@@ -241,6 +252,13 @@ impl LogValue {
             }
             Self::EntityId(v) => RowValue::EntityId(EntityId::new(*v)),
             Self::Timestamp(v) => RowValue::Timestamp(Timestamp::from_micros(*v)),
+            Self::Decimal { unscaled, scale } => {
+                let bytes: [u8; 16] = unscaled
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| bad_len("Decimal", 16, unscaled.len()))?;
+                RowValue::Decimal(Decimal::from_parts(i128::from_le_bytes(bytes), *scale))
+            }
             Self::Opt(v) => RowValue::Optional(match v {
                 None => None,
                 Some(inner) => Some(Box::new(inner.to_row_value()?)),
@@ -279,6 +297,7 @@ mod tests {
             RowValue::ConnectionId(ConnectionId::new(u128::MAX - 7)),
             RowValue::EntityId(EntityId::new(99)),
             RowValue::Timestamp(Timestamp::from_micros(-5)),
+            RowValue::Decimal(Decimal::from_parts(-123_456_789, 4)),
             RowValue::Optional(None),
             RowValue::Optional(Some(Box::new(RowValue::Str("inner".into())))),
             RowValue::List(vec![RowValue::U16(1), RowValue::U16(2)]),

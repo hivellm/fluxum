@@ -73,7 +73,7 @@ pub use auth::{AuthClaims, AuthOutcome, AuthProvider, Authenticator};
 pub use config::Config;
 pub use error::{FluxumError, Result};
 pub use reducer::{ReducerCaller, ReducerContext, ReducerRegistry, TxHandle};
-pub use types::{ConnectionId, EntityId, Identity, Timestamp};
+pub use types::{ConnectionId, Decimal, EntityId, Identity, Timestamp};
 
 #[cfg(test)]
 mod tests {

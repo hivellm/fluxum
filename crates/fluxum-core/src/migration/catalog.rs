@@ -53,6 +53,8 @@ pub enum StoredType {
     EntityId,
     /// [`crate::types::Timestamp`].
     Timestamp,
+    /// [`crate::types::Decimal`] — exact fixed-point (SPEC-017 CT-020).
+    Decimal,
     /// `Option<T>`.
     Option(Box<StoredType>),
     /// `Vec<T>`.
@@ -79,6 +81,7 @@ impl From<&FluxType> for StoredType {
             FluxType::ConnectionId => Self::ConnectionId,
             FluxType::EntityId => Self::EntityId,
             FluxType::Timestamp => Self::Timestamp,
+            FluxType::Decimal => Self::Decimal,
             FluxType::Option(inner) => Self::Option(Box::new(Self::from(*inner))),
             FluxType::List(inner) => Self::List(Box::new(Self::from(*inner))),
         }

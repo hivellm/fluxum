@@ -22,6 +22,7 @@
 //! | `ConnectionId` | 16 bytes raw (`u128` LE, no prefix) |
 //! | `EntityId` | 8 bytes LE (`u64` newtype) |
 //! | `Timestamp` | 8 bytes LE (`i64` µs since Unix epoch) |
+//! | `Decimal` | 16 bytes `i128` LE (unscaled) + 1 byte scale (SPEC-017 CT-020) |
 //! | struct | fields in declaration order, no separators, no names |
 //! | enum | `u8` tag + encode(variant payload) |
 //!
@@ -206,6 +207,14 @@ impl FluxBinWriter {
     /// `Timestamp` → 8 bytes LE (`i64` µs since Unix epoch).
     pub fn write_timestamp(&mut self, v: i64) {
         self.write_i64(v);
+    }
+
+    /// `Decimal` → 16 bytes `i128` LE (unscaled) + 1 byte scale (SPEC-017
+    /// CT-020). Self-describing: the scale travels with the value, so a
+    /// `Decimal` column accepts any scale without schema-side scale context.
+    pub fn write_decimal(&mut self, unscaled: i128, scale: u8) {
+        self.buf.extend_from_slice(&unscaled.to_le_bytes());
+        self.buf.push(scale);
     }
 
     /// enum tag → `u8`. The caller then writes the variant payload.
@@ -394,6 +403,14 @@ impl<'a> FluxBinReader<'a> {
     /// `Timestamp` — 8 bytes LE.
     pub fn read_timestamp(&mut self) -> Result<i64, FluxBinError> {
         self.read_i64()
+    }
+
+    /// `Decimal` — 16 bytes `i128` LE (unscaled) + 1 byte scale (SPEC-017
+    /// CT-020).
+    pub fn read_decimal(&mut self) -> Result<(i128, u8), FluxBinError> {
+        let unscaled = i128::from_le_bytes(self.take_array()?);
+        let scale = self.read_u8()?;
+        Ok((unscaled, scale))
     }
 
     /// enum tag — the caller then reads the variant payload.

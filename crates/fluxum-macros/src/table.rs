@@ -53,6 +53,7 @@ enum FluxTy {
     ConnectionId,
     EntityId,
     Timestamp,
+    Decimal,
     Opt(Box<FluxTy>),
     List(Box<FluxTy>),
 }
@@ -84,6 +85,7 @@ impl FluxTy {
             Self::ConnectionId => quote!(#path::ConnectionId),
             Self::EntityId => quote!(#path::EntityId),
             Self::Timestamp => quote!(#path::Timestamp),
+            Self::Decimal => quote!(#path::Decimal),
             Self::Opt(inner) => {
                 let inner = inner.tokens();
                 quote!(#path::Option(&#inner))
@@ -500,10 +502,26 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             .collect::<syn::Result<_>>()?;
 
         let (tag, tokens) = match decl.kind {
-            IndexKind::BTree => (
-                "btree",
-                quote!(::fluxum_core::schema::IndexSchema::BTree { columns: &[#(#ords),*] }),
-            ),
+            IndexKind::BTree => {
+                // Decimal is not yet a valid B-tree key: a numerically
+                // order-preserving memcomparable encoding across mixed scales
+                // is deferred (SPEC-017 CT-020).
+                for (col, ord) in decl.columns.iter().zip(&ords) {
+                    if columns[usize::from(*ord)].flux == FluxTy::Decimal {
+                        return Err(syn::Error::new(
+                            col.span(),
+                            format!(
+                                "`Decimal` column `{col}` cannot yet be a B-tree index key \
+                                 (SPEC-017 CT-020)"
+                            ),
+                        ));
+                    }
+                }
+                (
+                    "btree",
+                    quote!(::fluxum_core::schema::IndexSchema::BTree { columns: &[#(#ords),*] }),
+                )
+            }
             IndexKind::QuadTree | IndexKind::RTree => {
                 let (tag, kind) = match decl.kind {
                     IndexKind::QuadTree => (
@@ -949,6 +967,7 @@ fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
         "ConnectionId" => simple(FluxTy::ConnectionId),
         "EntityId" => simple(FluxTy::EntityId),
         "Timestamp" => simple(FluxTy::Timestamp),
+        "Decimal" => simple(FluxTy::Decimal),
         "Vec" => {
             let inner = generic_inner(&segment.arguments).ok_or_else(unsupported)?;
             let inner = parse_flux_type(inner)?;
@@ -998,6 +1017,7 @@ fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
         FluxTy::ConnectionId => quote!(#rv::ConnectionId(#expr)),
         FluxTy::EntityId => quote!(#rv::EntityId(#expr)),
         FluxTy::Timestamp => quote!(#rv::Timestamp(#expr)),
+        FluxTy::Decimal => quote!(#rv::Decimal(#expr)),
         FluxTy::Opt(inner) => {
             let inner = to_row_value(inner, quote!(__fx_inner));
             quote! {
@@ -1068,6 +1088,7 @@ fn from_row_value(flux: &FluxTy, src: TokenStream, table: &str, column: &str) ->
         FluxTy::ConnectionId => copied(quote!(ConnectionId)),
         FluxTy::EntityId => copied(quote!(EntityId)),
         FluxTy::Timestamp => copied(quote!(Timestamp)),
+        FluxTy::Decimal => copied(quote!(Decimal)),
         FluxTy::Opt(inner) => {
             let inner = from_row_value(inner, quote!((&**__fx_opt)), table, column);
             quote! {

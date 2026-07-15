@@ -104,6 +104,9 @@ pub enum FluxType {
     EntityId,
     /// [`crate::types::Timestamp`] — 8 bytes.
     Timestamp,
+    /// [`crate::types::Decimal`] — exact fixed-point (SPEC-017 CT-020):
+    /// 16-byte `i128` unscaled + 1-byte scale, self-describing.
+    Decimal,
     /// `Option<T>` — nullable column (DM-012).
     Option(&'static FluxType),
     /// `Vec<T>` — homogeneous list (DM-012).

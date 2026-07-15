@@ -208,6 +208,106 @@ impl fmt::Display for Timestamp {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Decimal
+// ---------------------------------------------------------------------------
+
+/// Exact fixed-point decimal: the value is `unscaled × 10^-scale`
+/// (SPEC-017 CT-020). The analogue of PostgreSQL `numeric(p, s)` — exact, no
+/// binary-float rounding.
+///
+/// The representation is **self-describing**: each value carries its own
+/// `scale`, so a `Decimal` column accepts any scale (a `#[normalize(money,
+/// scale)]` transform, added later, canonicalises to a fixed scale on write).
+///
+/// `PartialEq`/`Eq`/`Hash`/`Ord` are **structural** over `(unscaled, scale)`,
+/// which keeps "equal `RowValue` ⟺ equal FluxBIN bytes" — the invariant the
+/// store and index-integrity checks rely on (STG-007). Numeric comparison that
+/// treats `1.50` and `1.5` as equal is [`Decimal::value_cmp`], used by the
+/// query layer (`ORDER BY`), not by storage equality.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Decimal {
+    unscaled: i128,
+    scale: u8,
+}
+
+impl Decimal {
+    /// Construct from an unscaled integer and a scale: value `unscaled ×
+    /// 10^-scale` (e.g. `from_parts(150, 2)` == `1.50`).
+    pub const fn from_parts(unscaled: i128, scale: u8) -> Self {
+        Self { unscaled, scale }
+    }
+
+    /// An integer value (`scale == 0`).
+    pub const fn from_integer(value: i128) -> Self {
+        Self {
+            unscaled: value,
+            scale: 0,
+        }
+    }
+
+    /// The unscaled integer coefficient.
+    pub const fn unscaled(&self) -> i128 {
+        self.unscaled
+    }
+
+    /// The number of fractional decimal digits.
+    pub const fn scale(&self) -> u8 {
+        self.scale
+    }
+
+    /// Compare two decimals by **numeric value**, so `1.50` and `1.5` are
+    /// equal and `1.5 < 2.0` regardless of scale (SPEC-017 CT-020). Exact
+    /// where the scale alignment fits `i128`; for the rare extreme-scale
+    /// overflow it falls back to a sign/magnitude decision.
+    pub fn value_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.scale == other.scale {
+            return self.unscaled.cmp(&other.unscaled);
+        }
+        let max_scale = self.scale.max(other.scale);
+        let lift = |v: &Self| -> Option<i128> {
+            pow10_i128(u32::from(max_scale - v.scale)).and_then(|p| v.unscaled.checked_mul(p))
+        };
+        match (lift(self), lift(other)) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            // A lift overflowed `i128`: that side's magnitude dominates, so its
+            // sign decides the ordering (the overflowing coefficient is never 0).
+            (None, Some(_)) => sign_ordering(self.unscaled),
+            (Some(_), None) => sign_ordering(other.unscaled).reverse(),
+            (None, None) => self.unscaled.cmp(&other.unscaled),
+        }
+    }
+}
+
+/// `Greater`/`Less`/`Equal` from the sign of `v`.
+fn sign_ordering(v: i128) -> std::cmp::Ordering {
+    v.cmp(&0)
+}
+
+/// `10^n` as `i128`, or `None` on overflow.
+fn pow10_i128(n: u32) -> Option<i128> {
+    10i128.checked_pow(n)
+}
+
+impl fmt::Display for Decimal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scale = usize::from(self.scale);
+        // Digit-string arithmetic avoids any 10^scale overflow for large scales.
+        let digits = self.unscaled.unsigned_abs().to_string();
+        let sign = if self.unscaled < 0 { "-" } else { "" };
+        if scale == 0 {
+            return write!(f, "{sign}{digits}");
+        }
+        if digits.len() > scale {
+            let point = digits.len() - scale;
+            write!(f, "{sign}{}.{}", &digits[..point], &digits[point..])
+        } else {
+            let zeros = "0".repeat(scale - digits.len());
+            write!(f, "{sign}0.{zeros}{digits}")
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -299,5 +399,39 @@ mod tests {
         assert_eq!(EntityId::new(99).to_string(), "99");
         assert_eq!(Timestamp::from_micros(-5).as_micros(), -5);
         assert!(Timestamp::now().as_micros() > 1_600_000_000_000_000); // after 2020
+    }
+
+    #[test]
+    fn decimal_accessors_and_parts() {
+        let d = Decimal::from_parts(150, 2);
+        assert_eq!(d.unscaled(), 150);
+        assert_eq!(d.scale(), 2);
+        assert_eq!(Decimal::from_integer(42), Decimal::from_parts(42, 0));
+    }
+
+    #[test]
+    fn decimal_display_places_the_point() {
+        assert_eq!(Decimal::from_parts(150, 2).to_string(), "1.50");
+        assert_eq!(Decimal::from_parts(1234, 0).to_string(), "1234");
+        assert_eq!(Decimal::from_parts(-5, 3).to_string(), "-0.005");
+        assert_eq!(Decimal::from_parts(-12345, 2).to_string(), "-123.45");
+        assert_eq!(Decimal::from_parts(0, 4).to_string(), "0.0000");
+        assert_eq!(Decimal::from_parts(7, 1).to_string(), "0.7");
+    }
+
+    #[test]
+    fn decimal_structural_eq_distinguishes_scale_but_value_cmp_does_not() {
+        use std::cmp::Ordering;
+        let a = Decimal::from_parts(150, 2); // 1.50
+        let b = Decimal::from_parts(15, 1); // 1.5
+        assert_ne!(a, b); // structural: distinct bytes
+        assert_eq!(a.value_cmp(&b), Ordering::Equal); // numeric: equal value
+
+        let c = Decimal::from_parts(2, 0); // 2.0
+        assert_eq!(a.value_cmp(&c), Ordering::Less);
+        assert_eq!(c.value_cmp(&a), Ordering::Greater);
+        // negative vs positive across scales
+        let n = Decimal::from_parts(-1, 3); // -0.001
+        assert_eq!(n.value_cmp(&a), Ordering::Less);
     }
 }

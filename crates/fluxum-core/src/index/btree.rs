@@ -167,6 +167,16 @@ pub(crate) fn encode_value(value: &RowValue, out: &mut Vec<u8>) {
         RowValue::Timestamp(v) => {
             out.extend_from_slice(&(v.as_micros().cast_unsigned() ^ SIGN64).to_be_bytes());
         }
+        // Decimal is not yet a valid B-tree index key (rejected at macro
+        // expansion, SPEC-017 CT-020): a numerically order-preserving
+        // memcomparable encoding across mixed scales is deferred. This arm is
+        // therefore unreachable; it emits a deterministic, fixed-width form
+        // (sign-flipped `i128` big-endian + scale) purely for totality.
+        RowValue::Decimal(v) => {
+            const SIGN128: u128 = 1 << 127;
+            out.extend_from_slice(&(v.unscaled().cast_unsigned() ^ SIGN128).to_be_bytes());
+            out.push(v.scale());
+        }
         RowValue::Optional(None) => out.push(0x00),
         RowValue::Optional(Some(inner)) => {
             out.push(0x01);
