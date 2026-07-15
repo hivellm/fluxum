@@ -310,7 +310,12 @@ impl<'a> MigrationRunner<'a> {
         }
         self.write_meta(&mut tx, META_KEY_VERSION, encode_version(def.version)?)?;
         self.write_meta(&mut tx, META_KEY_CATALOG, working.encode()?)?;
-        self.commit_and_log(tx).await
+        let tx_id = self.commit_and_log(tx).await?;
+        // A committed step is durable before the next one runs: if a later
+        // step aborts startup (or the process dies), the resume path reads
+        // this step's version stamp and never re-runs it (MIG-012).
+        self.log.wait_durable(tx_id).await?;
+        Ok(tx_id)
     }
 
     /// Read a `__schema_meta__` value from the committed state.
