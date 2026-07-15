@@ -315,7 +315,8 @@ Reference baseline: SpacetimeDB in production — 150,000 tx/s, single binary.
 | Distributed cross-shard transactions | Shard boundary = transaction boundary; cross-shard writes are by design impossible |
 | Embedding a third-party storage engine (RocksDB, LMDB, SQLite) | The paged store, commit log, and buffer pool are owned code — the performance envelope is the product |
 | OIDC / OAuth2 as built-in providers | The pluggable `AuthProvider` trait handles any token scheme |
-| Full-text / vector search | Out of scope — the family has Nexus and Vectorizer for that |
+| Vector / semantic search | Out of scope — delegated to the family's Vectorizer |
+| Search *platform* features (fuzzy/typo, synonyms, faceting, multi-field scoring DSL) | Out of scope — beyond a realtime DB's remit |
 | GraphQL API | FluxRPC + HTTP/JSON admin covers all client needs |
 | Multi-primary (active-active) replication | Replica sets are single-primary per shard; conflict-free multi-primary is a research project, not a launch feature |
 

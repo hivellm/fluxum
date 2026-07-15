@@ -10,6 +10,6 @@
 - [ ] 1.9 Verification: example schema with money/datetime/string + a declared (not-yet-executed) #[encrypted] column compiles; schema registry reflects transforms; Decimal roundtrip + normalizer property tests green
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update SPEC-001 cross-refs and docs/specs/README.md to list SPEC-017; document the new attributes and Decimal type
-- [ ] 2.2 Write tests covering attribute parsing, Decimal roundtrip, and the three normalizers
-- [ ] 2.3 Run tests + clippy + coverage and confirm they pass
+- [ ] 2.1 Update or create documentation covering the implementation
+- [ ] 2.2 Write tests covering the new behavior
+- [ ] 2.3 Run tests and confirm they pass
