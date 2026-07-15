@@ -38,6 +38,22 @@ Traceability chain: **PRD** requirement IDs (`FR-xx`, `NFR-xx`) → **DAG** task
 | [SPEC-015](SPEC-015-tiered-storage.md) — Tiered Storage & Compression | Buffer pool, `memory.budget`, paged cold tier (page format, eviction), LZ4/zstd compression, datasets ≫ RAM | `TIER-` | **Page format freeze (G5)** |
 | [SPEC-016](SPEC-016-hardware-adaptivity.md) — Hardware Adaptivity & SIMD | Boot-time hardware probe (cores/RAM/cgroups), adaptive tuning, SIMD runtime dispatch, scalar-parity rule | `HWA-` | — |
 
+### Backlog specs (Fluxum-native extensions, post-core)
+
+| Spec | Scope | Prefix | Freeze event |
+|---|---|---|---|
+| [SPEC-017](SPEC-017-column-transforms.md) — Column Transforms & Field Security | Per-column normalize/encrypt/sign/mask, native `Decimal`, column grants | `CT-` | FluxBIN `Decimal` tag freezes at G5 |
+| [SPEC-018](SPEC-018-query-planner.md) — Index-Aware Query Planner | Access-path selection, range operators, keyset pagination, EXPLAIN | `QP-` | — |
+| [SPEC-019](SPEC-019-fulltext-search.md) — Lexical Full-Text Search | Positional inverted index, `MATCH`/phrase/prefix, BM25 ranking | `FTS-` | — |
+| [SPEC-020](SPEC-020-plugin-system.md) — Plugin System | Capability registry, in-proc + sidecar hosts, re-rank/retriever/CDC hooks | `PLG-` | — |
+| [SPEC-021](SPEC-021-client-sync-resilience.md) — Client Sync & Resilience | Optimistic mutations, resumable subscriptions, reducer idempotency, SDK offline cache | `CS-` | `tx_offset`/`Resume` freeze at G5 |
+| [SPEC-022](SPEC-022-reactive-views-query-extensions.md) — Reactive Views & Query Extensions | Reactive materialized views / live top-N, temporal `AS OF`, declarative constraints/triggers, relational RLS, computed columns | `RV-` | — |
+| [SPEC-023](SPEC-023-data-model-extensions.md) — Data Model Extensions | Ephemeral tables, row TTL, enum/struct types, blob store, typed edges, CRDT text | `DMX-` | Enum/struct FluxBIN tags freeze at G5 |
+| [SPEC-024](SPEC-024-developer-experience-tooling.md) — Developer Experience & Tooling | `fluxum dev` inner loop, reducer test kit, admin web console, seeding & migrate dry-run | `DEV-` | — |
+| [SPEC-025](SPEC-025-operations-multitenancy.md) — Operations & Multitenancy | Object-storage backup, audit trail, graceful drain, config hot-reload, namespaces, tenant quotas | `OPS-` | — |
+| [SPEC-026](SPEC-026-security-hardening.md) — Security Hardening | Encryption at rest, deterministic reducer stdlib, connection abuse protection | `SEC-` | — |
+| [SPEC-027](SPEC-027-analytics-interop.md) — Analytics Interop | Read-only Postgres-wire endpoint for BI tools | `PGW-` | — |
+
 ## Conventions
 
 - RFC 2119 keywords (**MUST**, **SHALL**, **MUST NOT**, **SHOULD**, **MAY**) are normative.
