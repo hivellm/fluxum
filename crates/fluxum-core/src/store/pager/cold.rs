@@ -325,3 +325,171 @@ fn index_key(
     key.extend_from_slice(pk);
     Ok(key)
 }
+
+#[cfg(test)]
+mod tests {
+    //! Accessor surface, query-shape validation errors, and the
+    //! internal-invariant guards (which the public API can only reach
+    //! through corrupted pages) of the cold tier.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::super::PagerOptions;
+    use super::*;
+    use crate::config::PageCompression;
+    use crate::schema::{
+        ColumnSchema, FluxType, IndexSchema, Schema, TableAccess, VisibilityRule,
+    };
+    use crate::store::MemStore;
+
+    static ITEM_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "label",
+            ty: FluxType::Str,
+        },
+        ColumnSchema {
+            name: "qty",
+            ty: FluxType::I64,
+        },
+    ];
+
+    static ITEM: TableSchema = TableSchema {
+        name: "Item",
+        columns: ITEM_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[IndexSchema::BTree { columns: &[1] }],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    fn spilled(dir: &std::path::Path) -> ColdTable {
+        let schema = Schema::from_tables([&ITEM]).unwrap();
+        let store = MemStore::new(&schema).unwrap();
+        let table = store.table_id("Item").unwrap();
+        let mut tx = store.begin();
+        for id in 0..4u64 {
+            tx.insert(
+                table,
+                vec![
+                    RowValue::U64(id),
+                    RowValue::Str(format!("label-{id}")),
+                    RowValue::I64(id as i64 * 3),
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let pager = Pager::open(
+            dir,
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 64 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap();
+        ColdTable::spill_snapshot(&pager, &store.snapshot(), table).unwrap()
+    }
+
+    #[test]
+    fn accessors_expose_schema_ids_and_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = spilled(dir.path());
+        assert_eq!(cold.schema().name, "Item");
+        assert_eq!(cold.table_id(), TableId::of("Item"));
+        assert!(cold.primary_tree().root_page_id() > 0);
+        let label_index = IndexId::of("Item", &["label"]);
+        assert!(cold.index_tree(label_index).is_some());
+        assert!(cold.index_tree(IndexId::of("Item", &["nope"])).is_none());
+    }
+
+    #[test]
+    fn malformed_index_scans_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = spilled(dir.path());
+        let label_index = IndexId::of("Item", &["label"]);
+
+        // Unknown index id.
+        let err = cold
+            .index_eq(IndexId::of("Item", &["ghost"]), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown index"), "{err}");
+
+        // Equality prefix longer than the index.
+        let err = cold
+            .index_eq(
+                label_index,
+                &[RowValue::Str("a".into()), RowValue::Str("b".into())],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("prefix has 2 value(s)"), "{err}");
+
+        // Range bounds after the prefix already covers every column.
+        let err = cold
+            .index_scan(
+                label_index,
+                &[RowValue::Str("label-1".into())],
+                Bound::Included(&RowValue::Str("x".into())),
+                Bound::Unbounded,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already covers"), "{err}");
+
+        // Mistyped prefix value.
+        let err = cold
+            .index_eq(label_index, &[RowValue::U64(1)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects"), "{err}");
+    }
+
+    #[test]
+    fn internal_ordinal_guards_report_out_of_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = spilled(dir.path());
+
+        let err = index_id_of(&ITEM, &[9]).unwrap_err().to_string();
+        assert!(err.contains("ordinal 9 out of range"), "{err}");
+
+        let row = vec![RowValue::U64(0)];
+        let err = index_key(&ITEM, &[9], &row, &[]).unwrap_err().to_string();
+        assert!(err.contains("ordinal 9 out of range"), "{err}");
+
+        let err = cold
+            .check_value(9, &RowValue::U64(0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ordinal 9 out of range"), "{err}");
+    }
+
+    #[test]
+    fn dangling_index_entries_are_reported_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cold = spilled(dir.path());
+        // Corrupt the invariant deliberately: remove a row from the primary
+        // tree while its index entry survives.
+        let pk = encode_pk_values(&ITEM, &[RowValue::U64(2)]).unwrap();
+        assert!(cold.primary.delete(pk.as_bytes()).unwrap());
+        let err = cold
+            .index_eq(
+                IndexId::of("Item", &["label"]),
+                &[RowValue::Str("label-2".into())],
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("absent from the primary tree"), "{err}");
+    }
+}

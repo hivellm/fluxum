@@ -538,4 +538,176 @@ mod tests {
         );
         assert_eq!(RowValue::Str("hi".into()).to_string(), "\"hi\"");
     }
+
+    // --- The full closed type universe (SPEC-001 §3) -------------------------
+
+    static UNIVERSE_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "c_bool",
+            ty: FluxType::Bool,
+        },
+        ColumnSchema {
+            name: "c_i8",
+            ty: FluxType::I8,
+        },
+        ColumnSchema {
+            name: "c_i16",
+            ty: FluxType::I16,
+        },
+        ColumnSchema {
+            name: "c_i32",
+            ty: FluxType::I32,
+        },
+        ColumnSchema {
+            name: "c_i64",
+            ty: FluxType::I64,
+        },
+        ColumnSchema {
+            name: "c_u8",
+            ty: FluxType::U8,
+        },
+        ColumnSchema {
+            name: "c_u16",
+            ty: FluxType::U16,
+        },
+        ColumnSchema {
+            name: "c_u32",
+            ty: FluxType::U32,
+        },
+        ColumnSchema {
+            name: "c_u64",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "c_f32",
+            ty: FluxType::F32,
+        },
+        ColumnSchema {
+            name: "c_f64",
+            ty: FluxType::F64,
+        },
+        ColumnSchema {
+            name: "c_str",
+            ty: FluxType::Str,
+        },
+        ColumnSchema {
+            name: "c_bytes",
+            ty: FluxType::Bytes,
+        },
+        ColumnSchema {
+            name: "c_identity",
+            ty: FluxType::Identity,
+        },
+        ColumnSchema {
+            name: "c_conn",
+            ty: FluxType::ConnectionId,
+        },
+        ColumnSchema {
+            name: "c_entity",
+            ty: FluxType::EntityId,
+        },
+        ColumnSchema {
+            name: "c_ts",
+            ty: FluxType::Timestamp,
+        },
+        ColumnSchema {
+            name: "c_opt",
+            ty: FluxType::Option(&FluxType::I8),
+        },
+        ColumnSchema {
+            name: "c_list",
+            ty: FluxType::List(&FluxType::Str),
+        },
+    ];
+
+    static UNIVERSE: TableSchema = TableSchema {
+        name: "Universe",
+        columns: UNIVERSE_COLS,
+        primary_key: &[8],
+        auto_inc: None,
+        access: crate::schema::TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[],
+        visibility: crate::schema::VisibilityRule::PublicAll,
+    };
+
+    fn universe_row() -> Vec<RowValue> {
+        vec![
+            RowValue::Bool(true),
+            RowValue::I8(-8),
+            RowValue::I16(-16),
+            RowValue::I32(-32),
+            RowValue::I64(-64),
+            RowValue::U8(8),
+            RowValue::U16(16),
+            RowValue::U32(32),
+            RowValue::U64(64),
+            RowValue::F32(0.5),
+            RowValue::F64(0.25),
+            RowValue::Str("s".into()),
+            RowValue::Bytes(vec![0xFF]),
+            RowValue::Identity(Identity::from_bytes([7u8; 32])),
+            RowValue::ConnectionId(ConnectionId::new(11)),
+            RowValue::EntityId(EntityId::new(13)),
+            RowValue::Timestamp(Timestamp::from_micros(17)),
+            RowValue::Optional(None),
+            RowValue::List(vec![RowValue::Str("a".into()), RowValue::Str("b".into())]),
+        ]
+    }
+
+    #[test]
+    fn every_type_round_trips_through_fluxbin() {
+        let row = universe_row();
+        check_row(&UNIVERSE, &row).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = encode_row(&row).unwrap_or_else(|e| panic!("{e}"));
+        let decoded = decode_row(&UNIVERSE, &bytes).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(decoded.values(), &row[..]);
+
+        // The PK encoding of the u64 column doubles as an all-types witness
+        // for the key-values form.
+        let pk = encode_pk_of_row(&UNIVERSE, &row).unwrap_or_else(|e| panic!("{e}"));
+        let same = encode_pk_values(&UNIVERSE, &[RowValue::U64(64)])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(pk, same);
+    }
+
+    #[test]
+    fn every_type_displays_without_panicking() {
+        for value in universe_row() {
+            assert!(!value.to_string().is_empty(), "{value:?}");
+        }
+        // The Some-wrapped optional renders its inner value.
+        let some = RowValue::Optional(Some(Box::new(RowValue::I8(-3))));
+        assert_eq!(some.to_string(), "-3");
+        assert_eq!(RowValue::F32(1.5).to_string(), "1.5");
+        assert_eq!(RowValue::I8(-8).to_string(), "-8");
+        assert_eq!(RowValue::I16(-16).to_string(), "-16");
+        assert_eq!(RowValue::U8(8).to_string(), "8");
+    }
+
+    #[test]
+    fn out_of_range_pk_ordinals_are_reported() {
+        static BROKEN: TableSchema = TableSchema {
+            name: "Broken",
+            columns: SENSOR_COLS,
+            primary_key: &[9],
+            auto_inc: None,
+            access: crate::schema::TableAccess::Public,
+            partition_by: None,
+            unique: &[],
+            indexes: &[],
+            visibility: crate::schema::VisibilityRule::PublicAll,
+        };
+        let err = match encode_pk_of_row(&BROKEN, &sensor_row()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("ordinal 9 must be out of range"),
+        };
+        assert!(err.contains("ordinal 9 out of range"), "{err}");
+        let err = match encode_pk_values(&BROKEN, &[RowValue::I32(1)]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("ordinal 9 must be out of range"),
+        };
+        assert!(err.contains("ordinal 9 out of range"), "{err}");
+    }
 }

@@ -540,3 +540,140 @@ async fn rotation_produces_ordered_segments_and_compaction_respects_holds() {
     log.wait_durable(13).await.unwrap();
     log.close().unwrap();
 }
+
+// --- Segment-level scan faults and whole-file quarantine (STG-015/031) ------
+
+mod segment_faults {
+    use super::*;
+    use crate::commitlog::format::encode_segment_header;
+    use crate::commitlog::segment::{ScanOutcome, quarantine_whole_file, scan_segment};
+
+    /// Write a segment file: a header at `header_epoch` plus pre-framed
+    /// entries, each `(envelope_epoch, record)`.
+    fn write_segment(path: &Path, header_epoch: u64, entries: &[(u64, TxRecord)]) {
+        let mut bytes = encode_segment_header(header_epoch).to_vec();
+        for (epoch, record) in entries {
+            let body = record.encode().unwrap();
+            bytes.extend_from_slice(&super::super::format::encode_entry(*epoch, &body).unwrap());
+        }
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn scan(path: &Path, prev_tx: Option<u64>, min_epoch: u64) -> super::super::segment::SegmentScan {
+        match scan_segment(path, SHARD, prev_tx, min_epoch, &mut |_, _| Ok(())).unwrap() {
+            ScanOutcome::Scanned(scan) => scan,
+            ScanOutcome::HeaderCorrupt(reason) => panic!("header corrupt: {reason}"),
+        }
+    }
+
+    #[test]
+    fn unreadable_header_is_header_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shard-00003-00000000000000000001.log");
+        fs::write(&path, b"not a segment at all").unwrap();
+        let outcome = scan_segment(&path, SHARD, None, 0, &mut |_, _| Ok(())).unwrap();
+        let reason = match outcome {
+            ScanOutcome::HeaderCorrupt(reason) => reason,
+            ScanOutcome::Scanned(scan) => panic!("scanned a garbage header: {scan:?}"),
+        };
+        assert!(reason.contains("header"), "{reason}");
+    }
+
+    #[test]
+    fn header_epoch_regression_faults_at_offset_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        write_segment(&path, 1, &[(1, rec(1))]);
+        let scan = scan(&path, None, 5);
+        let fault = scan.fault.expect("epoch regression must fault");
+        assert_eq!(fault.offset, 0);
+        assert!(fault.reason.contains("regresses below 5"), "{}", fault.reason);
+        assert_eq!(scan.entries, 0);
+    }
+
+    #[test]
+    fn entry_epoch_regression_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        // Header at epoch 5; the entry claims epoch 3.
+        write_segment(&path, 5, &[(3, rec(1))]);
+        let scan = scan(&path, None, 0);
+        let fault = scan.fault.expect("entry epoch regression must fault");
+        assert!(
+            fault.reason.contains("entry epoch 3 regresses below 5"),
+            "{}",
+            fault.reason
+        );
+    }
+
+    #[test]
+    fn undecodable_record_body_faults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let mut bytes = encode_segment_header(1).to_vec();
+        bytes.extend_from_slice(
+            &crate::commitlog::format::encode_entry(1, b"not messagepack").unwrap(),
+        );
+        fs::write(&path, bytes).unwrap();
+        let scan = scan(&path, None, 0);
+        assert!(scan.fault.is_some());
+        assert_eq!(scan.entries, 0);
+    }
+
+    #[test]
+    fn foreign_shard_entries_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        let mut record = rec(1);
+        record.shard_id = SHARD + 1;
+        write_segment(&path, 1, &[(1, record)]);
+        let scan = scan(&path, None, 0);
+        let fault = scan.fault.expect("foreign shard must fault");
+        assert!(
+            fault.reason.contains(&format!("in a shard-{SHARD} log")),
+            "{}",
+            fault.reason
+        );
+    }
+
+    #[test]
+    fn non_increasing_tx_ids_fault() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        write_segment(&path, 1, &[(1, rec(5)), (1, rec(5))]);
+        let scan = scan(&path, None, 0);
+        let fault = scan.fault.expect("repeated tx_id must fault");
+        assert!(
+            fault.reason.contains("does not strictly increase"),
+            "{}",
+            fault.reason
+        );
+        assert_eq!(scan.entries, 1, "the first entry stays valid");
+        assert_eq!(scan.last_tx, Some(5));
+
+        // Cross-segment expectation: prev_tx from an earlier segment.
+        write_segment(&path, 1, &[(1, rec(7))]);
+        let cross = self::scan(&path, Some(9), 0);
+        assert!(cross.fault.is_some(), "tx 7 after prev 9 must fault");
+    }
+
+    #[test]
+    fn whole_file_quarantine_renames_into_numbered_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seg.log");
+        fs::write(&path, b"garbage header").unwrap();
+        let report = quarantine_whole_file(&path, "bad header (test)").unwrap();
+        assert_eq!(report.from_offset, 0);
+        assert_eq!(report.bytes, 14);
+        assert_eq!(report.reason, "bad header (test)");
+        assert!(!path.exists(), "original removed from the log");
+        assert!(report.sidecar.exists(), "sidecar preserves the bytes");
+        assert_eq!(fs::read(&report.sidecar).unwrap(), b"garbage header");
+
+        // A second quarantine of the same name picks the next sidecar.
+        fs::write(&path, b"more garbage").unwrap();
+        let second = quarantine_whole_file(&path, "again").unwrap();
+        assert_ne!(second.sidecar, report.sidecar);
+        assert!(second.sidecar.exists());
+    }
+}

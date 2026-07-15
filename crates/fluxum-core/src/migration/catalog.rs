@@ -288,4 +288,48 @@ mod tests {
         assert!(!is_system_table("Task"));
         assert!(!is_system_table("__weird"));
     }
+
+    #[test]
+    fn stored_type_maps_the_full_flux_type_universe() {
+        let pairs = [
+            (FluxType::Bool, StoredType::Bool),
+            (FluxType::I8, StoredType::I8),
+            (FluxType::I16, StoredType::I16),
+            (FluxType::I32, StoredType::I32),
+            (FluxType::I64, StoredType::I64),
+            (FluxType::U8, StoredType::U8),
+            (FluxType::U16, StoredType::U16),
+            (FluxType::U32, StoredType::U32),
+            (FluxType::U64, StoredType::U64),
+            (FluxType::F32, StoredType::F32),
+            (FluxType::F64, StoredType::F64),
+            (FluxType::Str, StoredType::Str),
+            (FluxType::Bytes, StoredType::Bytes),
+            (FluxType::Identity, StoredType::Identity),
+            (FluxType::ConnectionId, StoredType::ConnectionId),
+            (FluxType::EntityId, StoredType::EntityId),
+            (FluxType::Timestamp, StoredType::Timestamp),
+        ];
+        for (flux, stored) in pairs {
+            assert_eq!(StoredType::from(&flux), stored, "{flux:?}");
+        }
+        assert_eq!(
+            StoredType::from(&FluxType::Option(&FluxType::I8)),
+            StoredType::Option(Box::new(StoredType::I8))
+        );
+        assert_eq!(
+            StoredType::from(&FluxType::List(&FluxType::Bool)),
+            StoredType::List(Box::new(StoredType::Bool))
+        );
+    }
+
+    #[test]
+    fn catalog_decode_rejects_garbage() {
+        let err = match StoredCatalog::decode(&[0xC1]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("garbage must not decode"),
+        };
+        assert!(err.contains("schema_catalog"), "{err}");
+        assert!(err.contains("MessagePack decode"), "{err}");
+    }
 }

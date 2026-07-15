@@ -625,4 +625,88 @@ mod tests {
             "{changes:?}"
         );
     }
+
+    /// Every `SchemaChange` variant, for the reporting-surface test below.
+    fn one_of_each() -> Vec<SchemaChange> {
+        vec![
+            SchemaChange::AddTable { table: "T".into() },
+            SchemaChange::AddColumnWithDefault {
+                table: "T".into(),
+                column: "c".into(),
+            },
+            SchemaChange::RenameColumn {
+                table: "T".into(),
+                from: "a".into(),
+                to: "b".into(),
+            },
+            SchemaChange::AddColumnNoDefault {
+                table: "T".into(),
+                column: "c".into(),
+            },
+            SchemaChange::RemoveColumn {
+                table: "T".into(),
+                column: "c".into(),
+            },
+            SchemaChange::RemoveTable { table: "T".into() },
+            SchemaChange::ChangeColumnType {
+                table: "T".into(),
+                column: "c".into(),
+                stored: StoredType::F32,
+                compiled: StoredType::F64,
+            },
+            SchemaChange::ChangePrimaryKey { table: "T".into() },
+            SchemaChange::ReorderColumns {
+                table: "T".into(),
+                column: "c".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn every_change_reports_table_action_and_description() {
+        for change in one_of_each() {
+            assert_eq!(change.table(), "T", "{change:?}");
+            // The MIG-020 diagnostics never render empty.
+            assert!(!change.required_action().is_empty(), "{change:?}");
+            let rendered = change.to_string();
+            assert!(rendered.contains("`T`"), "{rendered}");
+            // Safe changes auto-apply; the rest name their MIG-022 action.
+            if !change.is_safe() {
+                assert!(
+                    change.required_action().contains("MIG-022"),
+                    "{change:?}: {}",
+                    change.required_action()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rename_meta_without_a_stored_source_is_ignored() {
+        // #[rename(from = "ghost")] where `ghost` never existed in the
+        // stored layout: the rename is skipped and the column is a plain
+        // addition.
+        let stored = catalog(&[("Sensor", table(&[("id", StoredType::U64)], &[0]))]);
+        let compiled = catalog(&[(
+            "Sensor",
+            table(&[("id", StoredType::U64), ("value", StoredType::F64)], &[0]),
+        )]);
+        static RENAMES: &[ColumnRename] = &[ColumnRename {
+            column: "value",
+            from: "ghost",
+        }];
+        static META: TableColumnMeta = TableColumnMeta {
+            table: "Sensor",
+            defaults: &[],
+            renames: RENAMES,
+        };
+        let changes = diff_catalogs_with(&stored, &compiled, &MetaIndex::new(&[&META]));
+        assert_eq!(
+            changes,
+            vec![SchemaChange::AddColumnNoDefault {
+                table: "Sensor".into(),
+                column: "value".into()
+            }]
+        );
+    }
 }

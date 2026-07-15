@@ -120,3 +120,109 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         };
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Argument/shape validation of `#[fluxum::migration]`, probed on the
+    //! expansion function directly (the compile-fail UI suite exercises the
+    //! same errors end-to-end but outside coverage instrumentation).
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn good_fn() -> TokenStream {
+        quote! {
+            fn migrate_v2(ctx: &mut MigrationContext) -> fluxum::Result<()> {
+                Ok(())
+            }
+        }
+    }
+
+    fn expand_err(args: TokenStream, input: TokenStream) -> String {
+        try_expand(args, input)
+            .expect_err("expansion must fail")
+            .to_string()
+    }
+
+    #[test]
+    fn valid_input_registers_a_migration_def() {
+        let out = try_expand(quote::quote!(version = 2), good_fn())
+            .unwrap()
+            .to_string();
+        assert!(out.contains("MigrationDef"), "{out}");
+        assert!(out.contains("migrate_v2"), "{out}");
+    }
+
+    #[test]
+    fn duplicate_version_argument_is_rejected() {
+        let err = expand_err(quote::quote!(version = 2, version = 3), good_fn());
+        assert!(err.contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn version_must_be_a_name_value_pair() {
+        // Bare path.
+        let err = expand_err(quote::quote!(version), good_fn());
+        assert!(err.contains("version = N"), "{err}");
+        // List form.
+        let err = expand_err(quote::quote!(version(2)), good_fn());
+        assert!(err.contains("version = N"), "{err}");
+    }
+
+    #[test]
+    fn version_must_be_an_integer_literal() {
+        // Non-literal expression.
+        let err = expand_err(quote::quote!(version = 1 + 1), good_fn());
+        assert!(err.contains("integer literal"), "{err}");
+        // Wrong literal kind.
+        let err = expand_err(quote::quote!(version = "2"), good_fn());
+        assert!(err.contains("integer literal"), "{err}");
+    }
+
+    #[test]
+    fn unknown_arguments_are_rejected() {
+        let err = expand_err(quote::quote!(target = 2), good_fn());
+        assert!(err.contains("unknown #[fluxum::migration] argument"), "{err}");
+    }
+
+    #[test]
+    fn missing_and_below_two_versions_are_rejected() {
+        let err = expand_err(TokenStream::new(), good_fn());
+        assert!(err.contains("missing `version = N`"), "{err}");
+        let err = expand_err(quote::quote!(version = 1), good_fn());
+        assert!(err.contains(">= 2"), "{err}");
+    }
+
+    #[test]
+    fn async_generic_and_wrong_arity_functions_are_rejected() {
+        let err = expand_err(
+            quote::quote!(version = 2),
+            quote! {
+                async fn migrate_v2(ctx: &mut MigrationContext) -> fluxum::Result<()> {
+                    Ok(())
+                }
+            },
+        );
+        assert!(err.contains("synchronous"), "{err}");
+
+        let err = expand_err(
+            quote::quote!(version = 2),
+            quote! {
+                fn migrate_v2<T>(ctx: &mut MigrationContext) -> fluxum::Result<()> {
+                    Ok(())
+                }
+            },
+        );
+        assert!(err.contains("cannot be generic"), "{err}");
+
+        let err = expand_err(
+            quote::quote!(version = 2),
+            quote! {
+                fn migrate_v2(ctx: &mut MigrationContext, extra: u32) -> fluxum::Result<()> {
+                    Ok(())
+                }
+            },
+        );
+        assert!(err.contains("exactly one argument"), "{err}");
+    }
+}

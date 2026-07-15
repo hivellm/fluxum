@@ -473,3 +473,239 @@ fn render_changes(changes: &[SchemaChange]) -> String {
     }
     lines
 }
+
+#[cfg(test)]
+mod tests {
+    //! `auto_apply` defends MIG-021 invariants that the public runner path
+    //! can only reach through corrupted inputs; each guard is probed here
+    //! directly.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::migration::catalog::{StoredColumn, StoredTable, StoredType};
+    use crate::migration::{ColumnDefault, TableColumnMeta};
+    use crate::schema::{ColumnSchema, FluxType, TableAccess, TableSchema, VisibilityRule};
+
+    const fn task_table(name: &'static str, columns: &'static [ColumnSchema]) -> TableSchema {
+        TableSchema {
+            name,
+            columns,
+            primary_key: &[0],
+            auto_inc: None,
+            access: TableAccess::Public,
+            partition_by: None,
+            unique: &[],
+            indexes: &[],
+            visibility: VisibilityRule::PublicAll,
+        }
+    }
+
+    static TWO_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "title",
+            ty: FluxType::Str,
+        },
+    ];
+    static TASK: TableSchema = task_table("Task", TWO_COLS);
+
+    static PRIORITY_STR_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "title",
+            ty: FluxType::Str,
+        },
+        ColumnSchema {
+            name: "priority",
+            ty: FluxType::Str,
+        },
+    ];
+    static TASK_PRIORITY_STR: TableSchema = task_table("Task", PRIORITY_STR_COLS);
+
+    static PRIORITY_DEFAULTS: &[ColumnDefault] = &[ColumnDefault {
+        column: "priority",
+        value: || RowValue::U8(0),
+    }];
+    static TASK_META: TableColumnMeta = TableColumnMeta {
+        table: "Task",
+        defaults: PRIORITY_DEFAULTS,
+        renames: &[],
+    };
+
+    fn stored_task() -> StoredTable {
+        StoredTable {
+            columns: vec![
+                StoredColumn {
+                    name: "id".into(),
+                    ty: StoredType::U64,
+                },
+                StoredColumn {
+                    name: "title".into(),
+                    ty: StoredType::Str,
+                },
+            ],
+            primary_key: vec![0],
+        }
+    }
+
+    fn task_catalog() -> StoredCatalog {
+        let mut tables = BTreeMap::new();
+        tables.insert("Task".to_owned(), stored_task());
+        StoredCatalog { tables }
+    }
+
+    fn apply(
+        table: &'static TableSchema,
+        changes: &[SchemaChange],
+        working: &mut StoredCatalog,
+        compiled: &StoredCatalog,
+        meta: &MetaIndex<'_>,
+    ) -> String {
+        let schema = Schema::from_tables([table]).unwrap();
+        let store = MemStore::new(&schema).unwrap();
+        let mut tx = store.begin();
+        let err = auto_apply(&mut tx, &schema, changes, working, compiled, meta)
+            .expect_err("the corrupted input must be rejected")
+            .to_string();
+        tx.rollback();
+        err
+    }
+
+    #[test]
+    fn added_table_missing_from_the_compiled_catalog_is_rejected() {
+        let changes = [SchemaChange::AddTable {
+            table: "Ghost".into(),
+        }];
+        let err = apply(
+            &TASK,
+            &changes,
+            &mut task_catalog(),
+            &StoredCatalog::default(),
+            &MetaIndex::new(&[]),
+        );
+        assert!(err.contains("missing from the compiled catalog"), "{err}");
+    }
+
+    #[test]
+    fn renamed_table_missing_from_the_stored_catalog_is_rejected() {
+        let changes = [SchemaChange::RenameColumn {
+            table: "Ghost".into(),
+            from: "a".into(),
+            to: "b".into(),
+        }];
+        let err = apply(
+            &TASK,
+            &changes,
+            &mut StoredCatalog::default(),
+            &task_catalog(),
+            &MetaIndex::new(&[]),
+        );
+        assert!(err.contains("missing from the stored catalog"), "{err}");
+    }
+
+    #[test]
+    fn vanished_default_is_rejected() {
+        let changes = [SchemaChange::AddColumnWithDefault {
+            table: "Task".into(),
+            column: "priority".into(),
+        }];
+        let err = apply(
+            &TASK,
+            &changes,
+            &mut task_catalog(),
+            &task_catalog(),
+            &MetaIndex::new(&[]), // no #[default] metadata at all
+        );
+        assert!(err.contains("vanished"), "{err}");
+    }
+
+    #[test]
+    fn added_column_missing_from_the_compiled_schema_is_rejected() {
+        let changes = [SchemaChange::AddColumnWithDefault {
+            table: "Task".into(),
+            column: "priority".into(),
+        }];
+        // Metadata declares the default, but the compiled TASK has no
+        // `priority` column.
+        let err = apply(
+            &TASK,
+            &changes,
+            &mut task_catalog(),
+            &task_catalog(),
+            &MetaIndex::new(&[&TASK_META]),
+        );
+        assert!(err.contains("missing from the compiled schema"), "{err}");
+    }
+
+    #[test]
+    fn default_value_that_does_not_inhabit_the_column_type_is_rejected() {
+        let changes = [SchemaChange::AddColumnWithDefault {
+            table: "Task".into(),
+            column: "priority".into(),
+        }];
+        // #[default] yields U8(0) but the compiled column type is Str.
+        let err = apply(
+            &TASK_PRIORITY_STR,
+            &changes,
+            &mut task_catalog(),
+            &task_catalog(),
+            &MetaIndex::new(&[&TASK_META]),
+        );
+        assert!(err.contains("does not inhabit"), "{err}");
+    }
+
+    #[test]
+    fn defaulted_column_on_a_table_missing_from_the_stored_catalog_is_rejected() {
+        static PRIORITY_U8_COLS: &[ColumnSchema] = &[
+            ColumnSchema {
+                name: "id",
+                ty: FluxType::U64,
+            },
+            ColumnSchema {
+                name: "title",
+                ty: FluxType::Str,
+            },
+            ColumnSchema {
+                name: "priority",
+                ty: FluxType::U8,
+            },
+        ];
+        static TASK_PRIORITY_U8: TableSchema = task_table("Task", PRIORITY_U8_COLS);
+        let changes = [SchemaChange::AddColumnWithDefault {
+            table: "Task".into(),
+            column: "priority".into(),
+        }];
+        let err = apply(
+            &TASK_PRIORITY_U8,
+            &changes,
+            &mut StoredCatalog::default(), // no Task layout stored
+            &task_catalog(),
+            &MetaIndex::new(&[&TASK_META]),
+        );
+        assert!(err.contains("missing from the stored catalog"), "{err}");
+    }
+
+    #[test]
+    fn incompatible_changes_never_reach_auto_apply() {
+        let changes = [SchemaChange::RemoveTable {
+            table: "Task".into(),
+        }];
+        let err = apply(
+            &TASK,
+            &changes,
+            &mut task_catalog(),
+            &task_catalog(),
+            &MetaIndex::new(&[]),
+        );
+        assert!(err.contains("reached auto-apply"), "{err}");
+        assert!(err.contains("MIG-022"), "{err}");
+    }
+}

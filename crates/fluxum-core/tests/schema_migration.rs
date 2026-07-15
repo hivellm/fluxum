@@ -22,7 +22,7 @@ use fluxum_core::migration::{
 use fluxum_core::schema::{
     ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule,
 };
-use fluxum_core::store::{MemStore, RowValue, Tx};
+use fluxum_core::store::{MemStore, RowValue, TableId, Tx};
 use fluxum_core::types::Timestamp;
 
 const SHARD: u32 = 9;
@@ -822,4 +822,266 @@ async fn first_boot_adopts_the_compiled_schema() {
     assert!(report.applied.is_empty());
     assert!(report.auto_applied.is_empty());
     assert_eq!(logged_records(dir.path()), records);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn run_uses_the_link_time_registries() {
+    // This test binary registers no schema_version! and no migrations, so
+    // the production `run()` path resolves to version 1 with empty inputs.
+    let dir = tempfile::tempdir().unwrap();
+    let shard = boot(dir.path(), &[&TASK_V1]);
+    let report = MigrationRunner::new(&shard.store, &shard.log, &shard.schema)
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+    assert!(report.first_boot);
+    assert_eq!(report.to_version, 1);
+    assert!(report.applied.is_empty());
+}
+
+// --- MigrationContext error surface (MIG-011) ---------------------------------
+
+/// Probes every `MigrationContext` validation failure, then performs a real
+/// data fixup through `ctx.tx()` so the accessor path is exercised too.
+fn migrate_probe_context_errors(ctx: &mut MigrationContext<'_, '_>) -> fluxum_core::Result<()> {
+    assert_eq!(ctx.from_version, 1);
+    assert_eq!(ctx.to_version, 2);
+
+    // add_column: table not in the compiled schema.
+    let err = ctx
+        .add_column("Ghost", "col", RowValue::U8(0))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not in the compiled schema"), "{err}");
+    // add_column: column not declared on the compiled table.
+    let err = ctx
+        .add_column("Task", "ghost_col", RowValue::U8(0))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not declared on the compiled table"), "{err}");
+    // add_column: default value does not inhabit the column type.
+    let err = ctx
+        .add_column("Task", "priority", RowValue::Str("high".into()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not inhabit"), "{err}");
+    // add_column: table missing from the stored catalog (new table — the
+    // startup diff creates it, not the migration).
+    let err = ctx
+        .add_column("AuditEvent", "action", RowValue::Str(String::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not in the stored catalog"), "{err}");
+    // add_column: column already exists in the stored layout.
+    let err = ctx
+        .add_column("Task", "title", RowValue::Str(String::new()))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already exists"), "{err}");
+
+    // rename_column: identical names.
+    let err = ctx
+        .rename_column("Task", "title", "title")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("identical"), "{err}");
+    // rename_column: new name not declared on the compiled table.
+    let err = ctx
+        .rename_column("Task", "title", "ghost")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not declared on the compiled table"), "{err}");
+    // rename_column: new name already present in the stored layout.
+    let err = ctx
+        .rename_column("Task", "done", "title")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("already exists in the stored"), "{err}");
+    // rename_column: a rename may not change the column type
+    // (stored `done` is Bool, compiled `priority` is U8).
+    let err = ctx
+        .rename_column("Task", "done", "priority")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot change the column type"), "{err}");
+
+    // The real step: add the column, then fix data through ctx.tx().
+    ctx.add_column("Task", "priority", RowValue::U8(0))?;
+    let task_id = TableId::of("Task");
+    let tx = ctx.tx();
+    tx.upsert(
+        task_id,
+        vec![
+            RowValue::U64(1),
+            RowValue::Str("probe".into()),
+            RowValue::Bool(false),
+            RowValue::U8(9),
+        ],
+    )?;
+    Ok(())
+}
+static PROBE_ERRORS_V2: MigrationDef = MigrationDef {
+    version: 2,
+    name: "migrate_probe_context_errors",
+    run: migrate_probe_context_errors,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_context_rejects_invalid_ddl_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        shard.migrate(1, &[], &[]).await.unwrap();
+        let task_id = shard.store.table_id("Task").unwrap();
+        shard
+            .commit(|tx| {
+                tx.insert(task_id, task(1, "a", false)).unwrap();
+            })
+            .await;
+    }
+    {
+        // Compiled v2: Task gains `priority`, plus the brand-new AuditEvent
+        // table (present in the compiled schema, absent from the stored
+        // catalog until the startup diff runs).
+        let shard = boot(dir.path(), &[&TASK_V2, &AUDIT]);
+        let report = shard.migrate(2, &[&PROBE_ERRORS_V2], &[]).await.unwrap();
+        assert_eq!(report.applied.len(), 1);
+        // The data fixup through ctx.tx() landed.
+        let rows = shard.rows("Task");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][3], RowValue::U8(9));
+        assert_eq!(shard.meta_version(), 2);
+    }
+}
+
+// --- Stored catalog / data divergence (append_column arity check) -------------
+
+fn migrate_arity_divergence(ctx: &mut MigrationContext<'_, '_>) -> fluxum_core::Result<()> {
+    // The (corrupted) stored catalog claims Task has 2 columns, but the
+    // committed rows carry 3 values — the append must refuse to rewrite.
+    ctx.add_column("Task", "done", RowValue::Bool(false))
+}
+static ARITY_V2: MigrationDef = MigrationDef {
+    version: 2,
+    name: "migrate_arity_divergence",
+    run: migrate_arity_divergence,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diverged_catalog_and_data_abort_the_migration() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        shard.migrate(1, &[], &[]).await.unwrap();
+        let task_id = shard.store.table_id("Task").unwrap();
+        shard
+            .commit(|tx| {
+                tx.insert(task_id, task(1, "a", true)).unwrap();
+            })
+            .await;
+        // Corrupt the stored catalog: drop `done` from Task's layout while
+        // the committed rows keep 3 values.
+        let mut catalog = shard.meta_catalog();
+        let layout = catalog.tables.get_mut("Task").unwrap();
+        layout.columns.pop();
+        let bytes = catalog.encode().unwrap();
+        let meta_id = shard.store.table_id("__schema_meta__").unwrap();
+        shard
+            .commit(|tx| {
+                tx.upsert(
+                    meta_id,
+                    vec![
+                        RowValue::Str("schema_catalog".into()),
+                        RowValue::Bytes(bytes.clone()),
+                    ],
+                )
+                .unwrap();
+            })
+            .await;
+    }
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        let err = shard
+            .migrate(2, &[&ARITY_V2], &[])
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("diverged"), "{err}");
+        assert_eq!(shard.meta_version(), 1, "step rolled back");
+    }
+}
+
+// --- Runner input validation ---------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_version_zero_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = boot(dir.path(), &[&TASK_V1]);
+    let err = shard.migrate(0, &[], &[]).await.unwrap_err().to_string();
+    assert!(err.contains("SCHEMA_VERSION 0 is invalid"), "{err}");
+}
+
+static BELOW_TWO: MigrationDef = MigrationDef {
+    version: 1,
+    name: "migrate_below_two",
+    run: migrate_task_priority,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn migration_version_below_two_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = boot(dir.path(), &[&TASK_V2]);
+    let err = shard
+        .migrate(2, &[&BELOW_TWO], &[])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("version 1 is the initial schema"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runner_rejects_a_store_missing_the_meta_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // Schema WITH __schema_meta__, store assembled WITHOUT it.
+    let schema_with_meta = Schema::from_tables([&TASK_V1, &SCHEMA_META]).unwrap();
+    let schema_without = Schema::from_tables([&TASK_V1]).unwrap();
+    let store = MemStore::new(&schema_without).unwrap();
+    let log = CommitLog::open(
+        &dir.path().join("log"),
+        SHARD,
+        EPOCH,
+        CommitLogOptions::default(),
+    )
+    .unwrap();
+    let err = match MigrationRunner::new(&store, &log, &schema_with_meta) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("runner must reject a store without __schema_meta__"),
+    };
+    assert!(err.contains("assembled without"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_catalog_with_a_version_is_reported_as_corruption() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        shard.migrate(1, &[], &[]).await.unwrap();
+        // Delete schema_catalog, keeping schema_version — corrupt metadata.
+        let meta_id = shard.store.table_id("__schema_meta__").unwrap();
+        shard
+            .commit(|tx| {
+                assert!(
+                    tx.delete(meta_id, &[RowValue::Str("schema_catalog".into())])
+                        .unwrap()
+                );
+            })
+            .await;
+    }
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        let err = shard.migrate(2, &[], &[]).await.unwrap_err().to_string();
+        assert!(err.contains("schema_catalog is missing"), "{err}");
+        assert!(err.contains("corrupt"), "{err}");
+    }
 }
