@@ -33,6 +33,9 @@
 
 pub mod sendbuffer;
 
+#[cfg(test)]
+mod proptest;
+
 pub use sendbuffer::{
     BLOCKED_DROP_AFTER, DropReason, Message, Offered, SubscriberBuffer, SubscriberDropCounter, Tier,
 };
@@ -335,6 +338,33 @@ impl SubscriptionManager {
         for hash in handles.into_values() {
             self.drop_subscriber(hash, connection);
         }
+    }
+
+    /// The current server-side result of one query for `subscriber`, without
+    /// registering a subscription (a one-off read, SUB-025): the same
+    /// filtered, RLS-applied `InitialData` a fresh `Subscribe` would return
+    /// against `snapshot`. The subscription-correctness property suite uses
+    /// this as the ground truth its diff-maintained client caches must
+    /// match after every commit.
+    pub fn snapshot_result(
+        &self,
+        subscriber: Subscriber,
+        sql: &str,
+        snapshot: &Snapshot,
+    ) -> Result<InitialData> {
+        let plan = compile(&self.schema, sql)?;
+        let schema = self.table_schema(plan.table_ids[0])?;
+        if schema.access != TableAccess::Public {
+            return Err(FluxumError::query(
+                codes::FORBIDDEN,
+                format!(
+                    "table `{}` is not public and cannot be subscribed",
+                    schema.name
+                ),
+            ));
+        }
+        let (_, viewer) = self.effective_key(&plan, subscriber);
+        self.initial_data(&plan, viewer.as_ref(), snapshot)
     }
 
     /// Evaluate a commit against the candidate plans and produce one shared,
