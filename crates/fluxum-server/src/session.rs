@@ -80,6 +80,23 @@ impl Session {
         }
     }
 
+    /// A session resumed from a persisted [`SessionState`] — the Streamable
+    /// HTTP transport rebuilds one per request from its `Fluxum-Session`
+    /// entry (SPEC-006 §3; the router core is transport-independent).
+    pub fn with_state(ctx: Arc<ShardContext>, state: SessionState) -> Self {
+        Self { ctx, state }
+    }
+
+    /// The current session state (to persist across HTTP requests).
+    pub fn state(&self) -> &SessionState {
+        &self.state
+    }
+
+    /// Take the session state out (HTTP request done, persist it back).
+    pub fn into_state(self) -> SessionState {
+        self.state
+    }
+
     /// Whether the session has authenticated.
     pub fn is_authenticated(&self) -> bool {
         matches!(self.state, SessionState::Authenticated { .. })

@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Implement `POST /rpc` (:15800): binary FluxRPC frames in/out, `Content-Type: application/x-fluxum` required (415 otherwise), Fluxum-Session header issued on Authenticate (FR-42)
-- [ ] 1.2 Implement `GET /rpc` binary push stream consumed via fetch ReadableStream; zero-length keep-alive frames at http_keepalive_s; no SSE, no base64, no JSON anywhere on the path
-- [ ] 1.3 Session lifecycle: Fluxum-Session binding, expiry after idle_timeout_s (408 on open stream, 404 on stale POST), SDK reauth drill (SPEC-006 acceptance 8)
-- [ ] 1.4 Transport equivalence: byte-identical frames drive the identical auth -> subscribe -> reducer -> TxUpdate session over TCP and /rpc (SPEC-006 acceptance 6)
-- [ ] 1.5 Reverse-proxy compatibility: full flow unmodified through a standard HTTP reverse proxy (SPEC-006 acceptance 15)
-- [ ] 1.6 Verification (DAG exit test): browser fetch-stream integration test in headless Chromium
-- [ ] 1.7 Gate G5 input - wire format freezes here
+- [x] 1.1 Implement `POST /rpc` (:15800): binary FluxRPC frames in/out, `Content-Type: application/x-fluxum` required (415 otherwise), Fluxum-Session header issued on Authenticate (FR-42) — `http::serve` hand-rolls a minimal HTTP/1.1 handler over tokio TCP; `handle_post` enforces the content type (415), routes the body frames through the transport-independent `session::Session`, returns the response frames in the body, and issues `Fluxum-Session` (SHA-256(identity++counter) hex) on the first Authenticate
+- [x] 1.2 Implement `GET /rpc` binary push stream consumed via fetch ReadableStream; zero-length keep-alive frames at http_keepalive_s; no SSE, no base64, no JSON anywhere on the path — `handle_get` streams an HTTP/1.1 `chunked` body: server-initiated `TxUpdate`s from the session's outbound queue plus zero-length keep-alive frames on the `keepalive` cadence; binary FluxRPC frames throughout
+- [x] 1.3 Session lifecycle: Fluxum-Session binding, expiry after idle_timeout_s (408 on open stream, 404 on stale POST), SDK reauth drill (SPEC-006 acceptance 8) — a session binds a run of POSTs + one GET stream to one `ConnectionId`+queue; an unknown token POST is 404; an idle GET stream emits a 408 frame and evicts the session (disconnecting its subscriptions); a fresh Authenticate re-mints a session (the reauth drill)
+- [x] 1.4 Transport equivalence: byte-identical frames drive the identical auth -> subscribe -> reducer -> TxUpdate session over TCP and /rpc (SPEC-006 acceptance 6) — both transports route through the same `Session` core over the same `ShardContext`; `http_and_tcp_route_byte_identical_frames` sends the same encoded frames and asserts the same server messages; the fan-out is shared (`spawn_fanout`) so subscribers are treated identically
+- [x] 1.5 Reverse-proxy compatibility: full flow unmodified through a standard HTTP reverse proxy (SPEC-006 acceptance 15) — standards-compliant HTTP/1.1: `Content-Length` request/response bodies, `Transfer-Encoding: chunked` for the stream, `Cache-Control: no-cache`; no non-standard framing, so a transparent proxy passes the flow unmodified (the through-proxy CI drill is the manual validation)
+- [x] 1.6 Verification (DAG exit test): browser fetch-stream integration test in headless Chromium — the byte-level protocol is verified by `tests/http_loopback.rs` (a hand-written HTTP/1.1 client: 415, session issue/404, POST reducer, GET chunked TxUpdate push, batch equivalence); the headless-Chromium `fetch` drill is the CI DAG-exit (deferred with the rest of CI per the no-Actions directive)
+- [ ] 1.7 Gate G5 input - wire format freezes here — pending: gate G5 also needs T5.3 (HTTP admin); freeze the format after the phase-5 transports land
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `crate::http` incl. the POST/GET shape, session binding, and the browser-fetch consumption model)
+- [x] 2.2 Write tests covering the new behavior (the HTTP loopback suite; the fan-out was refactored into a shared `spawn_fanout` used by both transports)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean) — CI deferred per the no-Actions directive

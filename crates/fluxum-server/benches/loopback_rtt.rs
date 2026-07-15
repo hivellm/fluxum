@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::runtime::Runtime;
 
+use fluxum_core::Result;
 use fluxum_core::auth::{Authenticator, NoneProvider, ServerPeerRegistry};
 use fluxum_core::commitlog::{CommitLog, CommitLogOptions};
 use fluxum_core::reducer::{
@@ -24,12 +25,9 @@ use fluxum_core::schema::{
 use fluxum_core::store::{MemStore, RowValue};
 use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
-use fluxum_core::Result;
-use fluxum_protocol::{
-    Authenticate, ClientMessage, FrameCodec, Frame, ReducerCall, ServerMessage,
-};
-use fluxum_server::tcp::{self, TcpOptions};
+use fluxum_protocol::{Authenticate, ClientMessage, Frame, FrameCodec, ReducerCall, ServerMessage};
 use fluxum_server::ShardContext;
+use fluxum_server::tcp::{self, TcpOptions};
 
 static CHAT_COLS: &[ColumnSchema] = &[
     ColumnSchema {

@@ -79,7 +79,7 @@ pub async fn serve(
     let shutdown = Arc::new(Notify::new());
 
     // Shard-wide commit fan-out (SUB-021).
-    tokio::spawn(fanout_loop(Arc::clone(&ctx), shutdown.clone()));
+    crate::spawn_fanout(Arc::clone(&ctx), shutdown.clone());
 
     // Accept loop.
     let accept_ctx = Arc::clone(&ctx);
@@ -246,62 +246,6 @@ async fn route_frame(
         ctx.publish_commit(diff);
     }
     true
-}
-
-/// The shard-wide fan-out (SUB-021/024): evaluate each committed diff against
-/// the subscription manager once and push the shared `TxUpdate` to every
-/// subscriber's queue. A full queue trips the SUB-042 drop.
-async fn fanout_loop(ctx: Arc<ShardContext>, server_shutdown: Arc<Notify>) {
-    let mut commits = ctx.subscribe_commits();
-    let codec = FrameCodec::default();
-    loop {
-        let diff = tokio::select! {
-            _ = server_shutdown.notified() => break,
-            recv = commits.recv() => match recv {
-                Ok(diff) => diff,
-                // Lagged: the fan-out fell behind; clients recover on
-                // reconnect via the tx_id gap (SPEC-006 acceptance 14).
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            },
-        };
-
-        // Evaluate once, holding the mutex only across evaluation (SUB-041).
-        let deltas = {
-            let manager = ctx.subscriptions.lock().await;
-            match manager.on_commit(&diff) {
-                Ok(deltas) => deltas,
-                Err(e) => {
-                    tracing::error!(target: "fluxum::tcp", error = %e, "fan-out evaluation failed");
-                    continue;
-                }
-            }
-        };
-
-        for delta in deltas {
-            let tx_update =
-                fluxum_core::subscription::SubscriptionManager::tx_update(&diff, &delta);
-            let Ok(frame) = frame_message(&codec, &ServerMessage::TxUpdate(tx_update)) else {
-                continue;
-            };
-            for (conn_id, handle) in ctx.connections.handles_for(&delta.subscribers).await {
-                match handle.sink.try_send(Arc::clone(&frame)) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(_)) => {
-                        // SUB-042 Full tier: never block the fan-out — drop
-                        // the slow consumer.
-                        tracing::warn!(target: "fluxum::tcp", connection = conn_id,
-                            "subscriber dropped: send buffer full");
-                        handle.shutdown.notify_waiters();
-                        ctx.connections.remove(conn_id).await;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                        ctx.connections.remove(conn_id).await;
-                    }
-                }
-            }
-        }
-    }
 }
 
 /// The writer task: drain the outbound queue to the socket in order.

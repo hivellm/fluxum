@@ -20,6 +20,7 @@
 //!   timeout (`408`), a per-connection writer that multiplexes responses by
 //!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
+pub mod http;
 pub mod session;
 pub mod tcp;
 
@@ -144,4 +145,76 @@ impl ShardContext {
     pub fn subscribe_commits(&self) -> broadcast::Receiver<Arc<TxDiff>> {
         self.commit_tx.subscribe()
     }
+}
+
+/// Spawn the shard-wide commit fan-out task (SUB-021/024): evaluate each
+/// committed diff against the subscription manager once (mutex held only
+/// across evaluation, SUB-041) and push the shared, once-encoded `TxUpdate`
+/// frame to every subscriber's queue, dropping a slow consumer on a full
+/// queue (SUB-042).
+///
+/// A standalone `tcp::serve` / `http::serve` spawns one so a single-transport
+/// deployment works out of the box. The combined multi-transport assembly
+/// (the T5.4 `ShardHost`) instead spawns exactly one and starts each
+/// transport without its own — two fan-out tasks over one broadcast would
+/// double-deliver to a subscriber registered in the shared registry.
+pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
+    use fluxum_protocol::{FrameCodec, ServerMessage};
+
+    tokio::spawn(async move {
+        let mut commits = ctx.subscribe_commits();
+        let codec = FrameCodec::default();
+        loop {
+            let diff = tokio::select! {
+                _ = shutdown.notified() => break,
+                recv = commits.recv() => match recv {
+                    Ok(diff) => diff,
+                    // Lagged: the fan-out fell behind; clients recover on
+                    // reconnect via the tx_id gap (SPEC-006 acceptance 14).
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            };
+
+            // Evaluate once (SUB-041: mutex held only across evaluation).
+            let deltas = {
+                let manager = ctx.subscriptions.lock().await;
+                match manager.on_commit(&diff) {
+                    Ok(deltas) => deltas,
+                    Err(e) => {
+                        tracing::error!(target: "fluxum::fanout", error = %e,
+                            "fan-out evaluation failed");
+                        continue;
+                    }
+                }
+            };
+
+            for delta in deltas {
+                let tx_update = SubscriptionManager::tx_update(&diff, &delta);
+                let body = match ServerMessage::TxUpdate(tx_update).encode() {
+                    Ok(body) => body,
+                    Err(_) => continue,
+                };
+                let Ok(framed) = codec.encode(&body) else {
+                    continue;
+                };
+                let frame: OutFrame = Arc::new(framed);
+                for (conn_id, handle) in ctx.connections.handles_for(&delta.subscribers).await {
+                    match handle.sink.try_send(Arc::clone(&frame)) {
+                        Ok(()) => {}
+                        // SUB-042 Full tier: never block — drop the consumer.
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(target: "fluxum::fanout", connection = conn_id,
+                                "subscriber dropped: send buffer full");
+                            handle.shutdown.notify_waiters();
+                            ctx.connections.remove(conn_id).await;
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            ctx.connections.remove(conn_id).await;
+                        }
+                    }
+                }
+            }
+        }
+    });
 }
