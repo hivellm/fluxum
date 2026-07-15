@@ -1,0 +1,13 @@
+## 1. Implementation
+- [x] 1.1 Implement `#[fluxum::reducer]` dispatch with the link-time reducer registry: duplicate names abort startup; unknown reducer returns an error without starting a transaction (FR-20, RED-006) — `ReducerDef` inventory + `ReducerRegistry::from_registered`, macro-generated decode glue + RED-001 pre-transaction arg check (`reducer::args`), engine admission answers 404/400 with zero `TxState`/log records (asserted)
+- [x] 1.2 Implement lifecycle hooks: `#[fluxum::on_init]` (exactly once on fresh shard), `on_shard_start` (after recovery, before first call), `#[fluxum::on_connect]` / `#[fluxum::on_disconnect]` driving presence end to end (FR-23, RED-010..RED-013, UC-1) — `LifecycleDef` inventory + `LifecycleHooks` + `ReducerEngine::start/client_connected/client_disconnected`; freshness = `RecoveryOutcome::last_tx_id.is_none()`; two-boot test proves once-ever on_init
+- [x] 1.3 Implement `catch_unwind` panic isolation: panic = rollback + error to caller, no CommitLog entry, no subscription events, shard never dies (FR-25, TXN-022) — pipeline boundary reused; engine-level injection test asserts 500 + pointer-identical state + zero log records + next call succeeds with a gap-free tx id
+- [x] 1.4 Implement `#[fluxum::view]` read-only functions over `ReadOnlyTxHandle` (no write methods - compile-fail test) for the admin API `GET /view/:name` (FR-26 P1 half; RED-030/RED-031); `#[fluxum::procedure]` endpoint half is P2 post-launch — `ViewContext`/`ViewRegistry` over lock-free `Snapshot`, JSON results; `ui/fail/view_cannot_write.rs` pins the no-write guarantee
+- [x] 1.5 Panic-isolation soak: a panicking reducer called 10,000 times keeps returning internal-error results while interleaved healthy calls succeed; memory stable (RED-061) — `reducer_panic_soak.rs`: 10k out-of-bounds panics, healthy counter every 50 calls, RSS growth < 64 MiB after warmup
+- [x] 1.6 Verification (DAG exit test): panic-injection tests — `reducer_engine.rs` (7 tests) + soak green
+- [x] 1.7 Gate G3 input (with T3.4/T3.5/T3.6 suites) — T3.3 suites green on 3-OS CI + SIMD Matrix (commit `8cd1f5f`); T3.6 already delivered; the aggregate G3 gate closes when T3.4/T3.5 land their suites
+
+## 2. Tail (docs + tests — check or waive with tailWaiver)
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `reducer::{args, engine, view}`, macro rustdoc on all six attributes with RED references)
+- [x] 2.2 Write tests covering the new behavior (engine suite, panic soak, macro e2e `reducer_lifecycle.rs`, args/expansion unit tests, 2 compile-fail UI cases)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally, zero failures; fmt + clippy clean)

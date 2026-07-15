@@ -31,6 +31,10 @@ sdks/typescript/dist/
 /.rulebook/*
 !/.rulebook/specs/
 !/.rulebook/tasks/
+!/.rulebook/archive/
+!/.rulebook/decisions/
+!/.rulebook/knowledge/
+!/.rulebook/learnings/
 !/.rulebook/tasks/**/*.md
 !/.rulebook/rulebook.json
 
