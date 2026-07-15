@@ -1,0 +1,51 @@
+name: SIMD Matrix
+
+# SPEC-016 HWA-052/HWA-053 (NFR-14): the scalar-parity property suites must
+# run on both x86-64 and aarch64 runners; each runner exercises every kernel
+# variant its hardware supports (forced modes included), so no release
+# selects a variant the matrix did not execute. The full workspace suite
+# additionally runs under forced scalar (HWA-034).
+# Family precedent: Vectorizer simd-matrix.yml.
+
+on:
+  push:
+    branches: [ master, main, develop ]
+  pull_request:
+    branches: [ '**' ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  scalar-parity:
+    name: parity (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86-64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install toolchain from rust-toolchain.toml
+      # PRD §9: honor the workspace's pinned nightly (edition 2024) instead
+      # of pinning a channel in the workflow.
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: SIMD unit tests (dispatch selection, kernel vectors)
+      run: cargo test -p fluxum-core --lib simd
+
+    - name: Scalar-parity property suite (every selectable tier, HWA-052)
+      run: cargo test -p fluxum-core --test simd_parity
+
+    - name: Forced-scalar workspace suite (HWA-034)
+      run: cargo test --workspace
+      env:
+        FLUXUM_SIMD: scalar
