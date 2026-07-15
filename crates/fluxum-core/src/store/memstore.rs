@@ -594,6 +594,66 @@ impl Tx<'_> {
         Ok(self.base.table(table)?.rows.values())
     }
 
+    /// The rows a SPEC-010 (T3.6) migration rewrite operates on: every
+    /// committed row keyed by its exact encoded PK bytes, seen **through**
+    /// this transaction's pending replacements — a row already rewritten by
+    /// an earlier [`Tx::migrate_replace`] of this same step yields its
+    /// pending (new-layout) values, so consecutive DDL operations compose.
+    /// Rows the transaction deleted or freshly inserted are excluded
+    /// (inserts already carry the compiled layout).
+    ///
+    /// Keying by stored PK bytes — never re-deriving them from the compiled
+    /// schema's ordinals — is what keeps rows in an old column layout
+    /// addressable.
+    pub(crate) fn migrate_rows(&self, table: TableId) -> Result<Vec<(PkBytes, Row)>> {
+        let base = self.base.table(table)?;
+        let ops = self.state.tables.get(&table);
+        Ok(base
+            .rows
+            .iter()
+            .filter_map(|(pk, row)| {
+                let effective = match ops.and_then(|pending| pending.get(pk)) {
+                    Some(PendingOp::Update(replacement)) => replacement.clone(),
+                    Some(PendingOp::Delete | PendingOp::Insert(_)) => return None,
+                    None => row.clone(),
+                };
+                Some((pk.clone(), effective))
+            })
+            .collect())
+    }
+
+    /// SPEC-010 (T3.6) migration seam: buffer an in-place replacement of the
+    /// committed row at `pk` **without** validating `values` against the
+    /// compiled schema.
+    ///
+    /// Mid-migration rows live in intermediate layouts (the stored catalog's
+    /// layout plus the DDL steps applied so far), which only match the
+    /// compiled schema after the last migration step — `check_row` would
+    /// reject them. Safety rests on the migration runner's contract instead:
+    /// `values` are derived from the committed row itself by appending or
+    /// renaming columns, so PK bytes and every existing column ordinal
+    /// (indexes, `#[unique]`, spatial coordinates) are preserved by
+    /// construction, and the commit merge's remove(old)/insert(new) pairs
+    /// stay symmetric.
+    pub(crate) fn migrate_replace(
+        &mut self,
+        table: TableId,
+        pk: PkBytes,
+        values: Vec<RowValue>,
+    ) -> Result<()> {
+        let schema = self.store.schema_of(table)?;
+        if !self.base.table(table)?.rows.contains_key(&pk) {
+            return Err(FluxumError::Storage(format!(
+                "migrate_replace: table `{}` has no committed row at pk {pk} (SPEC-010 \
+                 rewrites address committed rows only)",
+                schema.name
+            )));
+        }
+        let ops = self.state.tables.entry(table).or_default();
+        ops.insert(pk, PendingOp::Update(Row::new(values)));
+        Ok(())
+    }
+
     /// Scan a B-tree index of the committed snapshot captured at `begin`
     /// (STG-004: pending writes are never visible). Same shapes and
     /// ordering as [`super::Snapshot::index_scan`].

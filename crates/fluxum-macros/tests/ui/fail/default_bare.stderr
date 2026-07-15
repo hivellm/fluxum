@@ -1,0 +1,5 @@
+error: expected `#[default(value)]` with the backfill value (MIG-020)
+ --> tests/ui/fail/default_bare.rs:9:5
+  |
+9 |     #[default]
+  |     ^^^^^^^^^^

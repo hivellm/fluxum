@@ -271,8 +271,9 @@ fn execute(store: &MemStore, reducer: ReducerFn) -> Result<TxDiff> {
 }
 
 /// Best-effort human-readable panic payload (`panic!` with a literal or a
-/// formatted string covers virtually all reducer panics).
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+/// formatted string covers virtually all reducer panics). Shared with the
+/// SPEC-010 migration runner's MIG-040 panic boundary.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         s
     } else if let Some(s) = payload.downcast_ref::<String>() {

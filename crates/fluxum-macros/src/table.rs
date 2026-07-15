@@ -10,12 +10,13 @@
 //! - a link-time `inventory` registration (DM-040).
 
 use proc_macro2::{Span, TokenStream};
-use quote::{ToTokens, quote};
+use quote::{ToTokens, format_ident, quote};
 use syn::parse::Parser;
 use syn::punctuated::Punctuated;
 use syn::spanned::Spanned;
 use syn::{
-    Attribute, Fields, GenericArgument, Ident, ItemStruct, Meta, PathArguments, Token, Type,
+    Attribute, Expr, Fields, GenericArgument, Ident, ItemStruct, Lit, Meta, PathArguments, Token,
+    Type,
 };
 
 /// Entry point: never panics, renders parse/validation failures as
@@ -104,6 +105,12 @@ struct Column {
     primary_key: Option<Span>,
     /// Span of an `#[auto_inc]` attribute, if present.
     auto_inc: Option<Span>,
+    /// The `#[default(expr)]` backfill expression, if present (SPEC-010
+    /// MIG-020/MIG-021).
+    default: Option<Expr>,
+    /// The `#[rename(from = "old")]` source name, if present (SPEC-010
+    /// MIG-020/MIG-021).
+    rename_from: Option<(String, Span)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -253,12 +260,24 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     for field in &mut named.named {
         let mut primary_key = None;
         let mut auto_inc = None;
+        let mut default = None;
+        let mut rename_from = None;
         let mut kept: Vec<Attribute> = Vec::new();
         for attr in std::mem::take(&mut field.attrs) {
             if attr.path().is_ident("primary_key") {
                 primary_key = Some(attr.span());
             } else if attr.path().is_ident("auto_inc") {
                 auto_inc = Some(attr.span());
+            } else if attr.path().is_ident("default") {
+                if default.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate `#[default]`"));
+                }
+                default = Some(parse_default(&attr)?);
+            } else if attr.path().is_ident("rename") {
+                if rename_from.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate `#[rename]`"));
+                }
+                rename_from = Some((parse_rename(&attr)?, attr.span()));
             } else if attr.path().is_ident("index")
                 || attr.path().is_ident("spatial")
                 || attr.path().is_ident("unique")
@@ -288,6 +307,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             flux,
             primary_key,
             auto_inc,
+            default,
+            rename_from,
         });
     }
     if columns.is_empty() {
@@ -295,6 +316,44 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             item.ident.span(),
             "a table must have at least one column (DM-001)",
         ));
+    }
+
+    // -- #[rename(from = "...")] consistency (SPEC-010) -----------------------
+    for column in &columns {
+        let Some((from, span)) = &column.rename_from else {
+            continue;
+        };
+        if column.ident == from.as_str() {
+            return Err(syn::Error::new(
+                *span,
+                "`#[rename(from = ...)]` names the field itself: point it at the column's \
+                 previous stored name (MIG-020)",
+            ));
+        }
+        if columns.iter().any(|other| other.ident == from.as_str()) {
+            return Err(syn::Error::new(
+                *span,
+                format!(
+                    "`#[rename(from = \"{from}\")]` names a column that is still declared: \
+                     a rename source must be the old, removed name (MIG-020)"
+                ),
+            ));
+        }
+        let duplicates = columns
+            .iter()
+            .filter(|other| {
+                other
+                    .rename_from
+                    .as_ref()
+                    .is_some_and(|(other_from, _)| other_from == from)
+            })
+            .count();
+        if duplicates > 1 {
+            return Err(syn::Error::new(
+                *span,
+                format!("two columns declare `#[rename(from = \"{from}\")]` (MIG-020)"),
+            ));
+        }
     }
 
     let ordinal_of = |ident: &Ident, context: &str| -> syn::Result<u16> {
@@ -588,6 +647,61 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         to_row_value(&c.flux, component)
     });
 
+    // #[default] / #[rename] column metadata for the SPEC-010 schema diff
+    // (MIG-020/MIG-021), registered only when the table declares any.
+    let mut default_fns: Vec<TokenStream> = Vec::new();
+    let mut default_entries: Vec<TokenStream> = Vec::new();
+    let mut rename_entries: Vec<TokenStream> = Vec::new();
+    for column in &columns {
+        let column_name = column.ident.to_string();
+        if let Some(expr) = &column.default {
+            let fn_ident = format_ident!("__fluxum_default_{}", column.ident);
+            let ty = &column.ty;
+            // The type ascription makes a default that does not inhabit the
+            // column's Rust type a compile error.
+            default_fns.push(quote! {
+                fn #fn_ident() -> ::fluxum_core::store::RowValue {
+                    let __value: #ty = #expr;
+                    ::fluxum_core::migration::IntoRowValue::into_row_value(__value)
+                }
+            });
+            default_entries.push(quote! {
+                ::fluxum_core::migration::ColumnDefault {
+                    column: #column_name,
+                    value: #fn_ident,
+                }
+            });
+        }
+        if let Some((from, _)) = &column.rename_from {
+            rename_entries.push(quote! {
+                ::fluxum_core::migration::ColumnRename {
+                    column: #column_name,
+                    from: #from,
+                }
+            });
+        }
+    }
+    let migration_meta = if default_entries.is_empty() && rename_entries.is_empty() {
+        quote!()
+    } else {
+        quote! {
+            #(#default_fns)*
+
+            static __FLUXUM_DEFAULTS: &[::fluxum_core::migration::ColumnDefault] =
+                &[#(#default_entries),*];
+            static __FLUXUM_RENAMES: &[::fluxum_core::migration::ColumnRename] =
+                &[#(#rename_entries),*];
+
+            ::fluxum_core::schema::inventory::submit! {
+                ::fluxum_core::migration::TableColumnMeta {
+                    table: #name_str,
+                    defaults: __FLUXUM_DEFAULTS,
+                    renames: __FLUXUM_RENAMES,
+                }
+            }
+        }
+    };
+
     Ok(quote! {
         #item
 
@@ -649,6 +763,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             ::fluxum_core::schema::inventory::submit! {
                 ::fluxum_core::schema::TableDef(&__FLUXUM_SCHEMA)
             }
+
+            #migration_meta
         };
     })
 }
@@ -656,6 +772,50 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 // ---------------------------------------------------------------------------
 // Attribute parsers
 // ---------------------------------------------------------------------------
+
+/// `#[default(expr)]` (SPEC-010 MIG-020): the backfill value used when the
+/// column is auto-applied onto existing rows.
+fn parse_default(attr: &Attribute) -> syn::Result<Expr> {
+    if matches!(attr.meta, Meta::Path(_)) {
+        return Err(syn::Error::new(
+            attr.span(),
+            "expected `#[default(value)]` with the backfill value (MIG-020)",
+        ));
+    }
+    attr.parse_args::<Expr>()
+}
+
+/// `#[rename(from = "old")]` (SPEC-010 MIG-020): the column's previous
+/// stored name, renamed in place by the startup schema diff.
+fn parse_rename(attr: &Attribute) -> syn::Result<String> {
+    let usage = || {
+        syn::Error::new(
+            attr.span(),
+            "expected `#[rename(from = \"old_name\")]` (MIG-020)",
+        )
+    };
+    let meta: Meta = attr.parse_args().map_err(|_| usage())?;
+    let Meta::NameValue(pair) = &meta else {
+        return Err(usage());
+    };
+    if !pair.path.is_ident("from") {
+        return Err(usage());
+    }
+    let Expr::Lit(lit) = &pair.value else {
+        return Err(usage());
+    };
+    let Lit::Str(name) = &lit.lit else {
+        return Err(usage());
+    };
+    let name = name.value();
+    if name.is_empty() {
+        return Err(syn::Error::new(
+            attr.span(),
+            "`#[rename(from = ...)]` needs a non-empty column name (MIG-020)",
+        ));
+    }
+    Ok(name)
+}
 
 /// `#[index(btree(col, ...))]` (DM-030/DM-031).
 fn parse_index(attr: &Attribute) -> syn::Result<IndexDecl> {

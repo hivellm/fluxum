@@ -1,0 +1,5 @@
+error: migration version must be >= 2: version 1 is the initial schema (fluxum::schema_version! defaults to 1, MIG-001/MIG-010)
+ --> tests/ui/fail/migration_version_one.rs:5:21
+  |
+5 | #[fluxum::migration(version = 1)]
+  |                     ^^^^^^^^^^^

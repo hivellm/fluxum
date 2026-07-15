@@ -42,6 +42,11 @@
 //!   explicit intra-transaction reads (`scan_pending`/`scan_all`, FR-17),
 //!   and same-transaction nested reducer calls via
 //!   [`reducer::ReducerRegistry`] (SPEC-004 §2, T3.2)
+//! - [`migration`] — the SPEC-010 schema-migration runner
+//!   ([`migration::MigrationRunner`]): `__schema_meta__` version tracking,
+//!   ordered `#[fluxum::migration]` execution, automatic schema diff with
+//!   safe auto-apply, and fail-closed aborts for incompatible changes
+//!   (T3.6)
 
 pub mod auth;
 pub mod checkpoint;
@@ -50,6 +55,7 @@ pub mod config;
 pub mod error;
 pub mod hw;
 pub mod index;
+pub mod migration;
 pub mod reducer;
 pub mod schema;
 pub mod simd;

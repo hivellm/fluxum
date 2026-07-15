@@ -1,0 +1,7 @@
+error: missing `version = N`: write `#[fluxum::migration(version = N)]` (MIG-010)
+ --> tests/ui/fail/migration_no_version.rs:5:1
+  |
+5 | #[fluxum::migration]
+  | ^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `fluxum::migration` (in Nightly builds, run with -Z macro-backtrace for more info)

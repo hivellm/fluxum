@@ -1,0 +1,5 @@
+error: `#[rename(from = "reading")]` names a column that is still declared: a rename source must be the old, removed name (MIG-020)
+  --> tests/ui/fail/rename_still_declared.rs:10:5
+   |
+10 |     #[rename(from = "reading")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
