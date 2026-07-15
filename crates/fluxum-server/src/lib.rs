@@ -20,6 +20,7 @@
 //!   timeout (`408`), a per-connection writer that multiplexes responses by
 //!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
+pub mod admin;
 pub mod http;
 pub mod session;
 pub mod tcp;
@@ -31,9 +32,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use fluxum_core::auth::Authenticator;
-use fluxum_core::reducer::ReducerEngine;
+use fluxum_core::reducer::{ReducerEngine, ViewRegistry};
 use fluxum_core::store::{MemStore, TxDiff};
 use fluxum_core::subscription::SubscriptionManager;
+use fluxum_core::types::Identity;
 
 /// One encoded, framed message ready for a connection's socket.
 pub type OutFrame = Arc<Vec<u8>>;
@@ -90,14 +92,34 @@ pub struct ShardContext {
     pub authenticator: Authenticator,
     /// Live connections, for the commit fan-out.
     pub connections: ConnectionRegistry,
+    /// The `#[fluxum::view]` registry for the HTTP admin `GET /view/:name`
+    /// (RED-030). Empty unless the assembly installs views.
+    pub views: ViewRegistry,
     /// This shard's id (carried in every `ReducerCaller`).
     pub shard_id: u32,
+    /// The server (admin) identity every HTTP admin call runs under
+    /// (bypasses RLS, AUTH-062) — admin tooling is a trusted operator.
+    pub admin_identity: Identity,
     /// Broadcast of every committed [`TxDiff`]; the fan-out task evaluates
     /// subscriptions against each and pushes `TxUpdate`s (SUB-021).
     commit_tx: broadcast::Sender<Arc<TxDiff>>,
     /// Monotonic `ConnectionId` allocator (ephemeral, never reused within a
     /// process; `0` is reserved for scheduled/system callers, RED-025).
     next_connection_id: AtomicU64,
+    /// Last committed `tx_id` (atomic, for the lock-free `/health` — RPC-053
+    /// forbids taking storage locks on the health path).
+    last_tx_id: AtomicU64,
+}
+
+/// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
+/// never touching a storage lock, so `/health` answers in < 50 ms even
+/// under sustained write load.
+#[derive(Debug, Clone, Copy)]
+pub struct Health {
+    /// This shard's id.
+    pub shard_id: u32,
+    /// Last committed transaction id (`0` before the first commit).
+    pub last_tx_id: u64,
 }
 
 impl ShardContext {
@@ -110,16 +132,47 @@ impl ShardContext {
         shard_id: u32,
         commit_capacity: usize,
     ) -> Arc<Self> {
+        Self::with_views(
+            engine,
+            subscriptions,
+            authenticator,
+            ViewRegistry::new(),
+            shard_id,
+            commit_capacity,
+        )
+    }
+
+    /// [`ShardContext::new`] with a `#[fluxum::view]` registry installed.
+    pub fn with_views(
+        engine: ReducerEngine,
+        subscriptions: SubscriptionManager,
+        authenticator: Authenticator,
+        views: ViewRegistry,
+        shard_id: u32,
+        commit_capacity: usize,
+    ) -> Arc<Self> {
         let (commit_tx, _) = broadcast::channel(commit_capacity.max(1));
+        let admin_identity = fluxum_core::auth::server_identity("__admin__");
         Arc::new(Self {
             engine,
             subscriptions: Mutex::new(subscriptions),
             authenticator,
             connections: ConnectionRegistry::default(),
+            views,
             shard_id,
+            admin_identity,
             commit_tx,
             next_connection_id: AtomicU64::new(1),
+            last_tx_id: AtomicU64::new(0),
         })
+    }
+
+    /// A lock-free health snapshot (RPC-053): reads only atomics.
+    pub fn health(&self) -> Health {
+        Health {
+            shard_id: self.shard_id,
+            last_tx_id: self.last_tx_id.load(Ordering::Relaxed),
+        }
     }
 
     /// The shard's committed store (lock-free snapshots for InitialData /
@@ -138,6 +191,7 @@ impl ShardContext {
     /// commit path — clients recover missed updates on reconnect via the
     /// `tx_id` gap (SPEC-006 acceptance 14).
     pub fn publish_commit(&self, diff: TxDiff) {
+        self.last_tx_id.fetch_max(diff.tx_id, Ordering::Relaxed);
         let _ = self.commit_tx.send(Arc::new(diff));
     }
 

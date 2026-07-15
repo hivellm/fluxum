@@ -188,6 +188,11 @@ impl SubscriptionManager {
         }
     }
 
+    /// The assembled schema (for HTTP admin `/schema` introspection).
+    pub fn schema(&self) -> &Schema {
+        &self.schema
+    }
+
     /// Number of unique compiled plans currently registered (SUB-044 cap
     /// surface; also the dedup witness).
     pub fn plan_count(&self) -> usize {
@@ -365,6 +370,42 @@ impl SubscriptionManager {
         }
         let (_, viewer) = self.effective_key(&plan, subscriber);
         self.initial_data(&plan, viewer.as_ref(), snapshot)
+    }
+
+    /// Run a one-off read (SUB-025) and return the rows as JSON — the shape
+    /// the HTTP admin `POST /query` returns (RPC-050): `{ "table": name,
+    /// "columns": [...], "rows": [ { col: value, ... }, ... ] }`. RLS and the
+    /// public-table gate apply exactly as for [`Self::snapshot_result`].
+    pub fn query_json(
+        &self,
+        subscriber: Subscriber,
+        sql: &str,
+        snapshot: &Snapshot,
+    ) -> Result<serde_json::Value> {
+        let plan = compile(&self.schema, sql)?;
+        let table = self.table_schema(plan.table_ids[0])?;
+        if table.access != TableAccess::Public {
+            return Err(FluxumError::query(
+                codes::FORBIDDEN,
+                format!("table `{}` is not public", table.name),
+            ));
+        }
+        let initial = self.snapshot_result(subscriber, sql, snapshot)?;
+        let columns: Vec<&str> = table.columns.iter().map(|c| c.name).collect();
+        let mut rows = Vec::new();
+        for bytes in initial.tables[0].inserts.iter() {
+            let row = crate::store::row::decode_row(table, bytes)?;
+            let mut object = serde_json::Map::new();
+            for (column, value) in table.columns.iter().zip(row.values()) {
+                object.insert(column.name.to_owned(), row_value_to_json(value));
+            }
+            rows.push(serde_json::Value::Object(object));
+        }
+        Ok(serde_json::json!({
+            "table": table.name,
+            "columns": columns,
+            "rows": rows,
+        }))
     }
 
     /// Evaluate a commit against the candidate plans and produce one shared,
@@ -696,6 +737,38 @@ fn encode_pk_rows(schema: &TableSchema, rows: &[&Row]) -> Result<RowList> {
         builder.push_row(pk.as_bytes());
     }
     Ok(builder.finish())
+}
+
+/// Convert one [`RowValue`] to JSON for the HTTP admin surface (RPC-050).
+/// Numbers that overflow an IEEE-754 double (`u64`/`i64` extremes,
+/// entity/timestamp micros) are rendered as strings to avoid precision
+/// loss; bytes and identities are hex strings.
+fn row_value_to_json(value: &crate::store::RowValue) -> serde_json::Value {
+    use crate::store::RowValue as V;
+    use serde_json::Value as J;
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    match value {
+        V::Bool(b) => J::Bool(*b),
+        V::I8(n) => J::from(*n),
+        V::I16(n) => J::from(*n),
+        V::I32(n) => J::from(*n),
+        V::I64(n) => J::from(*n),
+        V::U8(n) => J::from(*n),
+        V::U16(n) => J::from(*n),
+        V::U32(n) => J::from(*n),
+        V::U64(n) => J::from(*n),
+        V::F32(x) => serde_json::Number::from_f64(f64::from(*x)).map_or(J::Null, J::Number),
+        V::F64(x) => serde_json::Number::from_f64(*x).map_or(J::Null, J::Number),
+        V::Str(s) => J::String(s.clone()),
+        V::Bytes(b) => J::String(hex(b)),
+        V::Identity(id) => J::String(id.to_string()),
+        V::ConnectionId(c) => J::String(c.as_u128().to_string()),
+        V::EntityId(e) => J::String(e.as_u64().to_string()),
+        V::Timestamp(t) => J::String(t.as_micros().to_string()),
+        V::Optional(None) => J::Null,
+        V::Optional(Some(inner)) => row_value_to_json(inner),
+        V::List(items) => J::Array(items.iter().map(row_value_to_json).collect()),
+    }
 }
 
 /// Apply a plan's row-level visibility filter for `viewer` (SUB-030):

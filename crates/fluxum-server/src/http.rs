@@ -183,6 +183,11 @@ async fn serve_connection(
                 handle_get(&state, stream, &request, server_shutdown).await?;
                 return Ok(());
             }
+            // The HTTP/JSON admin surface (RPC-050) shares this port.
+            (method, path) if crate::admin::is_admin_path(path) => {
+                handle_admin(&state.ctx, &mut stream, method, path, &request.body).await?;
+                true
+            }
             ("GET" | "POST", _) => {
                 write_simple(&mut stream, 404, "Not Found").await?;
                 true
@@ -196,6 +201,27 @@ async fn serve_connection(
             return Ok(());
         }
     }
+}
+
+/// Dispatch an admin route and write its JSON (or `text/plain` for
+/// `/metrics`) response (RPC-050..052).
+async fn handle_admin(
+    ctx: &Arc<ShardContext>,
+    stream: &mut TcpStream,
+    method: &str,
+    path: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let response = crate::admin::dispatch(ctx, method, path, body).await;
+    // `/metrics` returns a JSON string that is really Prometheus text.
+    let (content_type, bytes) = match &response.body {
+        serde_json::Value::String(text) => ("text/plain; version=0.0.4", text.clone().into_bytes()),
+        value => (
+            "application/json",
+            serde_json::to_vec(value).unwrap_or_default(),
+        ),
+    };
+    write_json(stream, response.status, content_type, &bytes).await
 }
 
 /// `POST /rpc`: route the body frames and return the response frames.
@@ -495,6 +521,38 @@ async fn write_response(
     stream.write_all(head.as_bytes()).await?;
     stream.write_all(body).await?;
     stream.flush().await
+}
+
+/// Write a non-FluxRPC response (admin JSON / metrics text) with an explicit
+/// content type.
+async fn write_json(
+    stream: &mut TcpStream,
+    code: u16,
+    content_type: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 {code} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\r\n",
+        reason_phrase(code),
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(body).await?;
+    stream.flush().await
+}
+
+/// A minimal reason-phrase table for the admin responses.
+fn reason_phrase(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        429 => "Too Many Requests",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "OK",
+    }
 }
 
 async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {

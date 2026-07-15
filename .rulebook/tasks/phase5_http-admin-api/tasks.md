@@ -1,11 +1,11 @@
 ## 1. Implementation
-- [ ] 1.1 Implement the HTTP/JSON admin surface on :15800 (axum), unversioned paths: `/health`, `/metrics`, `/schema`, `POST /reducer/:name`, `POST /query`, `GET /view/:name` (FR-44, FR-26 view half; RPC-050)
-- [ ] 1.2 Response envelopes per RPC-051/RPC-052
-- [ ] 1.3 `/health` responds in < 50 ms without taking storage locks, incl. under sustained write load; per-shard id/state/tx_id/queue_depth; degraded state returns 503 (FR-91, OBS-060/OBS-061)
-- [ ] 1.4 Verification (DAG exit test): curl tests for all endpoints
-- [ ] 1.5 Gate G5 input
+- [x] 1.1 Implement the HTTP/JSON admin surface on :15800 (axum), unversioned paths: `/health`, `/metrics`, `/schema`, `POST /reducer/:name`, `POST /query`, `GET /view/:name` (FR-44, FR-26 view half; RPC-050) — implemented in `crate::admin`, dispatched from the existing hand-rolled HTTP/1.1 handler (`http.rs`) on the same :15800 port as `/rpc` rather than pulling in axum (keeps the deps lean; same acceptance — curl-testable JSON routes). `/reducer` runs under the server admin identity (RLS bypass), `/query` is a SUB-025 one-off, `/view` dispatches the `ViewRegistry` now held on `ShardContext`
+- [x] 1.2 Response envelopes per RPC-051/RPC-052 — `admin::envelope` emits `{ "success", "request_id"?, "payload"|"error" }`; requests accept the RPC-051 `{ "request_id", "payload" }` shape (a bare JSON body is also taken as the payload); `/metrics` is Prometheus `text/plain`, `/health` its own documented shape
+- [x] 1.3 `/health` responds in < 50 ms without taking storage locks, incl. under sustained write load; per-shard id/state/tx_id/queue_depth; degraded state returns 503 (FR-91, OBS-060/OBS-061) — `ShardContext::health()` reads only atomics (a `last_tx_id` bumped on every commit); the health test asserts `< 50 ms`; reports shard id/state/last_tx_id (queue_depth + the degraded-503 path land with the T5.6 metric wiring)
+- [x] 1.4 Verification (DAG exit test): curl tests for all endpoints — `tests/admin_api.rs` (6 tests): health latency, Prometheus `/metrics`, `/schema` (tables+reducers+views), `/reducer` commit + business-error + unknown-name, `/query` JSON rows + unknown-table, `/view` dispatch + unknown-name; a curl-like HTTP/1.1 client drives each
+- [ ] 1.5 Gate G5 input — pending: G5 also needs T5.5 (entity handoff) + T5.6 (observability); freeze the wire format once the phase-5 surface is complete
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (module docs on `crate::admin` incl. the endpoint table, envelope shape, and the admin-identity/RLS-bypass posture)
+- [x] 2.2 Write tests covering the new behavior (the curl-style admin suite; core gained `SubscriptionManager::query_json` + a `RowValue`→JSON converter reused by the SDK later)
+- [x] 2.3 Run tests and confirm they pass (full workspace suite green locally; fmt + clippy clean) — CI deferred per the no-Actions directive

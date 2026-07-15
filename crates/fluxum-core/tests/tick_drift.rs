@@ -125,6 +125,15 @@ async fn run_600_phase() -> std::result::Result<u64, ()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn fixed_timestep_drift_semantics() {
+    // Real-time timing has no meaning under coverage instrumentation, which
+    // slows every firing enough to falsely trip the stall detector. Skip
+    // under `cargo llvm-cov` (which sets LLVM_PROFILE_FILE); the test runs
+    // in full in the normal `cargo test` / CI test job.
+    if std::env::var_os("LLVM_PROFILE_FILE").is_some() {
+        eprintln!("tick_drift: skipped under coverage instrumentation");
+        return;
+    }
+
     // --- Phase 1 (DAG exit): 60 Hz over 10 s = 600 ± 1, no cumulative
     // drift. The absolute-target clock makes the count exact regardless of
     // per-firing jitter; a >3-period host freeze resets the clock (that is
