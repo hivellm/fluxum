@@ -135,7 +135,9 @@ pub async fn serve(
     });
 
     // Shard-wide commit fan-out (SUB-021) — one per shard, shared with TCP.
-    crate::spawn_fanout(ctx, shutdown.clone());
+    crate::spawn_fanout(Arc::clone(&ctx), shutdown.clone());
+    // Ephemeral TTL sweeper (DMX-011) — idempotent across transports.
+    ctx.start_ephemeral_sweeper();
 
     let accept_shutdown = shutdown.clone();
     tokio::spawn(async move {

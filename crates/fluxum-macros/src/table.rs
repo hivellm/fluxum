@@ -121,6 +121,9 @@ struct Column {
     rename_from: Option<(String, Span)>,
     /// Parsed transform attributes, canonical CT-011 order (SPEC-017).
     transforms: Vec<TransformDecl>,
+    /// Span of an `#[owner]` attribute (ephemeral `ConnectionId` binding,
+    /// SPEC-023 DMX-011), if present.
+    owner: Option<Span>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,6 +273,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let mut access: Option<(Access, Span)> = None;
     let mut table_pk: Option<(Vec<Ident>, Span)> = None;
     let mut partition_by: Option<Ident> = None;
+    let mut expire_after_us: Option<(i64, Span)> = None;
 
     let metas = Punctuated::<Meta, Token![,]>::parse_terminated.parse2(args)?;
     for meta in metas {
@@ -317,15 +321,37 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 ));
             }
             partition_by = Some(list.parse_args::<Ident>()?);
+        } else if meta.path().is_ident("expire_after") {
+            let nv = meta.require_name_value()?;
+            if expire_after_us.is_some() {
+                return Err(syn::Error::new(span, "duplicate `expire_after` argument"));
+            }
+            let text = meta_value_str(nv).ok_or_else(|| {
+                syn::Error::new(
+                    nv.span(),
+                    "`expire_after` must be a duration string like \"500ms\", \"10s\", \
+                     \"5m\", or \"2h\" (DMX-011)",
+                )
+            })?;
+            expire_after_us = Some((parse_duration_us(&text, nv.span())?, span));
         } else {
             return Err(syn::Error::new(
                 span,
                 "unknown #[fluxum::table] argument: expected `public`, `private`, `global`, \
-                 `ephemeral`, `primary_key(col, ...)`, or `partition_by(col)` (DM-020)",
+                 `ephemeral`, `primary_key(col, ...)`, `partition_by(col)`, or \
+                 `expire_after = \"...\"` (DM-020)",
             ));
         }
     }
     let access = access.map_or(Access::Private, |(a, _)| a);
+    if let Some((_, span)) = expire_after_us
+        && access != Access::Ephemeral
+    {
+        return Err(syn::Error::new(
+            span,
+            "`expire_after` is only valid on an `ephemeral` table (DMX-011)",
+        ));
+    }
 
     // -- companion struct attributes (stripped from the output) --------------
     let mut unique: Vec<Vec<Ident>> = Vec::new();
@@ -376,12 +402,15 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         let mut default = None;
         let mut rename_from = None;
         let mut transforms: Vec<TransformDecl> = Vec::new();
+        let mut owner = None;
         let mut kept: Vec<Attribute> = Vec::new();
         for attr in std::mem::take(&mut field.attrs) {
             if attr.path().is_ident("primary_key") {
                 primary_key = Some(attr.span());
             } else if attr.path().is_ident("auto_inc") {
                 auto_inc = Some(attr.span());
+            } else if attr.path().is_ident("owner") {
+                owner = Some(attr.span());
             } else if attr.path().is_ident("normalize") {
                 transforms.push(parse_transform_normalize(&attr)?);
             } else if attr.path().is_ident("encrypted") {
@@ -450,6 +479,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             default,
             rename_from,
             transforms,
+            owner,
         });
     }
     if columns.is_empty() {
@@ -922,6 +952,59 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         }
     }
 
+    // -- ephemeral cleanup metadata (SPEC-023 DMX-011) ---------------------------
+    // `#[owner]` binds rows to a `ConnectionId` for disconnect cleanup;
+    // `expire_after` gives rows a TTL. Both register a link-time EphemeralDef.
+    let mut owner_ordinal: Option<u16> = None;
+    for (i, column) in columns.iter().enumerate() {
+        let Some(span) = column.owner else { continue };
+        if access != Access::Ephemeral {
+            return Err(syn::Error::new(
+                span,
+                "`#[owner]` is only valid on an `ephemeral` table (DMX-011)",
+            ));
+        }
+        if owner_ordinal.is_some() {
+            return Err(syn::Error::new(
+                span,
+                "at most one `#[owner]` column per table (DMX-011)",
+            ));
+        }
+        if !matches!(column.flux, FluxTy::ConnectionId) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "`#[owner]` column `{}` must be of type `ConnectionId` (DMX-011)",
+                    column.ident
+                ),
+            ));
+        }
+        owner_ordinal = Some(u16::try_from(i).unwrap_or(u16::MAX));
+    }
+    let ephemeral_submit: Option<TokenStream> =
+        if access == Access::Ephemeral && (owner_ordinal.is_some() || expire_after_us.is_some()) {
+            let table_name = item.ident.to_string();
+            let owner_tokens = match owner_ordinal {
+                Some(ord) => quote!(::core::option::Option::Some(#ord)),
+                None => quote!(::core::option::Option::None),
+            };
+            let expire_tokens = match expire_after_us {
+                Some((us, _)) => quote!(::core::option::Option::Some(#us)),
+                None => quote!(::core::option::Option::None),
+            };
+            Some(quote! {
+                ::fluxum_core::schema::inventory::submit! {
+                    ::fluxum_core::schema::EphemeralDef {
+                        table: #table_name,
+                        owner: #owner_tokens,
+                        expire_after_us: #expire_tokens,
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
     // -- visibility -------------------------------------------------------------
     let visibility_tokens = match &visibility {
         None => quote!(::fluxum_core::schema::VisibilityRule::PublicAll),
@@ -1134,6 +1217,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
             #(#transform_submits)*
 
+            #ephemeral_submit
+
             #migration_meta
         };
     })
@@ -1275,6 +1360,38 @@ fn meta_value_ident(nv: &syn::MetaNameValue) -> Option<String> {
         Expr::Path(p) => p.path.get_ident().map(ToString::to_string),
         _ => None,
     }
+}
+
+/// Parse an `expire_after` duration string — `<int>` + `ms`|`s`|`m`|`h` —
+/// into microseconds (DMX-011).
+fn parse_duration_us(text: &str, span: Span) -> syn::Result<i64> {
+    let bad = || {
+        syn::Error::new(
+            span,
+            format!(
+                "invalid duration `{text}`: expected `<integer>` + `ms`|`s`|`m`|`h`, e.g. \
+                 \"10s\" (DMX-011)"
+            ),
+        )
+    };
+    let split = text.find(|c: char| !c.is_ascii_digit()).ok_or_else(bad)?;
+    let (digits, unit) = text.split_at(split);
+    let value: i64 = digits.parse().map_err(|_| bad())?;
+    let per_unit: i64 = match unit {
+        "ms" => 1_000,
+        "s" => 1_000_000,
+        "m" => 60_000_000,
+        "h" => 3_600_000_000,
+        _ => return Err(bad()),
+    };
+    let us = value.checked_mul(per_unit).ok_or_else(bad)?;
+    if us <= 0 {
+        return Err(syn::Error::new(
+            span,
+            "`expire_after` must be a positive duration (DMX-011)",
+        ));
+    }
+    Ok(us)
 }
 
 /// A `name = "literal"` argument value.

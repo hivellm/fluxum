@@ -247,16 +247,34 @@ impl ReducerEngine {
     }
 
     /// Run the `on_disconnect` hooks when a client connection drops —
-    /// clean close or timeout (RED-012). Like [`Self::client_connected`],
-    /// returns the hook transaction's receipt for fan-out publication (a
-    /// cleanup that deletes a presence row must reach subscribers), or `None`
-    /// when no `on_disconnect` hook is registered.
+    /// clean close or timeout (RED-012) — plus the built-in ephemeral
+    /// `#[owner]` cleanup (SPEC-023 DMX-011): every ephemeral table bound to
+    /// a `ConnectionId` column drops this connection's rows, in the **same
+    /// transaction** as the user hooks, so presence rows and their cleanup
+    /// fan out atomically. Like [`Self::client_connected`], returns the
+    /// transaction's receipt for fan-out publication, or `None` when there is
+    /// neither a hook nor an owner-bound ephemeral table.
     pub async fn client_disconnected(
         &self,
         identity: Identity,
         connection_id: ConnectionId,
     ) -> Result<Option<CommitReceipt>> {
-        if self.hooks.on_disconnect.is_empty() {
+        // Resolve owner-bound ephemeral tables against this shard's store
+        // (defs for tables absent from the schema are skipped).
+        let store = self.pipeline.store();
+        let cleanup: Vec<(
+            crate::store::TableId,
+            u16,
+            &'static crate::schema::TableSchema,
+        )> = crate::schema::registered_ephemeral()
+            .filter_map(|def| {
+                let owner = def.owner?;
+                let table = store.table_id(def.table)?;
+                let schema = store.table_schema(table)?;
+                Some((table, owner, schema))
+            })
+            .collect();
+        if self.hooks.on_disconnect.is_empty() && cleanup.is_empty() {
             return Ok(None);
         }
         let caller = ReducerCaller {
@@ -265,7 +283,41 @@ impl ReducerEngine {
             timestamp: Timestamp::now(),
             shard_id: self.shard_id,
         };
-        self.run_hooks_as(self.hooks.on_disconnect.clone(), caller)
+        let defs = self.hooks.on_disconnect.clone();
+        let registry = Arc::clone(&self.registry);
+        self.pipeline
+            .call(Box::new(move |tx| {
+                with_context(&registry, caller, tx, |ctx| {
+                    for def in &defs {
+                        (def.handler)(ctx)?;
+                    }
+                    Ok(())
+                })?;
+                // Built-in DMX-011 owner cleanup, same transaction.
+                use crate::store::RowValue;
+                for (table, owner, schema) in &cleanup {
+                    let doomed: Vec<Vec<RowValue>> = tx
+                        .scan(*table)?
+                        .filter(|row| {
+                            matches!(
+                                row.value(*owner),
+                                Some(RowValue::ConnectionId(c)) if *c == connection_id
+                            )
+                        })
+                        .map(|row| {
+                            schema
+                                .primary_key
+                                .iter()
+                                .filter_map(|&ord| row.value(ord).cloned())
+                                .collect()
+                        })
+                        .collect();
+                    for pk_values in doomed {
+                        tx.delete(*table, &pk_values)?;
+                    }
+                }
+                Ok(())
+            }))
             .await
             .map(Some)
     }

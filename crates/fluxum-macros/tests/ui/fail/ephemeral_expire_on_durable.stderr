@@ -1,0 +1,5 @@
+error: `expire_after` is only valid on an `ephemeral` table (DMX-011)
+ --> tests/ui/fail/ephemeral_expire_on_durable.rs:5:25
+  |
+5 | #[fluxum::table(public, expire_after = "10s")]
+  |                         ^^^^^^^^^^^^^^^^^^^^

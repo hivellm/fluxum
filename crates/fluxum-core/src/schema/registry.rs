@@ -71,6 +71,8 @@ impl Schema {
         // this schema (runtime backstop behind the macro's compile-time
         // rejections; covers hand-registered defs).
         crate::transform::validate_registered(&schema)?;
+        // SPEC-023 DMX-011: ephemeral cleanup metadata must resolve too.
+        crate::schema::validate_registered_ephemeral(&schema)?;
         Ok(schema)
     }
 

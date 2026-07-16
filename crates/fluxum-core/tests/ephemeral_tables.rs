@@ -44,7 +44,7 @@ static ROOM: TableSchema = TableSchema {
 static CURSOR_COLS: &[ColumnSchema] = &[
     ColumnSchema {
         name: "conn",
-        ty: FluxType::U32,
+        ty: FluxType::ConnectionId,
     },
     ColumnSchema {
         name: "x",
@@ -83,8 +83,22 @@ fn pipeline_in(dir: &std::path::Path) -> (Arc<MemStore>, TxPipeline, tokio::task
 fn room(id: u64, name: &str) -> Vec<RowValue> {
     vec![RowValue::U64(id), RowValue::Str(name.into())]
 }
-fn cursor(conn: u32, x: i32, y: i32) -> Vec<RowValue> {
-    vec![RowValue::U32(conn), RowValue::I32(x), RowValue::I32(y)]
+fn cursor(conn: u128, x: i32, y: i32) -> Vec<RowValue> {
+    vec![
+        RowValue::ConnectionId(fluxum_core::types::ConnectionId::new(conn)),
+        RowValue::I32(x),
+        RowValue::I32(y),
+    ]
+}
+
+// DMX-011 cleanup metadata for Cursor: owner-bound to `conn` (ordinal 0),
+// rows expire 300 s after their last write (time injected in tests).
+fluxum_core::schema::inventory::submit! {
+    fluxum_core::schema::EphemeralDef {
+        table: "Cursor",
+        owner: Some(0),
+        expire_after_us: Some(300_000_000),
+    }
 }
 
 #[test]
@@ -248,4 +262,124 @@ async fn ephemeral_table_is_empty_after_restart() {
         0,
         "ephemeral table is empty after restart (DMX-012)"
     );
+}
+
+// --- DMX-011: owner-bound disconnect cleanup + expire_after sweeper -------------
+
+/// DMX-011: on disconnect, the engine deletes exactly the dropped
+/// connection's rows from owner-bound ephemeral tables — in the hook
+/// transaction, whose receipt fans the deletes out.
+#[tokio::test(flavor = "multi_thread")]
+async fn disconnect_cleanup_deletes_only_the_owners_rows() {
+    use fluxum_core::reducer::{LifecycleHooks, ReducerEngine, ReducerRegistry};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, pipeline, _worker) = pipeline_in(dir.path());
+    let cursor_id = store.table_id("Cursor").unwrap();
+    let engine = ReducerEngine::new(
+        pipeline.clone(),
+        Arc::new(ReducerRegistry::from_defs([]).unwrap()),
+        LifecycleHooks::none(),
+        SHARD,
+        fluxum_core::auth::server_identity("ephemeral-test"),
+    );
+
+    // Two connections, three rows.
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.insert(cursor_id, cursor(42, 1, 1))?;
+            tx.insert(cursor_id, cursor(43, 2, 2))?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+
+    // Connection 42 drops: its row is deleted, 43's row survives.
+    let receipt = engine
+        .client_disconnected(
+            fluxum_core::types::Identity::from_bytes([9u8; 32]),
+            fluxum_core::types::ConnectionId::new(42),
+        )
+        .await
+        .unwrap()
+        .expect("cleanup transaction expected");
+    assert_eq!(receipt.diff.tables.len(), 1);
+    assert_eq!(receipt.diff.tables[0].deletes.len(), 1);
+    let snap = store.snapshot();
+    assert_eq!(snap.row_count(cursor_id).unwrap(), 1);
+
+    // A connection with no rows commits an empty cleanup (no hook, no rows).
+    let receipt = engine
+        .client_disconnected(
+            fluxum_core::types::Identity::from_bytes([9u8; 32]),
+            fluxum_core::types::ConnectionId::new(99),
+        )
+        .await
+        .unwrap()
+        .expect("cleanup transaction expected");
+    assert!(receipt.diff.tables.is_empty());
+}
+
+/// DMX-011: the sweeper expires rows `expire_after` after their last write
+/// (identity-witness semantics) — an actively rewritten row never expires,
+/// idle sweeps run no transaction, and deletes fan out as ordinary diffs.
+#[tokio::test(flavor = "multi_thread")]
+async fn sweeper_expires_stale_rows_and_refreshes_rewritten_ones() {
+    use fluxum_core::scheduler::EphemeralSweeper;
+    use fluxum_core::types::Timestamp;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, pipeline, _worker) = pipeline_in(dir.path());
+    let cursor_id = store.table_id("Cursor").unwrap();
+    let sweeper = EphemeralSweeper::from_registered(pipeline.clone()).expect("Cursor has a TTL");
+    assert!(sweeper.cadence() >= std::time::Duration::from_millis(100));
+
+    let t0 = Timestamp::from_micros(1_000_000_000);
+    let ttl = 300_000_000; // Cursor's registered expire_after_us
+
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.insert(cursor_id, cursor(42, 1, 1))?;
+            tx.insert(cursor_id, cursor(43, 2, 2))?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+
+    // First observation registers witnesses; nothing is due → no transaction.
+    assert!(sweeper.sweep_once_at(t0).await.unwrap().is_none());
+
+    // Connection 42 keeps writing; 43 goes idle.
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.upsert(cursor_id, cursor(42, 5, 5))?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+
+    // Past 43's TTL: 43 expires, 42 was rewritten → witness refreshes.
+    let t1 = Timestamp::from_micros(t0.as_micros() + ttl + 1_000_000);
+    let receipt = sweeper
+        .sweep_once_at(t1)
+        .await
+        .unwrap()
+        .expect("one expiry due");
+    assert_eq!(receipt.diff.tables.len(), 1);
+    assert_eq!(receipt.diff.tables[0].deletes.len(), 1);
+    assert_eq!(store.snapshot().row_count(cursor_id).unwrap(), 1);
+
+    // 42 now idles past its TTL (measured from the refresh at t1).
+    let t2 = Timestamp::from_micros(t1.as_micros() + ttl + 1_000_000);
+    let receipt = sweeper
+        .sweep_once_at(t2)
+        .await
+        .unwrap()
+        .expect("last row expires");
+    assert_eq!(receipt.diff.tables[0].deletes.len(), 1);
+    assert_eq!(store.snapshot().row_count(cursor_id).unwrap(), 0);
+
+    // Fully empty table: idle sweep, no transaction.
+    let t3 = Timestamp::from_micros(t2.as_micros() + ttl);
+    assert!(sweeper.sweep_once_at(t3).await.unwrap().is_none());
 }

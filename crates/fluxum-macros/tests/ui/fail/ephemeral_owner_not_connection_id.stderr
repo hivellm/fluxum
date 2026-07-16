@@ -1,0 +1,5 @@
+error: `#[owner]` column `who` must be of type `ConnectionId` (DMX-011)
+ --> tests/ui/fail/ephemeral_owner_not_connection_id.rs:9:5
+  |
+9 |     #[owner]
+  |     ^^^^^^^^

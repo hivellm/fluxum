@@ -109,6 +109,9 @@ pub struct ShardContext {
     /// Last committed `tx_id` (atomic, for the lock-free `/health` — RPC-053
     /// forbids taking storage locks on the health path).
     last_tx_id: AtomicU64,
+    /// Whether the DMX-011 ephemeral TTL sweeper has been spawned (both
+    /// transports request it on serve; only the first call spawns).
+    sweeper_started: std::sync::atomic::AtomicBool,
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -164,7 +167,40 @@ impl ShardContext {
             commit_tx,
             next_connection_id: AtomicU64::new(1),
             last_tx_id: AtomicU64::new(0),
+            sweeper_started: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Start the ephemeral TTL sweeper (SPEC-023 DMX-011) if any registered
+    /// ephemeral table declares `expire_after`. Idempotent — both transports
+    /// call this on serve; only the first call spawns. The sweep's delete
+    /// diffs are published to the shard fan-out like any commit.
+    pub fn start_ephemeral_sweeper(self: &Arc<Self>) {
+        if self
+            .sweeper_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(sweeper) = fluxum_core::scheduler::EphemeralSweeper::from_registered(
+            self.engine.pipeline().clone(),
+        ) else {
+            return;
+        };
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            let cadence = sweeper.cadence();
+            loop {
+                tokio::time::sleep(cadence).await;
+                match sweeper.sweep_once().await {
+                    Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(target: "fluxum::server", error = %e, "ephemeral sweep failed");
+                    }
+                }
+            }
+        });
     }
 
     /// A lock-free health snapshot (RPC-053): reads only atomics.

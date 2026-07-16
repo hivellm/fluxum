@@ -29,8 +29,10 @@ mod table;
 /// | `public` | Visible to client subscriptions (DM-005) |
 /// | `private` | Server-internal only — the default (DM-005) |
 /// | `global` | Replicated read-only to all shards (DM-007) |
+/// | `ephemeral` | Memory-only + client-visible: fans out but skips the commit log, checkpoints, and replication (SPEC-023 DMX-010) |
 /// | `primary_key(a, b, ...)` | Composite primary key (DM-003) |
 /// | `partition_by(col)` | Partition key for sharding; not with `global` (DM-008) |
+/// | `expire_after = "10s"` | Ephemeral-row TTL since last write (`ms`/`s`/`m`/`h`, SPEC-023 DMX-011) |
 ///
 /// # Field attributes
 ///
@@ -38,6 +40,7 @@ mod table;
 /// |---|---|
 /// | `#[primary_key]` | Single-column primary key (DM-002) |
 /// | `#[auto_inc]` | Server-assigned monotonic id; `u64` `#[primary_key]` only (DM-004) |
+/// | `#[owner]` | Ephemeral-table `ConnectionId` binding: the owner's rows are deleted on disconnect (SPEC-023 DMX-011) |
 /// | `#[default(value)]` | Backfill value: the schema diff auto-adds the column to existing rows (SPEC-010 MIG-021) |
 /// | `#[rename(from = "old")]` | Column was renamed from `old`: the schema diff renames it in place (SPEC-010 MIG-021) |
 /// | `#[normalize(money\|datetime\|string, …)]` | Deterministic value canonicalization (SPEC-017 CT-021..023) |

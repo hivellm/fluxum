@@ -272,6 +272,71 @@ pub enum VisibilityRule {
     Custom(&'static str),
 }
 
+/// Cleanup metadata of one ephemeral table (SPEC-023 DMX-011), registered at
+/// link time by `#[fluxum::table(ephemeral, ...)]` when the table declares an
+/// `expire_after` and/or an `#[owner]` binding. Keyed by table name and kept
+/// off [`TableSchema`] (side registry, like the SPEC-017 transforms) so the
+/// additive metadata costs no change at its construction sites.
+pub struct EphemeralDef {
+    /// The `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// Ordinal of the `#[owner]` `ConnectionId` column, if bound: the owner's
+    /// rows are deleted (with delete diffs) when that connection drops.
+    pub owner: Option<u16>,
+    /// Row lifetime in microseconds since the last write, if declared: the
+    /// sweeper drops older rows (at sweep-cadence granularity).
+    pub expire_after_us: Option<i64>,
+}
+
+inventory::collect!(EphemeralDef);
+
+/// Every registered ephemeral-cleanup def in this binary (linker order).
+pub fn registered_ephemeral() -> impl Iterator<Item = &'static EphemeralDef> {
+    inventory::iter::<EphemeralDef>()
+}
+
+/// The cleanup metadata of ephemeral `table`, if registered.
+pub fn ephemeral_def(table: &str) -> Option<&'static EphemeralDef> {
+    registered_ephemeral().find(|def| def.table == table)
+}
+
+/// Startup validation of every registered [`EphemeralDef`] against an
+/// assembled schema (DMX-011 backstop; defs for tables outside `schema` are
+/// skipped — the registry is process-global, schemas may be subsets).
+pub(crate) fn validate_registered_ephemeral(schema: &Schema) -> Result<()> {
+    use crate::error::FluxumError;
+    for def in registered_ephemeral() {
+        let Some(table) = schema.table(def.table) else {
+            continue;
+        };
+        if !table.is_ephemeral() {
+            return Err(FluxumError::Schema(format!(
+                "table `{}`: ephemeral cleanup metadata on a non-ephemeral table (DMX-011)",
+                def.table
+            )));
+        }
+        if let Some(owner) = def.owner {
+            let owner_ty = table.column(owner).map(|c| &c.ty);
+            if !matches!(owner_ty, Some(FluxType::ConnectionId)) {
+                return Err(FluxumError::Schema(format!(
+                    "table `{}`: the #[owner] binding must be a `ConnectionId` column \
+                     (DMX-011)",
+                    def.table
+                )));
+            }
+        }
+        if let Some(us) = def.expire_after_us
+            && us <= 0
+        {
+            return Err(FluxumError::Schema(format!(
+                "table `{}`: expire_after must be positive (DMX-011)",
+                def.table
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Generated for each table struct by `#[fluxum::table]` (DM-043).
 ///
 /// Consumed by the storage engine (SPEC-002) and the typed

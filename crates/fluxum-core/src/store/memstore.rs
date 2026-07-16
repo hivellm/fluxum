@@ -205,6 +205,11 @@ impl MemStore {
         self.catalog.contains_key(&id).then_some(id)
     }
 
+    /// The schema of a registered table (by id).
+    pub fn table_schema(&self, table: TableId) -> Option<&'static TableSchema> {
+        self.catalog.get(&table).copied()
+    }
+
     /// The [`IndexId`] of the B-tree index declared on table `name` over
     /// exactly `columns` (names in declared key order), if one exists.
     pub fn index_id(&self, name: &str, columns: &[&str]) -> Option<IndexId> {

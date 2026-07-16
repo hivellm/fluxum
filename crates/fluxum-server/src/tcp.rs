@@ -80,6 +80,8 @@ pub async fn serve(
 
     // Shard-wide commit fan-out (SUB-021).
     crate::spawn_fanout(Arc::clone(&ctx), shutdown.clone());
+    // Ephemeral TTL sweeper (DMX-011) — idempotent across transports.
+    ctx.start_ephemeral_sweeper();
 
     // Accept loop.
     let accept_ctx = Arc::clone(&ctx);

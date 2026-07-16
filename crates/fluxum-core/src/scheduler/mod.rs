@@ -40,7 +40,9 @@
 //!   ([`ReducerRegistry::check_call`]).
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -51,8 +53,8 @@ use tokio::time::Instant;
 use crate::error::{FluxumError, Result};
 use crate::reducer::{FluxValue, ReducerCaller, ReducerRegistry, with_context};
 use crate::schema::{ColumnSchema, FluxType, Table, TableAccess, TableSchema, VisibilityRule};
-use crate::store::RowValue;
-use crate::txn::TxPipeline;
+use crate::store::{PkBytes, Row, RowValue, TableId};
+use crate::txn::{CommitReceipt, TxPipeline};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
 /// Stored name of the schedule system table (RED-021).
@@ -608,5 +610,171 @@ async fn fire_entry(
                 reducer = %entry.reducer_name, error = %e,
                 "scheduled execution failed; transaction rolled back, will re-deliver");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ephemeral TTL sweeper (SPEC-023 DMX-011)
+// ---------------------------------------------------------------------------
+
+/// TTL sweeper for ephemeral tables declaring `expire_after` (DMX-011).
+///
+/// A row expires `expire_after` after its **last write**, at sweep-cadence
+/// granularity, tracked without touching the storage engine: the sweeper
+/// keeps a per-PK *identity witness* — the [`Row`]'s shared allocation
+/// ([`Row::same_identity`]) plus the time it was last observed to change. A
+/// rewrite (upsert) replaces the row allocation, so the witness refreshes and
+/// an actively-updated cursor never expires; a row untouched past its TTL is
+/// deleted in an ordinary transaction whose delete diffs fan out to
+/// subscribers like any commit.
+///
+/// The scan runs on a wait-free snapshot; a transaction is only started when
+/// something is actually due (idle sweeps consume no `tx_id`), and each
+/// doomed row is re-verified by identity inside the transaction, so a write
+/// racing the sweep wins.
+pub struct EphemeralSweeper {
+    pipeline: TxPipeline,
+    tables: Vec<SweepTable>,
+    witnesses: Mutex<HashMap<(TableId, PkBytes), Witness>>,
+}
+
+#[derive(Clone, Copy)]
+struct SweepTable {
+    table: TableId,
+    schema: &'static TableSchema,
+    expire_after_us: i64,
+}
+
+struct Witness {
+    row: Row,
+    changed_at: Timestamp,
+}
+
+impl EphemeralSweeper {
+    /// Build a sweeper for every registered ephemeral table with an
+    /// `expire_after` that resolves against `pipeline`'s store. `None` when
+    /// no table needs sweeping.
+    pub fn from_registered(pipeline: TxPipeline) -> Option<Self> {
+        let store = Arc::clone(pipeline.store());
+        let tables: Vec<SweepTable> = crate::schema::registered_ephemeral()
+            .filter_map(|def| {
+                let expire_after_us = def.expire_after_us?;
+                let table = store.table_id(def.table)?;
+                let schema = store.table_schema(table)?;
+                Some(SweepTable {
+                    table,
+                    schema,
+                    expire_after_us,
+                })
+            })
+            .collect();
+        if tables.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pipeline,
+            tables,
+            witnesses: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// The recommended sweep interval: a quarter of the shortest TTL,
+    /// clamped to `[100 ms, 5 s]`.
+    pub fn cadence(&self) -> Duration {
+        let min_us = self
+            .tables
+            .iter()
+            .map(|t| t.expire_after_us)
+            .min()
+            .unwrap_or(1_000_000);
+        Duration::from_micros(u64::try_from(min_us / 4).unwrap_or(1_000_000))
+            .clamp(Duration::from_millis(100), Duration::from_secs(5))
+    }
+
+    /// One sweep at the wall clock.
+    pub async fn sweep_once(&self) -> Result<Option<CommitReceipt>> {
+        self.sweep_once_at(Timestamp::now()).await
+    }
+
+    /// One sweep pass at `now` (injectable for tests): refresh witnesses
+    /// from a snapshot, then delete every row unchanged for longer than its
+    /// table's TTL. Returns the delete transaction's receipt, or `None` when
+    /// nothing was due (no transaction, no `tx_id` consumed).
+    pub async fn sweep_once_at(&self, now: Timestamp) -> Result<Option<CommitReceipt>> {
+        // Phase 1 — bookkeeping on a wait-free snapshot (no transaction).
+        let snapshot = self.pipeline.store().snapshot();
+        let mut doomed: Vec<(SweepTable, Vec<RowValue>, Row)> = Vec::new();
+        {
+            let mut witnesses = self.witnesses.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live: HashSet<(TableId, PkBytes)> = HashSet::new();
+            for entry in &self.tables {
+                for row in snapshot.scan(entry.table)? {
+                    let pk = crate::store::row::encode_pk_of_row(entry.schema, row.values())?;
+                    let key = (entry.table, pk);
+                    live.insert(key.clone());
+                    match witnesses.get_mut(&key) {
+                        Some(witness) if witness.row.same_identity(row) => {
+                            let age = now.as_micros() - witness.changed_at.as_micros();
+                            if age > entry.expire_after_us {
+                                let pk_values = entry
+                                    .schema
+                                    .primary_key
+                                    .iter()
+                                    .filter_map(|&ord| row.value(ord).cloned())
+                                    .collect();
+                                doomed.push((*entry, pk_values, row.clone()));
+                            }
+                        }
+                        // New row, or rewritten since last observed: refresh.
+                        _ => {
+                            witnesses.insert(
+                                key,
+                                Witness {
+                                    row: row.clone(),
+                                    changed_at: now,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            // Rows gone from the snapshot no longer need a witness.
+            witnesses.retain(|key, _| live.contains(key));
+        }
+        if doomed.is_empty() {
+            return Ok(None);
+        }
+
+        // Phase 2 — delete in one ordinary transaction, re-verifying each row
+        // by identity so a write that raced the snapshot wins.
+        let plan: Vec<(TableId, Vec<RowValue>, Row)> = doomed
+            .iter()
+            .map(|(entry, pk_values, row)| (entry.table, pk_values.clone(), row.clone()))
+            .collect();
+        let receipt = self
+            .pipeline
+            .call(Box::new(move |tx| {
+                for (table, pk_values, witness) in &plan {
+                    match tx.query_pk(*table, pk_values)? {
+                        Some(current) if current.same_identity(witness) => {
+                            tx.delete(*table, pk_values)?;
+                        }
+                        // Rewritten or already gone: leave it alone.
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }))
+            .await?;
+        // Deleted rows lose their witness (a survivor re-registers next pass).
+        {
+            let mut witnesses = self.witnesses.lock().unwrap_or_else(|e| e.into_inner());
+            for (entry, pk_values, _) in &doomed {
+                if let Ok(pk) = crate::store::row::encode_pk_values(entry.schema, pk_values) {
+                    witnesses.remove(&(entry.table, pk));
+                }
+            }
+        }
+        Ok(Some(receipt))
     }
 }

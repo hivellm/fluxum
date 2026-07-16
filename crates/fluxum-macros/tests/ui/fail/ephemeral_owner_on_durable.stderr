@@ -1,0 +1,13 @@
+error: `#[owner]` is only valid on an `ephemeral` table (DMX-011)
+ --> tests/ui/fail/ephemeral_owner_on_durable.rs:9:5
+  |
+9 |     #[owner]
+  |     ^^^^^^^^
+
+warning: unused import: `fluxum_core::types::ConnectionId`
+ --> tests/ui/fail/ephemeral_owner_on_durable.rs:3:5
+  |
+3 | use fluxum_core::types::ConnectionId;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
