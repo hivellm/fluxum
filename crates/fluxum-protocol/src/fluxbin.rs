@@ -66,7 +66,7 @@ pub enum FluxBinError {
 impl FluxBinError {
     /// The RPC-034 wire error code for this failure: 400 (malformed body).
     pub const fn code(&self) -> u16 {
-        codes::MALFORMED
+        codes::PROTO_MALFORMED
     }
 }
 

@@ -28,7 +28,7 @@ pub struct RowListError(String);
 impl RowListError {
     /// The RPC-034 wire error code for this failure: 400.
     pub const fn code(&self) -> u16 {
-        codes::MALFORMED
+        codes::PROTO_MALFORMED
     }
 }
 

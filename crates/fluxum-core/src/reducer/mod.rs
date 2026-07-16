@@ -279,7 +279,7 @@ impl ReducerRegistry {
             .ok_or_else(|| unknown_reducer(name))?;
         if !registered.client_callable {
             return Err(FluxumError::query(
-                codes::FORBIDDEN,
+                codes::REDUCER_SCHEDULE_ONLY,
                 format!("schedule-only reducer `{name}` (RED-025)"),
             ));
         }
@@ -412,7 +412,7 @@ impl ReducerContext<'_, '_, '_> {
         }
         let delay_us = i64::try_from(delay.as_micros()).map_err(|_| {
             FluxumError::query(
-                codes::MALFORMED,
+                codes::REDUCER_BAD_ARGS,
                 format!("schedule_after delay {delay:?} overflows the µs clock"),
             )
         })?;
@@ -580,7 +580,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let depth = self.env.depth.get();
         if depth >= MAX_CALL_DEPTH {
             return Err(FluxumError::query(
-                codes::INTERNAL,
+                codes::SYS_INTERNAL,
                 format!(
                     "reducer call depth exceeded {MAX_CALL_DEPTH} calling `{reducer}`: \
                      unbounded recursion via ctx.tx.call (RED-005)"
@@ -631,7 +631,7 @@ fn decode_rows<T: Table>(rows: &[Row]) -> Result<Vec<T>> {
 
 fn unknown_reducer(name: &str) -> FluxumError {
     FluxumError::query(
-        codes::NOT_FOUND,
+        codes::REDUCER_UNKNOWN,
         format!("unknown reducer `{name}` (RED-006)"),
     )
 }

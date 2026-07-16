@@ -178,7 +178,10 @@ async fn ten_thousand_panics_leave_the_shard_serving_and_memory_stable() {
             .call(caller, "buggy", vec![])
             .await
             .expect_err("the buggy reducer must fail every time");
-        assert_eq!(err.query_code(), Some(500), "internal error result: {err}");
+        assert!(
+            matches!(err, fluxum_core::FluxumError::ReducerPanic(_)),
+            "panic result: {err}"
+        );
 
         if i % HEALTHY_EVERY == 0 {
             engine

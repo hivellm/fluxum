@@ -553,7 +553,11 @@ async fn schedule_only_reducers_reject_clients_with_403() {
         .call(client(), "slow_mark", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_SCHEDULE_ONLY),
+        "{err}"
+    );
     assert!(err.to_string().contains("schedule-only"), "{err}");
 
     shard
@@ -584,7 +588,11 @@ async fn schedule_only_reducers_reject_clients_with_403() {
         }))
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(404), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN),
+        "{err}"
+    );
 }
 
 // --- Scheduler assembly validation (RED-020/RED-021) --------------------------------

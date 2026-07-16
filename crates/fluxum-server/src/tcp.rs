@@ -173,7 +173,7 @@ async fn drive_connection(
             ReadOutcome::Data(n) => buf.extend_from_slice(&read_chunk[..n]),
             ReadOutcome::Idle => {
                 // RPC-060: send 408 then close.
-                let msg = error_frame(&codec, None, codes::IDLE_TIMEOUT, "idle timeout");
+                let msg = error_frame(&codec, None, codes::PROTO_IDLE_TIMEOUT, "idle timeout");
                 let _ = out_tx.send(msg).await;
                 break Ok(());
             }
@@ -220,7 +220,7 @@ async fn route_frame(
             let frame = error_frame(
                 codec,
                 None,
-                codes::MALFORMED,
+                codes::PROTO_MALFORMED,
                 format!("malformed message: {e}"),
             );
             return out_tx.send(frame).await.is_ok();
@@ -324,10 +324,6 @@ fn error_frame(
     code: u16,
     message: impl Into<String>,
 ) -> OutFrame {
-    let msg = ServerMessage::Error(ErrorMessage {
-        id,
-        code,
-        message: message.into(),
-    });
+    let msg = ServerMessage::Error(ErrorMessage::from_catalog(id, code, message, Vec::new()));
     frame_message(codec, &msg).unwrap_or_else(|()| Arc::new(Vec::new()))
 }

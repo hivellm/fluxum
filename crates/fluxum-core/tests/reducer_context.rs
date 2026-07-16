@@ -461,7 +461,10 @@ fn registry_rejects_duplicates_and_unknown_dispatch() {
     let err = registry
         .dispatch(caller(), "missing", &[], &mut tx)
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(404));
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN)
+    );
     assert!(
         err.to_string().contains("unknown reducer `missing`"),
         "{err}"
@@ -474,7 +477,10 @@ fn registry_rejects_duplicates_and_unknown_dispatch() {
         ctx.tx.call("missing", &[])
     })
     .unwrap_err();
-    assert_eq!(err.query_code(), Some(404));
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN)
+    );
     tx.rollback();
 }
 

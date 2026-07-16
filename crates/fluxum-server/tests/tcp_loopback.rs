@@ -266,7 +266,7 @@ async fn pre_auth_messages_are_401_and_keep_the_connection_open() {
         .await;
     match client.recv().await.unwrap() {
         ServerMessage::Error(e) => {
-            assert_eq!(e.code, 401);
+            assert_eq!(e.code, fluxum_protocol::codes::AUTH_REQUIRED);
             assert_eq!(e.id, Some(1));
         }
         other => panic!("expected 401 Error, got {other:?}"),
@@ -311,7 +311,7 @@ async fn reducer_call_commits_and_returns_reducerresult() {
     match client.recv().await.unwrap() {
         ServerMessage::ReducerResult(r) => {
             assert_eq!(r.id, 43);
-            assert_eq!(r.outcome.unwrap_err(), "empty text");
+            assert_eq!(r.outcome.unwrap_err().message, "empty text");
         }
         other => panic!("expected ReducerResult Err, got {other:?}"),
     }
@@ -469,7 +469,9 @@ async fn idle_connection_gets_408_then_closes() {
     client.authenticate(b"alice", 1).await;
     // Send nothing; expect a 408 then close.
     match client.recv_timeout(Duration::from_secs(2)).await {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408),
+        Some(ServerMessage::Error(e)) => {
+            assert_eq!(e.code, fluxum_protocol::codes::PROTO_IDLE_TIMEOUT)
+        }
         other => panic!("expected 408, got {other:?}"),
     }
     assert!(client.recv().await.is_none(), "connection closed after 408");
@@ -490,7 +492,9 @@ async fn oversized_frame_gets_413_then_closes() {
     let header = 2_000_000u32.to_le_bytes();
     client.send_raw(&header).await;
     match client.recv_timeout(Duration::from_secs(2)).await {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 413),
+        Some(ServerMessage::Error(e)) => {
+            assert_eq!(e.code, fluxum_protocol::codes::PROTO_FRAME_TOO_LARGE)
+        }
         other => panic!("expected 413, got {other:?}"),
     }
     assert!(client.recv().await.is_none(), "connection closed after 413");
@@ -785,7 +789,11 @@ async fn a_malformed_envelope_is_400_and_keeps_the_connection() {
     client.send_raw(&garbage).await;
     match client.recv().await.unwrap() {
         ServerMessage::Error(e) => {
-            assert_eq!(e.code, 400, "RPC-001 malformed envelope");
+            assert_eq!(
+                e.code,
+                fluxum_protocol::codes::PROTO_MALFORMED,
+                "RPC-001 malformed envelope"
+            );
             assert_eq!(e.id, None, "no id to echo");
         }
         other => panic!("expected 400 Error, got {other:?}"),

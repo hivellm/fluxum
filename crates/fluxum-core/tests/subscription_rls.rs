@@ -250,7 +250,11 @@ fn private_tables_cannot_be_subscribed() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_TABLE_NOT_PUBLIC),
+        "{err}"
+    );
     assert!(err.to_string().contains("not public"), "{err}");
     // Even a server peer cannot subscribe to a private table.
     let err = mgr
@@ -261,7 +265,11 @@ fn private_tables_cannot_be_subscribed() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_TABLE_NOT_PUBLIC),
+        "{err}"
+    );
 }
 
 // --- SPEC-001 two-client Task scenario -----------------------------------------

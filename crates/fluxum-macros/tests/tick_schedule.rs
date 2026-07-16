@@ -110,12 +110,20 @@ async fn macro_declared_ticks_and_schedules_run_end_to_end() {
         .call(client(), "heartbeat", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_SCHEDULE_ONLY),
+        "{err}"
+    );
     let err = engine
         .call(client(), "boot_probe", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_SCHEDULE_ONLY),
+        "{err}"
+    );
     engine
         .call(client(), "sweeper", vec![])
         .await
@@ -125,7 +133,11 @@ async fn macro_declared_ticks_and_schedules_run_end_to_end() {
         .call(client(), "sweeper", vec![FluxValue::I64(1)])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
 
     // Run the link-time scheduler: tick at 50 Hz plus both static defs.
     let scheduler = Scheduler::from_registered(

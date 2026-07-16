@@ -186,7 +186,7 @@ impl SpatialIndexState {
             Ok(())
         } else {
             Err(FluxumError::query(
-                fluxum_protocol::codes::SHARD_UNAVAILABLE,
+                fluxum_protocol::codes::STORAGE_SPATIAL_REBUILDING,
                 "spatial index not ready",
             ))
         }
@@ -388,7 +388,7 @@ impl SpatialPredicate {
     pub fn validate(&self) -> Result<()> {
         let reject = |what: &str, value: f64| {
             Err(FluxumError::query(
-                fluxum_protocol::codes::MALFORMED,
+                fluxum_protocol::codes::SQL_MALFORMED,
                 format!("spatial predicate {what} must be non-negative, got {value}"),
             ))
         };
@@ -492,7 +492,11 @@ mod tests {
             rebuilding.insert_row(&point_row(1.0, 1.0), pk(2)).unwrap(); // no-op
             rebuilding.remove_row(&point_row(1.0, 1.0), &pk(2)).unwrap(); // no-op
             let err = rebuilding.query_point(1.0, 1.0).unwrap_err();
-            assert_eq!(err.query_code(), Some(503), "{err}");
+            assert_eq!(
+                err.query_code(),
+                Some(fluxum_protocol::codes::STORAGE_SPATIAL_REBUILDING),
+                "{err}"
+            );
 
             // fresh_like restores a ready, empty index of the same shape.
             assert!(state.fresh_like().is_ready());
@@ -571,7 +575,11 @@ mod tests {
             }
             .validate()
             .unwrap_err();
-            assert_eq!(err.query_code(), Some(400), "{err}");
+            assert_eq!(
+                err.query_code(),
+                Some(fluxum_protocol::codes::SQL_MALFORMED),
+                "{err}"
+            );
             let err = SpatialPredicate::InRegion {
                 x: 0.0,
                 y: 0.0,

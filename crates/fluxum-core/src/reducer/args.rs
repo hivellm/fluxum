@@ -172,7 +172,7 @@ impl<T: ReducerArg> ReducerArg for Option<T> {
 pub fn check_arity(reducer: &str, args: &[FluxValue], expected: usize) -> Result<()> {
     if args.len() != expected {
         return Err(FluxumError::query(
-            codes::MALFORMED,
+            codes::REDUCER_BAD_ARGS,
             format!(
                 "reducer `{reducer}` takes {expected} argument(s), got {} (RED-001)",
                 args.len()
@@ -192,13 +192,13 @@ pub fn decode_arg<T: ReducerArg>(
 ) -> Result<T> {
     let value = args.get(index).ok_or_else(|| {
         FluxumError::query(
-            codes::MALFORMED,
+            codes::REDUCER_BAD_ARGS,
             format!("reducer `{reducer}`: missing argument {index} (`{name}`) (RED-001)"),
         )
     })?;
     T::from_flux(value).ok_or_else(|| {
         FluxumError::query(
-            codes::MALFORMED,
+            codes::REDUCER_BAD_ARGS,
             format!(
                 "reducer `{reducer}`: argument {index} (`{name}`) expects {}, got {value:?} \
                  (RED-001)",
@@ -293,12 +293,12 @@ mod tests {
         let args = [FluxValue::I64(1), FluxValue::Str("x".into())];
         check_arity("send", &args, 2).unwrap();
         let err = check_arity("send", &args, 3).unwrap_err();
-        assert_eq!(err.query_code(), Some(codes::MALFORMED));
+        assert_eq!(err.query_code(), Some(codes::REDUCER_BAD_ARGS));
 
         let n: u32 = decode_arg("send", &args, 0, "channel").unwrap();
         assert_eq!(n, 1);
         let err = decode_arg::<u32>("send", &args, 1, "channel").unwrap_err();
-        assert_eq!(err.query_code(), Some(codes::MALFORMED));
+        assert_eq!(err.query_code(), Some(codes::REDUCER_BAD_ARGS));
         assert!(err.to_string().contains("`channel`"), "{err}");
         let err = decode_arg::<u32>("send", &args, 9, "missing").unwrap_err();
         assert!(err.to_string().contains("missing argument"), "{err}");

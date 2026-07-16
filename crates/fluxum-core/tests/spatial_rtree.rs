@@ -445,7 +445,11 @@ fn invalid_predicates_and_non_spatial_tables_return_code_400() {
             .eval_spatial(table, &predicate)
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(err.query_code(), Some(400), "{err}");
+        assert_eq!(
+            err.query_code(),
+            Some(fluxum_protocol::codes::SQL_MALFORMED),
+            "{err}"
+        );
         assert!(err.to_string().contains(needle), "{err}");
         assert!(err.to_string().contains("non-negative"), "{err}");
     }
@@ -463,7 +467,11 @@ fn invalid_predicates_and_non_spatial_tables_return_code_400() {
         )
         .map(|_| ())
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SQL_NO_SPATIAL_INDEX),
+        "{err}"
+    );
     assert!(
         err.to_string()
             .contains("table 'Plain' has no spatial index"),
@@ -507,14 +515,22 @@ fn rebuild_gate_returns_503_then_identical_results() {
     for table in [ids.zone, ids.vehicle] {
         assert!(!snap.spatial_ready(table).unwrap());
         let err = snap.eval_spatial(table, &region).map(|_| ()).unwrap_err();
-        assert_eq!(err.query_code(), Some(503), "{err}");
+        assert_eq!(
+            err.query_code(),
+            Some(fluxum_protocol::codes::STORAGE_SPATIAL_REBUILDING),
+            "{err}"
+        );
         assert!(err.to_string().contains("spatial index not ready"), "{err}");
         // Direct spatial reads hit the same gate — no scan fallback exists.
         let err = snap
             .spatial_radius(table, 0.0, 0.0, 1000.0)
             .map(|_| ())
             .unwrap_err();
-        assert_eq!(err.query_code(), Some(503), "{err}");
+        assert_eq!(
+            err.query_code(),
+            Some(fluxum_protocol::codes::STORAGE_SPATIAL_REBUILDING),
+            "{err}"
+        );
     }
     // Non-spatial access is unaffected while rebuilding.
     assert_eq!(snap.row_count(ids.zone).unwrap(), 2);

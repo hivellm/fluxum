@@ -166,7 +166,7 @@ impl TableState {
     pub(crate) fn spatial(&self) -> Result<&SpatialIndexState> {
         self.spatial.as_ref().ok_or_else(|| {
             FluxumError::query(
-                fluxum_protocol::codes::MALFORMED,
+                fluxum_protocol::codes::SQL_NO_SPATIAL_INDEX,
                 format!("table '{}' has no spatial index", self.schema.name),
             )
         })

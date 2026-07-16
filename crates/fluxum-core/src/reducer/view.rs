@@ -161,7 +161,10 @@ impl ViewRegistry {
         args: &[FluxValue],
     ) -> Result<serde_json::Value> {
         let handler = self.views.get(name).ok_or_else(|| {
-            FluxumError::query(codes::NOT_FOUND, format!("unknown view `{name}` (RED-030)"))
+            FluxumError::query(
+                codes::REDUCER_UNKNOWN_VIEW,
+                format!("unknown view `{name}` (RED-030)"),
+            )
         })?;
         let ctx = ViewContext {
             timestamp: Timestamp::now(),

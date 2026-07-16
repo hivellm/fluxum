@@ -363,8 +363,8 @@ fn json_to_flux(value: &Value) -> Option<FluxValue> {
     }
 }
 
-/// The HTTP status for a [`FluxumError`]: a `Query` error's wire code (which
-/// is HTTP-compatible), else 500.
+/// The HTTP status for a [`FluxumError`], derived from its SPEC-028 catalog
+/// entry (§7): total via [`FluxumError::to_wire`].
 fn status_of(e: &FluxumError) -> u16 {
-    e.query_code().unwrap_or(500)
+    fluxum_protocol::codes::entry(e.to_wire().code).map_or(500, |entry| entry.http_status)
 }

@@ -233,7 +233,7 @@ impl SubscriptionManager {
         let schema = self.table_schema(table_id)?;
         if !schema.access.is_client_visible() {
             return Err(FluxumError::query(
-                codes::FORBIDDEN,
+                codes::SUB_TABLE_NOT_PUBLIC,
                 format!(
                     "table `{}` is not public and cannot be subscribed",
                     schema.name
@@ -361,7 +361,7 @@ impl SubscriptionManager {
         let schema = self.table_schema(plan.table_ids[0])?;
         if !schema.access.is_client_visible() {
             return Err(FluxumError::query(
-                codes::FORBIDDEN,
+                codes::SUB_TABLE_NOT_PUBLIC,
                 format!(
                     "table `{}` is not public and cannot be subscribed",
                     schema.name
@@ -386,7 +386,7 @@ impl SubscriptionManager {
         let table = self.table_schema(plan.table_ids[0])?;
         if !table.access.is_client_visible() {
             return Err(FluxumError::query(
-                codes::FORBIDDEN,
+                codes::SUB_TABLE_NOT_PUBLIC,
                 format!("table `{}` is not public", table.name),
             ));
         }
@@ -795,7 +795,7 @@ fn visible(plan: &CompiledPlan, row: &Row, viewer: Option<&Identity>) -> bool {
 
 fn limit_exceeded(which: &str) -> FluxumError {
     FluxumError::query(
-        codes::RATE_LIMITED,
+        codes::SUB_LIMIT_EXCEEDED,
         format!("subscription limit exceeded: {which}"),
     )
 }

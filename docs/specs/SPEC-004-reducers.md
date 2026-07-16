@@ -455,6 +455,11 @@ are specializations of the reducer form.
 - **RED-060** Reducer return type [P0] — All `#[fluxum::reducer]` and `#[fluxum::procedure]`
   functions MUST return `Result<T, String>` (`Result<(), String>` for void reducers). Returning
   `Err(msg)` SHALL trigger a full transaction rollback and send the error string to the caller.
+  *(Amended by [SPEC-028](SPEC-028-error-catalog.md) ERR-012: the string reaches the caller as a
+  structured `ReducerResult` outcome `[code, app_code, message]` with code 5001
+  `REDUCER_USER_ERROR` and the message verbatim; a RED-061 panic is 5002 `REDUCER_PANIC`, never
+  5001; other system-caused failures — unknown reducer, argument mismatch, rate limit,
+  schedule-only — keep their own catalog codes as `Error` frames.)*
 
   ```rust
   #[fluxum::reducer]

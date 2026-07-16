@@ -119,7 +119,10 @@ fn plan_of(sql: &str) -> CompiledPlan {
 fn reject(sql: &str) -> String {
     match compile(&schema(), sql) {
         Err(e) => {
-            assert_eq!(e.query_code(), Some(400), "{sql} must be a 400: {e}");
+            assert!(
+                matches!(e.query_code(), Some(c) if (3000..=3999).contains(&c)),
+                "{sql} must be an SQL-range error: {e}"
+            );
             e.to_string()
         }
         Ok(plan) => panic!("{sql} must be rejected, compiled {plan:?}"),

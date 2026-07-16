@@ -41,7 +41,7 @@ pub enum FrameError {
 impl FrameError {
     /// The RPC-034 wire error code for this failure: 413.
     pub const fn code(&self) -> u16 {
-        codes::FRAME_TOO_LARGE
+        codes::PROTO_FRAME_TOO_LARGE
     }
 }
 

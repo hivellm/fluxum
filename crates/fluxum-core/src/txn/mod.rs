@@ -19,8 +19,8 @@
 //!   queue: [`MemStore::snapshot`] stays wait-free, so concurrent reads never
 //!   block (and are never blocked by) the sequential writer (TXN-060).
 //! - **Backpressure is immediate, not blocking** (TXN-011): `submit` uses
-//!   `try_send`; a full queue answers `Error { code: 503, message: "shard
-//!   busy" }` right away instead of parking the transport task. Capacity
+//!   `try_send`; a full queue answers `CLUSTER_SHARD_UNAVAILABLE` ("shard
+//!   busy") right away instead of parking the transport task. Capacity
 //!   defaults to 1,000 ([`TxPipelineOptions::queue_capacity`]).
 //! - **Respond after the in-memory merge, not after fsync** (TXN-021 steps
 //!   9/12, TXN-004): a successful commit is appended to the `CommitLog`
@@ -153,16 +153,17 @@ impl TxPipeline {
 
     /// Enqueue a reducer job (TXN-010: processed in arrival order by the
     /// single writer). Never blocks: a full queue answers
-    /// `503 "shard busy"` immediately (TXN-011), and a stopped worker is a
+    /// `CLUSTER_SHARD_UNAVAILABLE` ("shard busy") immediately (TXN-011), and a stopped worker is a
     /// storage error. On success, the returned receiver resolves to the
     /// job's commit receipt or rollback error once the writer reaches it.
     pub fn submit(&self, reducer: ReducerFn) -> Result<oneshot::Receiver<Result<CommitReceipt>>> {
         let (respond, receipt) = oneshot::channel();
         match self.sender.try_send(Job { reducer, respond }) {
             Ok(()) => Ok(receipt),
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                Err(FluxumError::query(codes::SHARD_UNAVAILABLE, "shard busy"))
-            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(FluxumError::query(
+                codes::CLUSTER_SHARD_UNAVAILABLE,
+                "shard busy",
+            )),
             Err(mpsc::error::TrySendError::Closed(_)) => Err(FluxumError::Storage(
                 "transaction pipeline worker stopped".into(),
             )),
@@ -292,13 +293,11 @@ fn execute(store: &MemStore, reducer: ReducerFn) -> Result<TxDiff> {
         }
         Err(payload) => {
             tx.rollback();
-            Err(FluxumError::query(
-                codes::INTERNAL,
-                format!(
-                    "reducer panicked: {} (transaction rolled back, TXN-022)",
-                    panic_message(payload.as_ref())
-                ),
-            ))
+            // SPEC-028: a panic is 5002 REDUCER_PANIC, never a user error.
+            Err(FluxumError::ReducerPanic(format!(
+                "{} (transaction rolled back, TXN-022)",
+                panic_message(payload.as_ref())
+            )))
         }
     }
 }

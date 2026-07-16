@@ -152,7 +152,10 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
     let ast = parse::Parser::new(&tokens).parse_query()?;
 
     let table = schema.table(&ast.table).ok_or_else(|| {
-        FluxumError::query(codes::MALFORMED, format!("unknown table `{}`", ast.table))
+        FluxumError::query(
+            codes::SQL_UNKNOWN_TABLE,
+            format!("unknown table `{}`", ast.table),
+        )
     })?;
     let table_id = TableId::of(table.name);
 
@@ -291,7 +294,7 @@ fn compile_spatial(table: &TableSchema, clause: SpatialAst) -> Result<SpatialCon
         .any(|index| matches!(index, IndexSchema::Spatial { .. }));
     if !has_spatial {
         return Err(FluxumError::query(
-            codes::MALFORMED,
+            codes::SQL_NO_SPATIAL_INDEX,
             format!("table '{}' has no spatial index (SPX-022)", table.name),
         ));
     }
@@ -327,7 +330,7 @@ fn resolve_column<'s>(table: &'s TableSchema, column: &str) -> Result<(u16, &'s 
         })
         .ok_or_else(|| {
             FluxumError::query(
-                codes::MALFORMED,
+                codes::SQL_UNKNOWN_COLUMN,
                 format!("unknown column `{column}` on table `{}`", table.name),
             )
         })
@@ -338,7 +341,7 @@ fn resolve_column<'s>(table: &'s TableSchema, column: &str) -> Result<(u16, &'s 
 fn coerce(table: &TableSchema, column: &str, lit: &Lit, ty: &FluxType) -> Result<RowValue> {
     let mismatch = || {
         FluxumError::query(
-            codes::MALFORMED,
+            codes::SQL_TYPE_MISMATCH,
             format!(
                 "table `{}`, column `{column}`: literal {lit} does not inhabit the column \
                  type {ty:?}",

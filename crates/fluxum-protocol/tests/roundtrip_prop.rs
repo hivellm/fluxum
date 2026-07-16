@@ -140,13 +140,21 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
                     token,
                 })
             }),
-        (any::<u32>(), prop::option::of(".{0,24}")).prop_map(|(id, err)| {
-            let outcome = match err {
-                None => Ok(()),
-                Some(message) => Err(message),
-            };
-            ServerMessage::ReducerResult(ReducerResult { id, outcome })
-        }),
+        (
+            any::<u32>(),
+            prop::option::of((any::<u16>(), prop::option::of(".{0,8}"), ".{0,24}"))
+        )
+            .prop_map(|(id, err)| {
+                let outcome = match err {
+                    None => Ok(()),
+                    Some((code, app_code, message)) => Err(fluxum_protocol::ReducerError {
+                        code,
+                        app_code,
+                        message,
+                    }),
+                };
+                ServerMessage::ReducerResult(ReducerResult { id, outcome })
+            }),
         (
             any::<u32>(),
             any::<u32>(),
@@ -191,9 +199,23 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
                     tables,
                 })
             }),
-        (prop::option::of(any::<u32>()), any::<u16>(), ".{0,24}").prop_map(
-            |(id, code, message)| { ServerMessage::Error(ErrorMessage { id, code, message }) }
-        ),
+        (
+            prop::option::of(any::<u32>()),
+            prop::sample::select(
+                fluxum_protocol::codes::CATALOG
+                    .iter()
+                    .map(|e| e.code)
+                    .collect::<Vec<_>>(),
+            ),
+            ".{0,24}",
+            prop::option::of(any::<u32>()),
+        )
+            .prop_map(|(id, code, message, retry_after_ms)| {
+                ServerMessage::Error(
+                    ErrorMessage::from_catalog(id, code, message, Vec::new())
+                        .with_retry_after(retry_after_ms),
+                )
+            }),
     ]
 }
 

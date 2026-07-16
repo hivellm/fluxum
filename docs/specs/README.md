@@ -53,6 +53,7 @@ Traceability chain: **PRD** requirement IDs (`FR-xx`, `NFR-xx`) → **DAG** task
 | [SPEC-025](SPEC-025-operations-multitenancy.md) — Operations & Multitenancy | Object-storage backup, audit trail, graceful drain, config hot-reload, namespaces, tenant quotas | `OPS-` | — |
 | [SPEC-026](SPEC-026-security-hardening.md) — Security Hardening | Encryption at rest, deterministic reducer stdlib, connection abuse protection | `SEC-` | — |
 | [SPEC-027](SPEC-027-analytics-interop.md) — Analytics Interop | Read-only Postgres-wire endpoint for BI tools | `PGW-` | — |
+| [SPEC-028](SPEC-028-error-catalog.md) — Stable Error Catalog | Per-subsystem `u16` code registry, structured `Error` payload, retry semantics, SQLSTATE, HTTP derivation, generated `docs/errors.md` | `ERR-` | **Wire freeze (G5)** |
 
 ## Conventions
 

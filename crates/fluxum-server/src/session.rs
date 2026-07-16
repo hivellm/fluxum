@@ -130,7 +130,7 @@ impl Session {
             }
             return Routed::reply(error(
                 Some(request_id(&message)),
-                codes::UNAUTHENTICATED,
+                codes::AUTH_REQUIRED,
                 "unauthenticated",
             ));
         }
@@ -194,10 +194,26 @@ impl Session {
                 })],
                 commit: Some(receipt.diff),
             },
+            // RED-060/SPEC-028: a body's own Err is 5001; a panic is 5002 —
+            // both travel as the ReducerResult outcome, not an Error frame.
             Err(FluxumError::Reducer(message)) => {
                 Routed::reply(ServerMessage::ReducerResult(ReducerResult {
                     id,
-                    outcome: Err(message),
+                    outcome: Err(fluxum_protocol::ReducerError {
+                        code: codes::REDUCER_USER_ERROR,
+                        app_code: None,
+                        message,
+                    }),
+                }))
+            }
+            Err(FluxumError::ReducerPanic(message)) => {
+                Routed::reply(ServerMessage::ReducerResult(ReducerResult {
+                    id,
+                    outcome: Err(fluxum_protocol::ReducerError {
+                        code: codes::REDUCER_PANIC,
+                        app_code: None,
+                        message,
+                    }),
                 }))
             }
             Err(e) => Routed::reply(from_error(Some(id), &e)),
@@ -299,18 +315,17 @@ fn request_id(message: &ClientMessage) -> u32 {
 
 /// An `Error` server message.
 fn error(id: Option<u32>, code: u16, message: impl Into<String>) -> ServerMessage {
-    ServerMessage::Error(ErrorMessage {
-        id,
-        code,
-        message: message.into(),
-    })
+    ServerMessage::Error(ErrorMessage::from_catalog(id, code, message, Vec::new()))
 }
 
 /// Map a [`FluxumError`] to an `Error` frame: a `Query` error forwards its
 /// wire code verbatim (400/403/404/429/503/…); anything else is a 500.
+/// Project any [`FluxumError`] onto its SPEC-028 catalog entry — total: the
+/// core mapping covers every variant, so no path emits an uncataloged code.
 fn from_error(id: Option<u32>, e: &FluxumError) -> ServerMessage {
-    match e {
-        FluxumError::Query { code, message } => error(id, *code, message.clone()),
-        other => error(id, codes::INTERNAL, other.to_string()),
-    }
+    let wire = e.to_wire();
+    ServerMessage::Error(
+        ErrorMessage::from_catalog(id, wire.code, wire.message, wire.details)
+            .with_retry_after(wire.retry_after_ms),
+    )
 }

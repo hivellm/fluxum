@@ -137,10 +137,9 @@ fn hostile_inputs_are_always_rejected_never_panic() {
     for sql in HOSTILE {
         match compile(&schema, sql) {
             Ok(plan) => panic!("hostile input compiled to a plan: {sql:?} -> {plan:?}"),
-            Err(e) => assert_eq!(
-                e.query_code(),
-                Some(400),
-                "hostile input must be a wire-ready 400: {sql:?} -> {e}"
+            Err(e) => assert!(
+                matches!(e.query_code(), Some(c) if (3000..=3999).contains(&c)),
+                "hostile input must be an SQL-range catalog error: {sql:?} -> {e}"
             ),
         }
     }
@@ -172,12 +171,18 @@ fn deeply_nested_and_long_inputs_are_bounded_not_crashing() {
         "a".repeat(16_000)
     );
     let err = compile(&schema, &too_long).unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert!(
+        matches!(err.query_code(), Some(c) if (3000..=3999).contains(&c)),
+        "{err}"
+    );
 
     // Many parentheses never recurse unboundedly (the grammar is flat).
     let parens = format!("SELECT * FROM Account WHERE id IN {}", "(".repeat(1_000));
     let err = compile(&schema, &parens).unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert!(
+        matches!(err.query_code(), Some(c) if (3000..=3999).contains(&c)),
+        "{err}"
+    );
 }
 
 #[test]

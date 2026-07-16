@@ -426,7 +426,11 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(429), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_LIMIT_EXCEEDED),
+        "{err}"
+    );
     assert!(
         err.to_string().contains("max_subscriptions_per_connection"),
         "{err}"
@@ -451,7 +455,11 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(429), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_LIMIT_EXCEEDED),
+        "{err}"
+    );
     assert!(err.to_string().contains("max_compiled_plans"), "{err}");
 
     // Subscribing to an EXISTING plan does not count against the plan cap.
@@ -634,7 +642,11 @@ fn private_tables_are_forbidden_on_every_read_surface() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_TABLE_NOT_PUBLIC),
+        "{err}"
+    );
 
     let err = mgr
         .snapshot_result(
@@ -643,7 +655,11 @@ fn private_tables_are_forbidden_on_every_read_surface() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_TABLE_NOT_PUBLIC),
+        "{err}"
+    );
     assert!(err.to_string().contains("Secret"), "{err}");
 
     let err = mgr
@@ -653,7 +669,11 @@ fn private_tables_are_forbidden_on_every_read_surface() {
             &store.snapshot(),
         )
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::SUB_TABLE_NOT_PUBLIC),
+        "{err}"
+    );
 }
 
 // --- RPC-050: query_json renders committed rows -----------------------------------

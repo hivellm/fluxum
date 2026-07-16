@@ -384,27 +384,39 @@ hot path.
   client-side event routing; `timestamp` orders events; `duration_us` enables client-side
   profiling.
 
-- **RPC-034** [P0] **Error.**
+- **RPC-034** [P0] **Error** *(amended by [SPEC-028](SPEC-028-error-catalog.md): the
+  HTTP-compatible code table is replaced by the stable machine-readable catalog)*.
 
   ```rust
   pub struct Error {
-      pub id: Option<u32>,   // echoes request id if applicable; None for server-initiated errors
-      pub code: u16,         // HTTP-compatible status code
-      pub message: String,
+      pub id: Option<u32>,        // echoes request id if applicable; None for server-initiated
+      pub code: u16,              // stable SPEC-028 catalog code (per-subsystem ranges)
+      pub name: String,           // stable SCREAMING_SNAKE catalog name
+      pub message: String,        // human-readable; never the machine interface
+      pub severity: Severity,     // error | fatal (fatal = connection closes after this frame)
+      pub retryable: bool,        // SPEC-028 §4 retry semantics
+      pub retry_after_ms: Option<u32>,
+      pub sqlstate: Option<String>, // SQL-range codes only (PostgreSQL-compatible)
+      pub details: Vec<(String, FluxValue)>, // keys documented per code in the catalog
   }
   ```
 
-  `code` values are HTTP-compatible. Codes mandated by this spec (non-exhaustive; others such as
-  400/404/500/503 MAY be used where their HTTP meaning applies):
+  Codes this spec's own conditions emit (the full registry lives in
+  `fluxum-protocol/src/codes.rs`; the generated reference is `docs/errors.md`):
 
-  | Code | Meaning | Mandated by |
-  |------|---------|-------------|
-  | 400 | malformed frame or message body | RPC-001 |
-  | 401 | `unauthenticated` — message before successful `Authenticate` | RPC-020 |
-  | 408 | `idle timeout` — sent before closing an idle connection | RPC-060 |
-  | 413 | `frame too large` — frame exceeds `max_frame_bytes` | RPC-061 |
-  | 429 | rate limit exceeded — per-(Identity, reducer) token bucket (SPEC-004); also subscription admission control (SPEC-005 SUB-044) | RPC-021 |
-  | 503 | shard unavailable (e.g. during entity handoff, SPEC-007) | — |
+  | Code | Name | Mandated by |
+  |------|------|-------------|
+  | 1000 | `PROTO_MALFORMED` | RPC-001 |
+  | 1003 | `PROTO_FRAME_TOO_LARGE` | RPC-061 |
+  | 1004 | `PROTO_IDLE_TIMEOUT` | RPC-060 |
+  | 1005 | `PROTO_SESSION_EXPIRED` | RPC-007 |
+  | 2000 | `AUTH_REQUIRED` | RPC-020 |
+  | 5005 | `REDUCER_RATE_LIMITED` | RPC-021 (SPEC-004 RED-050) |
+  | 6000 | `SUB_LIMIT_EXCEEDED` | SPEC-005 SUB-044 |
+  | 8000 | `CLUSTER_SHARD_UNAVAILABLE` | SPEC-007 / TXN-011 |
+
+  The Streamable HTTP transport derives its response status from the entry's `http_status`
+  (SPEC-028 §7), preserving the previous externally observable semantics.
 
 - **RPC-035** [P1] **TxUpdate metadata mode (`tx_updates: full | light`).** The default remains
   the enriched `TxUpdate` of RPC-033 (FR-43). A connection MAY opt out via the per-connection

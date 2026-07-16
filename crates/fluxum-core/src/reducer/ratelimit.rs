@@ -124,7 +124,7 @@ impl RateLimiter {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if !bucket.try_consume(now) {
                 return Err(FluxumError::query(
-                    codes::SHARD_UNAVAILABLE,
+                    codes::SYS_OVERLOADED,
                     "shard overloaded",
                 ));
             }
@@ -142,9 +142,14 @@ impl RateLimiter {
         if bucket.try_consume(now) {
             Ok(())
         } else {
-            Err(FluxumError::query(
-                codes::RATE_LIMITED,
+            // SPEC-028 §4: advertise the refill estimate — the next token
+            // arrives within one refill period (1000 ms / rate), so a client
+            // honoring `retry_after_ms` never worsens the condition.
+            let retry_after_ms = 1_000u32.div_ceil(max_rate_per_sec.max(1));
+            Err(FluxumError::query_retryable(
+                codes::REDUCER_RATE_LIMITED,
                 format!("reducer `{reducer}` rate limit exceeded ({max_rate_per_sec}/s, RED-050)"),
+                Some(retry_after_ms),
             ))
         }
     }
@@ -170,7 +175,7 @@ mod tests {
             match limiter.check(&caller, "send_chat", 5) {
                 Ok(()) => accepted += 1,
                 Err(e) => {
-                    assert_eq!(e.query_code(), Some(codes::RATE_LIMITED), "{e}");
+                    assert_eq!(e.query_code(), Some(codes::REDUCER_RATE_LIMITED), "{e}");
                     rejected += 1;
                 }
             }
@@ -232,7 +237,7 @@ mod tests {
             match limiter.check(&id(i), "f", 0) {
                 Ok(()) => ok += 1,
                 Err(e) => {
-                    assert_eq!(e.query_code(), Some(codes::SHARD_UNAVAILABLE), "{e}");
+                    assert_eq!(e.query_code(), Some(codes::SYS_OVERLOADED), "{e}");
                     assert!(e.to_string().contains("shard overloaded"), "{e}");
                     overloaded += 1;
                 }

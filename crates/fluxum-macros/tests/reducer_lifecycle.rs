@@ -216,7 +216,11 @@ async fn macro_declared_module_runs_end_to_end() {
         .call(ana, "send_message", vec![FluxValue::I64(7)])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
     let err = engine
         .call(
             ana,
@@ -228,7 +232,11 @@ async fn macro_declared_module_runs_end_to_end() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
     assert!(err.to_string().contains("`channel`"), "{err}");
 
     // The view computes over committed state and serializes to JSON.

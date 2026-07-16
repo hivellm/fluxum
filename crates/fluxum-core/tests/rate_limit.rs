@@ -179,7 +179,11 @@ async fn burst_of_ten_against_five_per_second_accepts_five_rejects_five() {
                 last_tx = receipt.tx_id;
             }
             Err(e) => {
-                assert_eq!(e.query_code(), Some(429), "{e}");
+                assert_eq!(
+                    e.query_code(),
+                    Some(fluxum_protocol::codes::REDUCER_RATE_LIMITED),
+                    "{e}"
+                );
                 assert!(e.to_string().contains("rate limit"), "{e}");
                 rejected += 1;
             }
@@ -207,7 +211,11 @@ async fn buckets_are_independent_and_refill_restores_capacity() {
         engine.call(ana, "send_chat", vec![]).await.unwrap();
     }
     let err = engine.call(ana, "send_chat", vec![]).await.unwrap_err();
-    assert_eq!(err.query_code(), Some(429), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_RATE_LIMITED),
+        "{err}"
+    );
 
     // Same identity, different reducer: independent bucket.
     engine.call(ana, "rename_user", vec![]).await.unwrap();
@@ -278,7 +286,11 @@ async fn load_above_the_shard_cap_answers_503_on_the_excess_only() {
                 last_tx = receipt.tx_id;
             }
             Err(e) => {
-                assert_eq!(e.query_code(), Some(503), "{e}");
+                assert_eq!(
+                    e.query_code(),
+                    Some(fluxum_protocol::codes::SYS_OVERLOADED),
+                    "{e}"
+                );
                 assert!(e.to_string().contains("shard overloaded"), "{e}");
                 overloaded += 1;
             }

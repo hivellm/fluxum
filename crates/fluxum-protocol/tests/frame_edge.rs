@@ -81,7 +81,10 @@ fn length_over_max_is_rejected_from_header_alone() {
         codec.decode(&header),
         Err(FrameError::TooLarge { len: 9, max: 8 })
     );
-    assert_eq!(FrameError::TooLarge { len: 9, max: 8 }.code(), 413);
+    assert_eq!(
+        FrameError::TooLarge { len: 9, max: 8 }.code(),
+        fluxum_protocol::codes::PROTO_FRAME_TOO_LARGE
+    );
 
     // Default codec: a u32::MAX length prefix is rejected the same way.
     let codec = FrameCodec::default();

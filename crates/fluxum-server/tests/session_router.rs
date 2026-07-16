@@ -214,7 +214,7 @@ async fn every_pre_auth_message_type_is_401_with_its_id_echoed() {
         let routed = session.handle(message).await;
         match routed.responses.first() {
             Some(ServerMessage::Error(e)) => {
-                assert_eq!(e.code, 401, "id {id}");
+                assert_eq!(e.code, fluxum_protocol::codes::AUTH_REQUIRED, "id {id}");
                 assert_eq!(e.id, Some(id), "the request id echoes (RPC-002)");
             }
             other => panic!("expected 401 Error for id {id}, got {other:?}"),
@@ -234,7 +234,11 @@ async fn a_token_in_the_reserved_server_namespace_is_rejected() {
         Some(ServerMessage::Error(e)) => {
             assert_eq!(e.id, Some(7));
             // `FluxumError::Auth` is not a Query error: SPEC-006 maps it 500.
-            assert_eq!(e.code, 500, "non-Query errors map to INTERNAL");
+            assert_eq!(
+                e.code,
+                fluxum_protocol::codes::AUTH_FAILED,
+                "auth failures map to AUTH_FAILED"
+            );
             assert!(e.message.contains("authentication failed"), "{}", e.message);
         }
         other => panic!("expected an auth Error, got {other:?}"),
@@ -288,7 +292,11 @@ async fn an_unknown_reducer_maps_to_an_error_frame() {
     match routed.responses.first() {
         Some(ServerMessage::Error(e)) => {
             assert_eq!(e.id, Some(9));
-            assert_eq!(e.code, 404, "RED-006 unknown reducer");
+            assert_eq!(
+                e.code,
+                fluxum_protocol::codes::REDUCER_UNKNOWN,
+                "RED-006 unknown reducer"
+            );
         }
         other => panic!("expected Error, got {other:?}"),
     }
@@ -316,7 +324,11 @@ async fn a_bad_query_in_a_subscribe_batch_stops_at_the_failure() {
     match &routed.responses[1] {
         ServerMessage::Error(e) => {
             assert_eq!(e.id, Some(4));
-            assert_eq!(e.code, 400, "SQL parse failure");
+            assert_eq!(
+                e.code,
+                fluxum_protocol::codes::SQL_UNSUPPORTED,
+                "SQL parse failure"
+            );
         }
         other => panic!("expected Error, got {other:?}"),
     }
@@ -336,7 +348,11 @@ async fn a_bad_one_off_query_is_an_error_frame() {
     match routed.responses.first() {
         Some(ServerMessage::Error(e)) => {
             assert_eq!(e.id, Some(6));
-            assert_eq!(e.code, 400, "unknown table");
+            assert_eq!(
+                e.code,
+                fluxum_protocol::codes::SQL_UNKNOWN_TABLE,
+                "unknown table"
+            );
         }
         other => panic!("expected Error, got {other:?}"),
     }

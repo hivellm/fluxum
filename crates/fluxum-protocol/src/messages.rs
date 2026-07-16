@@ -47,16 +47,33 @@ mod bin32 {
     }
 }
 
-/// Serde adapter: `Result<(), String>` as `["Ok", nil]` / `["Err", message]`
-/// (RPC-031).
+/// A structured reducer failure (RPC-031 / SPEC-028 RED-060 amendment):
+/// `code` is a stable `REDUCER_*` catalog code (5001 `REDUCER_USER_ERROR`
+/// for a body's own `Err`, 5002 `REDUCER_PANIC`, …); `app_code` is an
+/// optional application-defined string in its own namespace, never shadowing
+/// catalog codes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReducerError {
+    /// Stable catalog code (`crate::codes`, 5xxx range).
+    pub code: u16,
+    /// Application-defined error code, if the reducer attached one.
+    pub app_code: Option<String>,
+    /// Human-readable message (a user error's string travels verbatim).
+    pub message: String,
+}
+
+/// Serde adapter: `Result<(), ReducerError>` as `["Ok", nil]` /
+/// `["Err", [code, app_code, message]]` (RPC-031).
 mod outcome {
     use std::fmt;
 
     use serde::de::{Deserializer, SeqAccess, Visitor};
     use serde::ser::{SerializeTuple, Serializer};
 
+    use super::ReducerError;
+
     pub fn serialize<S: Serializer>(
-        outcome: &Result<(), String>,
+        outcome: &Result<(), ReducerError>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         let mut tuple = serializer.serialize_tuple(2)?;
@@ -65,9 +82,9 @@ mod outcome {
                 tuple.serialize_element("Ok")?;
                 tuple.serialize_element(&())?;
             }
-            Err(message) => {
+            Err(error) => {
                 tuple.serialize_element("Err")?;
-                tuple.serialize_element(message)?;
+                tuple.serialize_element(error)?;
             }
         }
         tuple.end()
@@ -75,14 +92,14 @@ mod outcome {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Result<(), String>, D::Error> {
+    ) -> Result<Result<(), ReducerError>, D::Error> {
         struct OutcomeVisitor;
 
         impl<'de> Visitor<'de> for OutcomeVisitor {
-            type Value = Result<(), String>;
+            type Value = Result<(), ReducerError>;
 
             fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("[\"Ok\", nil] or [\"Err\", message]")
+                f.write_str("[\"Ok\", nil] or [\"Err\", [code, app_code, message]]")
             }
 
             fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
@@ -197,9 +214,10 @@ pub struct AuthResult {
 pub struct ReducerResult {
     /// Echoes `ReducerCall.id`.
     pub id: u32,
-    /// Encoded as `["Ok", nil]` or `["Err", "message"]`.
+    /// Encoded as `["Ok", nil]` or `["Err", [code, app_code, message]]`
+    /// (SPEC-028 RED-060 amendment).
     #[serde(with = "outcome")]
-    pub outcome: Result<(), String>,
+    pub outcome: Result<(), ReducerError>,
 }
 
 /// RPC-032 — snapshot response to `Subscribe` / `SubscribeSingle` /
@@ -263,16 +281,69 @@ pub struct TxUpdateLight {
     pub tables: Vec<TableUpdate>,
 }
 
-/// RPC-034 — error response (wire tag `"Error"`); codes in [`crate::codes`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// RPC-034 — error response (wire tag `"Error"`), structured per the
+/// SPEC-028 catalog: stable `code`/`name`, retry semantics, optional
+/// SQLSTATE, and a documented `details` map so clients never parse
+/// `message` to extract data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ErrorMessage {
     /// Echoes the request id if applicable; `None` for server-initiated
     /// errors.
     pub id: Option<u32>,
-    /// HTTP-compatible status code (RPC-034 table).
+    /// Stable catalog code ([`crate::codes`], SPEC-028 §2).
     pub code: u16,
-    /// Human-readable description.
+    /// Stable canonical `SCREAMING_SNAKE` catalog name.
+    pub name: String,
+    /// Human-readable description (never the machine interface).
     pub message: String,
+    /// `fatal` means the server closes the connection after this frame.
+    pub severity: crate::codes::Severity,
+    /// Whether a retry can succeed (SPEC-028 §4).
+    pub retryable: bool,
+    /// Server's safe-retry delay estimate, when it has one.
+    pub retry_after_ms: Option<u32>,
+    /// PostgreSQL-compatible SQLSTATE — SQL-range codes only.
+    pub sqlstate: Option<String>,
+    /// Structured data; keys are exactly those the catalog documents for
+    /// `code`.
+    pub details: Vec<(String, crate::value::FluxValue)>,
+}
+
+impl ErrorMessage {
+    /// Build a structured error from its catalog entry (SPEC-028 §6): name,
+    /// severity, retryability, and SQLSTATE come from the registry — the one
+    /// sanctioned construction path, so no emission can carry a code the
+    /// catalog does not hold. An unreleased `code` is a bug and degrades to
+    /// [`crate::codes::SYS_INTERNAL`] (debug builds assert).
+    pub fn from_catalog(
+        id: Option<u32>,
+        code: u16,
+        message: impl Into<String>,
+        details: Vec<(String, crate::value::FluxValue)>,
+    ) -> Self {
+        let entry = crate::codes::entry(code).unwrap_or_else(|| {
+            debug_assert!(false, "error code {code} is not in the SPEC-028 catalog");
+            #[allow(clippy::unwrap_used)] // SYS_INTERNAL is a released entry
+            crate::codes::entry(crate::codes::SYS_INTERNAL).unwrap()
+        });
+        Self {
+            id,
+            code: entry.code,
+            name: entry.name.to_owned(),
+            message: message.into(),
+            severity: entry.severity,
+            retryable: entry.retryable,
+            retry_after_ms: None,
+            sqlstate: entry.sqlstate.map(str::to_owned),
+            details,
+        }
+    }
+
+    /// [`ErrorMessage::from_catalog`] with a retry-delay estimate attached.
+    pub fn with_retry_after(mut self, retry_after_ms: Option<u32>) -> Self {
+        self.retry_after_ms = retry_after_ms;
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------

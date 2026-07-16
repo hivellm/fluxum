@@ -30,7 +30,7 @@ fn rowlist_validate_rejects_inconsistent_lists() {
         rows_data: vec![1],
     };
     let err = bad.validate().unwrap_err();
-    assert_eq!(err.code(), 400);
+    assert_eq!(err.code(), fluxum_protocol::codes::PROTO_MALFORMED);
     assert!(err.to_string().contains("Fixed(0)"), "{err}");
 
     // Offsets with row_count = 0 cannot carry data bytes.
@@ -130,7 +130,19 @@ fn reducer_result_outcome_rejects_unknown_tag() {
 
 #[test]
 fn reducer_result_outcome_round_trips_both_arms() {
-    for outcome in [Ok(()), Err("no such reducer".to_owned())] {
+    for outcome in [
+        Ok(()),
+        Err(fluxum_protocol::ReducerError {
+            code: 5001,
+            app_code: None,
+            message: "saldo insuficiente".to_owned(),
+        }),
+        Err(fluxum_protocol::ReducerError {
+            code: 5002,
+            app_code: Some("APP_LIMIT".to_owned()),
+            message: "boom".to_owned(),
+        }),
+    ] {
         let msg = ReducerResult { id: 9, outcome };
         let bytes = rmp_serde::to_vec(&msg).unwrap();
         let back: ReducerResult = rmp_serde::from_slice(&bytes).unwrap();
@@ -186,7 +198,10 @@ fn reducer_result_outcome_rejects_truncated_tuples() {
     let err = rmp_serde::from_slice::<ReducerResult>(&bytes)
         .unwrap_err()
         .to_string();
-    assert!(err.contains(r#"["Ok", nil] or ["Err", message]"#), "{err}");
+    assert!(
+        err.contains(r#"["Ok", nil] or ["Err", [code, app_code, message]]"#),
+        "{err}"
+    );
 
     // A lone tag without its payload element.
     let wire = (3u32, ("Ok",));
@@ -194,7 +209,10 @@ fn reducer_result_outcome_rejects_truncated_tuples() {
     let err = rmp_serde::from_slice::<ReducerResult>(&bytes)
         .unwrap_err()
         .to_string();
-    assert!(err.contains(r#"["Ok", nil] or ["Err", message]"#), "{err}");
+    assert!(
+        err.contains(r#"["Ok", nil] or ["Err", [code, app_code, message]]"#),
+        "{err}"
+    );
 }
 
 // --- FluxValue visitor: owned/optional deserializer shapes ----------------------

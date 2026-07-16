@@ -239,8 +239,8 @@ async fn handle_post(
     let messages = match decode_frames(&codec, &request.body) {
         Ok(messages) => messages,
         Err(code) => {
-            // Frame too large (413) or malformed body (400).
-            return write_simple(stream, code, "").await;
+            // PROTO_FRAME_TOO_LARGE → 413, PROTO_MALFORMED → 400 (SPEC-028 §7).
+            return write_simple(stream, http_status(code), "").await;
         }
     };
 
@@ -408,7 +408,7 @@ async fn handle_get(
             () = sleep_until(idle_deadline) => {
                 // RPC-060: idle expiry — 408 frame then close, drop session.
                 let codec = FrameCodec::default();
-                let frame = error_frame(&codec, codes::IDLE_TIMEOUT, "idle timeout");
+                let frame = error_frame(&codec, codes::PROTO_IDLE_TIMEOUT, "idle timeout");
                 let _ = write_chunk(&mut stream, &frame).await;
                 break Ok(());
             }
@@ -639,13 +639,14 @@ fn decode_frames(codec: &FrameCodec, body: &[u8]) -> Result<Vec<ClientMessage>, 
         match codec.decode(&body[offset..]) {
             Ok(Some((frame, consumed))) => {
                 if let Frame::Body(bytes) = frame {
-                    let message = ClientMessage::decode(bytes).map_err(|_| codes::MALFORMED)?;
+                    let message =
+                        ClientMessage::decode(bytes).map_err(|_| codes::PROTO_MALFORMED)?;
                     messages.push(message);
                 }
                 offset += consumed;
             }
             Ok(None) => break, // trailing partial frame — ignore
-            Err(_too_large) => return Err(codes::FRAME_TOO_LARGE),
+            Err(_too_large) => return Err(codes::PROTO_FRAME_TOO_LARGE),
         }
     }
     Ok(messages)
@@ -657,12 +658,18 @@ fn frame_message(codec: &FrameCodec, message: &ServerMessage) -> Result<Vec<u8>,
 }
 
 fn error_frame(codec: &FrameCodec, code: u16, message: &str) -> Vec<u8> {
-    let msg = ServerMessage::Error(fluxum_protocol::ErrorMessage {
-        id: None,
+    let msg = ServerMessage::Error(fluxum_protocol::ErrorMessage::from_catalog(
+        None,
         code,
-        message: message.to_owned(),
-    });
+        message,
+        Vec::new(),
+    ));
     frame_message(codec, &msg).unwrap_or_default()
+}
+
+/// The HTTP status a catalog code derives for this transport (SPEC-028 §7).
+fn http_status(code: u16) -> u16 {
+    codes::entry(code).map_or(500, |entry| entry.http_status)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {

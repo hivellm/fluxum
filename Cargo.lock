@@ -375,6 +375,7 @@ name = "fluxum-macros"
 version = "0.1.0"
 dependencies = [
  "fluxum-core",
+ "fluxum-protocol",
  "fluxum-testmod",
  "proc-macro2",
  "quote",

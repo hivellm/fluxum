@@ -58,7 +58,7 @@ impl std::fmt::Display for Token {
 
 pub(crate) fn unsupported(detail: impl std::fmt::Display) -> FluxumError {
     FluxumError::query(
-        codes::MALFORMED,
+        codes::SQL_UNSUPPORTED,
         format!("unsupported query syntax: {detail}"),
     )
 }

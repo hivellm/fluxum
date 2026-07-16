@@ -72,21 +72,30 @@ pub enum FluxumError {
 
     /// A reducer body returned `Err(message)` (SPEC-004 RED-060): the
     /// transaction was fully rolled back and the message travels verbatim to
-    /// the caller as `ReducerResult { outcome: Err(message) }` — unlike
-    /// [`FluxumError::Query`], which maps to a wire `Error` frame.
+    /// the caller as a `ReducerResult` outcome with code 5001
+    /// `REDUCER_USER_ERROR` — unlike [`FluxumError::Query`], which maps to a
+    /// wire `Error` frame.
     #[error("reducer error: {0}")]
     Reducer(String),
 
-    /// Query rejected with a wire error code (SPEC-006 RPC-034 registry) —
-    /// e.g. SPEC-008's `400 table 'X' has no spatial index` (SPX-022) and
-    /// `503 spatial index not ready` (SPX-023). The server layer forwards
-    /// `code`/`message` verbatim as the wire `Error` payload.
+    /// A reducer body panicked (RED-061): the transaction was fully rolled
+    /// back; the caller receives a `ReducerResult` outcome with code 5002
+    /// `REDUCER_PANIC` (SPEC-028 — a panic is never a user error).
+    #[error("reducer panicked: {0}")]
+    ReducerPanic(String),
+
+    /// Request rejected with a stable catalog code (SPEC-028): the server
+    /// layer projects `code`/`message` into the structured wire `Error`
+    /// payload via [`FluxumError::to_wire`].
     #[error("query error {code}: {message}")]
     Query {
-        /// HTTP-compatible wire error code (`fluxum_protocol::codes`).
+        /// Stable SPEC-028 catalog code (`fluxum_protocol::codes`).
         code: u16,
         /// Human-readable message, sent verbatim to the client.
         message: String,
+        /// Safe-retry delay estimate, when the rejecting subsystem has one
+        /// (e.g. the RED-050 token bucket's refill estimate).
+        retry_after_ms: Option<u32>,
     },
 
     /// Hardware probe / derivation failure that must abort boot
@@ -101,11 +110,25 @@ impl FluxumError {
         Self::Config(msg.to_string())
     }
 
-    /// Build a [`FluxumError::Query`] carrying a wire error code.
+    /// Build a [`FluxumError::Query`] carrying a stable catalog code.
     pub fn query(code: u16, message: impl std::fmt::Display) -> Self {
         Self::Query {
             code,
             message: message.to_string(),
+            retry_after_ms: None,
+        }
+    }
+
+    /// [`FluxumError::query`] with a safe-retry delay estimate attached.
+    pub fn query_retryable(
+        code: u16,
+        message: impl std::fmt::Display,
+        retry_after_ms: Option<u32>,
+    ) -> Self {
+        Self::Query {
+            code,
+            message: message.to_string(),
+            retry_after_ms,
         }
     }
 
@@ -121,9 +144,98 @@ impl FluxumError {
     pub fn hardware(msg: impl std::fmt::Display) -> Self {
         Self::Hardware(msg.to_string())
     }
+
+    /// Project this error onto the SPEC-028 wire catalog — **total**: every
+    /// variant maps to a released code (the exhaustive match makes adding a
+    /// variant without a mapping a compile error).
+    pub fn to_wire(&self) -> WireError {
+        use fluxum_protocol::{FluxValue, codes};
+        let plain = |code: u16| WireError {
+            code,
+            message: self.to_string(),
+            retry_after_ms: None,
+            details: Vec::new(),
+        };
+        match self {
+            Self::Config(_) | Self::ConfigParse(_) | Self::Io(_) | Self::Hardware(_) => {
+                plain(codes::SYS_INTERNAL)
+            }
+            Self::Storage(_) => plain(codes::STORAGE_INTERNAL),
+            Self::BufferPoolExhausted { capacity } => WireError {
+                code: codes::STORAGE_BUFFER_POOL_EXHAUSTED,
+                message: self.to_string(),
+                retry_after_ms: None,
+                details: vec![(
+                    "capacity".to_owned(),
+                    FluxValue::I64(i64::try_from(*capacity).unwrap_or(i64::MAX)),
+                )],
+            },
+            Self::PageCorrupt {
+                shard_id,
+                table_id,
+                page_id,
+            } => WireError {
+                code: codes::STORAGE_PAGE_CORRUPT,
+                message: self.to_string(),
+                retry_after_ms: None,
+                details: vec![
+                    ("shard_id".to_owned(), FluxValue::I64(i64::from(*shard_id))),
+                    ("table_id".to_owned(), FluxValue::I64(i64::from(*table_id))),
+                    (
+                        "page_id".to_owned(),
+                        FluxValue::I64(i64::try_from(*page_id).unwrap_or(i64::MAX)),
+                    ),
+                ],
+            },
+            Self::Protocol(_) => plain(codes::PROTO_MALFORMED),
+            Self::Auth(_) => plain(codes::AUTH_FAILED),
+            Self::Schema(_) => plain(codes::SCHEMA_INVALID),
+            // RED-060: the reducer's own message, verbatim, under the stable
+            // user-error code (SPEC-028; system-caused failures use their own
+            // codes upstream of this mapping).
+            Self::Reducer(message) => WireError {
+                code: codes::REDUCER_USER_ERROR,
+                message: message.clone(),
+                retry_after_ms: None,
+                details: Vec::new(),
+            },
+            Self::ReducerPanic(message) => WireError {
+                code: codes::REDUCER_PANIC,
+                message: message.clone(),
+                retry_after_ms: None,
+                details: Vec::new(),
+            },
+            Self::Query {
+                code,
+                message,
+                retry_after_ms,
+            } => WireError {
+                code: *code,
+                message: message.clone(),
+                retry_after_ms: *retry_after_ms,
+                details: Vec::new(),
+            },
+        }
+    }
+}
+
+/// The wire-facing projection of a [`FluxumError`] (SPEC-028 §6): what the
+/// transport turns into a structured `Error` frame via
+/// `ErrorMessage::from_catalog`.
+#[derive(Debug, Clone)]
+pub struct WireError {
+    /// Stable catalog code.
+    pub code: u16,
+    /// Human-readable message.
+    pub message: String,
+    /// Safe-retry delay estimate, if any.
+    pub retry_after_ms: Option<u32>,
+    /// Structured details (keys per the catalog entry).
+    pub details: Vec<(String, fluxum_protocol::FluxValue)>,
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 
@@ -149,5 +261,82 @@ mod tests {
     fn io_error_converts() {
         let e: FluxumError = std::io::Error::new(std::io::ErrorKind::NotFound, "gone").into();
         assert!(matches!(e, FluxumError::Io(_)));
+    }
+
+    /// SPEC-028 §6 registry adherence: every `FluxumError` variant projects
+    /// onto a **released** catalog entry — no emission path can produce an
+    /// uncataloged code (the `to_wire` match is exhaustive, so a new variant
+    /// without a mapping fails compilation; this test pins the codes).
+    #[test]
+    fn every_variant_maps_onto_the_catalog() {
+        use fluxum_protocol::codes;
+        let yaml_err = serde_yaml::from_str::<u32>("[not an int").unwrap_err();
+        let cases: Vec<(FluxumError, u16)> = vec![
+            (FluxumError::config("x"), codes::SYS_INTERNAL),
+            (FluxumError::ConfigParse(yaml_err), codes::SYS_INTERNAL),
+            (std::io::Error::other("io").into(), codes::SYS_INTERNAL),
+            (FluxumError::hardware("probe"), codes::SYS_INTERNAL),
+            (FluxumError::Storage("disk".into()), codes::STORAGE_INTERNAL),
+            (
+                FluxumError::BufferPoolExhausted { capacity: 64 },
+                codes::STORAGE_BUFFER_POOL_EXHAUSTED,
+            ),
+            (
+                FluxumError::PageCorrupt {
+                    shard_id: 1,
+                    table_id: 2,
+                    page_id: 3,
+                },
+                codes::STORAGE_PAGE_CORRUPT,
+            ),
+            (FluxumError::Protocol("bad".into()), codes::PROTO_MALFORMED),
+            (FluxumError::Auth("no".into()), codes::AUTH_FAILED),
+            (FluxumError::Schema("dup".into()), codes::SCHEMA_INVALID),
+            (
+                FluxumError::Reducer("saldo insuficiente".into()),
+                codes::REDUCER_USER_ERROR,
+            ),
+            (
+                FluxumError::ReducerPanic("boom".into()),
+                codes::REDUCER_PANIC,
+            ),
+            (
+                FluxumError::query(codes::SQL_UNKNOWN_TABLE, "no such table"),
+                codes::SQL_UNKNOWN_TABLE,
+            ),
+        ];
+        for (error, expected) in cases {
+            let wire = error.to_wire();
+            assert_eq!(wire.code, expected, "{error}");
+            let entry = codes::entry(wire.code)
+                .unwrap_or_else(|| panic!("{error} maps to uncataloged code {}", wire.code));
+            // Emitted details keys stay within the documented set.
+            for (key, _) in &wire.details {
+                assert!(
+                    entry.details_keys.contains(&key.as_str()),
+                    "{error}: undocumented details key `{key}`"
+                );
+            }
+        }
+    }
+
+    /// SPEC-028 scenarios pinned at the core boundary.
+    #[test]
+    fn wire_projection_carries_structured_data() {
+        use fluxum_protocol::{FluxValue, codes};
+        // Buffer-pool exhaustion advertises its capacity (scenario).
+        let wire = FluxumError::BufferPoolExhausted { capacity: 64 }.to_wire();
+        assert_eq!(
+            wire.details,
+            vec![("capacity".to_owned(), FluxValue::I64(64))]
+        );
+        // A user error's message travels verbatim (RED-060 scenario).
+        let wire = FluxumError::Reducer("saldo insuficiente".into()).to_wire();
+        assert_eq!(wire.message, "saldo insuficiente");
+        // The retry estimate survives the projection.
+        let wire =
+            FluxumError::query_retryable(codes::REDUCER_RATE_LIMITED, "slow down", Some(200))
+                .to_wire();
+        assert_eq!(wire.retry_after_ms, Some(200));
     }
 }

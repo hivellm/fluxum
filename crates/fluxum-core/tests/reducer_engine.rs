@@ -368,7 +368,11 @@ async fn admission_rejects_unknown_names_and_bad_args_without_a_transaction() {
         .call(client(1), "no_such_reducer", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(404), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN),
+        "{err}"
+    );
 
     // Argument-count mismatch: 400 before any transaction (RED-001).
     let err = shard
@@ -376,7 +380,11 @@ async fn admission_rejects_unknown_names_and_bad_args_without_a_transaction() {
         .call(client(1), "record_event", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
 
     // Argument-type mismatch: 400 naming the parameter.
     let err = shard
@@ -384,7 +392,11 @@ async fn admission_rejects_unknown_names_and_bad_args_without_a_transaction() {
         .call(client(1), "record_event", vec![FluxValue::I64(7)])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
     assert!(err.to_string().contains("`label`"), "{err}");
 
     assert_eq!(
@@ -453,7 +465,10 @@ async fn panic_rolls_back_answers_500_and_the_shard_keeps_serving() {
         .call(client(3), "explode", vec![])
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(500), "{err}");
+    assert!(
+        matches!(err, fluxum_core::FluxumError::ReducerPanic(_)),
+        "{err}"
+    );
     assert!(err.to_string().contains("reducer bug"), "{err}");
     assert!(
         before.same_state(&shard.store.snapshot()),
@@ -631,7 +646,11 @@ async fn views_read_committed_state_and_reject_unknown_names() {
     let err = views
         .dispatch("no_such_view", &snapshot, SHARD, &[])
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(404), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN_VIEW),
+        "{err}"
+    );
 
     // Duplicate view names abort startup.
     let err = match ViewRegistry::from_defs([&COUNT_EVENTS, &COUNT_EVENTS]) {
@@ -678,11 +697,19 @@ fn check_call_combines_name_callability_and_argument_admission() {
         .check_call("record_event", &[FluxValue::Str("ok".into())])
         .unwrap();
     let err = registry.check_call("ghost", &[]).unwrap_err();
-    assert_eq!(err.query_code(), Some(404), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_UNKNOWN),
+        "{err}"
+    );
     let err = registry
         .check_call("record_event", &[FluxValue::I64(3)])
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
 }
 
 // --- RED-013: a failing on_shard_start hook aborts startup --------------------
@@ -746,7 +773,11 @@ async fn schedule_after_rejects_overflowing_delays_and_missing_schedule_table() 
         }))
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
     assert!(err.to_string().contains("overflows the µs clock"), "{err}");
 
     // A sane delay against a schema without __schedule__ fails at insert.

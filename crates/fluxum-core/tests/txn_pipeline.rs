@@ -312,7 +312,10 @@ async fn panicking_reducer_rolls_back_and_the_shard_keeps_serving() {
     std::panic::set_hook(hook);
 
     // Same rollback as an Err (TXN-022), reported as a wire-ready 500.
-    assert_eq!(err.query_code(), Some(500));
+    assert!(
+        matches!(err, fluxum_core::FluxumError::ReducerPanic(_)),
+        "{err}"
+    );
     assert!(err.to_string().contains("reducer panicked"), "{err}");
     assert!(err.to_string().contains("deliberate reducer bug"), "{err}");
     assert!(before.same_state(&store.snapshot()));
@@ -792,8 +795,11 @@ async fn full_queue_answers_503_shard_busy_immediately() {
         "rejection must be immediate, took {:?}",
         start.elapsed()
     );
-    assert_eq!(err.query_code(), Some(503));
-    assert_eq!(err.to_string(), "query error 503: shard busy");
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::CLUSTER_SHARD_UNAVAILABLE)
+    );
+    assert_eq!(err.to_string(), "query error 8000: shard busy");
 
     // Release the writer: everything accepted still commits, in order.
     release_tx.send(()).unwrap();
@@ -1002,7 +1008,10 @@ async fn non_string_panic_payloads_are_reported_generically() {
         .call(Box::new(|_tx| std::panic::panic_any(42u32)))
         .await
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(500), "{err}");
+    assert!(
+        matches!(err, fluxum_core::FluxumError::ReducerPanic(_)),
+        "{err}"
+    );
     assert!(
         err.to_string().contains("non-string panic payload"),
         "{err}"

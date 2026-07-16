@@ -318,7 +318,7 @@ fn rowlist_schema_known_fixed_size_survives_empty_batch() {
 }
 
 #[test]
-fn rowlist_inconsistent_is_rejected_with_400() {
+fn rowlist_inconsistent_is_rejected_as_proto_malformed() {
     // Fixed(32) claiming 3 rows over 95 bytes of data.
     let bad = RowList {
         row_count: 3,
@@ -326,7 +326,7 @@ fn rowlist_inconsistent_is_rejected_with_400() {
         rows_data: vec![0; 95],
     };
     let err = bad.validate().unwrap_err();
-    assert_eq!(err.code(), 400);
+    assert_eq!(err.code(), fluxum_protocol::codes::PROTO_MALFORMED);
 
     // Offset table shorter than row_count.
     let bad = RowList {
@@ -334,7 +334,10 @@ fn rowlist_inconsistent_is_rejected_with_400() {
         size_hint: RowSizeHint::Offsets(vec![0]),
         rows_data: vec![1, 2, 3],
     };
-    assert_eq!(bad.validate().unwrap_err().code(), 400);
+    assert_eq!(
+        bad.validate().unwrap_err().code(),
+        fluxum_protocol::codes::PROTO_MALFORMED
+    );
 
     // Offset beyond the data buffer.
     let bad = RowList {
@@ -400,6 +403,9 @@ fn reader_rejects_malformed_input() {
     let mut r = FluxBinReader::new(&[0x01, 0x02]);
     r.read_u8().unwrap();
     assert_eq!(r.expect_eof(), Err(FluxBinError::TrailingBytes(1)));
-    // Every FluxBIN decode failure maps to wire code 400.
-    assert_eq!(FluxBinError::InvalidUtf8.code(), 400);
+    // Every FluxBIN decode failure maps to the PROTO_MALFORMED catalog code.
+    assert_eq!(
+        FluxBinError::InvalidUtf8.code(),
+        fluxum_protocol::codes::PROTO_MALFORMED
+    );
 }

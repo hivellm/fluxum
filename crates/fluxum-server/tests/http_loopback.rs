@@ -353,7 +353,7 @@ async fn reducer_call_without_a_session_is_401() {
     let resp = post(server.local_addr, None, CONTENT_TYPE, &[frame(&call)]).await;
     assert_eq!(resp.status, 200);
     match resp.messages().first() {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 401),
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, fluxum_protocol::codes::AUTH_REQUIRED),
         other => panic!("expected 401 Error, got {other:?}"),
     }
     server.shutdown();
@@ -697,7 +697,11 @@ async fn idle_session_gets_408_on_the_stream_and_a_stale_post_after() {
     let session = authenticate(addr, b"alice").await;
     let mut stream = open_stream(addr, &session).await;
     match read_stream_message(&mut stream, Duration::from_secs(3)).await {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408, "RPC-060 idle expiry"),
+        Some(ServerMessage::Error(e)) => assert_eq!(
+            e.code,
+            fluxum_protocol::codes::PROTO_IDLE_TIMEOUT,
+            "RPC-060 idle expiry"
+        ),
         other => panic!("expected a 408 Error frame, got {other:?}"),
     }
     // The stream terminates and the session is evicted: a later POST is 404.
@@ -917,7 +921,9 @@ async fn lifecycle_hooks_fire_over_http_sessions() {
     // The GET stream expiring runs `on_disconnect` and publishes its diff.
     let mut stream = open_stream(addr, &session).await;
     match read_stream_message(&mut stream, Duration::from_secs(3)).await {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408),
+        Some(ServerMessage::Error(e)) => {
+            assert_eq!(e.code, fluxum_protocol::codes::PROTO_IDLE_TIMEOUT)
+        }
         other => panic!("expected 408, got {other:?}"),
     }
     assert!(
@@ -961,7 +967,9 @@ async fn failing_lifecycle_hooks_do_not_break_the_http_transport() {
     // The on_disconnect hook fails on idle expiry; the server keeps serving.
     let mut stream = open_stream(addr, &session).await;
     match read_stream_message(&mut stream, Duration::from_secs(3)).await {
-        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408),
+        Some(ServerMessage::Error(e)) => {
+            assert_eq!(e.code, fluxum_protocol::codes::PROTO_IDLE_TIMEOUT)
+        }
         other => panic!("expected 408, got {other:?}"),
     }
     let _fresh = authenticate(addr, b"bob").await;
