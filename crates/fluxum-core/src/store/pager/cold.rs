@@ -74,6 +74,9 @@ impl ColdTable {
             let columns = match declared {
                 IndexSchema::BTree { columns } => *columns,
                 IndexSchema::Spatial { columns, .. } => *columns,
+                // Full-text indexes are rebuilt from rows on recovery, not
+                // spilled as paged B-trees (FTS-022).
+                IndexSchema::FullText { .. } => continue,
             };
             let id = index_id_of(schema, columns)?;
             let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
 use crate::index::btree::{self, BTreeIndex};
-use crate::index::{IndexId, Rect, SpatialIndexState, SpatialPredicate};
+use crate::index::{FullTextIndexState, IndexId, Rect, SpatialIndexState, SpatialPredicate};
 use crate::schema::TableSchema;
 use crate::store::TableId;
 use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
@@ -31,6 +31,9 @@ pub struct TableState {
     pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
     /// The `#[spatial(...)]` index, if declared (SPEC-008, SPX-030).
     pub(crate) spatial: Option<SpatialIndexState>,
+    /// The `#[fulltext(...)]` indexes, in declaration order (SPEC-019
+    /// FTS-021) — one per declared text column.
+    pub(crate) fulltext: Vec<FullTextIndexState>,
     /// One committed value map per `#[unique]` constraint, in declared
     /// order (DM-006) — the TXN-041 eager-check lookup structure (T3.1),
     /// maintained inside the commit merge like the B-tree indexes.
@@ -243,6 +246,22 @@ impl TableState {
                 return Err(FluxumError::Storage(format!(
                     "spatial index on table `{}` ({table_id}) diverged from a fresh rebuild \
                      over CommittedState (STG-007, SPX-030)",
+                    self.schema.name
+                )));
+            }
+        }
+        for fulltext in &self.fulltext {
+            if !fulltext.is_ready() {
+                continue;
+            }
+            let mut rebuilt = fulltext.fresh_like();
+            for (pk, row) in &self.rows {
+                rebuilt.insert_row(row, pk.clone())?;
+            }
+            if rebuilt != *fulltext {
+                return Err(FluxumError::Storage(format!(
+                    "full-text index on table `{}` ({table_id}) diverged from a fresh rebuild \
+                     over CommittedState (STG-007, FTS-021)",
                     self.schema.name
                 )));
             }
@@ -468,6 +487,7 @@ mod tests {
             rows,
             indexes: BTreeMap::new(),
             spatial: None,
+            fulltext: Vec::new(),
             unique: Vec::new(),
             auto_inc_high_water: 0,
         }

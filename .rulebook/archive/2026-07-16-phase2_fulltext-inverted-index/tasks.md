@@ -1,0 +1,14 @@
+## 1. Implementation
+- [x] 1.1 `#[fulltext(col, [simple|english], [stop_words], [stemming])]` parsed in the proc-macro; rejects non-String/Option<String>/Vec<String> columns (FTS-002) and #[encrypted] columns (protected-index-column check) at compile time; runtime backstop in schema assembly (FTS-001/002; crates/fluxum-macros/src/table.rs, crates/fluxum-core/src/schema/registry.rs)
+- [x] 1.2 Deterministic analyzer: Unicode tokenization with positions → case-fold → English stop-words → light deterministic English stemmer; `simple` = tokenize+lowercase; versioned `AnalyzerId` (`ANALYZER_VERSION`) (FTS-010; crates/fluxum-core/src/index/fulltext.rs)
+- [x] 1.3 `FullTextIndexState`: positional posting lists `term → { pk → positions }` in a BTreeMap (prefix-scan ready); per-doc length, per-term document frequency (via posting-list length), total docs/total length + `avg_doc_len`/`doc_freq`/`posting` accessors — every BM25 input (FTS-020)
+- [x] 1.4 Commit-merge maintenance like btree/spatial: insert/delete/update on the private pre-swap copy, atomic TableState swap, rollback discards TxState; wired into the insert/delete/update arms and the recover path (FTS-021; crates/fluxum-core/src/store/memstore.rs, checkpoint/recover.rs)
+- [x] 1.5 `verify_index_integrity` analogue: the maintained postings/positions/doc-len are bit-identical to a fresh rebuild over committed rows (STG-007 rule 2), checked in `TableState::verify_index_integrity` (FTS-021; crates/fluxum-core/src/store/committed.rs)
+- [x] 1.6 Tiered/rebuild compliance: postings live in TableState in a BTreeMap (page/evict with the pager when it is wired into the live path, as spatial does); `mark_fulltext_rebuilding`/`rebuild_fulltext_indexes`/`fulltext_ready` rebuild from rows on recovery behind the STORAGE_FULLTEXT_REBUILDING (7004) 503 gate (FTS-022; crates/fluxum-core/src/store/memstore.rs, crates/fluxum-protocol/src/codes.rs)
+- [x] 1.7 Schema surface: `IndexSchema::FullText { column, language, stop_words, stemming }` + `FullTextLanguage` in TableSchema; `analyzer_id()` exposed for the phase-4 __schema_meta__ writer (FTS-050/051; crates/fluxum-core/src/schema/mod.rs)
+- [x] 1.8 Verification: a 400-step random insert/update/delete sequence stays rebuild-identical after every commit; analyzer determinism (tokenization, stop-words-with-positions, English stemmer, versioned id); a 1000-document corpus stays consistent; recovery rebuild reproduces the index; trybuild pass + two compile-fail fixtures (non-text, encrypted) (crates/fluxum-core/tests/fulltext_index.rs; crates/fluxum-macros/tests/ui/{pass,fail}/fulltext_*.rs)
+
+## 2. Tail (docs + tests — check or waive with tailWaiver)
+- [x] 2.1 Update or create documentation covering the implementation
+- [x] 2.2 Write tests covering the new behavior
+- [x] 2.3 Run tests and confirm they pass

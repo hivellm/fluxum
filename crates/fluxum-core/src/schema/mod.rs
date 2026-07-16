@@ -216,6 +216,29 @@ pub enum IndexSchema {
         /// Coordinate column ordinals: 2 for quadtree, 4 for rtree.
         columns: &'static [u16],
     },
+    /// `#[fulltext(col, language, stop_words, stemming)]` — a positional
+    /// inverted index over one `String`/`Vec<String>` column (SPEC-019
+    /// FTS-001/010).
+    FullText {
+        /// Indexed text column ordinal.
+        column: u16,
+        /// Analyzer language (stop-word set + stemmer selection).
+        language: FullTextLanguage,
+        /// Drop language stop-words.
+        stop_words: bool,
+        /// Apply the language stemmer.
+        stemming: bool,
+    },
+}
+
+/// Full-text analyzer language (SPEC-019 FTS-010) — the schema-literal mirror
+/// of [`crate::index::Language`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullTextLanguage {
+    /// Tokenize + case-fold only (language-agnostic).
+    Simple,
+    /// English stop-words + light English stemmer.
+    English,
 }
 
 /// Spatial index family (DM-032, SPEC-008).

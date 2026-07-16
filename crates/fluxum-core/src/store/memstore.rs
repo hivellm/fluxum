@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use arc_swap::ArcSwap;
 
 use crate::error::{FluxumError, Result};
-use crate::index::{BTreeIndex, IndexId, Rect, SpatialIndexState, SpatialPredicate};
+use crate::index::{
+    BTreeIndex, FullTextIndexState, IndexId, Rect, SpatialIndexState, SpatialPredicate,
+};
 use crate::schema::{IndexSchema, Schema, SpatialKind, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
@@ -183,6 +185,7 @@ impl MemStore {
                     rows: BTreeMap::new(),
                     indexes: build_btree_indexes(table)?,
                     spatial: build_spatial_index(table, &options)?,
+                    fulltext: build_fulltext_indexes(table),
                     unique: table.unique.iter().map(|c| UniqueIndex::new(c)).collect(),
                     auto_inc_high_water: 0,
                 }),
@@ -311,6 +314,54 @@ impl MemStore {
         }
         self.committed.store(Arc::new(CommittedState { tables }));
         Ok(())
+    }
+
+    /// FTS-022, step 1: put every full-text index into the **rebuilding**
+    /// state — emptied, not ready — mirroring [`mark_spatial_rebuilding`].
+    ///
+    /// [`mark_spatial_rebuilding`]: Self::mark_spatial_rebuilding
+    pub fn mark_fulltext_rebuilding(&self) {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tables = self.committed.load_full().tables.clone();
+        for slot in tables.values_mut() {
+            if slot.fulltext.is_empty() {
+                continue;
+            }
+            let rebuilding = slot.fulltext.iter().map(|f| f.rebuilding_like()).collect();
+            Arc::make_mut(slot).fulltext = rebuilding;
+        }
+        self.committed.store(Arc::new(CommittedState { tables }));
+    }
+
+    /// FTS-022, step 2: rebuild every full-text index from the committed rows
+    /// and publish the ready state atomically. After this returns, full-text
+    /// query results are identical to a never-crashed store's.
+    pub fn rebuild_fulltext_indexes(&self) -> Result<()> {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tables = self.committed.load_full().tables.clone();
+        for slot in tables.values_mut() {
+            if slot.fulltext.is_empty() {
+                continue;
+            }
+            let mut rebuilt: Vec<_> = slot.fulltext.iter().map(|f| f.fresh_like()).collect();
+            for (pk, row) in &slot.rows {
+                for index in &mut rebuilt {
+                    index.insert_row(row, pk.clone())?;
+                }
+            }
+            Arc::make_mut(slot).fulltext = rebuilt;
+        }
+        self.committed.store(Arc::new(CommittedState { tables }));
+        Ok(())
+    }
+
+    /// Whether every full-text index of this store is ready (FTS-022).
+    pub fn fulltext_ready(&self) -> bool {
+        self.committed
+            .load()
+            .tables
+            .values()
+            .all(|t| t.fulltext.iter().all(FullTextIndexState::is_ready))
     }
 
     /// Whether every spatial index of this store is ready to serve queries
@@ -882,6 +933,9 @@ impl Tx<'_> {
                         if let Some(spatial) = &mut table.spatial {
                             spatial.insert_row(&row, pk.clone())?;
                         }
+                        for fulltext in &mut table.fulltext {
+                            fulltext.insert_row(&row, pk.clone())?;
+                        }
                         for constraint in &mut table.unique {
                             constraint.insert(&row, pk.clone())?;
                         }
@@ -895,6 +949,9 @@ impl Tx<'_> {
                         }
                         if let Some(spatial) = &mut table.spatial {
                             spatial.remove_row(&old, &pk)?;
+                        }
+                        for fulltext in &mut table.fulltext {
+                            fulltext.remove_row(&old, &pk)?;
                         }
                         diff.deletes.push((pk, old));
                     }
@@ -913,6 +970,12 @@ impl Tx<'_> {
                             // pre-swap copy, so no stale entry can publish.
                             spatial.remove_row(&old, &pk)?;
                             spatial.insert_row(&row, pk.clone())?;
+                        }
+                        for fulltext in &mut table.fulltext {
+                            // FTS-021: re-analyze the old text out, the new
+                            // text in — atomic with the row swap.
+                            fulltext.remove_row(&old, &pk)?;
+                            fulltext.insert_row(&row, pk.clone())?;
                         }
                         // The old row's unique values were released in the
                         // two-pass removal above; claim the new row's.
@@ -1062,6 +1125,35 @@ fn build_spatial_index(
         });
     }
     Ok(spatial)
+}
+
+/// The empty full-text indexes of `table`, one per `#[fulltext(...)]`
+/// declaration, in declaration order (SPEC-019 FTS-001/010).
+fn build_fulltext_indexes(table: &'static TableSchema) -> Vec<FullTextIndexState> {
+    use crate::index::{Analyzer, Language};
+    table
+        .indexes
+        .iter()
+        .filter_map(|index| match index {
+            IndexSchema::FullText {
+                column,
+                language,
+                stop_words,
+                stemming,
+            } => {
+                let analyzer = Analyzer {
+                    language: match language {
+                        crate::schema::FullTextLanguage::Simple => Language::Simple,
+                        crate::schema::FullTextLanguage::English => Language::English,
+                    },
+                    stop_words: *stop_words,
+                    stemming: *stemming,
+                };
+                Some(FullTextIndexState::new(*column, analyzer))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Empty secondary B-tree indexes for `table`, keyed by stable [`IndexId`]

@@ -150,6 +150,20 @@ enum IndexKind {
     BTree,
     QuadTree,
     RTree,
+    /// `#[fulltext(col, [english|simple], [stop_words], [stemming])]`
+    /// (SPEC-019 FTS-001).
+    FullText {
+        language: FtLang,
+        stop_words: bool,
+        stemming: bool,
+    },
+}
+
+/// Full-text analyzer language keyword (FTS-010).
+#[derive(Clone, Copy)]
+enum FtLang {
+    Simple,
+    English,
 }
 
 struct IndexDecl {
@@ -375,6 +389,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             indexes.push(parse_index(&attr)?);
         } else if attr.path().is_ident("spatial") {
             indexes.push(parse_spatial(&attr)?);
+        } else if attr.path().is_ident("fulltext") {
+            indexes.push(parse_fulltext(&attr)?);
         } else if attr.path().is_ident("visibility") {
             if visibility.is_some() {
                 return Err(syn::Error::new(
@@ -435,6 +451,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 rename_from = Some((parse_rename(&attr)?, attr.span()));
             } else if attr.path().is_ident("index")
                 || attr.path().is_ident("spatial")
+                || attr.path().is_ident("fulltext")
                 || attr.path().is_ident("unique")
                 || attr.path().is_ident("visibility")
             {
@@ -668,6 +685,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             .iter()
             .map(|col| match decl.kind {
                 IndexKind::BTree => ordinal_of(col, "`#[index(btree(...))]` (DM-030)"),
+                IndexKind::FullText { .. } => ordinal_of(col, "`#[fulltext(...)]` (FTS-001)"),
                 _ => ordinal_of(col, "`#[spatial(...)]` (DM-032)"),
             })
             .collect::<syn::Result<_>>()?;
@@ -725,6 +743,41 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                         ::fluxum_core::schema::IndexSchema::Spatial {
                             kind: #kind,
                             columns: &[#(#ords),*],
+                        }
+                    },
+                )
+            }
+            IndexKind::FullText {
+                language,
+                stop_words,
+                stemming,
+            } => {
+                let ord = ords[0];
+                let flux = &columns[usize::from(ord)].flux;
+                let is_text = matches!(flux, FluxTy::Str)
+                    || matches!(flux, FluxTy::Opt(inner) | FluxTy::List(inner) if matches!(**inner, FluxTy::Str));
+                if !is_text {
+                    return Err(syn::Error::new(
+                        decl.columns[0].span(),
+                        format!(
+                            "`#[fulltext]` column `{}` must be `String`, `Option<String>`, \
+                             or `Vec<String>` (FTS-002)",
+                            decl.columns[0]
+                        ),
+                    ));
+                }
+                let lang = match language {
+                    FtLang::Simple => quote!(::fluxum_core::schema::FullTextLanguage::Simple),
+                    FtLang::English => quote!(::fluxum_core::schema::FullTextLanguage::English),
+                };
+                (
+                    "fulltext",
+                    quote! {
+                        ::fluxum_core::schema::IndexSchema::FullText {
+                            column: #ord,
+                            language: #lang,
+                            stop_words: #stop_words,
+                            stemming: #stemming,
                         }
                     },
                 )
@@ -1325,6 +1378,50 @@ fn parse_spatial(attr: &Attribute) -> syn::Result<IndexDecl> {
     Ok(IndexDecl {
         kind,
         columns: cols.into_iter().collect(),
+        span: attr.span(),
+    })
+}
+
+/// `#[fulltext(col, [simple|english], [stop_words], [stemming])]`
+/// (SPEC-019 FTS-001/010). The first item names the indexed text column;
+/// the rest are analyzer keywords in any order.
+fn parse_fulltext(attr: &Attribute) -> syn::Result<IndexDecl> {
+    let items = attr.parse_args_with(Punctuated::<Ident, Token![,]>::parse_terminated)?;
+    let mut iter = items.iter();
+    let Some(column) = iter.next().cloned() else {
+        return Err(syn::Error::new(
+            attr.span(),
+            "expected `#[fulltext(col, [simple|english], [stop_words], [stemming])]` \
+             (FTS-001)",
+        ));
+    };
+    let mut language = FtLang::Simple;
+    let mut stop_words = false;
+    let mut stemming = false;
+    for kw in iter {
+        match kw.to_string().as_str() {
+            "simple" => language = FtLang::Simple,
+            "english" => language = FtLang::English,
+            "stop_words" => stop_words = true,
+            "stemming" => stemming = true,
+            other => {
+                return Err(syn::Error::new(
+                    kw.span(),
+                    format!(
+                        "unknown `#[fulltext]` option `{other}`: expected `simple`, \
+                         `english`, `stop_words`, or `stemming` (FTS-010)"
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(IndexDecl {
+        kind: IndexKind::FullText {
+            language,
+            stop_words,
+            stemming,
+        },
+        columns: vec![column],
         span: attr.span(),
     })
 }

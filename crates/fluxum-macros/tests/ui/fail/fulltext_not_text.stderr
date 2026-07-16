@@ -1,0 +1,5 @@
+error: `#[fulltext]` column `score` must be `String`, `Option<String>`, or `Vec<String>` (FTS-002)
+ --> tests/ui/fail/fulltext_not_text.rs:7:12
+  |
+7 | #[fulltext(score)]
+  |            ^^^^^

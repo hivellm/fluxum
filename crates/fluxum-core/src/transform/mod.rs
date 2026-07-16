@@ -118,6 +118,9 @@ pub(crate) fn validate_registered(schema: &crate::schema::Schema) -> Result<()> 
                 IndexSchema::BTree { columns } | IndexSchema::Spatial { columns, .. } => {
                     protected.extend(columns.iter().copied());
                 }
+                // An #[encrypted] full-text column makes no sense — ciphertext
+                // is not analyzable (FTS-002); treat it as protected.
+                IndexSchema::FullText { column, .. } => protected.push(*column),
             }
         }
 

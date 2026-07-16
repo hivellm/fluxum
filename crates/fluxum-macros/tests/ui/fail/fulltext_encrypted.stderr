@@ -1,0 +1,5 @@
+error: `#[encrypted]` cannot apply to column `body`: encrypted columns cannot be a primary key, unique, index, partition, or spatial column (CT-013)
+  --> tests/ui/fail/fulltext_encrypted.rs:12:5
+   |
+12 |     #[encrypted(ecies, key = "docs")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

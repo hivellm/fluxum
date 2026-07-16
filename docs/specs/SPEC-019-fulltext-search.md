@@ -116,6 +116,29 @@ snapshot-ranked / boolean-live), so it introduces no new architectural shape.
   gate returning `503` until ready (`index/mod.rs:171`); durable persistence of postings is a
   tiered-storage optimization, not required for v1 correctness.
 
+### Implementation status (phase 2 — storage foundation complete)
+FTS-001/002, FTS-010, FTS-020/021/022 are implemented; §5 (`MATCH`), §6 (BM25 ranking), and §7's
+schema-meta writer are the sibling phase-4 task.
+- **Declaration** ([macros/src/table.rs](../../crates/fluxum-macros/src/table.rs)): the accepted
+  attribute is `#[fulltext(col, [simple|english], [stop_words], [stemming])]` — the first item names
+  the column, the rest are analyzer keywords in any order (this replaces the illustrative
+  `language = "en"` key/value form sketched in §2). Non-`String`/`Option<String>`/`Vec<String>`
+  columns and `#[encrypted]` columns are rejected at compile time (FTS-002), with a runtime backstop
+  in schema assembly.
+- **Analyzer** ([index/fulltext.rs](../../crates/fluxum-core/src/index/fulltext.rs)): deterministic
+  Unicode tokenization with positions → case-fold → English stop-words → a light deterministic English
+  stemmer; a versioned `AnalyzerId` (`ANALYZER_VERSION`) for the FTS-051 schema-meta check. The
+  `english` stemmer is deliberately a compact suffix-stripper, not full Porter — ranking quality is
+  the phase-4 concern; determinism (the rebuild-identity invariant) is what the foundation needs.
+- **Index** (`FullTextIndexState`): positional posting lists `term → { pk → positions }` in a
+  `BTreeMap`, plus per-document length, per-term document frequency, and corpus totals — every BM25
+  input. Maintenance rides the commit merge alongside the B-tree/spatial indexes; `verify_index_integrity`
+  proves bit-identity to a fresh rebuild (FTS-021), and `mark_fulltext_rebuilding` /
+  `rebuild_fulltext_indexes` / `fulltext_ready` provide the FTS-022 recovery gate
+  (`STORAGE_FULLTEXT_REBUILDING`, wire code 7004).
+- **Scope note**: like the spatial index, the postings live in `TableState`; they page and evict
+  through the same mechanism when the pager is wired into the live write path (a later task).
+
 ## 5. Query surface
 
 - **FTS-030** [P0] The subscription/query SQL subset ([SPEC-005](SPEC-005-subscriptions.md) SUB-010,

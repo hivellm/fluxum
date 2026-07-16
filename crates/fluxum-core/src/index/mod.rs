@@ -42,10 +42,12 @@
 //!   is derivable from the schema alone.
 
 pub mod btree;
+pub mod fulltext;
 pub mod quadtree;
 pub mod rtree;
 
 pub use btree::BTreeIndex;
+pub use fulltext::{Analyzer, AnalyzerId, FullTextIndexState, Language};
 pub use quadtree::{QuadTree, Rect};
 pub use rtree::{Aabb, RTree};
 

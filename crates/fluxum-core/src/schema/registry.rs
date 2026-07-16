@@ -127,6 +127,16 @@ pub fn spatial_stream_advisory(table: &TableSchema) -> Option<String> {
 }
 
 /// Validate one table against the DM-040 startup checks.
+/// Whether `ty` is a valid `#[fulltext]` column type (FTS-002): `String`,
+/// `Option<String>`, or `Vec<String>`.
+fn is_fulltext_type(ty: &FluxType) -> bool {
+    match ty {
+        FluxType::Str => true,
+        FluxType::Option(inner) | FluxType::List(inner) => matches!(inner, FluxType::Str),
+        _ => false,
+    }
+}
+
 fn validate_table(t: &'static TableSchema) -> Result<()> {
     let err = |msg: String| Err(FluxumError::Schema(format!("table `{}`: {msg}", t.name)));
 
@@ -240,6 +250,18 @@ fn validate_table(t: &'static TableSchema) -> Result<()> {
                             col.name, col.ty
                         ));
                     }
+                }
+            }
+            IndexSchema::FullText {
+                column: ordinal, ..
+            } => {
+                let col = column(*ordinal, "#[fulltext]")?;
+                if !is_fulltext_type(&col.ty) {
+                    return err(format!(
+                        "full-text index column `{}` must be String or Vec<String>, found \
+                         {:?} (FTS-002)",
+                        col.name, col.ty
+                    ));
                 }
             }
         }

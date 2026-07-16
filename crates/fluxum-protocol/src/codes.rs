@@ -131,6 +131,8 @@ pub const STORAGE_PAGE_CORRUPT: u16 = 7001;
 pub const STORAGE_BUFFER_POOL_EXHAUSTED: u16 = 7002;
 /// 7003 — spatial index still rebuilding after recovery (SPX-023).
 pub const STORAGE_SPATIAL_REBUILDING: u16 = 7003;
+/// 7004 — full-text index still rebuilding after recovery (FTS-022).
+pub const STORAGE_FULLTEXT_REBUILDING: u16 = 7004;
 
 // --- 8xxx CLUSTER_ ----------------------------------------------------------
 
@@ -426,6 +428,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         sqlstate: None,
         details_keys: &["table"],
         message_template: "spatial index is rebuilding after recovery; retry shortly",
+        http_status: 503,
+    },
+    CatalogEntry {
+        code: STORAGE_FULLTEXT_REBUILDING,
+        name: "STORAGE_FULLTEXT_REBUILDING",
+        severity: Severity::Error,
+        retryable: true,
+        sqlstate: None,
+        details_keys: &["table"],
+        message_template: "full-text index is rebuilding after recovery; retry shortly",
         http_status: 503,
     },
     CatalogEntry {

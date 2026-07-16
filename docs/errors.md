@@ -196,6 +196,13 @@ spatial index is rebuilding after recovery; retry shortly
 - severity: `error` · retryable: `true` · HTTP 503
 - details keys: `table`
 
+## 7004 `STORAGE_FULLTEXT_REBUILDING`
+
+full-text index is rebuilding after recovery; retry shortly
+
+- severity: `error` · retryable: `true` · HTTP 503
+- details keys: `table`
+
 ## 8000 `CLUSTER_SHARD_UNAVAILABLE`
 
 shard temporarily unavailable; retry shortly
