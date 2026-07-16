@@ -162,6 +162,7 @@ pub(crate) fn encode_value(value: &RowValue, out: &mut Vec<u8>) {
         RowValue::Str(v) => encode_terminated(v.as_bytes(), out),
         RowValue::Bytes(v) => encode_terminated(v, out),
         RowValue::Identity(v) => out.extend_from_slice(v.as_bytes()),
+        RowValue::Blob(v) => out.extend_from_slice(v.as_bytes()),
         RowValue::ConnectionId(v) => out.extend_from_slice(&v.as_u128().to_be_bytes()),
         RowValue::EntityId(v) => out.extend_from_slice(&v.as_u64().to_be_bytes()),
         RowValue::Timestamp(v) => {

@@ -54,6 +54,7 @@ pub(crate) enum FluxTy {
     EntityId,
     Timestamp,
     Decimal,
+    Blob,
     Opt(Box<FluxTy>),
     List(Box<FluxTy>),
     /// A `#[derive(FluxType)]` enum or nested struct used as a column
@@ -89,6 +90,7 @@ impl FluxTy {
             Self::EntityId => quote!(#path::EntityId),
             Self::Timestamp => quote!(#path::Timestamp),
             Self::Decimal => quote!(#path::Decimal),
+            Self::Blob => quote!(#path::Blob),
             Self::Opt(inner) => {
                 let inner = inner.tokens();
                 quote!(#path::Option(&#inner))
@@ -1760,6 +1762,7 @@ pub(crate) fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
         "EntityId" => simple(FluxTy::EntityId),
         "Timestamp" => simple(FluxTy::Timestamp),
         "Decimal" => simple(FluxTy::Decimal),
+        "BlobRef" => simple(FluxTy::Blob),
         "Vec" => {
             let inner = generic_inner(&segment.arguments).ok_or_else(unsupported)?;
             let inner = parse_flux_type(inner)?;
@@ -1814,6 +1817,7 @@ pub(crate) fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
         FluxTy::EntityId => quote!(#rv::EntityId(#expr)),
         FluxTy::Timestamp => quote!(#rv::Timestamp(#expr)),
         FluxTy::Decimal => quote!(#rv::Decimal(#expr)),
+        FluxTy::Blob => quote!(#rv::Blob(#expr)),
         FluxTy::Opt(inner) => {
             let inner = to_row_value(inner, quote!(__fx_inner));
             quote! {
@@ -1893,6 +1897,7 @@ pub(crate) fn from_row_value(
         FluxTy::EntityId => copied(quote!(EntityId)),
         FluxTy::Timestamp => copied(quote!(Timestamp)),
         FluxTy::Decimal => copied(quote!(Decimal)),
+        FluxTy::Blob => copied(quote!(Blob)),
         FluxTy::Opt(inner) => {
             let inner = from_row_value(inner, quote!((&**__fx_opt)), table, column);
             quote! {

@@ -126,6 +126,10 @@ pub struct MemStore {
     /// transaction.
     writer: Mutex<WriterState>,
     options: StoreOptions,
+    /// The shard's blob store, once attached (SPEC-023 DMX-040): `Blob`
+    /// columns are validated against it at write time and reference-counted
+    /// in the commit merge; without one, `Blob` writes are rejected.
+    blobs: std::sync::OnceLock<Arc<crate::commitlog::BlobStore>>,
 }
 
 impl MemStore {
@@ -189,6 +193,7 @@ impl MemStore {
         }
         Ok(Self {
             catalog,
+            blobs: std::sync::OnceLock::new(),
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -208,6 +213,39 @@ impl MemStore {
     /// The schema of a registered table (by id).
     pub fn table_schema(&self, table: TableId) -> Option<&'static TableSchema> {
         self.catalog.get(&table).copied()
+    }
+
+    /// Attach the shard's blob store (SPEC-023 DMX-040) and rebuild its
+    /// refcounts from the **current** committed snapshot — call after
+    /// recovery, before serving writes. `Blob` column writes are rejected
+    /// until a store is attached. Idempotent-safe: a second attach is
+    /// ignored (the first store stays authoritative).
+    pub fn attach_blob_store(&self, blobs: Arc<crate::commitlog::BlobStore>) {
+        use crate::commitlog::BlobHash;
+        let snapshot = self.snapshot();
+        let mut references: Vec<BlobHash> = Vec::new();
+        for (table_id, schema) in &self.catalog {
+            let ordinals = blob_ordinals(schema);
+            if ordinals.is_empty() {
+                continue;
+            }
+            if let Ok(rows) = snapshot.scan(*table_id) {
+                for row in rows {
+                    for &ordinal in &ordinals {
+                        if let Some(RowValue::Blob(blob)) = row.value(ordinal) {
+                            references.push(BlobHash::from_bytes(*blob.as_bytes()));
+                        }
+                    }
+                }
+            }
+        }
+        blobs.rebuild_refcounts(references);
+        let _ = self.blobs.set(blobs);
+    }
+
+    /// The attached blob store, if any.
+    pub fn blob_store(&self) -> Option<&Arc<crate::commitlog::BlobStore>> {
+        self.blobs.get()
     }
 
     /// The [`IndexId`] of the B-tree index declared on table `name` over
@@ -414,6 +452,25 @@ impl Tx<'_> {
     /// for an occupied primary key.
     fn write(&mut self, table: TableId, mut values: Vec<RowValue>, replace: bool) -> Result<Row> {
         let schema = self.store.schema_of(table)?;
+        // DMX-040: a `Blob` value must reference a stored object — validated
+        // here (write time) so the commit merge's incref can never miss.
+        for &ordinal in &blob_ordinals(schema) {
+            if let Some(RowValue::Blob(blob)) = values.get(usize::from(ordinal)) {
+                let Some(blobs) = self.store.blobs.get() else {
+                    return Err(FluxumError::Storage(format!(
+                        "table `{}`: Blob column write with no blob store attached (DMX-040)",
+                        schema.name
+                    )));
+                };
+                let hash = crate::commitlog::BlobHash::from_bytes(*blob.as_bytes());
+                if !blobs.contains(&hash) {
+                    return Err(FluxumError::Storage(format!(
+                        "table `{}`: Blob reference {hash} names no stored object — upload                          it first (DMX-040)",
+                        schema.name
+                    )));
+                }
+            }
+        }
         check_row(schema, &values)?;
         // SPX-010 eager constraint (like PK uniqueness below): an R-tree row
         // must satisfy min <= max per axis, so the commit merge stays
@@ -897,6 +954,13 @@ impl Tx<'_> {
             .committed
             .store(Arc::new(CommittedState { tables }));
 
+        // 4. Blob refcounts (DMX-040): row references drive GC. Applied
+        //    under the writer lock, increments before decrements so an
+        //    intra-commit move never dips a count to a reclaimable zero.
+        if let Some(blobs) = self.store.blobs.get() {
+            apply_blob_refcounts(&self.store.catalog, blobs, &diffs);
+        }
+
         Ok(TxDiff {
             tx_id,
             tables: diffs,
@@ -1003,6 +1067,61 @@ fn build_spatial_index(
 /// Empty secondary B-tree indexes for `table`, keyed by stable [`IndexId`]
 /// (STG-051), one per `#[index(btree(...))]` declaration. Spatial
 /// declarations are handled by [`build_spatial_index`].
+/// Apply one commit's blob reference deltas (DMX-040): incref every `Blob`
+/// value in inserted rows, then unref every one in deleted rows (an update
+/// contributes both sides). Write-time validation guarantees every incref
+/// target exists; count bookkeeping errors are logged, never a commit
+/// failure — the snapshot already swapped.
+fn apply_blob_refcounts(
+    catalog: &HashMap<TableId, &'static TableSchema>,
+    blobs: &crate::commitlog::BlobStore,
+    diffs: &[TableDiff],
+) {
+    use crate::commitlog::BlobHash;
+    let hash_of = |value: Option<&RowValue>| match value {
+        Some(RowValue::Blob(blob)) => Some(BlobHash::from_bytes(*blob.as_bytes())),
+        _ => None,
+    };
+    for diff in diffs {
+        let Some(schema) = catalog.get(&diff.table_id) else {
+            continue;
+        };
+        let ordinals = blob_ordinals(schema);
+        if ordinals.is_empty() {
+            continue;
+        }
+        for row in &diff.inserts {
+            for &ordinal in &ordinals {
+                if let Some(hash) = hash_of(row.value(ordinal))
+                    && let Err(e) = blobs.incref(&hash)
+                {
+                    tracing::error!(target: "fluxum::blob", error = %e, "blob incref failed");
+                }
+            }
+        }
+        for (_, row) in &diff.deletes {
+            for &ordinal in &ordinals {
+                if let Some(hash) = hash_of(row.value(ordinal))
+                    && let Err(e) = blobs.unref(&hash)
+                {
+                    tracing::error!(target: "fluxum::blob", error = %e, "blob unref failed");
+                }
+            }
+        }
+    }
+}
+
+/// The ordinals of a schema's `Blob` columns (SPEC-023 DMX-040).
+fn blob_ordinals(schema: &TableSchema) -> Vec<u16> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.ty, crate::schema::FluxType::Blob))
+        .map(|(i, _)| u16::try_from(i).unwrap_or(u16::MAX))
+        .collect()
+}
+
 fn build_btree_indexes(table: &'static TableSchema) -> Result<BTreeMap<IndexId, BTreeIndex>> {
     let mut indexes = BTreeMap::new();
     for index in table.indexes {

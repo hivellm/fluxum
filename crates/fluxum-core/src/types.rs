@@ -308,6 +308,48 @@ impl fmt::Display for Decimal {
     }
 }
 
+/// A `Blob` column value (SPEC-023 DMX-040): the 32-byte **content hash** of
+/// a large object held out-of-row by the per-shard
+/// [`crate::commitlog::BlobStore`] — never the bytes themselves. FluxBIN
+/// encodes it as 32 raw bytes (like [`Identity`]); displays as 64 lowercase
+/// hex characters (the store's object file name).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BlobRef([u8; 32]);
+
+impl BlobRef {
+    /// Wrap raw content-hash bytes (e.g. from an upload response).
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// The raw 32 content-hash bytes.
+    pub const fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Parse the 64-hex-char display form.
+    pub fn parse(text: &str) -> Option<Self> {
+        if text.len() != 64 {
+            return None;
+        }
+        let mut bytes = [0u8; 32];
+        for (i, chunk) in text.as_bytes().chunks_exact(2).enumerate() {
+            let hex = std::str::from_utf8(chunk).ok()?;
+            bytes[i] = u8::from_str_radix(hex, 16).ok()?;
+        }
+        Some(Self(bytes))
+    }
+}
+
+impl std::fmt::Display for BlobRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

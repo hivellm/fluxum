@@ -112,6 +112,10 @@ pub enum FluxType {
     /// [`crate::types::Decimal`] — exact fixed-point (SPEC-017 CT-020):
     /// 16-byte `i128` unscaled + 1-byte scale, self-describing.
     Decimal,
+    /// [`crate::types::BlobRef`] — 32-byte content-hash reference to a large
+    /// object held out-of-row by the blob store (SPEC-023 DMX-040). The row
+    /// never carries the payload bytes.
+    Blob,
     /// `Option<T>` — nullable column (DM-012).
     Option(&'static FluxType),
     /// `Vec<T>` — homogeneous list (DM-012).

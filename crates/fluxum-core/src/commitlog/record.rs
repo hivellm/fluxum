@@ -173,6 +173,8 @@ pub enum LogValue {
         /// Fractional decimal digits.
         scale: u8,
     },
+    /// [`crate::types::BlobRef`] column — 32 raw content-hash bytes.
+    Blob(ByteBuf),
     /// `Option<T>` column.
     Opt(Option<Box<LogValue>>),
     /// `Vec<T>` column.
@@ -216,6 +218,7 @@ impl From<&RowValue> for LogValue {
                 unscaled: ByteBuf::from(v.unscaled().to_le_bytes().to_vec()),
                 scale: v.scale(),
             },
+            RowValue::Blob(v) => Self::Blob(ByteBuf::from(v.as_bytes().to_vec())),
             RowValue::Optional(v) => {
                 Self::Opt(v.as_ref().map(|inner| Box::new(Self::from(inner.as_ref()))))
             }
@@ -274,6 +277,13 @@ impl LogValue {
                     .try_into()
                     .map_err(|_| bad_len("Decimal", 16, unscaled.len()))?;
                 RowValue::Decimal(Decimal::from_parts(i128::from_le_bytes(bytes), *scale))
+            }
+            Self::Blob(v) => {
+                let bytes: [u8; 32] = v
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| bad_len("Blob", 32, v.len()))?;
+                RowValue::Blob(crate::types::BlobRef::from_bytes(bytes))
             }
             Self::Opt(v) => RowValue::Optional(match v {
                 None => None,

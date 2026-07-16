@@ -61,7 +61,9 @@ mod table;
 ///
 /// Column types are the SPEC-001 §3 universe: `bool`, the sized ints,
 /// `f32`/`f64`, `String`, `Vec<u8>`, `Identity`, `ConnectionId`, `EntityId`,
-/// `Timestamp`, `Decimal`, plus `Option<T>` and `Vec<T>` over those — and any
+/// `Timestamp`, `Decimal`, `BlobRef` (a content-hash reference to an
+/// out-of-row large object, SPEC-023 DMX-040), plus `Option<T>` and `Vec<T>`
+/// over those — and any
 /// `#[derive(FluxType)]` enum or nested struct (SPEC-023 DMX-030). Maps are a
 /// compile error (DM-012); model relationships with a keyed table.
 ///

@@ -112,6 +112,8 @@ pub struct ShardContext {
     /// Whether the DMX-011 ephemeral TTL sweeper has been spawned (both
     /// transports request it on serve; only the first call spawns).
     sweeper_started: std::sync::atomic::AtomicBool,
+    /// The shard's blob store (SPEC-023 DMX-040), once installed.
+    blob_store: std::sync::OnceLock<Arc<fluxum_core::commitlog::BlobStore>>,
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -168,7 +170,22 @@ impl ShardContext {
             next_connection_id: AtomicU64::new(1),
             last_tx_id: AtomicU64::new(0),
             sweeper_started: std::sync::atomic::AtomicBool::new(false),
+            blob_store: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the shard's blob store (SPEC-023 DMX-040): attaches it to the
+    /// store (write validation + commit refcounts, rebuilding counts from
+    /// the current snapshot) and enables the `/blob` HTTP endpoints. Call
+    /// after recovery, before serving. A second call is ignored.
+    pub fn set_blob_store(&self, blobs: Arc<fluxum_core::commitlog::BlobStore>) {
+        self.store().attach_blob_store(Arc::clone(&blobs));
+        let _ = self.blob_store.set(blobs);
+    }
+
+    /// The installed blob store, if any.
+    pub fn blob_store(&self) -> Option<&Arc<fluxum_core::commitlog::BlobStore>> {
+        self.blob_store.get()
     }
 
     /// Start the ephemeral TTL sweeper (SPEC-023 DMX-011) if any registered

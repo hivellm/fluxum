@@ -766,6 +766,7 @@ fn row_value_to_json(value: &crate::store::RowValue) -> serde_json::Value {
         V::EntityId(e) => J::String(e.as_u64().to_string()),
         V::Timestamp(t) => J::String(t.as_micros().to_string()),
         V::Decimal(d) => J::String(d.to_string()),
+        V::Blob(b) => J::String(b.to_string()),
         V::Optional(None) => J::Null,
         V::Optional(Some(inner)) => row_value_to_json(inner),
         V::List(items) => J::Array(items.iter().map(row_value_to_json).collect()),

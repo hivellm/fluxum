@@ -185,6 +185,17 @@ async fn serve_connection(
                 handle_get(&state, stream, &request, server_shutdown).await?;
                 return Ok(());
             }
+            // Blob upload/download (SPEC-023 DMX-041) — out-of-band of the
+            // 16 MB FluxRPC frame; shares this port with the admin surface.
+            ("POST", "/blob") => {
+                handle_blob_upload(&state.ctx, &mut stream, &request).await?;
+                true
+            }
+            ("GET", path) if path.strip_prefix("/blob/").is_some() => {
+                let hash = path.strip_prefix("/blob/").unwrap_or_default().to_owned();
+                handle_blob_download(&state.ctx, &mut stream, &hash).await?;
+                true
+            }
             // The HTTP/JSON admin surface (RPC-050) shares this port.
             (method, path) if crate::admin::is_admin_path(path) => {
                 handle_admin(&state.ctx, &mut stream, method, path, &request.body).await?;
@@ -207,6 +218,55 @@ async fn serve_connection(
 
 /// Dispatch an admin route and write its JSON (or `text/plain` for
 /// `/metrics`) response (RPC-050..052).
+/// `POST /blob` (DMX-041): stage the raw request body in the shard's blob
+/// store and answer `{"hash": "<64-hex>"}`. Staged bytes live under an
+/// upload lease until the first row references the hash (or blob GC reclaims
+/// the orphan). 404 when no blob store is installed; 413 above the cap.
+async fn handle_blob_upload(
+    ctx: &Arc<ShardContext>,
+    stream: &mut TcpStream,
+    request: &Request,
+) -> io::Result<()> {
+    /// Upload cap: generous (out-of-band of the 16 MB frame), still bounded.
+    const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
+    let Some(blobs) = ctx.blob_store() else {
+        return write_simple(stream, 404, "Not Found").await;
+    };
+    if request.body.len() > MAX_BLOB_BYTES {
+        return write_simple(stream, 413, "Payload Too Large").await;
+    }
+    if request.body.is_empty() {
+        return write_simple(stream, 400, "Bad Request").await;
+    }
+    match blobs.stage(&request.body) {
+        Ok(hash) => {
+            let body = format!("{{\"hash\":\"{hash}\"}}");
+            write_json(stream, 200, "application/json", body.as_bytes()).await
+        }
+        Err(_) => write_simple(stream, 500, "Internal Server Error").await,
+    }
+}
+
+/// `GET /blob/:hash` (DMX-041): the raw bytes as `application/octet-stream`;
+/// 404 for an unknown hash or when no blob store is installed.
+async fn handle_blob_download(
+    ctx: &Arc<ShardContext>,
+    stream: &mut TcpStream,
+    hash: &str,
+) -> io::Result<()> {
+    let Some(blobs) = ctx.blob_store() else {
+        return write_simple(stream, 404, "Not Found").await;
+    };
+    let Some(hash) = fluxum_core::commitlog::BlobHash::parse(hash) else {
+        return write_simple(stream, 400, "Bad Request").await;
+    };
+    match blobs.get(&hash) {
+        Ok(Some(bytes)) => write_json(stream, 200, "application/octet-stream", &bytes).await,
+        Ok(None) => write_simple(stream, 404, "Not Found").await,
+        Err(_) => write_simple(stream, 500, "Internal Server Error").await,
+    }
+}
+
 async fn handle_admin(
     ctx: &Arc<ShardContext>,
     stream: &mut TcpStream,

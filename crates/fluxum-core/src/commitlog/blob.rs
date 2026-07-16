@@ -42,6 +42,17 @@ impl BlobHash {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// Rebuild a hash from its raw 32 bytes (e.g. a row's
+    /// [`crate::types::BlobRef`] column value, DMX-040).
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Parse the 64-hex-char display form (the object file name).
+    pub fn parse(text: &str) -> Option<Self> {
+        parse_hash(text)
+    }
 }
 
 impl fmt::Display for BlobHash {
@@ -79,6 +90,13 @@ struct Inner {
     /// Retention holds: holder key (checkpoint id, segment id, transfer id…)
     /// → hashes it pins (STG-041 GC gate).
     holds: HashMap<u64, HashSet<BlobHash>>,
+    /// Upload leases (DMX-041): a staged blob's hold id and staging time —
+    /// released on the first row reference or by [`BlobStore::gc`] once the
+    /// orphan age passes.
+    uploads: HashMap<BlobHash, (u64, std::time::Instant)>,
+    /// Monotonic holder-id source for upload leases (upper id space, so
+    /// checkpoint/segment holders never collide).
+    next_upload_holder: u64,
 }
 
 /// Per-shard content-addressed, refcounted blob store (STG-041).
@@ -105,6 +123,8 @@ impl BlobStore {
             inner: Mutex::new(Inner {
                 refcounts,
                 holds: HashMap::new(),
+                uploads: HashMap::new(),
+                next_upload_holder: 0,
             }),
         })
     }
@@ -117,30 +137,120 @@ impl BlobStore {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Durably write the object file for `hash` if absent (temp write +
+    /// fsync + rename, so a crash never leaves a half-written object under a
+    /// valid hash name).
+    fn write_object(&self, hash: &BlobHash, bytes: &[u8]) -> Result<()> {
+        let path = self.object_path(hash);
+        if path.exists() {
+            return Ok(());
+        }
+        let tmp = self.dir.join(format!("{hash}.tmp"));
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, &path)?;
+        sync_dir(&self.dir)?;
+        Ok(())
+    }
+
     /// Store `bytes`, incrementing the refcount. Identical values are stored
     /// once — a second `put` of the same bytes only bumps the count.
     pub fn put(&self, bytes: &[u8]) -> Result<BlobHash> {
         let hash = BlobHash::of(bytes);
-        let path = self.object_path(&hash);
         let mut inner = self.lock();
         let count = inner.refcounts.entry(hash).or_insert(0);
-        if *count == 0 && !path.exists() {
-            // Durable create: temp write + fsync + rename, so a crash never
-            // leaves a half-written object under a valid hash name.
-            let tmp = self.dir.join(format!("{hash}.tmp"));
-            let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)?;
-            file.write_all(bytes)?;
-            file.sync_all()?;
-            drop(file);
-            fs::rename(&tmp, &path)?;
-            sync_dir(&self.dir)?;
+        if *count == 0 {
+            self.write_object(&hash, bytes)?;
         }
         *count += 1;
         Ok(hash)
+    }
+
+    /// Stage an uploaded blob (DMX-041): store the object at **refcount 0**
+    /// under an upload lease — a retention hold that keeps the bytes alive
+    /// until the first row references the hash (which releases the lease) or
+    /// [`BlobStore::gc`] reclaims it as an orphan after `orphan_after`.
+    pub fn stage(&self, bytes: &[u8]) -> Result<BlobHash> {
+        let hash = BlobHash::of(bytes);
+        let mut inner = self.lock();
+        inner.refcounts.entry(hash).or_insert(0);
+        self.write_object(&hash, bytes)?;
+        if !inner.uploads.contains_key(&hash) {
+            let holder = u64::MAX - inner.next_upload_holder;
+            inner.next_upload_holder += 1;
+            inner.holds.entry(holder).or_default().insert(hash);
+            inner
+                .uploads
+                .insert(hash, (holder, std::time::Instant::now()));
+        }
+        Ok(hash)
+    }
+
+    /// Whether `hash` names a stored object (staged or referenced) — the
+    /// write-time validation a row's `BlobRef` column runs (DMX-040).
+    pub fn contains(&self, hash: &BlobHash) -> bool {
+        self.lock().refcounts.contains_key(hash)
+    }
+
+    /// Add one row reference to an already-stored blob (commit merge,
+    /// insert side). Errors on an unknown hash — the write-time validation
+    /// makes this unreachable through `Tx`. Releases the upload lease: the
+    /// row reference now protects the bytes.
+    pub fn incref(&self, hash: &BlobHash) -> Result<u64> {
+        let mut inner = self.lock();
+        let count = inner
+            .refcounts
+            .get_mut(hash)
+            .ok_or_else(|| FluxumError::Storage(format!("incref of unknown blob {hash}")))?;
+        *count += 1;
+        let count = *count;
+        if let Some((holder, _)) = inner.uploads.remove(hash) {
+            inner.holds.remove(&holder);
+        }
+        Ok(count)
+    }
+
+    /// Reset every refcount from a full scan of live rows (recovery /
+    /// [`crate::store::MemStore`] attach): counts become exactly the number
+    /// of occurrences in `references`; objects not referenced drop to 0.
+    /// Upload leases survive (a staged-but-unreferenced blob is not leaked
+    /// by a restart-attach cycle — its lease was already gone; `gc` owns it).
+    pub fn rebuild_refcounts(&self, references: impl IntoIterator<Item = BlobHash>) {
+        let mut inner = self.lock();
+        for count in inner.refcounts.values_mut() {
+            *count = 0;
+        }
+        for hash in references {
+            *inner.refcounts.entry(hash).or_insert(0) += 1;
+        }
+    }
+
+    /// Release upload leases older than `orphan_after`, then
+    /// [`Self::reclaim`]: an uploaded blob that no row ever referenced is
+    /// reclaimed once its lease ages out (DMX-041). Returns the reclaimed
+    /// hashes.
+    pub fn gc(&self, orphan_after: std::time::Duration) -> Result<Vec<BlobHash>> {
+        {
+            let mut inner = self.lock();
+            let stale: Vec<BlobHash> = inner
+                .uploads
+                .iter()
+                .filter(|(_, (_, staged_at))| staged_at.elapsed() >= orphan_after)
+                .map(|(hash, _)| *hash)
+                .collect();
+            for hash in stale {
+                if let Some((holder, _)) = inner.uploads.remove(&hash) {
+                    inner.holds.remove(&holder);
+                }
+            }
+        }
+        self.reclaim()
     }
 
     /// Fetch a blob's bytes, if the hash is known.

@@ -16,7 +16,7 @@ use fluxum_protocol::{FluxBinError, FluxBinReader, FluxBinWriter};
 
 use crate::error::{FluxumError, Result};
 use crate::schema::{FluxType, TableSchema};
-use crate::types::{ConnectionId, Decimal, EntityId, Identity, Timestamp};
+use crate::types::{BlobRef, ConnectionId, Decimal, EntityId, Identity, Timestamp};
 
 /// One column value, from the closed SPEC-001 type universe.
 ///
@@ -62,6 +62,9 @@ pub enum RowValue {
     Timestamp(Timestamp),
     /// [`Decimal`] column — exact fixed-point (SPEC-017 CT-020).
     Decimal(Decimal),
+    /// [`BlobRef`] column — 32-byte content-hash reference to an out-of-row
+    /// large object (SPEC-023 DMX-040).
+    Blob(BlobRef),
     /// `Option<T>` column (DM-012).
     Optional(Option<Box<RowValue>>),
     /// `Vec<T>` column (DM-012).
@@ -101,6 +104,7 @@ impl RowValue {
             | (Self::EntityId(_), FluxType::EntityId)
             | (Self::Timestamp(_), FluxType::Timestamp)
             | (Self::Decimal(_), FluxType::Decimal)
+            | (Self::Blob(_), FluxType::Blob)
             | (Self::Optional(None), FluxType::Option(_)) => true,
             (Self::Optional(Some(inner)), FluxType::Option(inner_ty)) => {
                 inner.matches_type(inner_ty)
@@ -152,6 +156,7 @@ impl RowValue {
             Self::EntityId(v) => w.write_entity_id(v.as_u64()),
             Self::Timestamp(v) => w.write_timestamp(v.as_micros()),
             Self::Decimal(v) => w.write_decimal(v.unscaled(), v.scale()),
+            Self::Blob(v) => w.write_identity(v.as_bytes()),
             Self::Optional(None) => w.write_option_tag(false),
             Self::Optional(Some(inner)) => {
                 w.write_option_tag(true);
@@ -211,6 +216,7 @@ impl fmt::Display for RowValue {
             Self::EntityId(v) => write!(f, "{v}"),
             Self::Timestamp(v) => write!(f, "{v}"),
             Self::Decimal(v) => write!(f, "{v}"),
+            Self::Blob(v) => write!(f, "blob:{v}"),
             Self::Optional(None) => write!(f, "null"),
             Self::Optional(Some(inner)) => write!(f, "{inner}"),
             Self::List(items) => {
@@ -442,6 +448,7 @@ fn decode_value(r: &mut FluxBinReader<'_>, ty: &FluxType) -> Result<RowValue> {
             let (unscaled, scale) = r.read_decimal().map_err(map)?;
             RowValue::Decimal(Decimal::from_parts(unscaled, scale))
         }
+        FluxType::Blob => RowValue::Blob(BlobRef::from_bytes(r.read_identity().map_err(map)?)),
         FluxType::Option(inner) => {
             if r.read_option_tag().map_err(map)? {
                 RowValue::Optional(Some(Box::new(decode_value(r, inner)?)))
@@ -719,6 +726,10 @@ mod tests {
             ty: FluxType::Decimal,
         },
         ColumnSchema {
+            name: "c_blob",
+            ty: FluxType::Blob,
+        },
+        ColumnSchema {
             name: "c_opt",
             ty: FluxType::Option(&FluxType::I8),
         },
@@ -760,6 +771,7 @@ mod tests {
             RowValue::EntityId(EntityId::new(13)),
             RowValue::Timestamp(Timestamp::from_micros(17)),
             RowValue::Decimal(Decimal::from_parts(-12345, 2)),
+            RowValue::Blob(BlobRef::from_bytes([0xAB; 32])),
             RowValue::Optional(None),
             RowValue::List(vec![RowValue::Str("a".into()), RowValue::Str("b".into())]),
         ]
