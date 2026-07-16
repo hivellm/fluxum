@@ -82,11 +82,17 @@ pub const FLAG_CODEC_MASK: u16 = 0b0000_0011;
 pub const FLAG_INDEX: u16 = 1 << 2;
 /// Flags bit 3: overflow page (TIER-026).
 pub const FLAG_OVERFLOW: u16 = 1 << 3;
+/// Flags bit 4: the stored payload is AEAD-encrypted at rest (SPEC-014
+/// SEC-010) — a `[nonce ++ ciphertext ++ tag]` envelope over the (possibly
+/// compressed) payload. The CRC32C still covers the stored ciphertext, so a
+/// tampered page is rejected before any decryption runs (SEC-011).
+pub const FLAG_ENCRYPTED: u16 = 1 << 4;
 /// Flags bits 8–11: page-format version.
 pub const FLAG_VERSION_MASK: u16 = 0b1111 << 8;
 /// Every bit meaning something in version 1; set bits outside this mask
 /// reject the page as unreadable.
-pub const FLAG_KNOWN_MASK: u16 = FLAG_CODEC_MASK | FLAG_INDEX | FLAG_OVERFLOW | FLAG_VERSION_MASK;
+pub const FLAG_KNOWN_MASK: u16 =
+    FLAG_CODEC_MASK | FLAG_INDEX | FLAG_OVERFLOW | FLAG_ENCRYPTED | FLAG_VERSION_MASK;
 
 /// Decoded page header (the fixed 32 bytes before the payload).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +133,11 @@ impl PageHeader {
     /// Whether the overflow-page flag (bit 3) is set.
     pub fn is_overflow(&self) -> bool {
         self.flags & FLAG_OVERFLOW != 0
+    }
+
+    /// Whether the at-rest-encryption flag (bit 4) is set (SEC-010).
+    pub fn is_encrypted(&self) -> bool {
+        self.flags & FLAG_ENCRYPTED != 0
     }
 
     /// The page-format version (flags bits 8–11).

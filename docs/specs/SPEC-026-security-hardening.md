@@ -33,6 +33,29 @@ Given at-rest encryption enabled
 When the data directory is copied without the key
 Then no row data can be recovered from cold pages, checkpoints, or backups.
 
+#### Implementation status (phase 2 — complete)
+- **Cipher/keyring** ([crypto.rs](../../crates/fluxum-core/src/crypto.rs)): XChaCha20-Poly1305 with a
+  random 192-bit nonce per seal (copy-on-write page rewrites make a derived/counter nonce unsound, so
+  random is the safe choice). The sealed envelope is `[24-byte nonce ++ ciphertext ++ 16-byte tag]`; no
+  key id is stored — `Keyring::open` tries the active key then each `previous` key, and the Poly1305 tag
+  authenticates the match (SEC-012). Key bytes are zeroized on drop and never rendered by `Debug`.
+- **Cold pages** ([pager/codec.rs](../../crates/fluxum-core/src/store/pager/codec.rs)): `encode_for_storage`
+  runs the AEAD **after** compression and sets a new `FLAG_ENCRYPTED` page-header bit; the CRC32C covers
+  the ciphertext, so fault-in verifies integrity **before** `open_image` decrypts (SEC-011). The AEAD
+  associated data binds `(shard, table, page id, flags)`, so a sealed page cannot be replayed at another
+  position. Lazy rotation (SEC-012) is automatic: any page rewrite re-seals under the active key while
+  reads still accept retired keys.
+- **Checkpoint/backup artifacts**: `compress_artifact`/`decompress_artifact` seal after zstd compression
+  behind a self-describing `FLXENC01` magic; checkpoint objects are content-addressed, so their hash
+  verifies the ciphertext before decrypt (SEC-011). A wrong/absent key is an authentication failure, never
+  silent garbage.
+- **Config** ([config `storage.encryption`](../../crates/fluxum-core/src/config/mod.rs)): `enabled`,
+  `active_key_id`, and a `keys` list (`id` + 64-hex `key_hex`); `EncryptionConfig::keyring()` rejects
+  enabling with no keys or an `active_key_id` that names none (SEC-010). Config-embedded key material is
+  the baseline; a KMS key reference is a future `source` extension. Disabled by default (fully opt-in).
+- **Scope note**: the paged cold tier is not yet on the live `MemStore` write path, so encryption is
+  exercised at the pager/codec and artifact layers and travels with the pager when it is wired in.
+
 ## 3. Deterministic reducer stdlib (`SEC-02x`)
 
 ### Requirement: Determinism-preserving helpers

@@ -153,6 +153,76 @@ pub enum PageCompression {
     None,
 }
 
+/// One named at-rest key (SPEC-026 SEC-010). `key_hex` is 64 hex characters
+/// (256 bits). Config-embedded key material is the baseline; a KMS key
+/// reference is a future `source` extension.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionKey {
+    /// Stable key label, referenced by `active_key_id`.
+    pub id: String,
+    /// The 256-bit key as 64 hex characters.
+    pub key_hex: String,
+}
+
+/// At-rest encryption keyring (SPEC-026 SEC-010/012): an enable flag, the
+/// active key every write seals under, and the full key set (the active key
+/// plus any retired keys still accepted for reads during lazy rotation).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct EncryptionConfig {
+    /// Whether cold-tier pages and checkpoint/backup artifacts are encrypted
+    /// at rest. Enabling with no usable key material is a hard config error
+    /// (SEC-010).
+    pub enabled: bool,
+    /// The label of the key fresh writes seal under (must be in `keys`).
+    pub active_key_id: String,
+    /// All known keys: the active one plus retired keys reads still accept
+    /// (SEC-012). Order is irrelevant; the active key is chosen by id.
+    pub keys: Vec<EncryptionKey>,
+}
+
+impl EncryptionConfig {
+    /// Build the runtime [`Keyring`](crate::crypto::Keyring), or `None` when
+    /// encryption is disabled. Enabling with no keys, an empty/unknown
+    /// `active_key_id`, or malformed key material is rejected (SEC-010/011).
+    pub fn keyring(&self) -> crate::error::Result<Option<crate::crypto::Keyring>> {
+        use crate::crypto::{AtRestKey, Keyring};
+        use crate::error::FluxumError;
+        if !self.enabled {
+            return Ok(None);
+        }
+        if self.keys.is_empty() {
+            return Err(FluxumError::Config(
+                "storage.encryption.enabled is true but no keys are configured (SEC-010)".into(),
+            ));
+        }
+        if self.active_key_id.is_empty() {
+            return Err(FluxumError::Config(
+                "storage.encryption.active_key_id is required when encryption is enabled (SEC-010)"
+                    .into(),
+            ));
+        }
+        let mut active = None;
+        let mut previous = Vec::new();
+        for key in &self.keys {
+            let parsed = AtRestKey::from_hex(&key.id, &key.key_hex)?;
+            if key.id == self.active_key_id {
+                active = Some(parsed);
+            } else {
+                previous.push(parsed);
+            }
+        }
+        let active = active.ok_or_else(|| {
+            FluxumError::Config(format!(
+                "storage.encryption.active_key_id `{}` names no configured key (SEC-010)",
+                self.active_key_id
+            ))
+        })?;
+        Ok(Some(Keyring::new(active, previous)))
+    }
+}
+
 /// On-disk layout and storage-engine tuning (SPEC-002, SPEC-015).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -182,6 +252,8 @@ pub struct StorageConfig {
     pub evictor_low_watermark: f64,
     /// Commit-log write buffer; `auto` = `clamp(effective_memory / 1024, 64KiB, 4MiB)`.
     pub commit_log_write_buffer_bytes: AutoOr<ByteSize>,
+    /// At-rest encryption keyring (SPEC-026 SEC-010; disabled by default).
+    pub encryption: EncryptionConfig,
 }
 
 impl Default for StorageConfig {
@@ -199,6 +271,7 @@ impl Default for StorageConfig {
             evictor_high_watermark: 0.95,
             evictor_low_watermark: 0.90,
             commit_log_write_buffer_bytes: AutoOr::Auto,
+            encryption: EncryptionConfig::default(),
         }
     }
 }

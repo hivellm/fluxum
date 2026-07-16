@@ -189,17 +189,17 @@ fn manifest_roundtrips_and_rejects_any_single_byte_corruption() {
         }],
     };
     let bytes = encode_manifest(&manifest).unwrap();
-    assert_eq!(decode_manifest(&bytes).unwrap(), manifest);
+    assert_eq!(decode_manifest(&bytes, None).unwrap(), manifest);
 
     // Any single corrupted byte — magic, body, or the trailing hash — is
     // detected (STG-021 integrity hash).
     for pos in 0..bytes.len() {
         let mut bad = bytes.clone();
         bad[pos] ^= 0x01;
-        assert!(decode_manifest(&bad).is_err(), "byte {pos}");
+        assert!(decode_manifest(&bad, None).is_err(), "byte {pos}");
     }
-    assert!(decode_manifest(&bytes[..bytes.len() - 1]).is_err());
-    assert!(decode_manifest(b"short").is_err());
+    assert!(decode_manifest(&bytes[..bytes.len() - 1], None).is_err());
+    assert!(decode_manifest(b"short", None).is_err());
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn manifest_field_validation_and_hash_rendering() {
         timestamp: 0,
         tables: vec![],
     };
-    let err = decode_manifest(&encode_manifest(&future).unwrap()).unwrap_err();
+    let err = decode_manifest(&encode_manifest(&future).unwrap(), None).unwrap_err();
     assert!(
         err.to_string().contains("unsupported format version"),
         "{err}"
@@ -373,7 +373,7 @@ mod repo_verification {
         let dir = tempfile::tempdir().unwrap();
         // One real row chunk, but the manifest declares 2 rows.
         let rows: Vec<Vec<LogValue>> = vec![vec![LogValue::U64(1), LogValue::Str("ana".into())]];
-        let chunk = compress_artifact(&rmp_serde::to_vec(&rows).unwrap(), 3).unwrap();
+        let chunk = compress_artifact(&rmp_serde::to_vec(&rows).unwrap(), 3, None).unwrap();
         let repo = plant(
             dir.path(),
             1,

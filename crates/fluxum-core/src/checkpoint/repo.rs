@@ -117,6 +117,11 @@ pub struct CheckpointRepo {
     objects: PathBuf,
     /// zstd level for manifests and objects (TIER-042).
     zstd_level: i32,
+    /// At-rest encryption keyring (SPEC-026 SEC-010): `None` disables
+    /// artifact encryption; when present, manifests and objects are sealed
+    /// under the active key and reads decrypt after content-hash / AEAD
+    /// verification (SEC-011).
+    keyring: Option<std::sync::Arc<crate::crypto::Keyring>>,
     /// Replica-transfer pins (STG-023): checkpoints being transferred are
     /// never pruned until the transfer completes.
     pins: Mutex<HashSet<u64>>,
@@ -132,6 +137,7 @@ impl CheckpointRepo {
             dir: dir.to_path_buf(),
             objects,
             zstd_level: DEFAULT_ARTIFACT_ZSTD_LEVEL,
+            keyring: None,
             pins: Mutex::new(HashSet::new()),
         })
     }
@@ -143,6 +149,15 @@ impl CheckpointRepo {
     /// as new objects).
     pub fn with_compression_level(mut self, level: i32) -> Self {
         self.zstd_level = level;
+        self
+    }
+
+    /// Install the at-rest encryption keyring (SEC-010): newly written
+    /// manifests and objects are sealed under its active key; reads accept
+    /// any key in the ring (SEC-012 lazy rotation). Existing plaintext
+    /// artifacts keep reading (self-describing framing).
+    pub fn with_keyring(mut self, keyring: Option<std::sync::Arc<crate::crypto::Keyring>>) -> Self {
+        self.keyring = keyring;
         self
     }
 
@@ -236,7 +251,11 @@ impl CheckpointRepo {
             timestamp: Timestamp::now().as_micros(),
             tables,
         };
-        let bytes = compress_artifact(&encode_manifest(&manifest)?, self.zstd_level)?;
+        let bytes = compress_artifact(
+            &encode_manifest(&manifest)?,
+            self.zstd_level,
+            self.keyring.as_deref(),
+        )?;
         write_durable(&stats.manifest, &bytes)?;
         sync_dir(&self.dir)?;
         Ok(stats)
@@ -252,7 +271,7 @@ impl CheckpointRepo {
     ) -> Result<serde_bytes::ByteBuf> {
         let encoded = rmp_serde::to_vec(rows)
             .map_err(|e| FluxumError::Storage(format!("checkpoint chunk encoding failed: {e}")))?;
-        let bytes = compress_artifact(&encoded, self.zstd_level)?;
+        let bytes = compress_artifact(&encoded, self.zstd_level, self.keyring.as_deref())?;
         rows.clear();
         let hash = ObjectHash::of(&bytes);
         let path = self.objects.join(hash.to_string());
@@ -291,7 +310,7 @@ impl CheckpointRepo {
     /// hash and the per-table row counts (STG-021: restore verifies the
     /// manifest hash and every object hash before adopting the checkpoint).
     pub fn load(&self, checkpoint: &CheckpointRef) -> Result<LoadedCheckpoint> {
-        let manifest = decode_manifest(&fs::read(&checkpoint.path)?)?;
+        let manifest = decode_manifest(&fs::read(&checkpoint.path)?, self.keyring.as_deref())?;
         if manifest.shard_id != checkpoint.shard_id || manifest.last_tx_id != checkpoint.last_tx_id
         {
             return Err(FluxumError::Storage(format!(
@@ -313,7 +332,7 @@ impl CheckpointRepo {
                 }
                 // Hash verified over the stored bytes; decompress after
                 // (raw pre-compression objects pass through, TIER-042).
-                let bytes = decompress_artifact(&bytes)
+                let bytes = decompress_artifact(&bytes, self.keyring.as_deref())
                     .map_err(|e| FluxumError::Storage(format!("checkpoint object {hash}: {e}")))?;
                 let chunk: Vec<Vec<LogValue>> = rmp_serde::from_slice(&bytes).map_err(|e| {
                     FluxumError::Storage(format!("checkpoint object {hash}: decode failed: {e}"))
@@ -355,7 +374,7 @@ impl CheckpointRepo {
         for r in self.list(shard_id)?.iter().rev() {
             if fs::read(&r.path)
                 .map_err(FluxumError::Io)
-                .and_then(|bytes| decode_manifest(&bytes))
+                .and_then(|bytes| decode_manifest(&bytes, self.keyring.as_deref()))
                 .is_ok()
             {
                 return Ok(Some(r.last_tx_id));
@@ -422,7 +441,7 @@ impl CheckpointRepo {
         for r in self.list(shard_id)? {
             let manifest = match fs::read(&r.path)
                 .map_err(FluxumError::Io)
-                .and_then(|bytes| decode_manifest(&bytes))
+                .and_then(|bytes| decode_manifest(&bytes, self.keyring.as_deref()))
             {
                 Ok(m) => m,
                 Err(e) => {

@@ -152,6 +152,10 @@ pub struct Pager {
     page_size: usize,
     compression: codec::PageCodec,
     compression_min_bytes: usize,
+    /// At-rest encryption keyring (SPEC-026 SEC-010): `None` disables
+    /// encryption; when present, spilled pages are sealed under the active
+    /// key and fault-in decrypts after CRC verification.
+    keyring: Option<Arc<crate::crypto::Keyring>>,
     dir: PathBuf,
     pool: Arc<BufferPool>,
     tables: Mutex<HashMap<TableId, Arc<TableIo>>>,
@@ -160,8 +164,19 @@ pub struct Pager {
 
 impl Pager {
     /// Open a pager rooted at `storage.page_dir`-style directory `dir`
-    /// (page files live under `dir/shard-<shard_id>/`).
+    /// (page files live under `dir/shard-<shard_id>/`). Unencrypted; use
+    /// [`Pager::open_with_keyring`] to enable at-rest encryption.
     pub fn open(dir: impl Into<PathBuf>, options: PagerOptions) -> Result<Arc<Self>> {
+        Self::open_with_keyring(dir, options, None)
+    }
+
+    /// Open a pager with an optional at-rest encryption keyring (SEC-010).
+    /// A `Some` keyring seals every spilled page under its active key.
+    pub fn open_with_keyring(
+        dir: impl Into<PathBuf>,
+        options: PagerOptions,
+        keyring: Option<Arc<crate::crypto::Keyring>>,
+    ) -> Result<Arc<Self>> {
         let metrics = Arc::new(PagerMetrics::default());
         let pool = BufferPool::new(
             PoolOptions {
@@ -177,6 +192,7 @@ impl Pager {
             page_size: options.page_size,
             compression: codec::PageCodec::from(options.compression),
             compression_min_bytes: options.compression_min_bytes,
+            keyring,
             dir: dir.into(),
             pool,
             tables: Mutex::new(HashMap::new()),
@@ -261,8 +277,13 @@ impl Pager {
     /// saving gate), write it copy-on-write to a fresh extent, repoint the
     /// live directory, then free the superseded extent.
     fn spill(&self, key: PageKey, image: &[u8]) -> Result<()> {
-        let compressed =
-            codec::compress_image(image, self.compression, self.compression_min_bytes)?;
+        let compressed = codec::encode_for_storage(
+            image,
+            self.compression,
+            self.compression_min_bytes,
+            self.shard_id,
+            self.keyring.as_deref(),
+        )?;
         let stored: &[u8] = compressed.as_deref().unwrap_or(image);
         PagerMetrics::add(
             &self.metrics.compression_raw_bytes,
@@ -325,9 +346,16 @@ impl Pager {
                 PagerMetrics::add(&self.metrics.page_reads_data, 1);
             }
             // TIER-032 step 4 / TIER-044: rebuild the uncompressed pool
-            // image — decompression happens here and only here.
-            if header.codec() != 0 {
-                return codec::decompress_image(&header, payload, self.page_size);
+            // image — decryption (SEC-011, after the CRC above) and
+            // decompression happen here and only here.
+            if header.codec() != 0 || header.is_encrypted() {
+                return codec::open_image(
+                    &header,
+                    payload,
+                    self.page_size,
+                    self.shard_id,
+                    self.keyring.as_deref(),
+                );
             }
             Ok(image)
         };
@@ -620,5 +648,87 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("neither resident"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_pager_seals_the_cold_tier_and_faults_in_clear() {
+        use super::format::{PageHeader, encode_page};
+        use crate::crypto::{AtRestKey, Keyring};
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let keyring = Arc::new(Keyring::new(AtRestKey::new("active", [1u8; 32]), vec![]));
+        let pager = Pager::open_with_keyring(
+            dir.path(),
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 16 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::Lz4,
+                compression_min_bytes: 1024,
+            },
+            Some(keyring),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        let table = TableId::from_raw(7);
+        let page_id = pager.allocate_page_id(table);
+        // A compressible payload carrying a recognizable plaintext marker.
+        let marker: &[u8] = b"COLD-TIER-PLAINTEXT-MARKER";
+        let mut payload: Vec<u8> = b"the quick brown fox jumps over the lazy dog -- "
+            .iter()
+            .copied()
+            .cycle()
+            .take(3000)
+            .collect();
+        payload[50..50 + marker.len()].copy_from_slice(marker);
+        let image = encode_page(
+            &PageHeader::new(page_id, table.as_u32(), 5, super::format::FLAG_INDEX),
+            &payload,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+
+        // Install, then force the page out to the cold tier.
+        drop(
+            pager
+                .install(table, page_id, image.clone())
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        pager.flush().unwrap_or_else(|e| panic!("{e}"));
+        pager.evict_all().unwrap_or_else(|e| panic!("{e}"));
+
+        // The stored extent must be encrypted: the plaintext marker is gone
+        // and the page header carries FLAG_ENCRYPTED.
+        let (offset, len) = match pager
+            .page_extent(table, page_id)
+            .unwrap_or_else(|e| panic!("{e}"))
+        {
+            Some(extent) => extent,
+            None => panic!("page spilled to an extent"),
+        };
+        let io = pager.table_io(table).unwrap_or_else(|e| panic!("{e}"));
+        let stored = {
+            let file = io.file.lock().unwrap_or_else(PoisonError::into_inner);
+            file.read_page(Extent { offset, len })
+                .unwrap_or_else(|e| panic!("{e}"))
+        };
+        assert!(
+            !stored.windows(marker.len()).any(|w| w == marker),
+            "plaintext marker leaked to the cold-tier page file"
+        );
+        let (header, _) = super::format::decode_page(&stored, 0, table.as_u32(), page_id)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert!(header.is_encrypted(), "cold page must carry FLAG_ENCRYPTED");
+
+        // Fault-in decrypts and rebuilds the exact original pool image.
+        let faulted = pager
+            .fault(table, page_id)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            faulted.image(),
+            image.as_slice(),
+            "cold round-trip diverged"
+        );
     }
 }

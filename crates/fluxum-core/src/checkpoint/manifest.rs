@@ -134,8 +134,11 @@ pub(crate) fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>> {
 /// compression landed read as-is), then magic, integrity hash, body decode,
 /// format version. Any failure means the checkpoint does not exist (restore
 /// falls back to an older retained checkpoint, STG-021).
-pub(crate) fn decode_manifest(bytes: &[u8]) -> Result<Manifest> {
-    let bytes = &*crate::store::pager::codec::decompress_artifact(bytes)
+pub(crate) fn decode_manifest(
+    bytes: &[u8],
+    keyring: Option<&crate::crypto::Keyring>,
+) -> Result<Manifest> {
+    let bytes = &*crate::store::pager::codec::decompress_artifact(bytes, keyring)
         .map_err(|e| FluxumError::Storage(format!("checkpoint manifest: {e}")))?;
     let corrupt = |reason: &str| FluxumError::Storage(format!("checkpoint manifest: {reason}"));
     if bytes.len() < MANIFEST_MAGIC.len() + 32 {

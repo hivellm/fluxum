@@ -46,9 +46,23 @@
 use std::borrow::Cow;
 
 use crate::config::PageCompression;
+use crate::crypto::Keyring;
 use crate::error::{FluxumError, Result};
 
-use super::format::{self, FLAG_CODEC_MASK, PAGE_HEADER_LEN, PageHeader};
+use super::format::{self, FLAG_CODEC_MASK, FLAG_ENCRYPTED, PAGE_HEADER_LEN, PageHeader};
+
+/// The AEAD associated data binding a sealed page payload to its identity
+/// (SEC-010): shard, table, page id, and the stored flag bits (codec,
+/// encrypted, index/overflow, and version). A page sealed for one position
+/// can never authenticate in another.
+fn page_aad(shard_id: u32, header: &PageHeader) -> [u8; 18] {
+    let mut aad = [0u8; 18];
+    aad[0..4].copy_from_slice(&shard_id.to_le_bytes());
+    aad[4..8].copy_from_slice(&header.table_id.to_le_bytes());
+    aad[8..16].copy_from_slice(&header.page_id.to_le_bytes());
+    aad[16..18].copy_from_slice(&header.flags.to_le_bytes());
+    aad
+}
 
 /// zstd level used for compressed page payloads (fixed — TIER-041 exposes
 /// the codec choice, not a per-page level; zstd pages trade fault-in latency
@@ -247,33 +261,175 @@ pub fn decompress_image(
     format::encode_page(&raw_header, &raw)
 }
 
+/// Prepare an uncompressed pool image for cold storage (spill path):
+/// compress per the codec (TIER-040), then — when a keyring is present —
+/// AEAD-encrypt the stored payload under the active key (SEC-010), setting
+/// [`FLAG_ENCRYPTED`]. The CRC32C in the returned image covers the stored
+/// (ciphertext) bytes, so fault-in verifies integrity *before* decrypting
+/// (SEC-011).
+///
+/// Returns `None` only when the image is stored verbatim — possible solely
+/// when no keyring is configured *and* compression did not help; with
+/// encryption on, every page is sealed, so the result is always `Some`.
+pub fn encode_for_storage(
+    image: &[u8],
+    codec: PageCodec,
+    min_bytes: usize,
+    shard_id: u32,
+    keyring: Option<&Keyring>,
+) -> Result<Option<Vec<u8>>> {
+    let (header, payload) = format::trusted_header(image)?;
+    if header.codec() != 0 || header.is_encrypted() {
+        return Err(FluxumError::Storage(format!(
+            "pool image of page {} already carries codec/encryption bits — frames must \
+             hold plain uncompressed images (TIER-044)",
+            header.page_id
+        )));
+    }
+    let compressed = compress_payload(codec, payload, min_bytes)?;
+    let codec_bits = if compressed.is_some() {
+        codec.bits()
+    } else {
+        0
+    };
+    let stored_payload: &[u8] = compressed.as_deref().unwrap_or(payload);
+
+    match keyring {
+        None => {
+            let Some(stored_payload) = &compressed else {
+                return Ok(None); // verbatim: uncompressed, unencrypted
+            };
+            let stored_header = PageHeader {
+                flags: header.flags | codec_bits,
+                ..header
+            };
+            Ok(Some(format::encode_page(&stored_header, stored_payload)?))
+        }
+        Some(ring) => {
+            let flags = header.flags | codec_bits | FLAG_ENCRYPTED;
+            let stored_header = PageHeader { flags, ..header };
+            let sealed = ring.seal(stored_payload, &page_aad(shard_id, &stored_header))?;
+            Ok(Some(format::encode_page(&stored_header, &sealed)?))
+        }
+    }
+}
+
+/// Rebuild the uncompressed pool image from a CRC-verified stored page (fault
+/// path, TIER-044): decrypt the stored payload if [`FLAG_ENCRYPTED`] is set
+/// (SEC-011 — the CRC already passed), then decompress if the codec bits say
+/// so, then clear both the codec and encryption bits and re-encode. The
+/// result is bit-identical to the image originally spilled.
+///
+/// A page whose bytes were sealed under a retired (`previous`) key still
+/// opens (SEC-012 lazy rotation); it re-seals under the active key the next
+/// time it is modified and spilled.
+pub fn open_image(
+    header: &PageHeader,
+    stored_payload: &[u8],
+    max_raw: usize,
+    shard_id: u32,
+    keyring: Option<&Keyring>,
+) -> Result<Vec<u8>> {
+    // 1. Decrypt (SEC-011): only reached after CRC verification.
+    let payload: Cow<'_, [u8]> = if header.is_encrypted() {
+        let ring = keyring.ok_or_else(|| {
+            FluxumError::Storage(format!(
+                "page {} is encrypted at rest but no keyring is configured (SEC-010)",
+                header.page_id
+            ))
+        })?;
+        let (plain, _active) = ring.open(stored_payload, &page_aad(shard_id, header))?;
+        Cow::Owned(plain)
+    } else {
+        Cow::Borrowed(stored_payload)
+    };
+
+    // 2. Decompress if the codec bits are non-zero.
+    let codec = PageCodec::from_bits(header.codec()).ok_or_else(|| {
+        FluxumError::Storage(format!(
+            "page {} carries reserved codec bits 3 (TIER-021)",
+            header.page_id
+        ))
+    })?;
+    let raw = if codec == PageCodec::None {
+        payload.into_owned()
+    } else {
+        decompress_payload(codec, &payload, max_raw)?
+    };
+
+    // 3. Clear codec + encryption bits and re-encode the plain pool image.
+    let raw_header = PageHeader {
+        flags: header.flags & !(FLAG_CODEC_MASK | FLAG_ENCRYPTED),
+        ..*header
+    };
+    format::encode_page(&raw_header, &raw)
+}
+
 /// The stored payload length of an encoded image (bytes after the header) —
 /// the `fluxum_page_compression_ratio` denominator input (TIER-080).
 pub(crate) fn payload_len(image: &[u8]) -> u64 {
     image.len().saturating_sub(PAGE_HEADER_LEN) as u64
 }
 
+/// Magic prefix of an encrypted artifact envelope (SEC-010): the sealed
+/// `[nonce ++ ciphertext ++ tag]` follows. Distinct from the zstd frame
+/// magic and every plaintext artifact magic (`FLXCKPT1`, MessagePack), so
+/// artifacts stay self-describing across the encryption boundary.
+pub const ARTIFACT_ENC_MAGIC: [u8; 8] = *b"FLXENC01";
+
+/// The AEAD associated data binding an artifact envelope to the artifact
+/// domain (so a page envelope can never be replayed as an artifact and vice
+/// versa; pages bind an 18-byte position tuple instead).
+const ARTIFACT_AAD: &[u8] = b"fluxum-at-rest-artifact-v1";
+
 /// Compress a checkpoint/backup artifact (manifest, content-addressed
-/// object, backup archive member) as one zstd frame (TIER-042). `level` is
+/// object, backup archive member) as one zstd frame (TIER-042), then — when
+/// a keyring is present — AEAD-encrypt it under the active key (SEC-010),
+/// prefixed with [`ARTIFACT_ENC_MAGIC`]. `level` is
 /// `storage.checkpoint_compression_level` (default
 /// [`DEFAULT_ARTIFACT_ZSTD_LEVEL`]).
-pub fn compress_artifact(bytes: &[u8], level: i32) -> Result<Vec<u8>> {
-    zstd::stream::encode_all(bytes, level)
-        .map_err(|e| FluxumError::Storage(format!("zstd artifact compression failed: {e}")))
+pub fn compress_artifact(bytes: &[u8], level: i32, keyring: Option<&Keyring>) -> Result<Vec<u8>> {
+    let compressed = zstd::stream::encode_all(bytes, level)
+        .map_err(|e| FluxumError::Storage(format!("zstd artifact compression failed: {e}")))?;
+    match keyring {
+        None => Ok(compressed),
+        Some(ring) => {
+            let sealed = ring.seal(&compressed, ARTIFACT_AAD)?;
+            let mut out = Vec::with_capacity(ARTIFACT_ENC_MAGIC.len() + sealed.len());
+            out.extend_from_slice(&ARTIFACT_ENC_MAGIC);
+            out.extend_from_slice(&sealed);
+            Ok(out)
+        }
+    }
 }
 
-/// Decompress an artifact written by [`compress_artifact`], passing raw
-/// (pre-compression) artifacts through unchanged. Self-describing via the
-/// zstd frame magic: `FLXCKPT1` manifests and MessagePack chunk objects can
-/// never start with `28 B5 2F FD`.
-pub fn decompress_artifact(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
-    if bytes.starts_with(&ZSTD_MAGIC) {
-        let raw = zstd::stream::decode_all(bytes).map_err(|e| {
+/// Decompress an artifact written by [`compress_artifact`], decrypting first
+/// when the [`ARTIFACT_ENC_MAGIC`] envelope is present (SEC-011 — a wrong or
+/// absent key is an authentication failure, never silent garbage), then
+/// passing raw (pre-compression) artifacts through unchanged. Self-describing
+/// via the artifact and zstd magics.
+pub fn decompress_artifact<'a>(
+    bytes: &'a [u8],
+    keyring: Option<&Keyring>,
+) -> Result<Cow<'a, [u8]>> {
+    let inner: Cow<'a, [u8]> = if bytes.starts_with(&ARTIFACT_ENC_MAGIC) {
+        let ring = keyring.ok_or_else(|| {
+            FluxumError::Storage(
+                "artifact is encrypted at rest but no keyring is configured (SEC-010)".into(),
+            )
+        })?;
+        let (plain, _active) = ring.open(&bytes[ARTIFACT_ENC_MAGIC.len()..], ARTIFACT_AAD)?;
+        Cow::Owned(plain)
+    } else {
+        Cow::Borrowed(bytes)
+    };
+    if inner.starts_with(&ZSTD_MAGIC) {
+        let raw = zstd::stream::decode_all(inner.as_ref()).map_err(|e| {
             FluxumError::Storage(format!("zstd artifact decompression failed: {e}"))
         })?;
         Ok(Cow::Owned(raw))
     } else {
-        Ok(Cow::Borrowed(bytes))
+        Ok(inner)
     }
 }
 
@@ -459,12 +615,80 @@ mod tests {
     }
 
     #[test]
+    fn encode_for_storage_rejects_a_flagged_pool_image() {
+        // A pool image must arrive with clean flags (no codec/enc bits).
+        let header = PageHeader::new(4, 0xAB, 0, PageCodec::Lz4.bits());
+        let image = encode_page(&header, b"already-stored").unwrap_or_else(|e| panic!("{e}"));
+        let err = match encode_for_storage(&image, PageCodec::Lz4, 0, 0, None) {
+            Ok(_) => panic!("flagged pool image accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("already carries codec/encryption bits"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn open_image_rejects_reserved_codec_bits_3() {
+        let header = PageHeader {
+            page_id: 9,
+            table_id: 1,
+            row_count: 0,
+            flags: (crate::store::pager::format::FORMAT_VERSION << 8) | 0b11,
+        };
+        let err = match open_image(&header, &[0u8; 8], 4096, 0, None) {
+            Ok(_) => panic!("reserved codec bits decoded"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("reserved codec bits 3"), "{err}");
+    }
+
+    #[test]
+    fn encrypted_incompressible_page_seals_raw_and_opens() {
+        use crate::crypto::{AtRestKey, Keyring};
+        // splitmix64 output: incompressible, so compression is skipped and
+        // the raw payload is sealed (codec bits stay 0, FLAG_ENCRYPTED set).
+        let mut state = 11u64;
+        let mut payload = Vec::with_capacity(2048);
+        while payload.len() < 2048 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            payload.extend_from_slice(&(z ^ (z >> 27)).to_le_bytes());
+        }
+        let image =
+            encode_page(&PageHeader::new(2, 7, 1, 0), &payload).unwrap_or_else(|e| panic!("{e}"));
+        let ring = Keyring::new(AtRestKey::new("k", [3u8; 32]), vec![]);
+
+        // No keyring + incompressible ⇒ stored verbatim (None).
+        assert!(
+            encode_for_storage(&image, PageCodec::Lz4, 0, 0, None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_none(),
+            "incompressible unencrypted page stores verbatim"
+        );
+
+        // With a keyring, even an incompressible page is sealed (raw payload).
+        let stored = encode_for_storage(&image, PageCodec::Lz4, 0, 0, Some(&ring))
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("encryption always stores"));
+        let (header, sealed) = decode_page(&stored, 0, 7, 2).unwrap_or_else(|e| panic!("{e}"));
+        assert!(header.is_encrypted());
+        assert_eq!(header.codec(), 0, "raw payload sealed, no compression");
+        let rebuilt =
+            open_image(&header, sealed, 8192, 0, Some(&ring)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(rebuilt, image);
+    }
+
+    #[test]
     fn corrupt_zstd_artifacts_surface_a_decompression_error() {
         // The zstd magic followed by garbage: routed to the codec, which
         // must fail loudly instead of passing bytes through.
         let mut bogus = ZSTD_MAGIC.to_vec();
         bogus.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-        let err = match decompress_artifact(&bogus) {
+        let err = match decompress_artifact(&bogus, None) {
             Ok(_) => panic!("corrupt zstd frame passed through"),
             Err(e) => e,
         };
@@ -478,16 +702,16 @@ mod tests {
     #[test]
     fn artifacts_round_trip_and_raw_artifacts_pass_through() {
         let body = compressible(10_000);
-        let stored =
-            compress_artifact(&body, DEFAULT_ARTIFACT_ZSTD_LEVEL).unwrap_or_else(|e| panic!("{e}"));
+        let stored = compress_artifact(&body, DEFAULT_ARTIFACT_ZSTD_LEVEL, None)
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(stored.starts_with(&ZSTD_MAGIC));
         assert!(stored.len() < body.len());
-        let raw = decompress_artifact(&stored).unwrap_or_else(|e| panic!("{e}"));
+        let raw = decompress_artifact(&stored, None).unwrap_or_else(|e| panic!("{e}"));
         assert_eq!(raw.as_ref(), body.as_slice());
 
         // A pre-compression artifact (no zstd magic) passes through borrowed.
         let legacy = b"FLXCKPT1 legacy manifest bytes";
-        let out = decompress_artifact(legacy).unwrap_or_else(|e| panic!("{e}"));
+        let out = decompress_artifact(legacy, None).unwrap_or_else(|e| panic!("{e}"));
         assert!(matches!(out, Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), legacy);
     }
