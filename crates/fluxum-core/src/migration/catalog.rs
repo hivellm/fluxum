@@ -357,6 +357,7 @@ mod tests {
             (FluxType::ConnectionId, StoredType::ConnectionId),
             (FluxType::EntityId, StoredType::EntityId),
             (FluxType::Timestamp, StoredType::Timestamp),
+            (FluxType::Decimal, StoredType::Decimal),
         ];
         for (flux, stored) in pairs {
             assert_eq!(StoredType::from(&flux), stored, "{flux:?}");

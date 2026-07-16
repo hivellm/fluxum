@@ -952,3 +952,59 @@ async fn concurrent_readers_never_block_while_writes_serialize() {
     let expected: Vec<u64> = (1..=TOTAL + 1).collect();
     assert_eq!(logged, expected);
 }
+
+// --- Pipeline construction + worker-loss error surfaces (TXN-010/011) --------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn zero_queue_capacity_is_rejected_at_construction() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mem_store();
+    let log = Arc::new(CommitLog::open(dir.path(), SHARD, 1, CommitLogOptions::default()).unwrap());
+    let err = TxPipeline::new(store, log, TxPipelineOptions { queue_capacity: 0 }).unwrap_err();
+    assert!(err.to_string().contains("queue_capacity"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_worker_fails_submissions_and_in_flight_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = mem_store();
+    let log = Arc::new(
+        CommitLog::open(&dir.path().join("a"), SHARD, 1, CommitLogOptions::default()).unwrap(),
+    );
+    let (pipeline, worker) = TxPipeline::new(store, log, TxPipelineOptions::default()).unwrap();
+
+    // An in-flight call whose job the dying worker drops resolves to an
+    // error, never hangs.
+    let mut fut = Box::pin(pipeline.call(Box::new(|_tx| Ok(()))));
+    // Poll once so the job is queued (the worker never runs).
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut fut)
+            .await
+            .is_err(),
+        "no worker: the call cannot complete yet"
+    );
+    drop(worker);
+    let err = fut.await.unwrap_err();
+    assert!(err.to_string().contains("dropped the call"), "{err}");
+
+    // With the worker gone, new submissions fail immediately.
+    let err = pipeline.submit(Box::new(|_tx| Ok(()))).unwrap_err();
+    assert!(err.to_string().contains("worker stopped"), "{err}");
+}
+
+// --- TXN-022: non-string panic payloads still produce a wire-ready 500 --------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_string_panic_payloads_are_reported_generically() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_store, pipeline, _worker) = pipeline_in(dir.path(), TxPipelineOptions::default());
+    let err = pipeline
+        .call(Box::new(|_tx| std::panic::panic_any(42u32)))
+        .await
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(500), "{err}");
+    assert!(
+        err.to_string().contains("non-string panic payload"),
+        "{err}"
+    );
+}

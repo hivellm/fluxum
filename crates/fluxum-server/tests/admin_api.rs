@@ -397,3 +397,528 @@ async fn view_endpoint_dispatches_and_returns_json() {
     assert_eq!(resp.status, 404);
     server.shutdown();
 }
+
+// --- Admin routing edges (RPC-050) ----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_route_with_wrong_method_is_404_and_unknown_paths_map_to_http_codes() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // An admin path with the wrong method falls through dispatch → 404.
+    let resp = request(addr, "DELETE", "/health", None).await;
+    assert_eq!(resp.status, 404);
+    let json = resp.json();
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"], "not found");
+
+    // A GET/POST outside every route is a plain 404.
+    let resp = request(addr, "GET", "/nope", None).await;
+    assert_eq!(resp.status, 404);
+
+    // A non-GET/POST method outside the admin surface is 405.
+    let resp = request(addr, "DELETE", "/nope", None).await;
+    assert_eq!(resp.status, 405);
+    server.shutdown();
+}
+
+// --- POST /reducer error paths (RPC-051) -----------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reducer_endpoint_rejects_malformed_bodies() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // Invalid JSON → 400.
+    let resp = request(addr, "POST", "/reducer/send_chat", Some("{nope")).await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON")
+    );
+
+    // Empty body → empty argument list → arity failure (a 400 envelope).
+    let resp = request(addr, "POST", "/reducer/send_chat", None).await;
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["success"], false);
+
+    // An argument outside the FluxValue universe (a JSON object).
+    let resp = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":[{"k":1}]}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("FluxValue universe")
+    );
+
+    // A non-array payload.
+    let resp = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":"text"}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("argument array")
+    );
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn reducer_endpoint_accepts_bare_json_and_every_flux_json_shape() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // A bare (non-enveloped) JSON array body is taken as the payload.
+    let resp = request(addr, "POST", "/reducer/send_chat", Some(r#"["bare"]"#)).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["payload"]["committed"], true);
+
+    // Every JSON shape inside the FluxValue universe converts: null, bool,
+    // integer, float, string, nested array. send_chat then rejects the
+    // arity, proving conversion ran before dispatch.
+    let resp = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":[null, true, 3, 2.5, "s", [1, "x"]]}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    assert_eq!(resp.json()["success"], false);
+    server.shutdown();
+}
+
+// --- POST /query error paths ------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_endpoint_rejects_bad_bodies() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // Invalid JSON → 400.
+    let resp = request(addr, "POST", "/query", Some("{nope")).await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid JSON")
+    );
+
+    // Missing payload.sql → 400.
+    let resp = request(addr, "POST", "/query", Some(r#"{"payload":{}}"#)).await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("payload.sql")
+    );
+    server.shutdown();
+}
+
+// --- Transformed schema + error-status harness (CT-050/052; RPC-052) ------------
+
+static VAULT_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "id",
+        ty: FluxType::U64,
+    },
+    ColumnSchema {
+        name: "owner",
+        ty: FluxType::Identity,
+    },
+    ColumnSchema {
+        name: "amount",
+        ty: FluxType::Decimal,
+    },
+    ColumnSchema {
+        name: "at",
+        ty: FluxType::Timestamp,
+    },
+    ColumnSchema {
+        name: "memo",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "title",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "label",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "card",
+        ty: FluxType::Bytes,
+    },
+    ColumnSchema {
+        name: "total",
+        ty: FluxType::I64,
+    },
+    ColumnSchema {
+        name: "subtotal",
+        ty: FluxType::I64,
+    },
+    ColumnSchema {
+        name: "pub_note",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "own_note",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "srv_note",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "hint",
+        ty: FluxType::Str,
+    },
+];
+static VAULT: TableSchema = TableSchema {
+    name: "Vault",
+    columns: VAULT_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Public,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: VisibilityRule::PublicAll,
+};
+
+use fluxum_core::transform::{
+    CaseFold, ColumnTransformDef, CryptoScheme, GrantScope, MaskStrategy, SignScheme, SignedBy,
+    StringForm, TransformDescriptor,
+};
+
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "amount",
+        transforms: &[TransformDescriptor::NormalizeMoney { scale: 2, currency: Some("USD") }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "at",
+        transforms: &[TransformDescriptor::NormalizeDatetime],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "memo",
+        transforms: &[TransformDescriptor::NormalizeString {
+            form: StringForm::Nfc,
+            case: CaseFold::None,
+            trim: false,
+        }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "title",
+        transforms: &[TransformDescriptor::NormalizeString {
+            form: StringForm::Nfkc,
+            case: CaseFold::Fold,
+            trim: true,
+        }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "label",
+        transforms: &[TransformDescriptor::NormalizeString {
+            form: StringForm::Nfc,
+            case: CaseFold::Lower,
+            trim: false,
+        }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "card",
+        transforms: &[
+            TransformDescriptor::Encrypted { scheme: CryptoScheme::Ecies, key: "vault_key" },
+            TransformDescriptor::Masked { strategy: MaskStrategy::Ciphertext },
+            TransformDescriptor::Grant { select: GrantScope::Role("auditor") },
+        ],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "total",
+        transforms: &[TransformDescriptor::Signed {
+            scheme: SignScheme::Ed25519,
+            by: SignedBy::Server,
+        }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "subtotal",
+        transforms: &[TransformDescriptor::Signed {
+            scheme: SignScheme::Ed25519,
+            by: SignedBy::IdentityColumn(1),
+        }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "pub_note",
+        transforms: &[TransformDescriptor::Grant { select: GrantScope::Public }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "own_note",
+        transforms: &[TransformDescriptor::Grant { select: GrantScope::Owner }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "srv_note",
+        transforms: &[TransformDescriptor::Grant { select: GrantScope::ServerPeer }],
+    }
+}
+fluxum_core::schema::inventory::submit! {
+    ColumnTransformDef {
+        table: "Vault",
+        column: "hint",
+        transforms: &[TransformDescriptor::Masked { strategy: MaskStrategy::Hash }],
+    }
+}
+
+/// A view whose handler fails with a non-`Query` error → HTTP 500.
+fn boom_view(_ctx: &ViewContext<'_>, _args: &[FluxValue]) -> Result<Value> {
+    Err(fluxum_core::FluxumError::Storage("view exploded".into()))
+}
+static BOOM_VIEW: ViewDef = ViewDef {
+    name: "boom",
+    handler: boom_view,
+};
+
+/// A schedule-only reducer: a client (or admin) call answers 403 (RED-025).
+static SCHED_ONLY: ReducerDef = ReducerDef {
+    name: "sched_only",
+    handler: |_, _| Ok(()),
+    check_args: |_| Ok(()),
+    client_callable: false,
+    max_rate_per_sec: 0,
+};
+
+/// A rate-limited reducer: the second call within a second answers 429.
+static LIMITED: ReducerDef = ReducerDef {
+    name: "limited_chat",
+    handler: send_chat,
+    check_args,
+    client_callable: true,
+    max_rate_per_sec: 1,
+};
+
+async fn start_hardened(shard_max_reducers_per_sec: u64) -> http::HttpServer {
+    use fluxum_core::reducer::{RateLimiter, RateLimiterOptions};
+
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let schema = Schema::from_tables([&CHAT, &VAULT]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            1,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let engine = ReducerEngine::new(
+        pipeline,
+        Arc::new(ReducerRegistry::from_defs([&SEND_CHAT, &SCHED_ONLY, &LIMITED]).unwrap()),
+        LifecycleHooks::none(),
+        SHARD,
+        fluxum_core::auth::server_identity("admin-test"),
+    )
+    .with_rate_limiter(RateLimiter::new(
+        RateLimiterOptions {
+            shard_max_reducers_per_sec,
+        },
+        [],
+    ));
+    let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    let auth = Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
+    let views = ViewRegistry::from_defs([&CHAT_COUNT, &BOOM_VIEW]).unwrap();
+    let ctx = ShardContext::with_views(engine, subs, auth, views, SHARD, 256);
+    http::serve(ctx, "127.0.0.1:0", HttpOptions::default())
+        .await
+        .unwrap()
+}
+
+// --- CT-050/052: /schema surfaces every transform descriptor kind ---------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schema_surfaces_column_transform_descriptors() {
+    let server = start_hardened(0).await;
+    let resp = request(server.local_addr, "GET", "/schema", None).await;
+    assert_eq!(resp.status, 200);
+    let json = resp.json();
+    let tables = json["payload"]["tables"].as_array().unwrap();
+    let vault = tables.iter().find(|t| t["name"] == "Vault").unwrap();
+    let column = |name: &str| -> &Value {
+        vault["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap()
+    };
+
+    // Untransformed columns carry no `transforms` key.
+    assert!(column("id").get("transforms").is_none());
+
+    assert_eq!(
+        column("amount")["transforms"][0],
+        serde_json::json!({ "kind": "normalize.money", "scale": 2, "currency": "USD" })
+    );
+    assert_eq!(
+        column("at")["transforms"][0],
+        serde_json::json!({ "kind": "normalize.datetime" })
+    );
+    // The three case folds and both Unicode forms.
+    assert_eq!(column("memo")["transforms"][0]["form"], "nfc");
+    assert_eq!(column("memo")["transforms"][0]["case"], "none");
+    assert_eq!(column("memo")["transforms"][0]["trim"], false);
+    assert_eq!(column("title")["transforms"][0]["form"], "nfkc");
+    assert_eq!(column("title")["transforms"][0]["case"], "fold");
+    assert_eq!(column("title")["transforms"][0]["trim"], true);
+    assert_eq!(column("label")["transforms"][0]["case"], "lower");
+
+    // The encrypted → masked → grant pipeline, key NAME only (CT-052).
+    let card = column("card")["transforms"].as_array().unwrap();
+    assert_eq!(
+        card[0],
+        serde_json::json!({ "kind": "encrypted", "scheme": "ecies", "key": "vault_key" })
+    );
+    assert_eq!(
+        card[1],
+        serde_json::json!({ "kind": "masked", "strategy": "ciphertext" })
+    );
+    assert_eq!(
+        card[2],
+        serde_json::json!({ "kind": "column_grant", "select": { "role": "auditor" } })
+    );
+
+    // Both signing authorities.
+    assert_eq!(column("total")["transforms"][0]["by"], "server");
+    assert_eq!(
+        column("subtotal")["transforms"][0]["by"],
+        serde_json::json!({ "column": 1 })
+    );
+
+    // The remaining grant scopes and the hash mask.
+    assert_eq!(column("pub_note")["transforms"][0]["select"], "public");
+    assert_eq!(column("own_note")["transforms"][0]["select"], "owner");
+    assert_eq!(column("srv_note")["transforms"][0]["select"], "server_peer");
+    assert_eq!(column("hint")["transforms"][0]["strategy"], "hash");
+    server.shutdown();
+}
+
+// --- RPC-052: error statuses map onto HTTP codes ---------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_errors_carry_403_429_500_statuses() {
+    let server = start_hardened(0).await;
+    let addr = server.local_addr;
+
+    // A schedule-only reducer answers 403 (RED-025).
+    let resp = request(
+        addr,
+        "POST",
+        "/reducer/sched_only",
+        Some(r#"{"payload":[]}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 403);
+    assert_eq!(resp.json()["success"], false);
+
+    // A rate-limited reducer answers 429 on the burst excess (RED-050).
+    let first = request(
+        addr,
+        "POST",
+        "/reducer/limited_chat",
+        Some(r#"{"payload":["a"]}"#),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    let second = request(
+        addr,
+        "POST",
+        "/reducer/limited_chat",
+        Some(r#"{"payload":["b"]}"#),
+    )
+    .await;
+    assert_eq!(second.status, 429);
+
+    // A view failing with a non-Query error is a 500.
+    let resp = request(addr, "GET", "/view/boom", None).await;
+    assert_eq!(resp.status, 500);
+    assert!(
+        resp.json()["error"]
+            .as_str()
+            .unwrap()
+            .contains("view exploded")
+    );
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shard_cap_answers_503_on_the_excess_call() {
+    let server = start_hardened(1).await;
+    let addr = server.local_addr;
+    let first = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":["a"]}"#),
+    )
+    .await;
+    assert_eq!(first.status, 200);
+    let second = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":["b"]}"#),
+    )
+    .await;
+    assert_eq!(second.status, 503, "RED-052 shard overload");
+    server.shutdown();
+}

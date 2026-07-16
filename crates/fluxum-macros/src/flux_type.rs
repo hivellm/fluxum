@@ -274,3 +274,78 @@ fn expand_enum(name: &str, data: &DataEnum) -> syn::Result<Body> {
         },
     })
 }
+
+#[cfg(test)]
+mod tests {
+    //! Rejection branches of `#[derive(FluxType)]`, probed on the expansion
+    //! functions directly (the UI suite pins the end-to-end rendering).
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    fn expand_err(input: TokenStream) -> String {
+        try_expand(input).expect_err("derive must fail").to_string()
+    }
+
+    #[test]
+    fn generic_types_are_rejected() {
+        let err = expand_err(quote! { struct G<T> { a: T } });
+        assert!(err.contains("does not support generic types"), "{err}");
+
+        let err = expand_err(quote! { struct W where u32: Copy { a: u32 } });
+        assert!(err.contains("does not support generic types"), "{err}");
+    }
+
+    #[test]
+    fn unions_are_rejected() {
+        let err = expand_err(quote! { union U { a: u32 } });
+        assert!(err.contains("cannot be derived for unions"), "{err}");
+    }
+
+    #[test]
+    fn tuple_structs_are_rejected() {
+        let err = expand_err(quote! { struct P(u32); });
+        assert!(err.contains("requires named fields"), "{err}");
+    }
+
+    #[test]
+    fn empty_and_oversized_enums_are_rejected() {
+        let err = expand_err(quote! { enum Never {} });
+        assert!(err.contains("at least one variant"), "{err}");
+
+        let variants = (0..=256).map(|i| quote::format_ident!("V{i}"));
+        let err = expand_err(quote! { enum Big { #(#variants),* } });
+        assert!(err.contains("at most 256 variants"), "{err}");
+    }
+
+    #[test]
+    fn nameless_named_fields_are_rejected_defensively() {
+        // Unparseable via source text (named fields always carry idents), so
+        // the defensive branches are probed on mutated syntax trees.
+        let input: DeriveInput = syn::parse_quote! { struct S { a: u32 } };
+        let Data::Struct(mut data) = input.data else {
+            panic!("expected struct data");
+        };
+        if let Fields::Named(named) = &mut data.fields {
+            named.named.first_mut().expect("field").ident = None;
+        }
+        let err = expand_struct("S", &data.fields)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("expected a named field"), "{err}");
+
+        let input: DeriveInput = syn::parse_quote! { enum E { A { x: u32 } } };
+        let Data::Enum(mut data) = input.data else {
+            panic!("expected enum data");
+        };
+        if let Fields::Named(named) = &mut data.variants.first_mut().expect("variant").fields {
+            named.named.first_mut().expect("field").ident = None;
+        }
+        let err = expand_enum("E", &data)
+            .err()
+            .expect("must fail")
+            .to_string();
+        assert!(err.contains("expected a named field"), "{err}");
+    }
+}

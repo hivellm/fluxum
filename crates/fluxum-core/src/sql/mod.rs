@@ -463,3 +463,188 @@ fn normalize(ast: &QueryAst) -> String {
     }
     out
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnSchema, SpatialKind, TableAccess};
+
+    static RICH_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "a_i8",
+            ty: FluxType::I8,
+        },
+        ColumnSchema {
+            name: "b_i16",
+            ty: FluxType::I16,
+        },
+        ColumnSchema {
+            name: "c_u8",
+            ty: FluxType::U8,
+        },
+        ColumnSchema {
+            name: "d_u16",
+            ty: FluxType::U16,
+        },
+        ColumnSchema {
+            name: "e_f32",
+            ty: FluxType::F32,
+        },
+        ColumnSchema {
+            name: "f_f64",
+            ty: FluxType::F64,
+        },
+        ColumnSchema {
+            name: "g_entity",
+            ty: FluxType::EntityId,
+        },
+        ColumnSchema {
+            name: "h_bool",
+            ty: FluxType::Bool,
+        },
+    ];
+
+    static RICH: TableSchema = TableSchema {
+        name: "Rich",
+        columns: RICH_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[IndexSchema::Spatial {
+            kind: SpatialKind::QuadTree,
+            columns: &[5, 5],
+        }],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    fn coerce_ok(column: &str, lit: &Lit) -> RowValue {
+        let (_, ty) = resolve_column(&RICH, column).unwrap();
+        coerce(&RICH, column, lit, ty).unwrap()
+    }
+
+    fn coerce_err(column: &str, lit: &Lit) -> String {
+        let (_, ty) = resolve_column(&RICH, column).unwrap();
+        coerce(&RICH, column, lit, ty).unwrap_err().to_string()
+    }
+
+    /// SUB-010 literal coercion: int literals inhabit every numeric column
+    /// kind (range-checked), widen to floats, and reject non-numeric columns.
+    #[test]
+    fn int_literals_coerce_to_every_numeric_column_kind() {
+        assert_eq!(coerce_ok("a_i8", &Lit::Int(-5)), RowValue::I8(-5));
+        assert_eq!(coerce_ok("b_i16", &Lit::Int(-300)), RowValue::I16(-300));
+        assert_eq!(coerce_ok("c_u8", &Lit::Int(200)), RowValue::U8(200));
+        assert_eq!(coerce_ok("d_u16", &Lit::Int(60_000)), RowValue::U16(60_000));
+        assert_eq!(coerce_ok("e_f32", &Lit::Int(2)), RowValue::F32(2.0));
+        assert_eq!(coerce_ok("f_f64", &Lit::Int(3)), RowValue::F64(3.0));
+        assert_eq!(
+            coerce_ok("g_entity", &Lit::Int(9)),
+            RowValue::EntityId(crate::types::EntityId::new(9))
+        );
+        // Range breach and kind mismatch are both wire-ready 400s.
+        assert!(coerce_err("a_i8", &Lit::Int(200)).contains("does not inhabit"));
+        assert!(coerce_err("g_entity", &Lit::Int(-1)).contains("does not inhabit"));
+        assert!(coerce_err("h_bool", &Lit::Int(1)).contains("does not inhabit"));
+    }
+
+    #[test]
+    fn float_literals_coerce_only_to_float_columns() {
+        assert_eq!(coerce_ok("e_f32", &Lit::Float(0.25)), RowValue::F32(0.25));
+        assert_eq!(coerce_ok("f_f64", &Lit::Float(1.5)), RowValue::F64(1.5));
+        assert!(coerce_err("a_i8", &Lit::Float(1.5)).contains("does not inhabit"));
+    }
+
+    /// cmp_row_values: total within a variant, `None` across variants —
+    /// the BETWEEN / ORDER BY comparison contract.
+    #[test]
+    fn cmp_row_values_orders_within_a_variant_only() {
+        use std::cmp::Ordering::Less;
+        let cases: &[(RowValue, RowValue)] = &[
+            (RowValue::I8(-1), RowValue::I8(1)),
+            (RowValue::I16(-1), RowValue::I16(1)),
+            (RowValue::I32(-1), RowValue::I32(1)),
+            (RowValue::I64(-1), RowValue::I64(1)),
+            (RowValue::U8(1), RowValue::U8(2)),
+            (RowValue::U16(1), RowValue::U16(2)),
+            (RowValue::U32(1), RowValue::U32(2)),
+            (RowValue::U64(1), RowValue::U64(2)),
+            (RowValue::F32(0.5), RowValue::F32(1.5)),
+            (RowValue::F64(0.5), RowValue::F64(1.5)),
+            (RowValue::Str("a".into()), RowValue::Str("b".into())),
+            (
+                RowValue::EntityId(crate::types::EntityId::new(1)),
+                RowValue::EntityId(crate::types::EntityId::new(2)),
+            ),
+            (
+                RowValue::Timestamp(crate::types::Timestamp::from_micros(1)),
+                RowValue::Timestamp(crate::types::Timestamp::from_micros(2)),
+            ),
+        ];
+        for (lo, hi) in cases {
+            assert_eq!(cmp_row_values(lo, hi), Some(Less), "{lo:?} < {hi:?}");
+        }
+        // Cross-variant and non-orderable values have no order.
+        assert_eq!(cmp_row_values(&RowValue::I8(1), &RowValue::I16(1)), None);
+        assert_eq!(
+            cmp_row_values(&RowValue::Bool(true), &RowValue::Bool(false)),
+            None
+        );
+        // NaN floats have no order either.
+        assert_eq!(
+            cmp_row_values(&RowValue::F64(f64::NAN), &RowValue::F64(1.0)),
+            None
+        );
+    }
+
+    /// SPX-020/021: non-finite spatial parameters are rejected (the lexer
+    /// already refuses non-finite literals; this is the compiler's own
+    /// backstop over the parsed AST).
+    #[test]
+    fn compile_spatial_rejects_non_finite_parameters() {
+        let err = compile_spatial(
+            &RICH,
+            SpatialAst::Region {
+                x: f64::NAN,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-finite REGION"), "{err}");
+
+        let err = compile_spatial(
+            &RICH,
+            SpatialAst::Radius {
+                r: f64::INFINITY,
+                x: 0.0,
+                y: 0.0,
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("non-finite RADIUS"), "{err}");
+    }
+
+    #[test]
+    fn query_hash_and_plan_debug_render() {
+        assert_eq!(QueryHash(0xAB).to_string(), "00000000000000ab");
+        let plan = CompiledPlan {
+            query_id: 1,
+            table_ids: vec![TableId::of("Rich")],
+            filter: None,
+            rls: None,
+            order_by: None,
+            limit: Some(5),
+            equalities: vec![],
+            spatial: None,
+            query_hash: QueryHash(7),
+            normalized: "SELECT * FROM Rich LIMIT 5".to_owned(),
+        };
+        let debug = format!("{plan:?}");
+        assert!(debug.contains("has_filter"), "{debug}");
+        assert!(debug.contains("SELECT * FROM Rich LIMIT 5"), "{debug}");
+    }
+}

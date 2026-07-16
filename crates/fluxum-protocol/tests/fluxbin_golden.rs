@@ -14,6 +14,35 @@ fn written(f: impl FnOnce(&mut FluxBinWriter)) -> Vec<u8> {
 }
 
 #[test]
+fn writer_accessors_and_raw_splice() {
+    let mut w = FluxBinWriter::new();
+    assert!(w.is_empty());
+    assert_eq!(w.len(), 0);
+    w.write_u8(0xAA);
+    assert!(!w.is_empty());
+    // write_raw splices pre-encoded bytes verbatim.
+    w.write_raw(&[0xBB, 0xCC]);
+    assert_eq!(w.len(), 3);
+    assert_eq!(w.as_bytes(), [0xAA, 0xBB, 0xCC]);
+}
+
+#[test]
+fn reader_tracks_its_position() {
+    let bytes = written(|w| {
+        w.write_u16(0x1234);
+        w.write_u8(0x56);
+    });
+    let mut r = FluxBinReader::new(&bytes);
+    assert_eq!(r.position(), 0);
+    assert_eq!(r.read_u16().unwrap(), 0x1234);
+    assert_eq!(r.position(), 2);
+    assert_eq!(r.remaining(), 1);
+    assert_eq!(r.read_u8().unwrap(), 0x56);
+    assert_eq!(r.position(), 3);
+    r.expect_eof().unwrap();
+}
+
+#[test]
 fn golden_bool() {
     assert_eq!(written(|w| w.write_bool(false)), [0x00]);
     assert_eq!(written(|w| w.write_bool(true)), [0x01]);

@@ -377,6 +377,105 @@ mod tests {
     }
 
     #[test]
+    fn decompress_payload_rejects_the_none_codec() {
+        let err = match decompress_payload(PageCodec::None, &[0u8; 8], 4096) {
+            Ok(_) => panic!("codec None must be rejected"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("uncompressed page"), "{err}");
+    }
+
+    #[test]
+    fn stored_payload_shorter_than_the_prefix_is_rejected() {
+        let err = match decompress_payload(PageCodec::Lz4, &[1u8, 2], 4096) {
+            Ok(_) => panic!("2-byte stored payload decoded"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("shorter than its raw_len prefix"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn raw_len_overflowing_i32_is_rejected_without_allocating() {
+        // raw_len = u32::MAX passes the max_raw bound (usize::MAX) but must
+        // fail the i32 conversion the LZ4 API needs.
+        let mut stored = u32::MAX.to_le_bytes().to_vec();
+        stored.extend_from_slice(&[0u8; 4]);
+        let err = match decompress_payload(PageCodec::Lz4, &stored, usize::MAX) {
+            Ok(_) => panic!("oversized raw_len decoded"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("overflows i32"), "{err}");
+    }
+
+    #[test]
+    fn decoded_length_must_match_the_declared_raw_len() {
+        let payload = compressible(6000);
+        let mut stored = compress_payload(PageCodec::Zstd, &payload, 1024)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .unwrap_or_else(|| panic!("compressible payload stored raw"));
+        // Tamper the raw_len prefix upward by one: zstd decodes to the
+        // original 6000 bytes, which no longer equals the declared length.
+        let declared = u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]) + 1;
+        stored[..4].copy_from_slice(&declared.to_le_bytes());
+        let err = match decompress_payload(PageCodec::Zstd, &stored, 16384) {
+            Ok(_) => panic!("length-mismatched payload decoded"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("but declared raw_len"), "{err}");
+    }
+
+    #[test]
+    fn compress_image_rejects_an_already_compressed_pool_image() {
+        // A pool frame must never hold codec bits (TIER-044).
+        let header = PageHeader::new(3, 0xAB, 0, PageCodec::Lz4.bits());
+        let image = encode_page(&header, b"stored-form").unwrap_or_else(|e| panic!("{e}"));
+        let err = match compress_image(&image, PageCodec::Lz4, 0) {
+            Ok(_) => panic!("codec-flagged pool image accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("already carries codec bits"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("TIER-044"), "{err}");
+    }
+
+    #[test]
+    fn decompress_image_rejects_reserved_codec_bits_3() {
+        let header = PageHeader {
+            page_id: 9,
+            table_id: 1,
+            row_count: 0,
+            flags: (crate::store::pager::format::FORMAT_VERSION << 8) | 0b11,
+        };
+        let err = match decompress_image(&header, &[0u8; 8], 4096) {
+            Ok(_) => panic!("reserved codec bits decoded"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("reserved codec bits 3"), "{err}");
+    }
+
+    #[test]
+    fn corrupt_zstd_artifacts_surface_a_decompression_error() {
+        // The zstd magic followed by garbage: routed to the codec, which
+        // must fail loudly instead of passing bytes through.
+        let mut bogus = ZSTD_MAGIC.to_vec();
+        bogus.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let err = match decompress_artifact(&bogus) {
+            Ok(_) => panic!("corrupt zstd frame passed through"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string()
+                .contains("zstd artifact decompression failed"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn artifacts_round_trip_and_raw_artifacts_pass_through() {
         let body = compressible(10_000);
         let stored =

@@ -9,6 +9,15 @@ use fluxum_protocol::{DEFAULT_MAX_FRAME_BYTES, FRAME_HEADER_LEN, Frame, FrameCod
 use proptest::prelude::*;
 
 #[test]
+fn codec_reports_its_configured_limit() {
+    assert_eq!(FrameCodec::new(512).max_frame_bytes(), 512);
+    assert_eq!(
+        FrameCodec::default().max_frame_bytes(),
+        DEFAULT_MAX_FRAME_BYTES
+    );
+}
+
+#[test]
 fn incomplete_header_needs_more_bytes() {
     let codec = FrameCodec::default();
     for len in 0..FRAME_HEADER_LEN {

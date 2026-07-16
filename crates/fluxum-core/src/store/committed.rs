@@ -416,3 +416,158 @@ impl Snapshot {
         Arc::ptr_eq(&self.state, &other.state)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::Rect;
+    use crate::schema::{ColumnSchema, FluxType, TableAccess, VisibilityRule};
+    use crate::store::row::encode_pk_values;
+
+    static COV_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "x",
+            ty: FluxType::F64,
+        },
+        ColumnSchema {
+            name: "y",
+            ty: FluxType::F64,
+        },
+    ];
+
+    static COV: TableSchema = TableSchema {
+        name: "CovTable",
+        columns: COV_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Private,
+        partition_by: None,
+        unique: &[],
+        indexes: &[],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    fn pk(id: u64) -> PkBytes {
+        encode_pk_values(&COV, &[RowValue::U64(id)]).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn row(id: u64, x: f64, y: f64) -> Row {
+        Row::new(vec![RowValue::U64(id), RowValue::F64(x), RowValue::F64(y)])
+    }
+
+    /// A hand-built table state (the corruption seam for invariant tests).
+    fn state_with_rows() -> TableState {
+        let mut rows = BTreeMap::new();
+        rows.insert(pk(1), row(1, 1.0, 2.0));
+        TableState {
+            schema: &COV,
+            rows,
+            indexes: BTreeMap::new(),
+            spatial: None,
+            unique: Vec::new(),
+            auto_inc_high_water: 0,
+        }
+    }
+
+    #[test]
+    fn row_count_reflects_the_row_map() {
+        let state = state_with_rows();
+        assert_eq!(state.row_count(), 1);
+        assert_eq!(state.schema().name, "CovTable");
+    }
+
+    #[test]
+    fn out_of_range_index_ordinals_are_an_invariant_breach() {
+        let mut state = state_with_rows();
+        let index_id = IndexId::from_raw(0xC0);
+        state.indexes.insert(index_id, BTreeIndex::new(&[9]));
+        let err = match state.index_scan(
+            index_id,
+            &[RowValue::U64(1)],
+            Bound::Unbounded,
+            Bound::Unbounded,
+        ) {
+            Ok(_) => panic!("out-of-range ordinal scanned"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("ordinal 9 out of"), "{err}");
+        assert!(err.contains("internal invariant violated"), "{err}");
+    }
+
+    #[test]
+    fn a_range_bound_without_a_range_column_is_an_invariant_breach() {
+        // encode_bound is only reachable with a range column via index_scan;
+        // the defensive arm still reports rather than panics.
+        let state = state_with_rows();
+        let bound = RowValue::F64(1.0);
+        let err = match state.encode_bound(IndexId::from_raw(0xC1), None, Bound::Included(&bound)) {
+            Ok(_) => panic!("bound without a range column encoded"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("range bound without a range column"), "{err}");
+    }
+
+    #[test]
+    fn integrity_check_reports_a_diverged_btree_index() {
+        let mut state = state_with_rows();
+        // An empty index over a populated row map cannot equal a rebuild.
+        state
+            .indexes
+            .insert(IndexId::from_raw(0xC2), BTreeIndex::new(&[1]));
+        let err = match state.verify_index_integrity(TableId::of("CovTable")) {
+            Ok(()) => panic!("diverged btree index verified"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("diverged from a fresh rebuild"), "{err}");
+        assert!(err.contains("STG-007"), "{err}");
+    }
+
+    #[test]
+    fn integrity_check_reports_a_diverged_spatial_index() {
+        let mut state = state_with_rows();
+        // Ready but empty while rows exist: a rebuild must differ.
+        state.spatial = Some(SpatialIndexState::quadtree(
+            &[1, 2],
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            8,
+        ));
+        let err = match state.verify_index_integrity(TableId::of("CovTable")) {
+            Ok(()) => panic!("diverged spatial index verified"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("spatial index"), "{err}");
+        assert!(err.contains("diverged from a fresh rebuild"), "{err}");
+        assert!(err.contains("SPX-030"), "{err}");
+    }
+
+    #[test]
+    fn integrity_check_reports_a_diverged_unique_map() {
+        let mut state = state_with_rows();
+        state.unique = vec![UniqueIndex::new(&[1])];
+        let err = match state.verify_index_integrity(TableId::of("CovTable")) {
+            Ok(()) => panic!("diverged unique map verified"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("#[unique] map"), "{err}");
+        assert!(err.contains("TXN-041"), "{err}");
+    }
+
+    #[test]
+    fn unknown_table_ids_name_the_assembled_schema() {
+        let state = CommittedState {
+            tables: HashMap::new(),
+        };
+        let err = match state.table(TableId::from_raw(0x51)) {
+            Ok(_) => panic!("unknown table id resolved"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("unknown table id") && err.contains("assembled schema"),
+            "{err}"
+        );
+    }
+}

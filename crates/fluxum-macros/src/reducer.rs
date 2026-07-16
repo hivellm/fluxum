@@ -817,6 +817,71 @@ mod tests {
     }
 
     #[test]
+    fn public_entry_points_render_failures_as_compile_error() {
+        // Every expand_* wrapper turns a syn::Error into compile_error!.
+        let bad_fn = || quote! { fn f() {} };
+        for out in [
+            expand_reducer(TokenStream::new(), bad_fn()),
+            expand_lifecycle(Hook::Init, TokenStream::new(), bad_fn()),
+            expand_view(TokenStream::new(), bad_fn()),
+            expand_tick(quote!(rate = 60), bad_fn()),
+            expand_schedule(quote!(delay_ms = 50), bad_fn()),
+        ] {
+            let out = out.to_string();
+            assert!(out.contains("compile_error !"), "{out}");
+        }
+    }
+
+    #[test]
+    fn schedule_argument_shapes_are_validated() {
+        // Meta that is not `name = value`.
+        let err = expand_err(try_expand_tick(
+            quote!(rate(60)),
+            quote! { fn beat(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        ));
+        assert!(err.contains("`name = value` pairs"), "{err}");
+
+        // Multi-segment argument path.
+        let err = expand_err(try_expand_tick(
+            quote!(a::b = 1),
+            quote! { fn beat(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        ));
+        assert!(err.contains("plain argument name"), "{err}");
+
+        // Non-literal value for a known argument.
+        let err = expand_err(try_expand_tick(
+            quote!(rate = fast),
+            quote! { fn beat(ctx: &ReducerContext) -> Result<(), String> { Ok(()) } },
+        ));
+        assert!(err.contains("`rate` must be a literal"), "{err}");
+    }
+
+    #[test]
+    fn scheduled_functions_require_a_result_return_type() {
+        let err = expand_err(try_expand_tick(
+            quote!(rate = 60),
+            quote! { fn beat(ctx: &ReducerContext) {} },
+        ));
+        assert!(err.contains("Result<(), String> (RED-060)"), "{err}");
+    }
+
+    #[test]
+    fn late_self_receiver_is_rejected() {
+        // syn refuses to parse a receiver after the first parameter, so the
+        // defensive branch is probed on a hand-assembled signature.
+        let mut item: ItemFn = syn::parse_quote! {
+            fn f(ctx: &ReducerContext) -> Result<(), String> { Ok(()) }
+        };
+        let donor: ItemFn = syn::parse_quote! { fn g(&self) {} };
+        let receiver = donor.sig.inputs.first().expect("receiver").clone();
+        item.sig.inputs.push(receiver);
+        let err = check_shape(&item, "reducer")
+            .expect_err("self must be rejected")
+            .to_string();
+        assert!(err.contains("`self` parameters are not supported"), "{err}");
+    }
+
+    #[test]
     fn view_expands_and_requires_a_return_type() {
         let out = try_expand_view(
             TokenStream::new(),

@@ -668,6 +668,38 @@ mod tests {
     }
 
     #[test]
+    fn removals_collapse_split_subtrees_back_to_the_canonical_leaf() {
+        let mut qt = QuadTree::new(bounds(), 2);
+        // Five spread points overflow the bucket and split the root.
+        qt.insert(10.0, 10.0, pk(1));
+        qt.insert(90.0, 10.0, pk(2));
+        qt.insert(10.0, 90.0, pk(3));
+        qt.insert(90.0, 90.0, pk(4));
+        qt.insert(60.0, 60.0, pk(5));
+        assert_eq!(qt.len(), 5);
+        assert_eq!(
+            sorted(qt.query_region(Rect::new(0.0, 0.0, 100.0, 100.0))),
+            sorted((1u64..=5).map(pk).collect::<Vec<_>>())
+        );
+
+        // Dropping to bucket size collapses the subtree into one sorted
+        // leaf; the result must be bit-identical to a fresh tree over the
+        // surviving points (canonical structure).
+        assert!(qt.remove(90.0, 10.0, &pk(2)));
+        assert!(qt.remove(10.0, 90.0, &pk(3)));
+        assert!(qt.remove(90.0, 90.0, &pk(4)));
+        assert_eq!(qt.len(), 2);
+        let mut fresh = QuadTree::new(bounds(), 2);
+        fresh.insert(10.0, 10.0, pk(1));
+        fresh.insert(60.0, 60.0, pk(5));
+        assert_eq!(qt, fresh, "collapse must restore the canonical shape");
+        assert_eq!(
+            sorted(qt.query_region(Rect::new(0.0, 0.0, 100.0, 100.0))),
+            sorted(vec![pk(1), pk(5)])
+        );
+    }
+
+    #[test]
     fn root_edges_are_inclusive_and_outside_points_use_overflow() {
         let mut qt = QuadTree::new(bounds(), 2);
         // All four corners and an edge midpoint are in bounds.

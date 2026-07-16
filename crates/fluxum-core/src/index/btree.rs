@@ -414,6 +414,105 @@ mod tests {
     }
 
     #[test]
+    fn identity_connection_and_entity_ids_order_bytewise() {
+        use crate::types::{ConnectionId, EntityId, Identity};
+
+        assert_strictly_increasing(&[
+            RowValue::Identity(Identity::from_bytes([0u8; 32])),
+            RowValue::Identity(Identity::from_bytes([1u8; 32])),
+        ]);
+        // Fixed 32-byte width (prefix-free by construction).
+        assert_eq!(
+            enc(&RowValue::Identity(Identity::from_bytes([7u8; 32]))).len(),
+            32
+        );
+        assert_strictly_increasing(&[
+            RowValue::ConnectionId(ConnectionId::new(1)),
+            RowValue::ConnectionId(ConnectionId::new(256)),
+            RowValue::ConnectionId(ConnectionId::new(u128::MAX)),
+        ]);
+        assert_strictly_increasing(&[
+            RowValue::EntityId(EntityId::new(0)),
+            RowValue::EntityId(EntityId::new(300)),
+            RowValue::EntityId(EntityId::new(u64::MAX)),
+        ]);
+    }
+
+    #[test]
+    fn decimal_enum_and_struct_encodings_are_deterministic_totality_forms() {
+        use crate::types::Decimal;
+
+        // Decimal: sign-flipped i128 big-endian + scale byte — fixed width,
+        // sign-ordered at equal scale.
+        let neg = enc(&RowValue::Decimal(Decimal::from_parts(-100, 2)));
+        let pos = enc(&RowValue::Decimal(Decimal::from_parts(100, 2)));
+        assert_eq!(neg.len(), 17);
+        assert_eq!(pos.len(), 17);
+        assert!(neg < pos, "sign flip must order negatives first");
+
+        // Enum: u32 tag big-endian, then the payload encodings.
+        let bytes = enc(&RowValue::Enum {
+            tag: 1,
+            payload: vec![RowValue::U8(7)],
+        });
+        assert_eq!(bytes, vec![0, 0, 0, 1, 7]);
+
+        // Struct: field encodings back to back, no tag.
+        let bytes = enc(&RowValue::Struct(vec![
+            RowValue::U8(3),
+            RowValue::Bool(true),
+        ]));
+        assert_eq!(bytes, vec![3, 1]);
+    }
+
+    #[test]
+    fn index_maintenance_guards_ordinals_and_tolerates_absent_keys() {
+        let mut index = BTreeIndex::new(&[9]);
+        let row = Row::new(vec![RowValue::U64(1)]);
+        let pk = pk_of(1);
+        let err = match index.insert(&row, pk.clone()) {
+            Ok(()) => panic!("out-of-range index ordinal accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("index ordinal 9 out of range"), "{err}");
+
+        // remove() of a key that was never indexed is a structural no-op.
+        let mut index = BTreeIndex::new(&[0]);
+        index.remove(&row, &pk).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(index.scan_pks(Vec::new(), None).count(), 0);
+    }
+
+    fn pk_of(n: u64) -> PkBytes {
+        use crate::schema::{ColumnSchema, FluxType, TableAccess, TableSchema, VisibilityRule};
+        use crate::store::row::encode_pk_values;
+
+        static COLS: &[ColumnSchema] = &[ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        }];
+        static T: TableSchema = TableSchema {
+            name: "K",
+            columns: COLS,
+            primary_key: &[0],
+            auto_inc: None,
+            access: TableAccess::Private,
+            partition_by: None,
+            unique: &[],
+            indexes: &[],
+            visibility: VisibilityRule::PublicAll,
+        };
+        encode_pk_values(&T, &[RowValue::U64(n)]).unwrap()
+    }
+
+    #[test]
+    fn an_excluded_lower_bound_above_every_key_yields_the_empty_range() {
+        // prefix_successor of an all-0xFF start has no successor: the scan
+        // is provably empty, not unbounded.
+        let (start, end) = plan_scan(vec![], Bound::Excluded(vec![0xFF]), Bound::Unbounded);
+        assert_eq!((start, end), (vec![], Some(vec![])));
+    }
+
+    #[test]
     fn prefix_successor_increments_and_truncates() {
         assert_eq!(prefix_successor(vec![1, 2]), Some(vec![1, 3]));
         assert_eq!(prefix_successor(vec![1, 0xFF]), Some(vec![2]));

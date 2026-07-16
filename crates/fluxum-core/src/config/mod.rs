@@ -842,6 +842,77 @@ mod tests {
     }
 
     #[test]
+    fn load_reads_the_real_environment_and_fails_on_a_missing_file() {
+        // The env-backed entry point: a nonexistent file is a typed Config
+        // error naming the path, regardless of the process environment.
+        let err = Config::load(Some(std::path::Path::new(
+            "definitely/not/a/fluxum-config.yml",
+        )))
+        .unwrap_err();
+        assert!(matches!(err, FluxumError::Config(_)), "{err:?}");
+        assert!(err.to_string().contains("cannot read config file"), "{err}");
+    }
+
+    #[test]
+    fn every_semantic_validation_names_its_key() {
+        let cases: &[(&str, &str)] = &[
+            ("server:\n  http_port: 0\n", "server.http_port"),
+            ("server:\n  tcp_port: 0\n", "server.tcp_port"),
+            ("runtime:\n  worker_threads: 0\n", "runtime.worker_threads"),
+            (
+                "memory:\n  bufferpool_fraction: 1.5\n",
+                "memory.bufferpool_fraction",
+            ),
+            (
+                "storage:\n  checkpoint_interval_tx: 0\n",
+                "storage.checkpoint_interval_tx",
+            ),
+            ("storage:\n  page_size: 1234\n", "storage.page_size"),
+            (
+                "storage:\n  evictor_low_watermark: 0.99\n",
+                "evictor_low_watermark",
+            ),
+            (
+                "subscriptions:\n  fanout_concurrency: 0\n",
+                "subscriptions.fanout_concurrency",
+            ),
+        ];
+        for (yaml, key) in cases {
+            let file = write_config(&format!("{yaml}auth:\n  provider: none\n"));
+            let err = Config::load_with(Some(file.path()), &no_env).unwrap_err();
+            assert!(matches!(err, FluxumError::Config(_)), "{yaml}: {err:?}");
+            assert!(err.to_string().contains(key), "{yaml}: {err}");
+        }
+    }
+
+    #[test]
+    fn unknown_nested_mappings_record_leaves_then_fail_deserialization() {
+        // A whole unknown subtree merges (recording every leaf's provenance)
+        // and is then rejected by the typed deserialization.
+        let file = write_config("extra:\n  nested:\n    a: 1\n    b: 2\nauth:\n  provider: none\n");
+        let err = Config::load_with(Some(file.path()), &no_env).unwrap_err();
+        assert!(matches!(err, FluxumError::ConfigParse(_)), "{err:?}");
+    }
+
+    #[test]
+    fn empty_env_override_parses_as_an_empty_string() {
+        let env = env_of(&[
+            ("FLUXUM_PROFILE", "development"),
+            ("FLUXUM_SERVER_TCP_HOST", ""),
+        ]);
+        let cfg = Config::load_with(None, &env).unwrap();
+        assert_eq!(cfg.server.tcp_host, "");
+        assert_eq!(cfg.source_of("server.tcp_host"), ValueSource::Env);
+    }
+
+    #[test]
+    fn auto_or_displays_auto_and_values() {
+        assert_eq!(AutoOr::<usize>::Auto.to_string(), "auto");
+        assert_eq!(AutoOr::Value(7usize).to_string(), "7");
+        assert_eq!(AutoOr::Value(ByteSize(2 << 20)).to_string(), "2MiB");
+    }
+
+    #[test]
     fn full_architecture_example_shape_parses() {
         let file = write_config(
             r#"

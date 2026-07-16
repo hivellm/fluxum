@@ -450,6 +450,26 @@ mod tests {
     }
 
     #[test]
+    fn over_hardware_fanout_and_write_buffer_values_still_stand() {
+        // HWA-010: explicit values beyond the detected hardware only WARN.
+        let config = dev_config(&[
+            ("FLUXUM_SUBSCRIPTIONS_FANOUT_CONCURRENCY", "128"), // > 2 × 2 cores
+            ("FLUXUM_STORAGE_COMMIT_LOG_WRITE_BUFFER_BYTES", "1GiB"), // > 512 MiB limit
+            // Pin the budget so the HWA-015 auto-fit check does not apply:
+            // explicit oversubscription is the operator's call.
+            ("FLUXUM_MEMORY_BUDGET", "256MiB"),
+        ]);
+        let effective = derive(&container_profile(), &config).unwrap();
+        assert_eq!(effective.fanout_concurrency.value, 128);
+        assert_eq!(effective.fanout_concurrency.source, Provenance::Env);
+        assert_eq!(effective.commit_log_write_buffer_bytes.value, 1 << 30);
+        assert_eq!(
+            effective.commit_log_write_buffer_bytes.source,
+            Provenance::Env
+        );
+    }
+
+    #[test]
     fn auto_derivation_that_cannot_fit_fails_boot() {
         let hw = HardwareProfile {
             total_ram_bytes: 64 << 20, // below the 128 MiB budget floor

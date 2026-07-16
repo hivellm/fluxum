@@ -123,6 +123,7 @@ static SEND_CHAT: ReducerDef = ReducerDef {
 struct Harness {
     server: tcp::TcpServer,
     store: Arc<MemStore>,
+    ctx: Arc<ShardContext>,
 }
 
 async fn start(options: TcpOptions) -> Harness {
@@ -156,8 +157,10 @@ async fn start(options: TcpOptions) -> Harness {
     let authenticator =
         Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
     let ctx = ShardContext::new(engine, subscriptions, authenticator, SHARD, 256);
-    let server = tcp::serve(ctx, "127.0.0.1:0", options).await.unwrap();
-    Harness { server, store }
+    let server = tcp::serve(Arc::clone(&ctx), "127.0.0.1:0", options)
+        .await
+        .unwrap();
+    Harness { server, store, ctx }
 }
 
 // --- A minimal framed test client ----------------------------------------------
@@ -633,6 +636,14 @@ static PRESENCE_DISCONNECT: fluxum_core::reducer::LifecycleDef =
     };
 
 async fn start_presence() -> Harness {
+    start_hooked(LifecycleHooks::from_defs([
+        &PRESENCE_CONNECT,
+        &PRESENCE_DISCONNECT,
+    ]))
+    .await
+}
+
+async fn start_hooked(hooks: LifecycleHooks) -> Harness {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let schema = Schema::from_tables([&CHAT, &ONLINE]).unwrap();
     let store = Arc::new(MemStore::new(&schema).unwrap());
@@ -649,7 +660,6 @@ async fn start_presence() -> Harness {
         TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
     tokio::spawn(worker.run());
     let registry = Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap());
-    let hooks = LifecycleHooks::from_defs([&PRESENCE_CONNECT, &PRESENCE_DISCONNECT]);
     let engine = ReducerEngine::new(
         pipeline,
         registry,
@@ -661,10 +671,10 @@ async fn start_presence() -> Harness {
     let authenticator =
         Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
     let ctx = ShardContext::new(engine, subscriptions, authenticator, SHARD, 256);
-    let server = tcp::serve(ctx, "127.0.0.1:0", TcpOptions::default())
+    let server = tcp::serve(Arc::clone(&ctx), "127.0.0.1:0", TcpOptions::default())
         .await
         .unwrap();
-    Harness { server, store }
+    Harness { server, store, ctx }
 }
 
 async fn wait_for_rows(store: &MemStore, table: &str, want: usize) -> bool {
@@ -699,5 +709,243 @@ async fn lifecycle_hooks_fire_and_fan_out_over_the_transport() {
         "on_disconnect did not clean up the presence row"
     );
 
+    h.server.shutdown();
+}
+
+// --- Failing lifecycle hooks must not break the transport --------------------------
+
+fn failing_hook(_ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    Err(fluxum_core::FluxumError::Reducer("hook boom".into()))
+}
+static FAILING_CONNECT: fluxum_core::reducer::LifecycleDef = fluxum_core::reducer::LifecycleDef {
+    kind: fluxum_core::reducer::LifecycleKind::OnConnect,
+    name: "failing_connect",
+    handler: failing_hook,
+};
+static FAILING_DISCONNECT: fluxum_core::reducer::LifecycleDef =
+    fluxum_core::reducer::LifecycleDef {
+        kind: fluxum_core::reducer::LifecycleKind::OnDisconnect,
+        name: "failing_disconnect",
+        handler: failing_hook,
+    };
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_lifecycle_hooks_do_not_break_the_tcp_transport() {
+    let h = start_hooked(LifecycleHooks::from_defs([
+        &FAILING_CONNECT,
+        &FAILING_DISCONNECT,
+    ]))
+    .await;
+
+    // on_connect fails (warn only): the AuthResult still lands and the
+    // session is fully usable.
+    let mut client = Client::connect(h.server.local_addr).await;
+    let reply = client.authenticate(b"alice", 1).await;
+    assert!(matches!(reply, ServerMessage::AuthResult(_)));
+    client
+        .send(ClientMessage::ReducerCall(ReducerCall {
+            id: 2,
+            reducer: "send_chat".into(),
+            version: None,
+            args: vec![FluxValue::Str("survives".into())],
+        }))
+        .await;
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        ServerMessage::ReducerResult(_)
+    ));
+
+    // on_disconnect fails on EOF (warn only): the server keeps serving.
+    drop(client);
+    let mut next = Client::connect(h.server.local_addr).await;
+    let reply = next.authenticate(b"bob", 3).await;
+    assert!(matches!(reply, ServerMessage::AuthResult(_)));
+    h.server.shutdown();
+}
+
+// --- RPC-001: keep-alive frames and malformed envelopes ---------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_keepalive_frames_are_ignored() {
+    let h = start(TcpOptions::default()).await;
+    let mut client = Client::connect(h.server.local_addr).await;
+    // A zero-length keep-alive before and between real frames is a no-op.
+    client.send_raw(&FrameCodec::keepalive()).await;
+    let reply = client.authenticate(b"alice", 1).await;
+    assert!(matches!(reply, ServerMessage::AuthResult(_)));
+    h.server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_envelope_is_400_and_keeps_the_connection() {
+    let h = start(TcpOptions::default()).await;
+    let mut client = Client::connect(h.server.local_addr).await;
+    // A well-framed body that is not a decodable ClientMessage.
+    let garbage = client.codec.encode(&[0xC1, 0xFF, 0x00]).unwrap();
+    client.send_raw(&garbage).await;
+    match client.recv().await.unwrap() {
+        ServerMessage::Error(e) => {
+            assert_eq!(e.code, 400, "RPC-001 malformed envelope");
+            assert_eq!(e.id, None, "no id to echo");
+        }
+        other => panic!("expected 400 Error, got {other:?}"),
+    }
+    // The connection stays open: a following Authenticate succeeds.
+    let reply = client.authenticate(b"alice", 2).await;
+    assert!(matches!(reply, ServerMessage::AuthResult(_)));
+    h.server.shutdown();
+}
+
+// --- RPC-060: idle timeout disabled ------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+// SO_LINGER(0) is exactly what this test wants: an abortive RST close. The
+// deprecation concern (drop blocking the thread) is harmless on loopback
+// with empty buffers.
+#[allow(deprecated)]
+async fn idle_timeout_disabled_reads_without_expiry_and_survives_a_reset() {
+    let options = TcpOptions {
+        idle_timeout: None,
+        ..TcpOptions::default()
+    };
+    let h = start(options).await;
+    let mut client = Client::connect(h.server.local_addr).await;
+    client.authenticate(b"alice", 1).await;
+    // With expiry disabled, a quiet gap does not 408 the connection.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    client
+        .send(ClientMessage::ReducerCall(ReducerCall {
+            id: 2,
+            reducer: "send_chat".into(),
+            version: None,
+            args: vec![FluxValue::Str("after the gap".into())],
+        }))
+        .await;
+    assert!(matches!(
+        client.recv().await.unwrap(),
+        ServerMessage::ReducerResult(_)
+    ));
+
+    // An abortive close (RST via SO_LINGER 0) surfaces a read error; the
+    // server logs it and keeps serving new connections.
+    client.stream.set_linger(Some(Duration::ZERO)).unwrap();
+    drop(client);
+    let mut next = Client::connect(h.server.local_addr).await;
+    let reply = next.authenticate(b"bob", 3).await;
+    assert!(matches!(reply, ServerMessage::AuthResult(_)));
+    h.server.shutdown();
+}
+
+// --- SPEC-023 DMX-011: the ephemeral TTL sweeper over the transport ----------------
+
+static EPH_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "id",
+        ty: FluxType::U64,
+    },
+    ColumnSchema {
+        name: "note",
+        ty: FluxType::Str,
+    },
+];
+static EPH: TableSchema = TableSchema {
+    name: "EphNote",
+    columns: EPH_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Ephemeral,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: VisibilityRule::PublicAll,
+};
+
+fluxum_core::schema::inventory::submit! {
+    fluxum_core::schema::EphemeralDef {
+        table: "EphNote",
+        owner: None,
+        expire_after_us: Some(300_000), // 300 ms TTL → 100 ms sweep cadence
+    }
+}
+
+async fn start_ephemeral() -> Harness {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let schema = Schema::from_tables([&CHAT, &EPH]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            1,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let registry = Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap());
+    let engine = ReducerEngine::new(
+        pipeline,
+        registry,
+        LifecycleHooks::none(),
+        SHARD,
+        fluxum_core::auth::server_identity("tcp-test"),
+    );
+    let subscriptions = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    let authenticator =
+        Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
+    let ctx = ShardContext::new(engine, subscriptions, authenticator, SHARD, 256);
+    let server = tcp::serve(Arc::clone(&ctx), "127.0.0.1:0", TcpOptions::default())
+        .await
+        .unwrap();
+    Harness { server, store, ctx }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_rows_expire_and_the_sweep_fans_out_deletes() {
+    let h = start_ephemeral().await;
+    // Requesting the sweeper again is a no-op (both transports call it).
+    h.ctx.start_ephemeral_sweeper();
+
+    // Seed one ephemeral row directly in the committed store.
+    let eph = h.store.table_id("EphNote").unwrap();
+    let mut tx = h.store.begin();
+    tx.insert(
+        eph,
+        vec![RowValue::U64(1), RowValue::Str("fleeting".into())],
+    )
+    .unwrap();
+    let diff = tx.commit().unwrap();
+    h.ctx.publish_commit(diff);
+
+    // A subscriber sees the row in its InitialData…
+    let mut sub = Client::connect(h.server.local_addr).await;
+    sub.authenticate(b"watcher", 1).await;
+    sub.send(ClientMessage::SubscribeSingle(SubscribeSingle {
+        id: 5,
+        query: "SELECT * FROM EphNote".into(),
+    }))
+    .await;
+    match sub.recv().await.unwrap() {
+        ServerMessage::InitialData(data) => {
+            assert_eq!(data.tables[0].inserts.len(), 1, "the seeded row");
+        }
+        other => panic!("expected InitialData, got {other:?}"),
+    }
+
+    // …then the DMX-011 sweep deletes it after the TTL and the delete diff
+    // fans out as a TxUpdate.
+    match sub.recv_timeout(Duration::from_secs(5)).await {
+        Some(ServerMessage::TxUpdate(update)) => {
+            assert_eq!(update.tables[0].deletes.len(), 1, "the swept row");
+            assert!(update.tables[0].inserts.is_empty());
+        }
+        other => panic!("expected the sweep TxUpdate, got {other:?}"),
+    }
+    assert!(
+        wait_for_rows(&h.store, "EphNote", 0).await,
+        "the expired row is gone from the store"
+    );
     h.server.shutdown();
 }

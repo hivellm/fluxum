@@ -757,6 +757,43 @@ mod tests {
         assert_eq!(rt, RTree::new(2));
     }
 
+    #[test]
+    fn condense_dissolves_underflowing_nodes_and_reinserts_orphans() {
+        // Capacity 5 → min occupancy 2: removals leave 1-entry leaves that
+        // must dissolve, orphaning (and reinserting) their survivors, and
+        // cascading dissolution through internal levels on the way up.
+        let mut rt = RTree::new(5);
+        for i in 0..48u64 {
+            let f = f64::from(u32::try_from(i).unwrap_or(0));
+            let (x, y) = ((f % 8.0) * 10.0, (f / 8.0).floor() * 10.0);
+            assert!(rt.insert(Aabb::new(x, y, x + 4.0, y + 4.0), pk(i)));
+        }
+        assert_eq!(rt.len(), 48);
+
+        // Remove the first half; every query over the survivors must stay
+        // exact while condense churns the tree.
+        for i in 0..24u64 {
+            let f = f64::from(u32::try_from(i).unwrap_or(0));
+            let (x, y) = ((f % 8.0) * 10.0, (f / 8.0).floor() * 10.0);
+            assert!(rt.remove(&Aabb::new(x, y, x + 4.0, y + 4.0), &pk(i)), "{i}");
+        }
+        assert_eq!(rt.len(), 24);
+        assert_eq!(
+            sorted(rt.query_region(&Aabb::new(-1.0, -1.0, 101.0, 101.0))),
+            sorted((24u64..48).map(pk).collect::<Vec<_>>())
+        );
+
+        // Removing the rest drains the tree back to the canonical empty
+        // shape (single-child root shrink + empty root).
+        for i in 24..48u64 {
+            let f = f64::from(u32::try_from(i).unwrap_or(0));
+            let (x, y) = ((f % 8.0) * 10.0, (f / 8.0).floor() * 10.0);
+            assert!(rt.remove(&Aabb::new(x, y, x + 4.0, y + 4.0), &pk(i)), "{i}");
+        }
+        assert!(rt.is_empty());
+        assert_eq!(rt, RTree::new(5));
+    }
+
     /// Brute-force oracle over a flat list of boxes.
     #[derive(Default)]
     struct Oracle(Vec<(Aabb, u64)>);

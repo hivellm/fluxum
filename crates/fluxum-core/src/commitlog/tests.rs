@@ -541,6 +541,221 @@ async fn rotation_produces_ordered_segments_and_compaction_respects_holds() {
     log.close().unwrap();
 }
 
+// --- Options + accessors ------------------------------------------------------
+
+#[test]
+fn zero_queue_options_are_rejected_at_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = CommitLogOptions {
+        queue_depth: 0,
+        ..CommitLogOptions::default()
+    };
+    let err = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap_err();
+    assert!(
+        err.to_string().contains("queue_depth and max_batch"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn accessors_report_shard_and_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = CommitLog::open(dir.path(), SHARD, 3, CommitLogOptions::default()).unwrap();
+    assert_eq!(log.shard_id(), SHARD);
+    assert_eq!(log.epoch(), 3);
+    log.close().unwrap();
+}
+
+// --- STG-012: a fatal write error poisons the writer --------------------------
+
+#[tokio::test]
+async fn writer_failure_publishes_failed_and_poisons_every_surface() {
+    let dir = tempfile::tempdir().unwrap();
+    // segment_max_bytes = 1: every append rotates into a fresh segment.
+    let opts = CommitLogOptions {
+        segment_max_bytes: 1,
+        ..CommitLogOptions::default()
+    };
+    let log = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap();
+    log.append(rec(1)).await.unwrap();
+    log.wait_durable(1).await.unwrap();
+
+    // Sabotage the NEXT rotation target: a directory squats on the segment
+    // path, so create_segment fails and the flush actor stops (STG-012:
+    // no retry after a failed write — on-disk state would be undefined).
+    let next = dir.path().join(super::format::segment_file_name(SHARD, 2));
+    fs::create_dir(&next).unwrap();
+
+    log.append(rec(2)).await.unwrap(); // accepted by the queue
+    let err = log.wait_durable(2).await.unwrap_err();
+    assert!(err.to_string().contains("error"), "{err}");
+
+    // Every subsequent surface reports the failure, never hangs.
+    let err = log.durable_tx_id().unwrap_err();
+    assert!(matches!(err, crate::error::FluxumError::Storage(_)));
+    let err = log.append(rec(3)).await.unwrap_err();
+    assert!(
+        err.to_string().contains("stopped after a fatal error"),
+        "{err}"
+    );
+    let err = log.set_epoch(9).await.unwrap_err();
+    assert!(
+        err.to_string().contains("stopped after a fatal error"),
+        "{err}"
+    );
+    assert!(log.close().is_err(), "close reports the failure too");
+}
+
+// --- STG-031: a tail segment with an unreadable header quarantines wholesale --
+
+#[tokio::test]
+async fn corrupt_tail_header_is_quarantined_whole_and_appends_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = CommitLogOptions {
+        segment_max_bytes: 128,
+        ..CommitLogOptions::default()
+    };
+    let log = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap();
+    for tx in 1..=8 {
+        log.append(rec(tx)).await.unwrap();
+    }
+    log.wait_durable(8).await.unwrap();
+    log.close().unwrap();
+    let segments = segment_files(dir.path());
+    assert!(segments.len() > 1, "expected rotation");
+    let last = segments.last().unwrap().clone();
+
+    // Smash the tail segment's header magic.
+    let mut bytes = fs::read(&last).unwrap();
+    bytes[0..8].copy_from_slice(b"GARBAGE!");
+    fs::write(&last, &bytes).unwrap();
+
+    // Read-only replay reports the header corruption at offset 0 and keeps
+    // everything before the bad segment.
+    let (got, report) = collect(dir.path());
+    let corruption = report.corruption.expect("header corruption reported");
+    assert_eq!(corruption.segment, last);
+    assert_eq!(corruption.offset, 0);
+    assert!(got.len() < 8, "records of the bad segment are not replayed");
+    let survivors = got.len() as u64;
+
+    // Recovery quarantines the whole file (rename to a sidecar) and resumes.
+    let log = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap();
+    let recovery = log.recovery().clone();
+    let q = recovery.quarantine.expect("whole-file quarantine");
+    assert_eq!(q.from_offset, 0);
+    assert!(!last.exists(), "bad segment removed from the log");
+    assert!(q.sidecar.exists(), "bytes preserved in the sidecar");
+    assert_eq!(recovery.segments, segments.len() - 1);
+    assert_eq!(recovery.last_tx_id, Some(survivors));
+
+    log.append(rec(survivors + 1)).await.unwrap();
+    log.wait_durable(survivors + 1).await.unwrap();
+    log.close().unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_non_tail_header_refuses_to_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let opts = CommitLogOptions {
+        segment_max_bytes: 128,
+        ..CommitLogOptions::default()
+    };
+    let log = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap();
+    for tx in 1..=8 {
+        log.append(rec(tx)).await.unwrap();
+    }
+    log.wait_durable(8).await.unwrap();
+    log.close().unwrap();
+    let segments = segment_files(dir.path());
+    assert!(segments.len() > 1, "expected rotation");
+
+    let mut bytes = fs::read(&segments[0]).unwrap();
+    bytes[0..8].copy_from_slice(b"GARBAGE!");
+    fs::write(&segments[0], &bytes).unwrap();
+
+    let err = CommitLog::open(dir.path(), SHARD, 1, opts).unwrap_err();
+    assert!(err.to_string().contains("non-tail"), "{err}");
+}
+
+// --- Segment header field validation (STG-011) --------------------------------
+
+mod header_fields {
+    use crate::commitlog::format::{decode_segment_header, encode_segment_header};
+
+    fn patch_crc(buf: &mut [u8; 24]) {
+        let crc = crc32c::crc32c(&buf[0..20]);
+        buf[20..24].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    #[test]
+    fn each_header_field_is_validated_independently() {
+        // Too short.
+        let err = decode_segment_header(&[0u8; 4]).unwrap_err();
+        assert!(err.contains("shorter"), "{err}");
+
+        // Valid header round-trips its epoch.
+        let good = encode_segment_header(5);
+        assert_eq!(decode_segment_header(&good).unwrap(), 5);
+
+        // Bad magic (with a recomputed, valid CRC — isolates the magic check).
+        let mut bad = encode_segment_header(5);
+        bad[0] = b'X';
+        patch_crc(&mut bad);
+        let err = decode_segment_header(&bad).unwrap_err();
+        assert!(err.contains("bad segment magic"), "{err}");
+
+        // Unsupported format version.
+        let mut bad = encode_segment_header(5);
+        bad[8..10].copy_from_slice(&99u16.to_le_bytes());
+        patch_crc(&mut bad);
+        let err = decode_segment_header(&bad).unwrap_err();
+        assert!(err.contains("unsupported log format version 99"), "{err}");
+
+        // Unsupported checksum algorithm id.
+        let mut bad = encode_segment_header(5);
+        bad[10] = 7;
+        patch_crc(&mut bad);
+        let err = decode_segment_header(&bad).unwrap_err();
+        assert!(err.contains("unsupported checksum algorithm id 7"), "{err}");
+    }
+}
+
+// --- BlobHash + blob-store edge cases (STG-041) -------------------------------
+
+mod blob_edges {
+    use super::*;
+    use crate::commitlog::blob::{BlobHash, BlobStore};
+
+    #[test]
+    fn blob_hash_accessors_and_debug_render() {
+        let hash = BlobHash::of(b"payload");
+        assert_eq!(hash.as_bytes().len(), 32);
+        assert_eq!(format!("{hash:?}"), format!("BlobHash({hash})"));
+        assert_eq!(hash.to_string().len(), 64);
+    }
+
+    #[test]
+    fn open_ignores_non_hash_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("readme.txt"), b"not a blob").unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        assert_eq!(store.refcount(&BlobHash::of(b"nope")), None);
+    }
+
+    #[test]
+    fn reclaim_tolerates_an_already_missing_object_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlobStore::open(dir.path()).unwrap();
+        let hash = store.put(b"to be reclaimed").unwrap();
+        store.unref(&hash).unwrap();
+        // The file vanished out from under the store (operator action).
+        fs::remove_file(dir.path().join(hash.to_string())).unwrap();
+        assert_eq!(store.reclaim().unwrap(), vec![hash]);
+        assert_eq!(store.refcount(&hash), None);
+    }
+}
+
 // --- Segment-level scan faults and whole-file quarantine (STG-015/031) ------
 
 mod segment_faults {

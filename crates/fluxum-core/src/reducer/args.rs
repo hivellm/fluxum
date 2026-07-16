@@ -246,6 +246,25 @@ mod tests {
     }
 
     #[test]
+    fn kind_mismatches_decode_to_none_for_every_domain_type() {
+        assert_eq!(u64::from_flux(&FluxValue::Bool(true)), None);
+        assert_eq!(f32::from_flux(&FluxValue::I64(1)), None, "no int→f32");
+        assert_eq!(Identity::from_flux(&FluxValue::Str("x".into())), None);
+        assert_eq!(EntityId::from_flux(&FluxValue::Bool(true)), None);
+        assert_eq!(Timestamp::from_flux(&FluxValue::Str("now".into())), None);
+        // The I64 wire form inhabits EntityId (non-negative) and Timestamp.
+        assert_eq!(
+            EntityId::from_flux(&FluxValue::I64(7)),
+            Some(EntityId::new(7))
+        );
+        assert_eq!(EntityId::from_flux(&FluxValue::I64(-1)), None);
+        assert_eq!(
+            Timestamp::from_flux(&FluxValue::I64(-5)),
+            Some(Timestamp::from_micros(-5))
+        );
+    }
+
+    #[test]
     fn domain_newtypes_and_options_decode() {
         let id = Identity::from_bytes([9u8; 32]);
         assert_eq!(

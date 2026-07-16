@@ -432,6 +432,65 @@ mod tests {
     }
 
     #[test]
+    fn future_format_versions_are_rejected_by_name() {
+        // Version bits stamped as 2 (a future format), valid CRC: the page
+        // must be rejected as unreadable with the version in the message.
+        let header = PageHeader {
+            page_id: 4,
+            table_id: 5,
+            row_count: 0,
+            flags: 2 << 8,
+        };
+        let image = encode_page(&header, b"v2").unwrap_or_else(|e| panic!("{e}"));
+        let err = match decode_page(&image, 0, 5, 4) {
+            Ok(_) => panic!("future-version page served"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("format version 2"), "{err}");
+        assert!(
+            err.to_string().contains("this build reads version 1"),
+            "{err}"
+        );
+    }
+
+    /// Rewrite bytes of a superblock and restamp its CRC so the tampered
+    /// field — not the checksum — is what the decoder trips on.
+    fn restamp(mut block: Vec<u8>, offset: usize, value: u32) -> Vec<u8> {
+        block[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        let crc = crate::simd::global().crc32c(&block[..28]);
+        block[28..32].copy_from_slice(&crc.to_le_bytes());
+        block
+    }
+
+    #[test]
+    fn superblock_rejections_name_the_failure() {
+        let block = encode_superblock(8192, 3, 0xCAFE);
+
+        let err = match decode_superblock(&block[..10], 3, 0xCAFE) {
+            Ok(_) => panic!("truncated superblock accepted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("truncated"), "{err}");
+
+        let bad_magic = restamp(block.clone(), 0, 0xDEAD_BEEF);
+        let err = match decode_superblock(&bad_magic, 3, 0xCAFE) {
+            Ok(_) => panic!("wrong magic accepted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("magic mismatch"), "{err}");
+
+        let bad_version = restamp(block.clone(), 4, 2);
+        let err = match decode_superblock(&bad_version, 3, 0xCAFE) {
+            Ok(_) => panic!("future version accepted"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("unsupported file-format version"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn superblock_round_trips_and_verifies() {
         let block = encode_superblock(8192, 3, 0xCAFE);
         assert_eq!(block.len(), SUPERBLOCK_LEN);

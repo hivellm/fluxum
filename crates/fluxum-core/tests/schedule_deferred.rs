@@ -587,6 +587,250 @@ async fn schedule_only_reducers_reject_clients_with_403() {
     assert_eq!(err.query_code(), Some(404), "{err}");
 }
 
+// --- Scheduler assembly validation (RED-020/RED-021) --------------------------------
+
+static BAD_RATE_TICK: fluxum_core::scheduler::TickDef = fluxum_core::scheduler::TickDef {
+    name: "append_mark",
+    rate_hz: 0,
+};
+static GHOST_TICK: fluxum_core::scheduler::TickDef = fluxum_core::scheduler::TickDef {
+    name: "no_such_tick",
+    rate_hz: 10,
+};
+static GHOST_SCHEDULE: ScheduleDef = ScheduleDef {
+    name: "no_such_scheduled",
+    delay_us: 1,
+    period_us: 0,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_assembly_rejects_invalid_tick_and_schedule_defs() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = boot(dir.path());
+    let build = |ticks, schedules| {
+        Scheduler::new(
+            shard.pipeline.clone(),
+            Arc::clone(&shard.registry),
+            SHARD,
+            fluxum_core::auth::server_identity("sched-test"),
+            SchedulerOptions::default(),
+            ticks,
+            schedules,
+        )
+    };
+
+    let err = build(vec![&BAD_RATE_TICK], vec![]).err().unwrap();
+    assert!(err.to_string().contains("rate = 0"), "{err}");
+    let err = build(vec![&GHOST_TICK], vec![]).err().unwrap();
+    assert!(
+        err.to_string().contains("not in the reducer registry"),
+        "{err}"
+    );
+    let err = build(vec![], vec![&GHOST_SCHEDULE]).err().unwrap();
+    assert!(
+        err.to_string()
+            .contains("scheduled reducer `no_such_scheduled`"),
+        "{err}"
+    );
+}
+
+// --- ScheduleEntry Table plumbing ---------------------------------------------------
+
+#[test]
+fn schedule_entry_table_roundtrip_and_shape_errors() {
+    let entry = ScheduleEntry {
+        id: 9,
+        reducer_name: "append_mark".into(),
+        args: vec![1, 2],
+        execute_at_us: 100,
+        period_us: 0,
+        shard_id: SHARD,
+    };
+    assert_eq!(entry.primary_key(), 9);
+    let values = entry.clone().into_values();
+    assert_eq!(ScheduleEntry::from_values(&values).unwrap(), entry);
+    assert_eq!(ScheduleEntry::pk_values(&9), vec![RowValue::U64(9)]);
+
+    // A malformed row shape is a typed storage error, never a panic.
+    let err = ScheduleEntry::from_values(&[RowValue::Bool(true)]).unwrap_err();
+    assert!(err.to_string().contains("unexpected row shape"), "{err}");
+}
+
+// --- RED-021: undecodable args back off instead of hot-looping ----------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn undecodable_schedule_args_fail_the_firing_and_back_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let shard = boot(dir.path());
+    let now_us = Timestamp::now().as_micros();
+    let registry = Arc::clone(&shard.registry);
+    let caller = ReducerCaller {
+        identity: fluxum_core::auth::server_identity("sched-test"),
+        connection_id: ConnectionId::new(0),
+        timestamp: Timestamp::now(),
+        shard_id: SHARD,
+    };
+    shard
+        .pipeline
+        .call(Box::new(move |tx| {
+            fluxum_core::reducer::with_context(&registry, caller, tx, |ctx| {
+                ctx.tx.insert(ScheduleEntry {
+                    id: 0,
+                    reducer_name: "append_mark".into(),
+                    // 0xC1 is never valid MessagePack.
+                    args: vec![0xC1],
+                    execute_at_us: now_us - 1_000,
+                    period_us: 0,
+                    shard_id: SHARD,
+                })?;
+                Ok(())
+            })
+        }))
+        .await
+        .unwrap();
+
+    let scheduler = start_scheduler(&shard, vec![]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    scheduler.stop().await;
+
+    assert!(marks(&shard).is_empty(), "a failed decode never dispatches");
+    assert_eq!(
+        pending_schedule_rows(&shard).len(),
+        1,
+        "at-least-once: the row stays for re-delivery after the backoff"
+    );
+}
+
+// --- The worker tolerates a shard without the __schedule__ table --------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scheduler_idles_on_a_shard_without_the_schedule_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::from_tables([&MARK]).unwrap(); // no __schedule__
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            EPOCH,
+            fluxum_core::commitlog::CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let registry = Arc::new(ReducerRegistry::from_defs([&APPEND_MARK]).unwrap());
+
+    let scheduler = Scheduler::new(
+        pipeline,
+        registry,
+        SHARD,
+        fluxum_core::auth::server_identity("sched-test"),
+        SchedulerOptions::default(),
+        vec![],
+        vec![],
+    )
+    .unwrap()
+    .start()
+    .await
+    .unwrap();
+    assert!(scheduler.tick_stats("nope").is_none(), "no ticks running");
+    // A few polls against the missing table are clean no-ops.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    scheduler.stop().await;
+}
+
+// --- RED-020: failing ticks roll back and a long stall warns + resets ---------------
+
+static STALL_FIRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn failing_slow_tick(_ctx: &ReducerContext<'_, '_, '_>, _args: &[FluxValue]) -> Result<()> {
+    // One 80 ms stall (8 periods at 100 Hz) on the first firing, then fast.
+    if !STALL_FIRED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(80));
+    }
+    Err(FluxumError::Reducer("tick business error (test)".into()))
+}
+
+static FAILING_SLOW_TICK: ReducerDef = ReducerDef {
+    name: "failing_slow_tick",
+    handler: failing_slow_tick,
+    check_args: check_none,
+    client_callable: false,
+    max_rate_per_sec: 0,
+};
+
+static FAILING_TICK_DEF: fluxum_core::scheduler::TickDef = fluxum_core::scheduler::TickDef {
+    name: "failing_slow_tick",
+    rate_hz: 100,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_ticks_roll_back_and_long_stalls_warn_once_and_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::from_tables([&MARK, &SCHEDULE_TABLE]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            EPOCH,
+            fluxum_core::commitlog::CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let registry = Arc::new(ReducerRegistry::from_defs([&FAILING_SLOW_TICK]).unwrap());
+
+    let handle = Scheduler::new(
+        pipeline,
+        registry,
+        SHARD,
+        fluxum_core::auth::server_identity("sched-test"),
+        SchedulerOptions::default(),
+        vec![&FAILING_TICK_DEF],
+        vec![],
+    )
+    .unwrap()
+    .start()
+    .await
+    .unwrap();
+
+    // Wait until the stalled first firing plus a few more have happened.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let stats = handle.tick_stats("failing_slow_tick").unwrap();
+        let executions = stats.executions.load(std::sync::atomic::Ordering::SeqCst);
+        let warnings = stats.warnings.load(std::sync::atomic::Ordering::SeqCst);
+        if (executions >= 3 && warnings >= 1) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let stats = handle.tick_stats("failing_slow_tick").unwrap();
+    let executions = stats.executions.load(std::sync::atomic::Ordering::SeqCst);
+    let warnings = stats.warnings.load(std::sync::atomic::Ordering::SeqCst);
+    handle.stop().await;
+
+    assert!(executions >= 3, "the clock survives failing ticks");
+    assert!(
+        warnings >= 1,
+        "an 8-period stall must warn and reset the clock (RED-020)"
+    );
+    // Every firing rolled back: no rows were ever committed by the tick.
+    assert_eq!(
+        store
+            .snapshot()
+            .scan(store.table_id("Mark").unwrap())
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
 // --- Static #[fluxum::schedule] defs: enqueue at start, restart-safe ---------------
 
 static STATIC_MARK: ScheduleDef = ScheduleDef {

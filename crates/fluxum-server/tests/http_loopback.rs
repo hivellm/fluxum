@@ -107,9 +107,16 @@ static SEND_CHAT: ReducerDef = ReducerDef {
     max_rate_per_sec: 0,
 };
 
-async fn start(options: HttpOptions) -> http::HttpServer {
+/// A full harness: the running server plus the shard context and store the
+/// edge tests reach into (fan-out registry, presence rows).
+struct Harness {
+    server: http::HttpServer,
+    ctx: Arc<ShardContext>,
+    store: Arc<MemStore>,
+}
+
+async fn start_full(options: HttpOptions, hooks: LifecycleHooks, schema: Schema) -> Harness {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-    let schema = Schema::from_tables([&CHAT]).unwrap();
     let store = Arc::new(MemStore::new(&schema).unwrap());
     let log = Arc::new(
         CommitLog::open(
@@ -126,14 +133,24 @@ async fn start(options: HttpOptions) -> http::HttpServer {
     let engine = ReducerEngine::new(
         pipeline,
         Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap()),
-        LifecycleHooks::none(),
+        hooks,
         SHARD,
         fluxum_core::auth::server_identity("http-test"),
     );
     let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
     let auth = Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
     let ctx = ShardContext::new(engine, subs, auth, SHARD, 256);
-    http::serve(ctx, "127.0.0.1:0", options).await.unwrap()
+    let server = http::serve(Arc::clone(&ctx), "127.0.0.1:0", options)
+        .await
+        .unwrap();
+    Harness { server, ctx, store }
+}
+
+async fn start(options: HttpOptions) -> http::HttpServer {
+    let schema = Schema::from_tables([&CHAT]).unwrap();
+    start_full(options, LifecycleHooks::none(), schema)
+        .await
+        .server
 }
 
 // --- A minimal HTTP/1.1 client -------------------------------------------------
@@ -504,4 +521,449 @@ async fn http_and_tcp_route_byte_identical_frames() {
         .collect();
     assert_eq!(ids, vec![100, 101], "batched frames answered in order");
     server.shutdown();
+}
+
+// --- RPC-061/RPC-001: POST body frame edge cases --------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_body_frame_errors_map_to_400_and_413() {
+    let server = start(HttpOptions {
+        max_frame_bytes: 1024,
+        ..HttpOptions::default()
+    })
+    .await;
+    let addr = server.local_addr;
+
+    // A frame whose body is not a decodable envelope → 400.
+    let garbage = FrameCodec::default().encode(&[0xC1, 0xFF, 0x00]).unwrap();
+    let resp = post(addr, None, CONTENT_TYPE, &[garbage]).await;
+    assert_eq!(resp.status, 400, "malformed envelope");
+
+    // A frame header above max_frame_bytes → 413.
+    let oversized_header = 2_000_000u32.to_le_bytes().to_vec();
+    let resp = post(addr, None, CONTENT_TYPE, &[oversized_header]).await;
+    assert_eq!(resp.status, 413, "frame too large");
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn post_body_skips_keepalives_and_a_trailing_partial_frame() {
+    let server = start(HttpOptions::default()).await;
+    let auth = frame(&ClientMessage::Authenticate(Authenticate {
+        id: 1,
+        token: b"alice".to_vec(),
+        compression: None,
+        tx_updates: None,
+    }));
+    // keep-alive frame + real frame + a dangling 2-byte partial header.
+    let keepalive = FrameCodec::keepalive().to_vec();
+    let partial = vec![0xFF, 0x00];
+    let resp = post(
+        server.local_addr,
+        None,
+        CONTENT_TYPE,
+        &[keepalive, auth, partial],
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    assert!(
+        matches!(resp.messages().first(), Some(ServerMessage::AuthResult(_))),
+        "the enveloped frame routed; keep-alive and the partial tail ignored"
+    );
+    server.shutdown();
+}
+
+// --- GET /rpc session binding edges (RPC-060) ------------------------------------
+
+/// Issue a bare `GET /rpc` and return the response status.
+async fn get_status(addr: std::net::SocketAddr, session: Option<&str>) -> u16 {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut req = String::from("GET /rpc HTTP/1.1\r\nHost: x\r\n");
+    if let Some(token) = session {
+        req.push_str(&format!("Fluxum-Session: {token}\r\n"));
+    }
+    req.push_str("\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    read_response(&mut stream).await.status
+}
+
+/// Open the GET push stream and consume its response header.
+async fn open_stream(addr: std::net::SocketAddr, session: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let get = format!("GET /rpc HTTP/1.1\r\nHost: x\r\nFluxum-Session: {session}\r\n\r\n");
+    stream.write_all(get.as_bytes()).await.unwrap();
+    let mut header = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.unwrap();
+        header.push(b[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&header).contains("chunked"),
+        "chunked stream header"
+    );
+    stream
+}
+
+/// Read chunked stream data until a FluxRPC keep-alive (zero-length) frame
+/// appears; `false` on timeout/close.
+async fn saw_stream_keepalive(stream: &mut TcpStream, timeout: Duration) -> bool {
+    let codec = FrameCodec::default();
+    let mut frames = Vec::new();
+    let mut raw = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        while let Some(nl) = find(&raw, b"\r\n") {
+            let Ok(size) = usize::from_str_radix(String::from_utf8_lossy(&raw[..nl]).trim(), 16)
+            else {
+                break;
+            };
+            if raw.len() < nl + 2 + size + 2 {
+                break;
+            }
+            let data = raw[nl + 2..nl + 2 + size].to_vec();
+            raw.drain(..nl + 2 + size + 2);
+            frames.extend_from_slice(&data);
+        }
+        if let Ok(Some((frame, consumed))) = codec.decode(&frames) {
+            if matches!(frame, Frame::KeepAlive) {
+                return true;
+            }
+            frames.drain(..consumed);
+            continue;
+        }
+        let mut chunk = [0u8; 4096];
+        match tokio::time::timeout_at(deadline, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => return false,
+            Ok(Ok(n)) => raw.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_stream_without_or_with_a_stale_session_is_404() {
+    let server = start(HttpOptions::default()).await;
+    assert_eq!(get_status(server.local_addr, None).await, 404);
+    assert_eq!(get_status(server.local_addr, Some("deadbeef")).await, 404);
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_get_stream_on_one_session_is_409() {
+    let server = start(HttpOptions::default()).await;
+    let addr = server.local_addr;
+    let session = authenticate(addr, b"alice").await;
+    let _stream = open_stream(addr, &session).await;
+    assert_eq!(
+        get_status(addr, Some(&session)).await,
+        409,
+        "one stream max"
+    );
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn get_stream_carries_keepalives_with_idle_disabled() {
+    // idle_timeout: None exercises the disabled-expiry arm; the keep-alive
+    // cadence proves the stream stays open and ticking.
+    let server = start(HttpOptions {
+        keepalive: Duration::from_millis(100),
+        idle_timeout: None,
+        ..HttpOptions::default()
+    })
+    .await;
+    let addr = server.local_addr;
+    let session = authenticate(addr, b"alice").await;
+    let mut stream = open_stream(addr, &session).await;
+    assert!(
+        saw_stream_keepalive(&mut stream, Duration::from_secs(3)).await,
+        "keep-alive frame on the open stream"
+    );
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_session_gets_408_on_the_stream_and_a_stale_post_after() {
+    let server = start(HttpOptions {
+        keepalive: Duration::from_secs(10),
+        idle_timeout: Some(Duration::from_millis(300)),
+        ..HttpOptions::default()
+    })
+    .await;
+    let addr = server.local_addr;
+    let session = authenticate(addr, b"alice").await;
+    let mut stream = open_stream(addr, &session).await;
+    match read_stream_message(&mut stream, Duration::from_secs(3)).await {
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408, "RPC-060 idle expiry"),
+        other => panic!("expected a 408 Error frame, got {other:?}"),
+    }
+    // The stream terminates and the session is evicted: a later POST is 404.
+    assert!(
+        read_stream_message(&mut stream, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "stream closed after 408"
+    );
+    let call = ClientMessage::ReducerCall(ReducerCall {
+        id: 1,
+        reducer: "send_chat".into(),
+        version: None,
+        args: vec![FluxValue::Str("x".into())],
+    });
+    let resp = post(addr, Some(&session), CONTENT_TYPE, &[frame(&call)]).await;
+    assert_eq!(resp.status, 404, "session evicted after idle expiry");
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dropping_the_connection_handle_ends_the_get_stream() {
+    let schema = Schema::from_tables([&CHAT]).unwrap();
+    let h = start_full(HttpOptions::default(), LifecycleHooks::none(), schema).await;
+    let addr = h.server.local_addr;
+    let session = authenticate(addr, b"alice").await;
+    let mut stream = open_stream(addr, &session).await;
+    // Deregistering the connection drops its outbound sink; the stream's
+    // receiver sees the closed channel and terminates cleanly.
+    h.ctx.connections.remove(1).await;
+    assert!(
+        read_stream_message(&mut stream, Duration::from_secs(3))
+            .await
+            .is_none(),
+        "stream ends when the sink is dropped"
+    );
+    h.server.shutdown();
+}
+
+// --- HTTP/1.1 request parsing edges -----------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn header_lines_without_a_colon_are_skipped() {
+    let server = start(HttpOptions::default()).await;
+    let mut stream = TcpStream::connect(server.local_addr).await.unwrap();
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: x\r\nGarbageLineWithoutColon\r\n\r\n")
+        .await
+        .unwrap();
+    let resp = read_response(&mut stream).await;
+    assert_eq!(resp.status, 200, "the malformed header line is ignored");
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_oversized_header_block_closes_the_connection() {
+    let server = start(HttpOptions::default()).await;
+    let mut stream = TcpStream::connect(server.local_addr).await.unwrap();
+    // > 64 KiB with no header terminator.
+    let flood = vec![b'A'; 80 * 1024];
+    let _ = stream.write_all(b"GET /health HTTP/1.1\r\n").await;
+    let _ = stream.write_all(&flood).await;
+    let mut chunk = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk))
+        .await
+        .expect("server must react")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "connection closed without a response");
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_truncated_body_is_a_clean_close() {
+    let server = start(HttpOptions::default()).await;
+    let mut stream = TcpStream::connect(server.local_addr).await.unwrap();
+    // Content-Length promises 100 bytes; only 3 arrive, then EOF.
+    stream
+        .write_all(b"POST /rpc HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\nabc")
+        .await
+        .unwrap();
+    stream.shutdown().await.unwrap();
+    let mut chunk = [0u8; 64];
+    let n = tokio::time::timeout(Duration::from_secs(3), stream.read(&mut chunk))
+        .await
+        .expect("server must react")
+        .unwrap_or(0);
+    assert_eq!(n, 0, "no response for a truncated request");
+    server.shutdown();
+}
+
+// --- RED-011/012 lifecycle hooks over the HTTP transport --------------------------
+
+static ONLINE_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "conn",
+        ty: FluxType::ConnectionId,
+    },
+    ColumnSchema {
+        name: "who",
+        ty: FluxType::Identity,
+    },
+];
+static ONLINE: TableSchema = TableSchema {
+    name: "OnlineUser",
+    columns: ONLINE_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Public,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: VisibilityRule::PublicAll,
+};
+
+struct OnlineUser {
+    conn: fluxum_core::types::ConnectionId,
+    who: fluxum_core::types::Identity,
+}
+impl Table for OnlineUser {
+    type Pk = fluxum_core::types::ConnectionId;
+    const SCHEMA: &'static TableSchema = &ONLINE;
+    fn primary_key(&self) -> Self::Pk {
+        self.conn
+    }
+    fn into_values(self) -> Vec<RowValue> {
+        vec![
+            RowValue::ConnectionId(self.conn),
+            RowValue::Identity(self.who),
+        ]
+    }
+    fn from_values(values: &[RowValue]) -> Result<Self> {
+        match values {
+            [RowValue::ConnectionId(conn), RowValue::Identity(who)] => Ok(Self {
+                conn: *conn,
+                who: *who,
+            }),
+            _ => Err(fluxum_core::FluxumError::Storage("bad row".into())),
+        }
+    }
+    fn pk_values(pk: &Self::Pk) -> Vec<RowValue> {
+        vec![RowValue::ConnectionId(*pk)]
+    }
+}
+
+fn presence_connect(ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    ctx.tx.insert(OnlineUser {
+        conn: ctx.connection_id,
+        who: ctx.identity,
+    })?;
+    Ok(())
+}
+fn presence_disconnect(ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    ctx.tx.delete::<OnlineUser>(ctx.connection_id)?;
+    Ok(())
+}
+static PRESENCE_CONNECT: fluxum_core::reducer::LifecycleDef = fluxum_core::reducer::LifecycleDef {
+    kind: fluxum_core::reducer::LifecycleKind::OnConnect,
+    name: "presence_connect",
+    handler: presence_connect,
+};
+static PRESENCE_DISCONNECT: fluxum_core::reducer::LifecycleDef =
+    fluxum_core::reducer::LifecycleDef {
+        kind: fluxum_core::reducer::LifecycleKind::OnDisconnect,
+        name: "presence_disconnect",
+        handler: presence_disconnect,
+    };
+
+fn failing_hook(_ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    Err(fluxum_core::FluxumError::Reducer("hook boom".into()))
+}
+static FAILING_CONNECT: fluxum_core::reducer::LifecycleDef = fluxum_core::reducer::LifecycleDef {
+    kind: fluxum_core::reducer::LifecycleKind::OnConnect,
+    name: "failing_connect",
+    handler: failing_hook,
+};
+static FAILING_DISCONNECT: fluxum_core::reducer::LifecycleDef =
+    fluxum_core::reducer::LifecycleDef {
+        kind: fluxum_core::reducer::LifecycleKind::OnDisconnect,
+        name: "failing_disconnect",
+        handler: failing_hook,
+    };
+
+async fn wait_for_rows(store: &MemStore, table: &str, want: usize) -> bool {
+    let tid = store.table_id(table).unwrap();
+    for _ in 0..200 {
+        if store.snapshot().row_count(tid).unwrap() == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_hooks_fire_over_http_sessions() {
+    let schema = Schema::from_tables([&CHAT, &ONLINE]).unwrap();
+    let hooks = LifecycleHooks::from_defs([&PRESENCE_CONNECT, &PRESENCE_DISCONNECT]);
+    let h = start_full(
+        HttpOptions {
+            keepalive: Duration::from_secs(10),
+            idle_timeout: Some(Duration::from_millis(300)),
+            ..HttpOptions::default()
+        },
+        hooks,
+        schema,
+    )
+    .await;
+    let addr = h.server.local_addr;
+
+    // The first Authenticate mints the session and runs `on_connect`.
+    let session = authenticate(addr, b"alice").await;
+    assert!(
+        wait_for_rows(&h.store, "OnlineUser", 1).await,
+        "on_connect inserted the presence row (RED-011)"
+    );
+
+    // The GET stream expiring runs `on_disconnect` and publishes its diff.
+    let mut stream = open_stream(addr, &session).await;
+    match read_stream_message(&mut stream, Duration::from_secs(3)).await {
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408),
+        other => panic!("expected 408, got {other:?}"),
+    }
+    assert!(
+        wait_for_rows(&h.store, "OnlineUser", 0).await,
+        "on_disconnect cleaned up the presence row (RED-012)"
+    );
+    h.server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn failing_lifecycle_hooks_do_not_break_the_http_transport() {
+    let schema = Schema::from_tables([&CHAT]).unwrap();
+    let hooks = LifecycleHooks::from_defs([&FAILING_CONNECT, &FAILING_DISCONNECT]);
+    let h = start_full(
+        HttpOptions {
+            keepalive: Duration::from_secs(10),
+            idle_timeout: Some(Duration::from_millis(300)),
+            ..HttpOptions::default()
+        },
+        hooks,
+        schema,
+    )
+    .await;
+    let addr = h.server.local_addr;
+
+    // The on_connect hook fails; the session is still issued and usable.
+    let session = authenticate(addr, b"alice").await;
+    let call = ClientMessage::ReducerCall(ReducerCall {
+        id: 5,
+        reducer: "send_chat".into(),
+        version: None,
+        args: vec![FluxValue::Str("still works".into())],
+    });
+    let resp = post(addr, Some(&session), CONTENT_TYPE, &[frame(&call)]).await;
+    assert_eq!(resp.status, 200);
+    assert!(matches!(
+        resp.messages().first(),
+        Some(ServerMessage::ReducerResult(_))
+    ));
+
+    // The on_disconnect hook fails on idle expiry; the server keeps serving.
+    let mut stream = open_stream(addr, &session).await;
+    match read_stream_message(&mut stream, Duration::from_secs(3)).await {
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 408),
+        other => panic!("expected 408, got {other:?}"),
+    }
+    let _fresh = authenticate(addr, b"bob").await;
+    h.server.shutdown();
 }

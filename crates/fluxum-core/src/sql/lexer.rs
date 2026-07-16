@@ -222,3 +222,45 @@ fn lex_number(sql: &str, start: usize) -> Result<(Token, usize)> {
         Ok((Token::Int(value), i))
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_display_in_their_source_form() {
+        assert_eq!(Token::Word("Sensor".into()).to_string(), "Sensor");
+        assert_eq!(Token::Int(-3).to_string(), "-3");
+        assert_eq!(Token::Float(1.5).to_string(), "1.5");
+        // String display re-escapes embedded quotes.
+        assert_eq!(Token::Str("o'brien".into()).to_string(), "'o''brien'");
+        assert_eq!(Token::Star.to_string(), "*");
+        assert_eq!(Token::LParen.to_string(), "(");
+        assert_eq!(Token::RParen.to_string(), ")");
+        assert_eq!(Token::Comma.to_string(), ",");
+        assert_eq!(Token::Eq.to_string(), "=");
+    }
+
+    fn reject(sql: &str) -> String {
+        tokenize(sql).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn lone_minus_and_malformed_numerics_are_rejected() {
+        // `-` not introducing a numeric literal.
+        let err = reject("SELECT * FROM T WHERE a = - 1");
+        assert!(err.contains("operator `-`"), "{err}");
+        // A trailing decimal point with no fraction digits.
+        let err = reject("SELECT * FROM T WHERE a = 1.");
+        assert!(err.contains("malformed numeric literal"), "{err}");
+    }
+
+    #[test]
+    fn overflowing_float_literals_are_rejected_as_non_finite() {
+        // 400 digits parse as f64 infinity — rejected, never stored.
+        let huge = format!("SELECT * FROM T WHERE a = {}.0", "9".repeat(400));
+        let err = reject(&huge);
+        assert!(err.contains("non-finite numeric literal"), "{err}");
+    }
+}

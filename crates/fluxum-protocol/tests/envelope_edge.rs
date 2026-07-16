@@ -176,3 +176,79 @@ fn fluxvalue_rejects_msgpack_ext_values() {
     // fixext1 (type 5, one data byte) is outside the FluxValue universe.
     assert!(rmp_serde::from_slice::<FluxValue>(&[0xD4, 0x05, 0x2A]).is_err());
 }
+
+#[test]
+fn reducer_result_outcome_rejects_truncated_tuples() {
+    // An empty outcome array: the visitor's invalid_length error renders the
+    // `expecting` description.
+    let wire = (3u32, Vec::<String>::new());
+    let bytes = rmp_serde::to_vec(&wire).unwrap();
+    let err = rmp_serde::from_slice::<ReducerResult>(&bytes)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(r#"["Ok", nil] or ["Err", message]"#), "{err}");
+
+    // A lone tag without its payload element.
+    let wire = (3u32, ("Ok",));
+    let bytes = rmp_serde::to_vec(&wire).unwrap();
+    let err = rmp_serde::from_slice::<ReducerResult>(&bytes)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains(r#"["Ok", nil] or ["Err", message]"#), "{err}");
+}
+
+// --- FluxValue visitor: owned/optional deserializer shapes ----------------------
+//
+// MessagePack never drives `visit_string`/`visit_byte_buf` (rmp-serde hands
+// out transient slices) nor `visit_some`/`visit_none` (nil is `visit_unit`),
+// but `FluxValue: Deserialize` is format-agnostic — a self-describing format
+// that owns its data (or models optionality) must decode identically. A
+// minimal hand-rolled deserializer exercises those visitor entry points.
+
+#[derive(Clone)]
+enum OwnedShape {
+    Str(String),
+    Bytes(Vec<u8>),
+    Some(Box<OwnedShape>),
+    None,
+}
+
+impl<'de> serde::Deserializer<'de> for OwnedShape {
+    type Error = serde::de::value::Error;
+
+    fn deserialize_any<V: serde::de::Visitor<'de>>(
+        self,
+        visitor: V,
+    ) -> Result<V::Value, Self::Error> {
+        match self {
+            Self::Str(s) => visitor.visit_string(s),
+            Self::Bytes(b) => visitor.visit_byte_buf(b),
+            Self::Some(inner) => visitor.visit_some(*inner),
+            Self::None => visitor.visit_none(),
+        }
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+#[test]
+fn fluxvalue_decodes_owned_strings_bytes_and_options() {
+    use serde::Deserialize;
+
+    let s = FluxValue::deserialize(OwnedShape::Str("owned".into())).unwrap();
+    assert_eq!(s, FluxValue::Str("owned".into()));
+
+    let b = FluxValue::deserialize(OwnedShape::Bytes(vec![1, 2, 3])).unwrap();
+    assert_eq!(b, FluxValue::Bytes(vec![1, 2, 3]));
+
+    // `Some(inner)` decodes as the inner value; `None` decodes as Null.
+    let some =
+        FluxValue::deserialize(OwnedShape::Some(Box::new(OwnedShape::Str("in".into())))).unwrap();
+    assert_eq!(some, FluxValue::Str("in".into()));
+    let none = FluxValue::deserialize(OwnedShape::None).unwrap();
+    assert_eq!(none, FluxValue::Null);
+}

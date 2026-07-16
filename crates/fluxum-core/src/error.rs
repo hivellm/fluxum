@@ -140,6 +140,12 @@ mod tests {
     }
 
     #[test]
+    fn query_code_is_none_for_non_query_errors() {
+        assert_eq!(FluxumError::query(404, "nope").query_code(), Some(404));
+        assert_eq!(FluxumError::Storage("disk".into()).query_code(), None);
+    }
+
+    #[test]
     fn io_error_converts() {
         let e: FluxumError = std::io::Error::new(std::io::ErrorKind::NotFound, "gone").into();
         assert!(matches!(e, FluxumError::Io(_)));

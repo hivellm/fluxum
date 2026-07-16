@@ -485,6 +485,46 @@ mod tests {
     }
 
     #[test]
+    fn empty_columns_duplicate_pk_and_empty_constraint_lists_rejected() {
+        static NO_COLS: TableSchema = TableSchema {
+            columns: &[],
+            ..user_schema()
+        };
+        assert_schema_err(&NO_COLS, "at least one column (DM-001)");
+
+        static DUP_PK: TableSchema = TableSchema {
+            primary_key: &[0, 0],
+            auto_inc: None,
+            ..user_schema()
+        };
+        assert_schema_err(&DUP_PK, "same column twice (DM-002)");
+
+        static EMPTY_UNIQUE: TableSchema = TableSchema {
+            unique: &[&[]],
+            ..user_schema()
+        };
+        assert_schema_err(&EMPTY_UNIQUE, "empty column list (DM-006)");
+
+        static EMPTY_BTREE: TableSchema = TableSchema {
+            indexes: &[IndexSchema::BTree { columns: &[] }],
+            ..user_schema()
+        };
+        assert_schema_err(&EMPTY_BTREE, "empty column list (DM-030)");
+    }
+
+    #[test]
+    fn keyable_types_exclude_rich_and_variable_shapes() {
+        assert!(FluxType::U64.is_keyable());
+        assert!(FluxType::Str.is_keyable());
+        assert!(FluxType::Timestamp.is_keyable());
+        assert!(!FluxType::Bytes.is_keyable());
+        assert!(!FluxType::Option(&FluxType::U64).is_keyable());
+        assert!(!FluxType::List(&FluxType::U64).is_keyable());
+        assert!(FluxType::F32.is_float());
+        assert!(!FluxType::U64.is_float());
+    }
+
+    #[test]
     fn assemble_from_inventory_is_empty_in_this_crate() {
         // fluxum-core itself declares no tables; the macro integration tests
         // in fluxum-macros exercise the populated path.

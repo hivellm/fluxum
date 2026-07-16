@@ -508,4 +508,117 @@ mod tests {
         };
         assert!(err.to_string().contains("neither resident"), "{err}");
     }
+
+    fn open_pager(dir: &std::path::Path, page_size: usize) -> Arc<Pager> {
+        Pager::open(
+            dir,
+            PagerOptions {
+                shard_id: 0,
+                page_size,
+                pool_capacity_bytes: 16 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    #[test]
+    fn shard_id_is_exposed() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let pager = open_pager(dir.path(), 4096);
+        assert_eq!(pager.shard_id(), 0);
+    }
+
+    #[test]
+    fn a_page_size_overflowing_u32_is_rejected_and_allocation_degrades() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let pager = open_pager(dir.path(), (u32::MAX as usize) + 1);
+        let table = TableId::from_raw(7);
+        let err = match pager.coldtier_bytes(table) {
+            Ok(_) => panic!("4 GiB+ page size accepted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("overflows u32"), "{err}");
+        // allocate_page_id degrades to 1; the follow-up install/fault on the
+        // same table surfaces the real error with context.
+        assert_eq!(pager.allocate_page_id(table), 1);
+    }
+
+    #[test]
+    fn reopening_a_page_file_with_a_different_page_size_is_rejected() {
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let table = TableId::from_raw(9);
+        {
+            let pager = open_pager(dir.path(), 4096);
+            // First use creates shard-0/table-9.pages with page_size 4096.
+            assert!(
+                pager
+                    .coldtier_bytes(table)
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    > 0
+            );
+        }
+        // Same page size: the existing file reopens fine (TIER-022).
+        {
+            let pager = open_pager(dir.path(), 4096);
+            assert!(
+                pager
+                    .coldtier_bytes(table)
+                    .unwrap_or_else(|e| panic!("{e}"))
+                    > 0
+            );
+        }
+        // Different page size: refused, naming both sizes.
+        let pager = open_pager(dir.path(), 8192);
+        let err = match pager.coldtier_bytes(table) {
+            Ok(_) => panic!("page-size mismatch accepted"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("page_size 4096"), "{err}");
+        assert!(err.to_string().contains("8192"), "{err}");
+        assert!(err.to_string().contains("TIER-022"), "{err}");
+    }
+
+    #[test]
+    fn free_page_returns_the_spilled_extent_to_the_free_list() {
+        use super::format::{PageHeader, encode_page};
+
+        let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        let pager = open_pager(dir.path(), 4096);
+        let table = TableId::from_raw(3);
+        let page_id = pager.allocate_page_id(table);
+        let header = PageHeader::new(page_id, table.as_u32(), 0, 0);
+        let image = encode_page(&header, &[0xEE; 100]).unwrap_or_else(|e| panic!("{e}"));
+        drop(
+            pager
+                .install(table, page_id, image)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        pager.flush().unwrap_or_else(|e| panic!("{e}"));
+        assert!(
+            pager
+                .page_extent(table, page_id)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .is_some(),
+            "flush must have spilled the dirty page to an extent"
+        );
+        pager
+            .free_page(table, page_id)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            pager
+                .page_extent(table, page_id)
+                .unwrap_or_else(|e| panic!("{e}")),
+            None,
+            "freeing must drop the directory entry"
+        );
+        let err = match pager.fault(table, page_id) {
+            Ok(_) => panic!("freed page still faults"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("neither resident"), "{err}");
+    }
 }

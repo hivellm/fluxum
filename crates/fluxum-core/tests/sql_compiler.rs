@@ -269,6 +269,47 @@ fn schema_and_type_errors_are_wire_ready_400s() {
     assert!(err.contains("unknown column `ghost`"), "{err}");
 }
 
+// --- Parser diagnostics for malformed clause shapes --------------------------------
+
+#[test]
+fn malformed_clause_shapes_get_named_diagnostics() {
+    let err = reject("SELECT * FROM ChatMessage LIMIT 5000000000");
+    assert!(err.contains("exceeds the u32 range"), "{err}");
+
+    // A non-integer LIMIT names the offending token (Float / Str display).
+    let err = reject("SELECT * FROM ChatMessage LIMIT 1.5");
+    assert!(err.contains("`1.5`"), "{err}");
+    let err = reject("SELECT * FROM ChatMessage LIMIT 'ten'");
+    assert!(err.contains("'ten'"), "{err}");
+
+    // IN-list separator errors name what was found instead.
+    let err = reject("SELECT * FROM ChatMessage WHERE channel IN (1 2)");
+    assert!(err.contains("expected `,` or `)` in the IN list"), "{err}");
+
+    // A comma where a literal belongs (Comma token display).
+    let err = reject("SELECT * FROM ChatMessage WHERE channel = ,");
+    assert!(err.contains("expected a literal value, got `,`"), "{err}");
+
+    // Spatial coordinate-list shapes.
+    let err = reject("SELECT * FROM Vehicle IN REGION 0, 0, 1, 1");
+    assert!(err.contains("expected `(`"), "{err}");
+    let err = reject("SELECT * FROM Vehicle IN REGION (0 0, 1, 1)");
+    assert!(err.contains("expected `,` between coordinates"), "{err}");
+    let err = reject("SELECT * FROM Vehicle IN REGION (0, 0, 1, 1 LIMIT 5");
+    assert!(err.contains("expected `)`"), "{err}");
+    let err = reject("SELECT * FROM Vehicle WITHIN RADIUS wide OF (0, 0)");
+    assert!(err.contains("the radius"), "{err}");
+}
+
+#[test]
+fn float_literals_compile_and_normalize_canonically() {
+    // Vehicle.x is F64: a float equality compiles, evaluates, and its
+    // canonical text re-renders the float literal.
+    let plan = plan_of("SELECT * FROM Vehicle WHERE x = 1.5");
+    assert_eq!(plan.equalities, vec![(1, RowValue::F64(1.5))]);
+    assert_eq!(plan.normalized, "SELECT * FROM Vehicle WHERE x = 1.5");
+}
+
 // --- SUB-020: normalization + QueryHash -------------------------------------------
 
 #[test]

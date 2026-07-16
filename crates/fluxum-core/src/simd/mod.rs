@@ -640,4 +640,22 @@ mod tests {
         let d = global();
         assert_eq!(d.crc32c(b""), 0);
     }
+
+    #[test]
+    fn scalar_tier_is_supported_on_every_cpu() {
+        assert!(CpuFeatures::default().supports(Tier::Scalar));
+        assert!(CpuFeatures::detect().supports(Tier::Scalar));
+        assert_eq!(Tier::Scalar.as_str(), "scalar");
+    }
+
+    #[test]
+    fn init_global_selects_once_and_reports() {
+        // Boot-time initialization: validates the mode, then either installs
+        // the table or returns the already-initialized one (HWA-031).
+        let d = init_global(SimdMode::Auto).unwrap();
+        assert!(d.selection().report().contains("crc32c="));
+        // A second init keeps the existing table.
+        let again = init_global(SimdMode::Auto).unwrap();
+        assert_eq!(d.selection(), again.selection());
+    }
 }

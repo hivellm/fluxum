@@ -770,6 +770,100 @@ mod tests {
     }
 
     #[test]
+    fn double_install_serves_the_resident_frame() {
+        let (pool, metrics) = pool(4);
+        let spill = no_spill();
+        drop(
+            pool.install(key(1), vec![0xAA; 8], true, &spill)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        // A second install of the same key must not double-allocate: the
+        // resident frame (with the FIRST image) is served instead.
+        let again = pool
+            .install(key(1), vec![0xBB; 8], true, &spill)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(again.image(), &[0xAA; 8], "resident image must win");
+        assert_eq!(pool.occupied_frames(), 1);
+        assert_eq!(
+            metrics.snapshot().bufferpool_bytes,
+            64,
+            "one frame accounted"
+        );
+    }
+
+    #[test]
+    fn a_failed_spill_puts_the_dirty_victim_back() {
+        let (pool, _) = pool(2);
+        let ok_spill = no_spill();
+        drop(
+            pool.install(key(1), vec![0xD1; 8], false, &ok_spill)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        drop(
+            pool.install(key(2), vec![0xD2; 8], false, &ok_spill)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        // Both frames dirty; the fault must evict one, and the spill fails.
+        let fail_spill = |_: PageKey, _: &[u8]| Err(FluxumError::Storage("disk full".into()));
+        let read3 = || Ok(vec![0x03; 8]);
+        let err = match pool.get_or_fault(key(3), &read3, &fail_spill) {
+            Ok(_) => panic!("fault succeeded despite a failing spill"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("disk full"), "{err}");
+        // TIER-013: neither dirty page was dropped on the floor — both are
+        // still resident with their exact images.
+        let img1 = pool.lookup(key(1)).map(|g| g.image().to_vec());
+        let img2 = pool.lookup(key(2)).map(|g| g.image().to_vec());
+        assert_eq!(img1.as_deref(), Some(&[0xD1; 8][..]));
+        assert_eq!(img2.as_deref(), Some(&[0xD2; 8][..]));
+        // Once the spill path works again the fault goes through.
+        let g3 = pool
+            .get_or_fault(key(3), &read3, &ok_spill)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(g3.image(), &[0x03; 8]);
+    }
+
+    #[test]
+    fn discard_refuses_pinned_pages_and_drops_unpinned_ones() {
+        let (pool, _) = pool(2);
+        let spill = no_spill();
+        let read = || Ok(vec![7u8; 8]);
+        let guard = pool
+            .get_or_fault(key(1), &read, &spill)
+            .unwrap_or_else(|e| panic!("{e}"));
+        let err = match pool.discard(key(1)) {
+            Ok(()) => panic!("pinned page discarded"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("discard of pinned page"), "{err}");
+        drop(guard);
+        pool.discard(key(1)).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(pool.occupied_frames(), 0);
+        // Discarding an absent key is a no-op.
+        pool.discard(key(1)).unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    #[test]
+    fn dirty_eviction_through_the_noop_spill_succeeds() {
+        // Exercises the no_spill helper's closure on a real spill call: a
+        // 1-frame pool must spill the dirty resident to admit the new page.
+        let (pool, metrics) = pool(1);
+        let spill = no_spill();
+        drop(
+            pool.install(key(1), vec![0xD1; 8], false, &spill)
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
+        let read2 = || Ok(vec![0x02; 8]);
+        let g2 = pool
+            .get_or_fault(key(2), &read2, &spill)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(g2.image(), &[0x02; 8]);
+        assert_eq!(pool.occupied_frames(), 1);
+        assert!(metrics.snapshot().evictions_spill >= 1);
+    }
+
+    #[test]
     fn evict_all_empties_unpinned_and_faults_reread() {
         let (pool, metrics) = pool(4);
         let spill = no_spill();

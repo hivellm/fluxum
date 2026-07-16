@@ -640,3 +640,126 @@ async fn views_read_committed_state_and_reject_unknown_names() {
     };
     assert!(err.contains("duplicate view name"), "{err}");
 }
+
+// --- Registry surface: Debug rendering + combined admission ------------------
+
+#[test]
+fn registries_and_hooks_render_sorted_debug_summaries() {
+    let registry = ReducerRegistry::from_defs([&RECORD_EVENT, &EXPLODE]).unwrap();
+    let debug = format!("{registry:?}");
+    // Sorted names: explode < record_event.
+    assert!(
+        debug.contains(r#"reducers: ["explode", "record_event"]"#),
+        "{debug}"
+    );
+
+    let hooks = LifecycleHooks::from_defs([&ON_DISCONNECT, &ON_CONNECT, &ON_INIT]);
+    let debug = format!("{hooks:?}");
+    assert!(debug.contains(r#"on_init: ["seed_config"]"#), "{debug}");
+    assert!(debug.contains(r#"on_connect: ["presence_up"]"#), "{debug}");
+    assert!(debug.contains("on_shard_start: []"), "{debug}");
+
+    let views = ViewRegistry::new();
+    assert_eq!(format!("{views:?}"), "ViewRegistry { views: [] }");
+
+    let limiter = fluxum_core::reducer::RateLimiter::new(
+        fluxum_core::reducer::RateLimiterOptions::default(),
+        [Identity::from_bytes([1u8; 32])],
+    );
+    let debug = format!("{limiter:?}");
+    assert!(debug.contains("RateLimiter"), "{debug}");
+    assert!(debug.contains("exempt_identities: 1"), "{debug}");
+}
+
+#[test]
+fn check_call_combines_name_callability_and_argument_admission() {
+    let registry = ReducerRegistry::from_defs([&RECORD_EVENT]).unwrap();
+    registry
+        .check_call("record_event", &[FluxValue::Str("ok".into())])
+        .unwrap();
+    let err = registry.check_call("ghost", &[]).unwrap_err();
+    assert_eq!(err.query_code(), Some(404), "{err}");
+    let err = registry
+        .check_call("record_event", &[FluxValue::I64(3)])
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(400), "{err}");
+}
+
+// --- RED-013: a failing on_shard_start hook aborts startup --------------------
+
+fn failing_shard_start(_ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    Err(FluxumError::Reducer("cache warmup failed (test)".into()))
+}
+
+static FAILING_SHARD_START: LifecycleDef = LifecycleDef {
+    kind: LifecycleKind::OnShardStart,
+    name: "failing_shard_start",
+    handler: failing_shard_start,
+};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_on_shard_start_hook_aborts_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let schema = Schema::from_tables([&ONLINE, &EVENT]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            EPOCH,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let engine = ReducerEngine::new(
+        pipeline,
+        Arc::new(ReducerRegistry::from_defs([]).unwrap()),
+        LifecycleHooks::from_defs([&FAILING_SHARD_START]),
+        SHARD,
+        fluxum_core::auth::server_identity("test-shard"),
+    );
+    let err = engine.start(false).await.unwrap_err();
+    assert!(err.to_string().contains("cache warmup failed"), "{err}");
+}
+
+// --- schedule_after guard rails (RED-021) --------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn schedule_after_rejects_overflowing_delays_and_missing_schedule_table() {
+    let dir = tempfile::tempdir().unwrap();
+    // This shard's schema deliberately lacks the __schedule__ system table.
+    let shard = boot(dir.path());
+    let registry = Arc::new(ReducerRegistry::from_defs([&RECORD_EVENT]).unwrap());
+
+    let caller = client(9);
+    let reg = Arc::clone(&registry);
+    let err = shard
+        .engine
+        .pipeline()
+        .call(Box::new(move |tx| {
+            fluxum_core::reducer::with_context(&reg, caller, tx, |ctx| {
+                ctx.schedule_after(std::time::Duration::MAX, "record_event", &[])
+            })
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(400), "{err}");
+    assert!(err.to_string().contains("overflows the µs clock"), "{err}");
+
+    // A sane delay against a schema without __schedule__ fails at insert.
+    let reg = Arc::clone(&registry);
+    let err = shard
+        .engine
+        .pipeline()
+        .call(Box::new(move |tx| {
+            fluxum_core::reducer::with_context(&reg, caller, tx, |ctx| {
+                ctx.schedule_after(std::time::Duration::from_millis(5), "record_event", &[])
+            })
+        }))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("unknown table id"), "{err}");
+}

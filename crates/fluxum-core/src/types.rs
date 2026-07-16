@@ -402,6 +402,39 @@ mod tests {
     }
 
     #[test]
+    fn identity_debug_wraps_the_hex_form() {
+        let id = Identity::from_token("debug");
+        assert_eq!(format!("{id:?}"), format!("Identity({id})"));
+    }
+
+    #[test]
+    fn decimal_value_cmp_is_numeric_across_scales() {
+        use std::cmp::Ordering;
+        // Same scale: plain coefficient comparison.
+        assert_eq!(
+            Decimal::from_parts(150, 2).value_cmp(&Decimal::from_parts(151, 2)),
+            Ordering::Less
+        );
+        // Different scales: 1.50 == 1.5, 1.5 < 2.0.
+        assert_eq!(
+            Decimal::from_parts(150, 2).value_cmp(&Decimal::from_parts(15, 1)),
+            Ordering::Equal
+        );
+        assert_eq!(
+            Decimal::from_parts(15, 1).value_cmp(&Decimal::from_parts(2, 0)),
+            Ordering::Less
+        );
+        // Extreme-scale lift overflow: the overflowing side's sign decides.
+        let huge = Decimal::from_parts(i128::MAX, 0);
+        let tiny = Decimal::from_parts(1, 30);
+        assert_eq!(huge.value_cmp(&tiny), Ordering::Greater);
+        assert_eq!(tiny.value_cmp(&huge), Ordering::Less);
+        let huge_neg = Decimal::from_parts(i128::MIN, 0);
+        assert_eq!(huge_neg.value_cmp(&tiny), Ordering::Less);
+        assert_eq!(tiny.value_cmp(&huge_neg), Ordering::Greater);
+    }
+
+    #[test]
     fn decimal_accessors_and_parts() {
         let d = Decimal::from_parts(150, 2);
         assert_eq!(d.unscaled(), 150);

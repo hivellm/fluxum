@@ -121,3 +121,73 @@ pub(crate) fn violation_error(
         shown.join(", ")
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{ColumnSchema, FluxType, TableAccess, VisibilityRule};
+    use crate::store::row::encode_pk_values;
+
+    static COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "email",
+            ty: FluxType::Str,
+        },
+    ];
+
+    static T: TableSchema = TableSchema {
+        name: "CovUnique",
+        columns: COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Private,
+        partition_by: None,
+        unique: &[&[1]],
+        indexes: &[],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    fn pk(id: u64) -> PkBytes {
+        encode_pk_values(&T, &[RowValue::U64(id)]).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn row(id: u64, email: &str) -> Row {
+        Row::new(vec![RowValue::U64(id), RowValue::Str(email.into())])
+    }
+
+    #[test]
+    fn out_of_range_constraint_ordinals_are_an_invariant_breach() {
+        let index = UniqueIndex::new(&[9]);
+        let err = match index.key_of_values(&[RowValue::U64(1)]) {
+            Ok(_) => panic!("out-of-range ordinal keyed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("#[unique] ordinal 9 out of range"), "{err}");
+    }
+
+    #[test]
+    fn merging_a_key_claimed_by_another_pk_is_an_invariant_breach() {
+        let mut index = UniqueIndex::new(&[1]);
+        index
+            .insert(&row(1, "a@example.com"), pk(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // Reclaiming a key for the SAME pk is idempotent (update merges).
+        index
+            .insert(&row(1, "a@example.com"), pk(1))
+            .unwrap_or_else(|e| panic!("{e}"));
+        // A different pk claiming the same value means the eager TXN-041
+        // check missed a conflict — an invariant error, never silent.
+        let err = match index.insert(&row(2, "a@example.com"), pk(2)) {
+            Ok(()) => panic!("conflicting unique claim merged"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("eager TXN-041 validation missed a conflict"),
+            "{err}"
+        );
+    }
+}

@@ -145,6 +145,13 @@ mod tests {
     }
 
     #[test]
+    fn public_entry_point_renders_failures_as_compile_error() {
+        let out = expand(TokenStream::new(), good_fn()).to_string();
+        assert!(out.contains("compile_error !"), "{out}");
+        assert!(out.contains("missing `version = N`"), "{out}");
+    }
+
+    #[test]
     fn valid_input_registers_a_migration_def() {
         let out = try_expand(quote::quote!(version = 2), good_fn())
             .unwrap()

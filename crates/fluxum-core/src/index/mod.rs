@@ -441,4 +441,154 @@ mod tests {
         assert_eq!(IndexId::from_raw(0xAB).as_u32(), 0xAB);
         assert_eq!(IndexId::from_raw(0xAB).to_string(), "0x000000ab");
     }
+
+    #[allow(clippy::unwrap_used)]
+    mod spatial_state {
+        use super::super::*;
+        use crate::schema::{ColumnSchema, FluxType, TableAccess, TableSchema, VisibilityRule};
+        use crate::store::row::{Row, encode_pk_values};
+
+        /// A distinct `PkBytes` per `n` (FluxBIN-encoded u64, like the store).
+        fn pk(n: u64) -> PkBytes {
+            static COLS: &[ColumnSchema] = &[ColumnSchema {
+                name: "id",
+                ty: FluxType::U64,
+            }];
+            static T: TableSchema = TableSchema {
+                name: "P",
+                columns: COLS,
+                primary_key: &[0],
+                auto_inc: None,
+                access: TableAccess::Private,
+                partition_by: None,
+                unique: &[],
+                indexes: &[],
+                visibility: VisibilityRule::PublicAll,
+            };
+            encode_pk_values(&T, &[RowValue::U64(n)]).unwrap()
+        }
+
+        fn point_row(x: f64, y: f64) -> Row {
+            Row::new(vec![RowValue::F64(x), RowValue::F64(y)])
+        }
+
+        #[test]
+        fn quadtree_state_round_trips_points_and_rebuilding_gates_queries() {
+            let mut state =
+                SpatialIndexState::quadtree(&[0, 1], Rect::new(0.0, 0.0, 100.0, 100.0), 4);
+            assert!(state.is_ready());
+            state.insert_row(&point_row(5.0, 5.0), pk(1)).unwrap();
+            assert_eq!(
+                state.query_region(Rect::new(0.0, 0.0, 10.0, 10.0)).unwrap(),
+                vec![pk(1)]
+            );
+            assert_eq!(state.query_point(5.0, 5.0).unwrap(), vec![pk(1)]);
+            state.remove_row(&point_row(5.0, 5.0), &pk(1)).unwrap();
+            assert!(state.query_radius(5.0, 5.0, 1.0).unwrap().is_empty());
+
+            // SPX-031: the rebuilding clone answers 503 and skips maintenance.
+            let mut rebuilding = state.rebuilding_like();
+            assert!(!rebuilding.is_ready());
+            rebuilding.insert_row(&point_row(1.0, 1.0), pk(2)).unwrap(); // no-op
+            rebuilding.remove_row(&point_row(1.0, 1.0), &pk(2)).unwrap(); // no-op
+            let err = rebuilding.query_point(1.0, 1.0).unwrap_err();
+            assert_eq!(err.query_code(), Some(503), "{err}");
+
+            // fresh_like restores a ready, empty index of the same shape.
+            assert!(state.fresh_like().is_ready());
+        }
+
+        #[test]
+        fn rtree_state_supports_point_queries_and_insert_constraints() {
+            let mut state = SpatialIndexState::rtree(&[0, 1, 2, 3], 8);
+            let row = Row::new(vec![
+                RowValue::F64(0.0),
+                RowValue::F64(0.0),
+                RowValue::F64(10.0),
+                RowValue::F64(10.0),
+            ]);
+            state.check_insert("Zone", row.values()).unwrap();
+            state.insert_row(&row, pk(1)).unwrap();
+            assert_eq!(state.query_point(5.0, 5.0).unwrap(), vec![pk(1)]);
+            assert!(state.query_point(50.0, 50.0).unwrap().is_empty());
+            state.remove_row(&row, &pk(1)).unwrap();
+            assert!(state.query_point(5.0, 5.0).unwrap().is_empty());
+
+            // SPX-010: inverted boxes are rejected eagerly at insert time.
+            let inverted = Row::new(vec![
+                RowValue::F64(10.0),
+                RowValue::F64(0.0),
+                RowValue::F64(0.0),
+                RowValue::F64(10.0),
+            ]);
+            let err = state.check_insert("Zone", inverted.values()).unwrap_err();
+            assert!(err.to_string().contains("SPX-010"), "{err}");
+        }
+
+        #[test]
+        fn coordinate_and_arity_invariants_surface_as_errors_not_panics() {
+            // A non-float coordinate column (the registry validates DM-032;
+            // this is the runtime backstop).
+            let mut qt = SpatialIndexState::quadtree(&[0, 1], Rect::new(0.0, 0.0, 1.0, 1.0), 4);
+            let bad = Row::new(vec![RowValue::Str("x".into()), RowValue::Str("y".into())]);
+            let err = qt.insert_row(&bad, pk(1)).unwrap_err();
+            assert!(err.to_string().contains("not a float column"), "{err}");
+
+            // Wrong coordinate arity for each family, on every maintenance op.
+            let mut qt_bad = SpatialIndexState::quadtree(&[0], Rect::new(0.0, 0.0, 1.0, 1.0), 4);
+            let row = point_row(0.5, 0.5);
+            let err = qt_bad.insert_row(&row, pk(1)).unwrap_err();
+            assert!(err.to_string().contains("quadtree"), "{err}");
+            assert!(err.to_string().contains("expected 2"), "{err}");
+            let err = qt_bad.remove_row(&row, &pk(1)).unwrap_err();
+            assert!(err.to_string().contains("DM-032"), "{err}");
+
+            let mut rt_bad = SpatialIndexState::rtree(&[0, 1], 8);
+            let err = rt_bad.insert_row(&row, pk(1)).unwrap_err();
+            assert!(err.to_string().contains("rtree"), "{err}");
+            assert!(err.to_string().contains("expected 4"), "{err}");
+            let err = rt_bad.remove_row(&row, &pk(1)).unwrap_err();
+            assert!(err.to_string().contains("DM-032"), "{err}");
+            let err = rt_bad.check_insert("Zone", row.values()).unwrap_err();
+            assert!(err.to_string().contains("expected 4"), "{err}");
+        }
+
+        #[test]
+        fn spatial_predicate_validation_rejects_negative_and_nan_parameters() {
+            SpatialPredicate::InRegion {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0,
+            }
+            .validate()
+            .unwrap();
+            let err = SpatialPredicate::InRegion {
+                x: 0.0,
+                y: 0.0,
+                w: -1.0,
+                h: 1.0,
+            }
+            .validate()
+            .unwrap_err();
+            assert_eq!(err.query_code(), Some(400), "{err}");
+            let err = SpatialPredicate::InRegion {
+                x: 0.0,
+                y: 0.0,
+                w: 1.0,
+                h: f64::NAN,
+            }
+            .validate()
+            .unwrap_err();
+            assert!(err.to_string().contains("height"), "{err}");
+            let err = SpatialPredicate::WithinRadius {
+                x: 0.0,
+                y: 0.0,
+                r: -2.0,
+            }
+            .validate()
+            .unwrap_err();
+            assert!(err.to_string().contains("radius"), "{err}");
+        }
+    }
 }

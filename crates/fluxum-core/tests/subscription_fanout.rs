@@ -511,3 +511,200 @@ fn distinct_plans_on_one_table_fan_out_independently() {
     assert_eq!(update.tables.len(), 1);
     let _ = TableId::of("Sensor");
 }
+
+// --- SUB-004 edge cases: unknown handles + shared-plan handle bookkeeping --------
+
+#[test]
+fn unsubscribe_rejects_unknown_query_ids_and_double_handles_on_one_plan() {
+    let store = store();
+    let mut mgr = manager();
+
+    // Unknown connection entirely.
+    assert!(!mgr.unsubscribe(9, 1));
+
+    // Known connection, unknown query id.
+    let a = mgr
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "SELECT * FROM Sensor WHERE id = 1",
+            &store.snapshot(),
+        )
+        .unwrap();
+    assert!(!mgr.unsubscribe(1, a.query_id + 100));
+
+    // The same connection subscribes the same normalized SQL twice: two
+    // query ids, ONE shared plan bucket. Unsubscribing both handles must be
+    // safe even though the first eviction already removed the bucket.
+    let b = mgr
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "select * from Sensor where id=1",
+            &store.snapshot(),
+        )
+        .unwrap();
+    assert_ne!(a.query_id, b.query_id);
+    assert_eq!(mgr.plan_count(), 1, "dedup under one hash");
+    assert!(mgr.unsubscribe(1, a.query_id));
+    assert_eq!(mgr.plan_count(), 0, "single subscriber set: plan evicted");
+    assert!(mgr.unsubscribe(1, b.query_id), "handle existed");
+    assert_eq!(mgr.subscription_count(1), 0);
+}
+
+/// SUB-023 teardown: unsubscribing a value-indexed (equality) plan removes
+/// its search-args and indexed-column refcounts, so later commits at that
+/// value select nothing.
+#[test]
+fn unsubscribing_a_value_plan_deindexes_its_search_args() {
+    let store = store();
+    let sensor_id = store.table_id("Sensor").unwrap();
+    let mut mgr = manager();
+
+    let a = mgr
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "SELECT * FROM Sensor WHERE id = 42",
+            &store.snapshot(),
+        )
+        .unwrap();
+    // A second plan on the same column keeps the column refcount alive after
+    // the first plan leaves.
+    mgr.subscribe(
+        2,
+        Subscriber::client(client(2)),
+        "SELECT * FROM Sensor WHERE id = 43",
+        &store.snapshot(),
+    )
+    .unwrap();
+
+    assert!(mgr.unsubscribe(1, a.query_id));
+    let diff = commit(&store, |tx| {
+        tx.insert(sensor_id, sensor(42, 7, 10, 0.0, 0.0)).unwrap();
+    });
+    assert!(
+        mgr.on_commit(&diff).unwrap().is_empty(),
+        "deindexed plan no longer matches"
+    );
+    // The surviving plan still fires (refcounted column probing intact).
+    let diff = commit(&store, |tx| {
+        tx.insert(sensor_id, sensor(43, 7, 10, 0.0, 0.0)).unwrap();
+    });
+    assert_eq!(mgr.on_commit(&diff).unwrap().len(), 1);
+
+    // Disconnect drops the last plan; the column probe map empties too.
+    mgr.disconnect(2);
+    let diff = commit(&store, |tx| {
+        tx.insert(sensor_id, sensor(44, 7, 10, 0.0, 0.0)).unwrap();
+    });
+    assert!(mgr.on_commit(&diff).unwrap().is_empty());
+}
+
+// --- Non-public tables are rejected across every read surface -------------------
+
+static SECRET_COLS: &[ColumnSchema] = &[ColumnSchema {
+    name: "id",
+    ty: FluxType::U64,
+}];
+
+static SECRET: TableSchema = TableSchema {
+    name: "Secret",
+    columns: SECRET_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Private,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: VisibilityRule::PublicAll,
+};
+
+#[test]
+fn private_tables_are_forbidden_on_every_read_surface() {
+    let schema = Arc::new(Schema::from_tables([&SENSOR, &SECRET]).unwrap());
+    let store = MemStore::new(&schema).unwrap();
+    let mut mgr = SubscriptionManager::new(Arc::clone(&schema), SubscriptionLimits::default());
+
+    let err = mgr
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "SELECT * FROM Secret",
+            &store.snapshot(),
+        )
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(403), "{err}");
+
+    let err = mgr
+        .snapshot_result(
+            Subscriber::client(client(1)),
+            "SELECT * FROM Secret",
+            &store.snapshot(),
+        )
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(403), "{err}");
+    assert!(err.to_string().contains("Secret"), "{err}");
+
+    let err = mgr
+        .query_json(
+            Subscriber::client(client(1)),
+            "SELECT * FROM Secret",
+            &store.snapshot(),
+        )
+        .unwrap_err();
+    assert_eq!(err.query_code(), Some(403), "{err}");
+}
+
+// --- RPC-050: query_json renders committed rows -----------------------------------
+
+#[test]
+fn query_json_returns_table_columns_and_rows() {
+    let store = store();
+    let sensor_id = store.table_id("Sensor").unwrap();
+    commit(&store, |tx| {
+        tx.insert(sensor_id, sensor(1, 7, -10, 1.5, 2.5)).unwrap();
+    });
+
+    let mgr = manager();
+    let json = mgr
+        .query_json(
+            Subscriber::client(client(1)),
+            "SELECT * FROM Sensor WHERE channel = 7",
+            &store.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(json["table"], "Sensor");
+    assert_eq!(json["columns"][1], "channel");
+    assert_eq!(json["rows"][0]["id"], 1);
+    assert_eq!(json["rows"][0]["reading"], -10);
+    assert_eq!(json["rows"][0]["x"], 1.5);
+}
+
+// --- SUB-011: WITHIN RADIUS InitialData goes through the spatial index -------------
+
+#[test]
+fn radius_initialdata_uses_the_spatial_index() {
+    let store = store();
+    let sensor_id = store.table_id("Sensor").unwrap();
+    commit(&store, |tx| {
+        tx.insert(sensor_id, sensor(1, 7, 10, 3.0, 4.0)).unwrap(); // distance 5
+        tx.insert(sensor_id, sensor(2, 7, 20, 300.0, 400.0))
+            .unwrap();
+    });
+
+    let mut mgr = manager();
+    let sub = mgr
+        .subscribe(
+            1,
+            Subscriber::client(client(1)),
+            "SELECT * FROM Sensor WITHIN RADIUS 5 OF (0, 0)",
+            &store.snapshot(),
+        )
+        .unwrap();
+    assert_eq!(
+        rowlist_len(&sub.initial.tables[0].inserts),
+        1,
+        "only the row within the radius"
+    );
+}

@@ -295,6 +295,22 @@ mod tests {
     }
 
     #[test]
+    fn reading_past_the_end_of_the_file_is_an_io_error() {
+        let (_dir, path) = temp_file();
+        let file = PageFile::create(&path, 4096, 0, 1).unwrap_or_else(|e| panic!("{e}"));
+        // An extent no writer ever produced: positional read must fail
+        // instead of returning zeroed bytes.
+        let err = match file.read_page(Extent {
+            offset: 1 << 20,
+            len: 64,
+        }) {
+            Ok(_) => panic!("read past EOF returned bytes"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("read past end"), "{err}");
+    }
+
+    #[test]
     fn cow_never_reuses_a_live_offset() {
         let (_dir, path) = temp_file();
         let mut file = PageFile::create(&path, 4096, 0, 1).unwrap_or_else(|e| panic!("{e}"));

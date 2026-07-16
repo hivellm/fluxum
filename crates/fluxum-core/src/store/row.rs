@@ -971,5 +971,35 @@ mod tests {
             RowValue::Struct(vec![RowValue::I32(1), RowValue::I32(2)]).to_string(),
             "{1, 2}"
         );
+        // A multi-value payload renders comma-separated.
+        assert_eq!(
+            RowValue::Enum {
+                tag: 2,
+                payload: vec![RowValue::U16(5), RowValue::Str("hi".into())],
+            }
+            .to_string(),
+            "#2(5, \"hi\")"
+        );
+    }
+
+    #[test]
+    fn a_stored_enum_tag_out_of_the_variant_range_fails_decode() {
+        // Encode a valid Rich row, then tamper the stored tag byte (offset
+        // 8, right after the u64 id) to a variant that does not exist.
+        let row = vec![
+            RowValue::U64(1),
+            RowValue::Enum {
+                tag: 0,
+                payload: vec![],
+            },
+            RowValue::Struct(vec![RowValue::I32(0), RowValue::I32(0)]),
+        ];
+        let mut bytes = encode_row(&row).unwrap_or_else(|e| panic!("{e}"));
+        bytes[8] = 9;
+        let err = match decode_row(&RICH, &bytes) {
+            Ok(_) => panic!("out-of-range variant tag decoded"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("variant tag 9 out of range (0..3)"), "{err}");
     }
 }

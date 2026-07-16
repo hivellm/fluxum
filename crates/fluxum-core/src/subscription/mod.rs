@@ -799,3 +799,81 @@ fn limit_exceeded(which: &str) -> FluxumError {
         format!("subscription limit exceeded: {which}"),
     )
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::row_value_to_json;
+    use crate::store::RowValue;
+    use crate::types::{ConnectionId, Decimal, EntityId, Identity, Timestamp};
+    use serde_json::{Value as J, json};
+
+    /// RPC-050: every RowValue variant renders to its documented JSON form —
+    /// numbers as numbers, precision-risky scalars as strings, bytes as hex.
+    #[test]
+    fn every_row_value_variant_renders_to_json() {
+        assert_eq!(row_value_to_json(&RowValue::Bool(true)), json!(true));
+        assert_eq!(row_value_to_json(&RowValue::I8(-1)), json!(-1));
+        assert_eq!(row_value_to_json(&RowValue::I16(-300)), json!(-300));
+        assert_eq!(row_value_to_json(&RowValue::I32(70_000)), json!(70_000));
+        assert_eq!(row_value_to_json(&RowValue::I64(-9)), json!(-9));
+        assert_eq!(row_value_to_json(&RowValue::U8(255)), json!(255));
+        assert_eq!(row_value_to_json(&RowValue::U16(65_535)), json!(65_535));
+        assert_eq!(row_value_to_json(&RowValue::U32(7)), json!(7));
+        assert_eq!(row_value_to_json(&RowValue::U64(u64::MAX)), json!(u64::MAX));
+        assert_eq!(row_value_to_json(&RowValue::F32(0.5)), json!(0.5));
+        assert_eq!(row_value_to_json(&RowValue::F64(1.25)), json!(1.25));
+        // Non-finite floats have no JSON number: rendered as null.
+        assert_eq!(row_value_to_json(&RowValue::F32(f32::NAN)), J::Null);
+        assert_eq!(row_value_to_json(&RowValue::F64(f64::INFINITY)), J::Null);
+        assert_eq!(row_value_to_json(&RowValue::Str("hi".into())), json!("hi"));
+        assert_eq!(
+            row_value_to_json(&RowValue::Bytes(vec![0x00, 0xAB])),
+            json!("00ab")
+        );
+        let id = Identity::from_bytes([9u8; 32]);
+        assert_eq!(
+            row_value_to_json(&RowValue::Identity(id)),
+            json!(id.to_string())
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::ConnectionId(ConnectionId::new(42))),
+            json!("42")
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::EntityId(EntityId::new(7))),
+            json!("7")
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::Timestamp(Timestamp::from_micros(1000))),
+            json!("1000")
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::Decimal(Decimal::from_parts(150, 2))),
+            json!("1.50")
+        );
+        assert_eq!(row_value_to_json(&RowValue::Optional(None)), J::Null);
+        assert_eq!(
+            row_value_to_json(&RowValue::Optional(Some(Box::new(RowValue::U32(3))))),
+            json!(3)
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::List(vec![RowValue::I64(1), RowValue::I64(2)])),
+            json!([1, 2])
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::Enum {
+                tag: 2,
+                payload: vec![RowValue::Bool(false)],
+            }),
+            json!({ "tag": 2, "payload": [false] })
+        );
+        assert_eq!(
+            row_value_to_json(&RowValue::Struct(vec![
+                RowValue::U8(1),
+                RowValue::Str("s".into()),
+            ])),
+            json!([1, "s"])
+        );
+    }
+}

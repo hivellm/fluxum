@@ -202,6 +202,506 @@ fn manifest_roundtrips_and_rejects_any_single_byte_corruption() {
     assert!(decode_manifest(b"short").is_err());
 }
 
+#[test]
+fn manifest_field_validation_and_hash_rendering() {
+    use super::manifest::ObjectHash;
+
+    let hash = ObjectHash::of(b"chunk");
+    assert_eq!(format!("{hash:?}"), format!("ObjectHash({hash})"));
+    assert_eq!(hash.to_string().len(), 64);
+    assert_eq!(ObjectHash::from_bytes(*hash.as_bytes()), hash);
+
+    // A chunk hash of the wrong width is a typed error naming the table.
+    let bad_chunk = super::TableManifest {
+        table_id: 1,
+        table_name: "User".into(),
+        auto_inc_high_water: 0,
+        row_count: 0,
+        chunks: vec![serde_bytes::ByteBuf::from(vec![0xAB; 31])],
+    };
+    let err = bad_chunk.chunk_hashes().unwrap_err();
+    assert!(
+        err.to_string().contains("must be 32 bytes, got 31"),
+        "{err}"
+    );
+
+    // An unknown format version is rejected after integrity verification.
+    let future = Manifest {
+        format_version: super::manifest::MANIFEST_VERSION + 1,
+        shard_id: SHARD,
+        last_tx_id: 1,
+        epoch: 1,
+        timestamp: 0,
+        tables: vec![],
+    };
+    let err = decode_manifest(&encode_manifest(&future).unwrap()).unwrap_err();
+    assert!(
+        err.to_string().contains("unsupported format version"),
+        "{err}"
+    );
+}
+
+// --- repository verification failures (STG-021) --------------------------------
+
+mod repo_verification {
+    use super::*;
+    use crate::commitlog::record::LogValue;
+    use crate::store::pager::codec::compress_artifact;
+
+    fn manifest_name(shard: u32, tx: u64) -> String {
+        format!("ckpt-{shard:010}-{tx:020}.manifest")
+    }
+
+    /// Write a hand-crafted manifest (and optional raw objects) into a repo.
+    fn plant(
+        dir: &Path,
+        tx: u64,
+        tables: Vec<super::super::TableManifest>,
+        objects: &[Vec<u8>],
+    ) -> CheckpointRepo {
+        let repo = CheckpointRepo::open(dir).unwrap();
+        for bytes in objects {
+            let hash = super::super::manifest::ObjectHash::of(bytes);
+            fs::write(dir.join("objects").join(hash.to_string()), bytes).unwrap();
+        }
+        let manifest = Manifest {
+            format_version: super::super::manifest::MANIFEST_VERSION,
+            shard_id: SHARD,
+            last_tx_id: tx,
+            epoch: EPOCH,
+            timestamp: 0,
+            tables,
+        };
+        fs::write(
+            dir.join(manifest_name(SHARD, tx)),
+            encode_manifest(&manifest).unwrap(),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn table_entry(
+        name: &str,
+        table_id: u32,
+        row_count: u64,
+        chunk_bytes: &[Vec<u8>],
+    ) -> super::super::TableManifest {
+        super::super::TableManifest {
+            table_id,
+            table_name: name.into(),
+            auto_inc_high_water: 0,
+            row_count,
+            chunks: chunk_bytes
+                .iter()
+                .map(|bytes| {
+                    serde_bytes::ByteBuf::from(
+                        super::super::manifest::ObjectHash::of(bytes)
+                            .as_bytes()
+                            .to_vec(),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn compression_level_is_configurable_and_reads_stay_level_agnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = mem_store();
+        let mut tx = store.begin();
+        tx.insert(
+            user(&store),
+            vec![RowValue::U64(0), RowValue::Str("compressed".into())],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let repo = CheckpointRepo::open(dir.path())
+            .unwrap()
+            .with_compression_level(9);
+        repo.write(&store.snapshot(), SHARD, 1, EPOCH).unwrap();
+        let loaded = repo.load(&repo.list(SHARD).unwrap()[0]).unwrap();
+        let users = loaded
+            .tables
+            .iter()
+            .find(|t| t.table_name == "User")
+            .unwrap();
+        assert_eq!(users.rows.len(), 1);
+    }
+
+    #[test]
+    fn manifest_body_and_file_name_must_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = plant(dir.path(), 5, vec![], &[]);
+        // Rename the manifest so its file name claims tx 6.
+        fs::rename(
+            dir.path().join(manifest_name(SHARD, 5)),
+            dir.path().join(manifest_name(SHARD, 6)),
+        )
+        .unwrap();
+        let refs = repo.list(SHARD).unwrap();
+        assert_eq!(refs[0].last_tx_id, 6);
+        let err = repo.load(&refs[0]).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees with the file name"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn undecodable_chunk_objects_fail_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // The object's stored bytes hash correctly but are not MessagePack.
+        let garbage = b"not messagepack rows".to_vec();
+        let repo = plant(
+            dir.path(),
+            1,
+            vec![table_entry(
+                "User",
+                TableId::of("User").as_u32(),
+                1,
+                std::slice::from_ref(&garbage),
+            )],
+            &[garbage],
+        );
+        let err = repo.load(&repo.list(SHARD).unwrap()[0]).unwrap_err();
+        assert!(err.to_string().contains("decode failed"), "{err}");
+    }
+
+    #[test]
+    fn row_count_disagreement_fails_the_load() {
+        let dir = tempfile::tempdir().unwrap();
+        // One real row chunk, but the manifest declares 2 rows.
+        let rows: Vec<Vec<LogValue>> = vec![vec![LogValue::U64(1), LogValue::Str("ana".into())]];
+        let chunk = compress_artifact(&rmp_serde::to_vec(&rows).unwrap(), 3).unwrap();
+        let repo = plant(
+            dir.path(),
+            1,
+            vec![table_entry(
+                "User",
+                TableId::of("User").as_u32(),
+                2,
+                std::slice::from_ref(&chunk),
+            )],
+            &[chunk],
+        );
+        let err = repo.load(&repo.list(SHARD).unwrap()[0]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("1 rows restored but the manifest declares 2"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn latest_verified_tx_skips_unreadable_manifests_and_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = plant(dir.path(), 3, vec![], &[]);
+        // A newer manifest full of junk is skipped, not adopted.
+        fs::write(dir.path().join(manifest_name(SHARD, 9)), b"junk").unwrap();
+        assert_eq!(repo.latest_verified_tx(SHARD).unwrap(), Some(3));
+
+        // Malformed manifest names are not checkpoints at all.
+        fs::write(dir.path().join("ckpt-0000000003-123.manifest"), b"x").unwrap();
+        fs::write(dir.path().join("ckpt-junk"), b"x").unwrap();
+        let listed: Vec<u64> = repo
+            .list(SHARD)
+            .unwrap()
+            .iter()
+            .map(|r| r.last_tx_id)
+            .collect();
+        assert_eq!(listed, vec![3, 9]);
+    }
+}
+
+// --- archival hook edge case (FR-104) ------------------------------------------
+
+#[test]
+fn directory_archive_rejects_paths_without_a_file_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = DirectoryArchive::open(&dir.path().join("archive")).unwrap();
+    let err = super::compact::SegmentArchive::archive(&archive, Path::new("/")).unwrap_err();
+    assert!(err.to_string().contains("has no file name"), "{err}");
+}
+
+// --- worker failure accounting (STG-020/023) ------------------------------------
+
+#[tokio::test]
+async fn checkpoint_now_surfaces_write_failures_and_counts_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(mem_store());
+    let repo = Arc::new(CheckpointRepo::open(dir.path()).unwrap());
+
+    let mut tx = store.begin();
+    tx.insert(
+        user(&store),
+        vec![RowValue::U64(0), RowValue::Str("w".into())],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    let worker = SnapshotWorker::spawn(
+        Arc::clone(&store),
+        Arc::clone(&repo),
+        SHARD,
+        WorkerOptions {
+            interval_tx: 1_000_000, // cadence never fires on its own
+            compaction: Some(LogCompaction {
+                // A log dir that does not exist: compaction after a
+                // successful write fails and is counted, never fatal.
+                log_dir: dir.path().join("no-such-log-dir"),
+                archive_dir: None,
+            }),
+            ..WorkerOptions::default()
+        },
+    )
+    .unwrap();
+    worker.observe_commit(1);
+
+    // First checkpoint succeeds (stamp 1); its post-write compaction fails.
+    worker.checkpoint_now().unwrap();
+
+    // A competing writer moves the repo ahead; the worker's next stamp (still
+    // 1-based) no longer strictly increases, so the write itself fails.
+    let side = CheckpointRepo::open(dir.path()).unwrap();
+    let mut tx = store.begin();
+    tx.insert(
+        user(&store),
+        vec![RowValue::U64(0), RowValue::Str("w2".into())],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    side.write(&store.snapshot(), SHARD, 50, EPOCH).unwrap();
+
+    worker.observe_commit(2);
+    let err = worker.checkpoint_now().unwrap_err();
+    assert!(err.to_string().contains("checkpoint write failed"), "{err}");
+
+    let report = worker.close().unwrap();
+    assert_eq!(report.checkpoints, 1);
+    assert!(
+        report.failures >= 2,
+        "one compaction failure + one write failure, got {}",
+        report.failures
+    );
+    assert_eq!(report.last_checkpoint_tx, 1);
+}
+
+#[tokio::test]
+async fn dropping_a_worker_without_close_shuts_it_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(mem_store());
+    let repo = Arc::new(CheckpointRepo::open(dir.path()).unwrap());
+    let worker = SnapshotWorker::spawn(store, repo, SHARD, WorkerOptions::default()).unwrap();
+    worker.observe_commit(1);
+    drop(worker); // Drop joins the actor thread; no panic, no leak.
+}
+
+// --- recovery schema-mismatch guards (STG-030/STG-050) ---------------------------
+
+mod recovery_guards {
+    use super::*;
+
+    fn plant_manifest(dir: &Path, tables: Vec<super::super::TableManifest>) -> CheckpointRepo {
+        let repo = CheckpointRepo::open(dir).unwrap();
+        let manifest = Manifest {
+            format_version: super::super::manifest::MANIFEST_VERSION,
+            shard_id: SHARD,
+            last_tx_id: 1,
+            epoch: EPOCH,
+            timestamp: 0,
+            tables,
+        };
+        fs::write(
+            dir.join(format!("ckpt-{SHARD:010}-{:020}.manifest", 1)),
+            encode_manifest(&manifest).unwrap(),
+        )
+        .unwrap();
+        repo
+    }
+
+    fn entry(name: &str, table_id: u32) -> super::super::TableManifest {
+        super::super::TableManifest {
+            table_id,
+            table_name: name.into(),
+            auto_inc_high_water: 0,
+            row_count: 0,
+            chunks: vec![],
+        }
+    }
+
+    #[test]
+    fn recorded_table_id_must_equal_crc32_of_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = plant_manifest(&dir.path().join("snap"), vec![entry("User", 999)]);
+        let store = mem_store();
+        let err = recover(&store, &repo, &dir.path().join("log"), SHARD).unwrap_err();
+        assert!(
+            err.to_string().contains("disagrees with crc32(name)"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn checkpoint_tables_must_exist_in_the_assembled_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = plant_manifest(
+            &dir.path().join("snap"),
+            vec![entry("Ghost", TableId::of("Ghost").as_u32())],
+        );
+        let store = mem_store();
+        let err = recover(&store, &repo, &dir.path().join("log"), SHARD).unwrap_err();
+        assert!(
+            err.to_string().contains("is not in the assembled schema"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn log_records_for_unknown_tables_abort_recovery() {
+        use crate::commitlog::record::{TableMutation, TxRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let log = CommitLog::open(&log_dir, SHARD, EPOCH, CommitLogOptions::default()).unwrap();
+        log.append(TxRecord {
+            tx_id: 1,
+            timestamp: 0,
+            shard_id: SHARD,
+            mutations: vec![TableMutation {
+                table_id: 0xDEAD_BEEF, // no such table in the schema
+                inserts: vec![],
+                deletes: vec![],
+            }],
+            auto_inc: vec![],
+        })
+        .await
+        .unwrap();
+        log.wait_durable(1).await.unwrap();
+        log.close().unwrap();
+
+        let repo = CheckpointRepo::open(&dir.path().join("snap")).unwrap();
+        let store = mem_store();
+        let err = recover(&store, &repo, &log_dir, SHARD).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references table 0xdeadbeef which is not in the assembled schema"),
+            "{err}"
+        );
+    }
+}
+
+// --- recovery rebuilds spatial + unique structures (STG-030 step 5) --------------
+
+mod recovery_rebuilds {
+    use super::*;
+    use crate::schema::SpatialKind;
+
+    static POI_COLS: &[ColumnSchema] = &[
+        ColumnSchema {
+            name: "id",
+            ty: FluxType::U64,
+        },
+        ColumnSchema {
+            name: "x",
+            ty: FluxType::F64,
+        },
+        ColumnSchema {
+            name: "y",
+            ty: FluxType::F64,
+        },
+        ColumnSchema {
+            name: "tag",
+            ty: FluxType::Str,
+        },
+    ];
+
+    static POI: TableSchema = TableSchema {
+        name: "Poi",
+        columns: POI_COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Public,
+        partition_by: None,
+        unique: &[&[3]],
+        indexes: &[IndexSchema::Spatial {
+            kind: SpatialKind::QuadTree,
+            columns: &[1, 2],
+        }],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    fn poi_store() -> MemStore {
+        MemStore::new(&Schema::from_tables([&POI]).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn spatial_and_unique_indexes_are_rebuilt_from_recovered_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("log");
+        let store = poi_store();
+        let poi = store.table_id("Poi").unwrap();
+        let log = CommitLog::open(&log_dir, SHARD, EPOCH, CommitLogOptions::default()).unwrap();
+        let mut tx = store.begin();
+        tx.insert(
+            poi,
+            vec![
+                RowValue::U64(1),
+                RowValue::F64(1.0),
+                RowValue::F64(2.0),
+                RowValue::Str("cafe".into()),
+            ],
+        )
+        .unwrap();
+        tx.insert(
+            poi,
+            vec![
+                RowValue::U64(2),
+                RowValue::F64(50.0),
+                RowValue::F64(60.0),
+                RowValue::Str("park".into()),
+            ],
+        )
+        .unwrap();
+        let diff = tx.commit().unwrap();
+        log.append_diff(&diff, Timestamp::from_micros(1))
+            .await
+            .unwrap();
+        log.wait_durable(diff.tx_id).await.unwrap();
+        log.close().unwrap();
+
+        let recovered = poi_store();
+        let repo = CheckpointRepo::open(&dir.path().join("snap")).unwrap();
+        recover(&recovered, &repo, &log_dir, SHARD).unwrap();
+        let poi = recovered.table_id("Poi").unwrap();
+        assert_eq!(recovered.snapshot().row_count(poi).unwrap(), 2);
+
+        // The rebuilt unique constraint still rejects duplicates…
+        let mut tx = recovered.begin();
+        let err = tx
+            .insert(
+                poi,
+                vec![
+                    RowValue::U64(3),
+                    RowValue::F64(9.0),
+                    RowValue::F64(9.0),
+                    RowValue::Str("cafe".into()),
+                ],
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("unique"), "{err}");
+        tx.rollback();
+
+        // …and the rebuilt spatial index answers region queries.
+        let rows = recovered
+            .snapshot()
+            .spatial_region(poi, crate::index::Rect::new(0.0, 0.0, 10.0, 10.0))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].value(0), Some(&RowValue::U64(1)));
+    }
+}
+
 // --- equivalence: checkpoint + replay == full-log replay (task 1.6) ----------
 
 #[tokio::test]

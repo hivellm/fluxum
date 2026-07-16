@@ -383,3 +383,39 @@ async fn sweeper_expires_stale_rows_and_refreshes_rewritten_ones() {
     let t3 = Timestamp::from_micros(t2.as_micros() + ttl);
     assert!(sweeper.sweep_once_at(t3).await.unwrap().is_none());
 }
+
+/// The wall-clock sweep wrapper: a fresh sweeper's first pass only registers
+/// witnesses (nothing is older than its TTL), so no transaction runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn wall_clock_sweep_registers_witnesses_without_a_transaction() {
+    use fluxum_core::scheduler::EphemeralSweeper;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (store, pipeline, _worker) = pipeline_in(dir.path());
+    let cursor_id = store.table_id("Cursor").unwrap();
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.insert(cursor_id, cursor(42, 1, 1))?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+
+    let sweeper = EphemeralSweeper::from_registered(pipeline.clone()).expect("Cursor has a TTL");
+    assert!(sweeper.sweep_once().await.unwrap().is_none());
+    assert_eq!(store.snapshot().row_count(cursor_id).unwrap(), 1);
+}
+
+/// DMX-011 backstop: a registered EphemeralDef whose table is not part of
+/// the assembled schema is skipped (the registry is process-global; schemas
+/// may be subsets).
+#[test]
+fn ephemeral_defs_for_absent_tables_are_skipped_at_assembly() {
+    // This binary registers a def for `Cursor`; a schema without Cursor
+    // still assembles.
+    let schema = Schema::from_tables([&ROOM]).unwrap();
+    assert!(schema.table("Cursor").is_none());
+    // And the def registry is queryable by name.
+    assert!(fluxum_core::schema::ephemeral_def("Cursor").is_some());
+    assert!(fluxum_core::schema::ephemeral_def("Ghost").is_none());
+}
