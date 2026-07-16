@@ -307,6 +307,22 @@ async fn handle_post(
             },
         );
         issued_token = Some(token);
+        // RED-011: run the `on_connect` hooks for the fresh session; their diff
+        // is published with the rest of this request's commits below.
+        if let SessionState::Authenticated { caller, .. } = &router_state {
+            match state
+                .ctx
+                .engine
+                .client_connected(caller.identity, caller.connection_id)
+                .await
+            {
+                Ok(Some(receipt)) => commits.push(receipt.diff),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
+                }
+            }
+        }
     } else if let Some(token) = &session_token {
         // Persist any state change (e.g. a re-auth) back to the store.
         if let Some(sess) = state.sessions.lock().await.get_mut(token) {
@@ -399,7 +415,7 @@ async fn handle_get(
 
     // Terminate the chunked body and evict the session.
     let _ = write_last_chunk(&mut stream).await;
-    state.sessions.lock().await.remove(&token);
+    let evicted = state.sessions.lock().await.remove(&token);
     state.ctx.connections.remove(connection_id).await;
     state
         .ctx
@@ -407,6 +423,24 @@ async fn handle_get(
         .lock()
         .await
         .disconnect(connection_id);
+    // RED-012: run the `on_disconnect` hooks and publish their diff to the
+    // remaining subscribers (a presence cleanup must reach them).
+    if let Some(session) = evicted
+        && let SessionState::Authenticated { caller, .. } = &session.state
+    {
+        match state
+            .ctx
+            .engine
+            .client_disconnected(caller.identity, caller.connection_id)
+            .await
+        {
+            Ok(Some(receipt)) => state.ctx.publish_commit(receipt.diff),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
+            }
+        }
+    }
     result
 }
 

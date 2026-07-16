@@ -183,6 +183,17 @@ async fn drive_connection(
     if let Some(conn_id) = session.connection_id() {
         ctx.connections.remove(conn_id).await;
         ctx.subscriptions.lock().await.disconnect(conn_id);
+        // RED-012: run the `on_disconnect` hooks and publish their diff to the
+        // remaining subscribers (a presence cleanup must reach them).
+        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
+            match ctx.engine.client_disconnected(identity, cid).await {
+                Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
+                }
+            }
+        }
     }
     drop(out_tx);
     let _ = writer.await;
@@ -231,6 +242,17 @@ async fn route_frame(
                 },
             )
             .await;
+        // RED-011: run the `on_connect` hooks and publish their diff to the
+        // shard fan-out (a presence insert must reach subscribers).
+        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
+            match ctx.engine.client_connected(identity, cid).await {
+                Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
+                }
+            }
+        }
     }
 
     for response in routed.responses {

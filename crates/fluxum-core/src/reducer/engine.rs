@@ -223,13 +223,17 @@ impl ReducerEngine {
 
     /// Run the `on_connect` hooks for an authenticated client session
     /// (RED-011), inside one transaction under the client's identity.
+    /// Returns the hook transaction's [`CommitReceipt`] so the transport can
+    /// publish its `TxDiff` to the shard fan-out (SUB-021) — an `on_connect`
+    /// that inserts a presence row must reach subscribers. `None` when no
+    /// `on_connect` hook is registered (no transaction, no `tx_id` consumed).
     pub async fn client_connected(
         &self,
         identity: Identity,
         connection_id: ConnectionId,
-    ) -> Result<()> {
+    ) -> Result<Option<CommitReceipt>> {
         if self.hooks.on_connect.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let caller = ReducerCaller {
             identity,
@@ -239,18 +243,21 @@ impl ReducerEngine {
         };
         self.run_hooks_as(self.hooks.on_connect.clone(), caller)
             .await
-            .map(|_| ())
+            .map(Some)
     }
 
     /// Run the `on_disconnect` hooks when a client connection drops —
-    /// clean close or timeout (RED-012).
+    /// clean close or timeout (RED-012). Like [`Self::client_connected`],
+    /// returns the hook transaction's receipt for fan-out publication (a
+    /// cleanup that deletes a presence row must reach subscribers), or `None`
+    /// when no `on_disconnect` hook is registered.
     pub async fn client_disconnected(
         &self,
         identity: Identity,
         connection_id: ConnectionId,
-    ) -> Result<()> {
+    ) -> Result<Option<CommitReceipt>> {
         if self.hooks.on_disconnect.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let caller = ReducerCaller {
             identity,
@@ -260,7 +267,7 @@ impl ReducerEngine {
         };
         self.run_hooks_as(self.hooks.on_disconnect.clone(), caller)
             .await
-            .map(|_| ())
+            .map(Some)
     }
 
     /// Execute reducer `name` for `caller` (FR-20).

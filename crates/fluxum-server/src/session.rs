@@ -110,6 +110,16 @@ impl Session {
         }
     }
 
+    /// The authenticated caller (identity + connection id), if any — the seam
+    /// the transport uses to fire the `on_connect` / `on_disconnect` lifecycle
+    /// hooks (RED-011/012).
+    pub fn caller(&self) -> Option<&ReducerCaller> {
+        match &self.state {
+            SessionState::Authenticated { caller, .. } => Some(caller),
+            SessionState::Unauthenticated => None,
+        }
+    }
+
     /// Route one decoded client message (SPEC-006 §4).
     pub async fn handle(&mut self, message: ClientMessage) -> Routed {
         // Pre-auth gate (AUTH-020): only `Authenticate` is accepted; every

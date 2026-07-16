@@ -549,3 +549,155 @@ async fn reconnect_resubscribe_gets_fresh_initialdata_reflecting_missed_commits(
     }
     h.server.shutdown();
 }
+
+// --- Lifecycle hooks over the transport (RED-011/012, UC-1 presence) ------------
+
+static ONLINE_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "conn",
+        ty: FluxType::ConnectionId,
+    },
+    ColumnSchema {
+        name: "who",
+        ty: FluxType::Identity,
+    },
+];
+static ONLINE: TableSchema = TableSchema {
+    name: "OnlineUser",
+    columns: ONLINE_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Public,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: VisibilityRule::PublicAll,
+};
+
+struct OnlineUser {
+    conn: fluxum_core::types::ConnectionId,
+    who: fluxum_core::types::Identity,
+}
+
+impl Table for OnlineUser {
+    type Pk = fluxum_core::types::ConnectionId;
+    const SCHEMA: &'static TableSchema = &ONLINE;
+    fn primary_key(&self) -> Self::Pk {
+        self.conn
+    }
+    fn into_values(self) -> Vec<RowValue> {
+        vec![
+            RowValue::ConnectionId(self.conn),
+            RowValue::Identity(self.who),
+        ]
+    }
+    fn from_values(values: &[RowValue]) -> Result<Self> {
+        match values {
+            [RowValue::ConnectionId(conn), RowValue::Identity(who)] => Ok(Self {
+                conn: *conn,
+                who: *who,
+            }),
+            other => Err(fluxum_core::FluxumError::Storage(format!(
+                "OnlineUser: unexpected shape {other:?}"
+            ))),
+        }
+    }
+    fn pk_values(pk: &Self::Pk) -> Vec<RowValue> {
+        vec![RowValue::ConnectionId(*pk)]
+    }
+}
+
+fn presence_connect(ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    ctx.tx.insert(OnlineUser {
+        conn: ctx.connection_id,
+        who: ctx.identity,
+    })?;
+    Ok(())
+}
+
+fn presence_disconnect(ctx: &ReducerContext<'_, '_, '_>) -> Result<()> {
+    ctx.tx.delete::<OnlineUser>(ctx.connection_id)?;
+    Ok(())
+}
+
+static PRESENCE_CONNECT: fluxum_core::reducer::LifecycleDef = fluxum_core::reducer::LifecycleDef {
+    kind: fluxum_core::reducer::LifecycleKind::OnConnect,
+    name: "presence_connect",
+    handler: presence_connect,
+};
+static PRESENCE_DISCONNECT: fluxum_core::reducer::LifecycleDef =
+    fluxum_core::reducer::LifecycleDef {
+        kind: fluxum_core::reducer::LifecycleKind::OnDisconnect,
+        name: "presence_disconnect",
+        handler: presence_disconnect,
+    };
+
+async fn start_presence() -> Harness {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let schema = Schema::from_tables([&CHAT, &ONLINE]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            1,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let registry = Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap());
+    let hooks = LifecycleHooks::from_defs([&PRESENCE_CONNECT, &PRESENCE_DISCONNECT]);
+    let engine = ReducerEngine::new(
+        pipeline,
+        registry,
+        hooks,
+        SHARD,
+        fluxum_core::auth::server_identity("tcp-test"),
+    );
+    let subscriptions = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    let authenticator =
+        Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
+    let ctx = ShardContext::new(engine, subscriptions, authenticator, SHARD, 256);
+    let server = tcp::serve(ctx, "127.0.0.1:0", TcpOptions::default())
+        .await
+        .unwrap();
+    Harness { server, store }
+}
+
+async fn wait_for_rows(store: &MemStore, table: &str, want: usize) -> bool {
+    let tid = store.table_id(table).unwrap();
+    for _ in 0..200 {
+        if store.snapshot().row_count(tid).unwrap() == want {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_hooks_fire_and_fan_out_over_the_transport() {
+    let h = start_presence().await;
+
+    // Connect + authenticate → the `on_connect` hook inserts a presence row
+    // and its diff is published to the fan-out (RED-011).
+    let mut client = Client::connect(h.server.local_addr).await;
+    client.authenticate(b"alice", 1).await;
+    assert!(
+        wait_for_rows(&h.store, "OnlineUser", 1).await,
+        "on_connect did not insert the presence row"
+    );
+
+    // Drop the socket → the read loop sees EOF and runs `on_disconnect`,
+    // deleting the presence row (RED-012).
+    drop(client);
+    assert!(
+        wait_for_rows(&h.store, "OnlineUser", 0).await,
+        "on_disconnect did not clean up the presence row"
+    );
+
+    h.server.shutdown();
+}
