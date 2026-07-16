@@ -66,7 +66,12 @@ impl Schema {
                 )));
             }
         }
-        Ok(Self { tables: map })
+        let schema = Self { tables: map };
+        // SPEC-017 CT-051: registered column transforms must resolve against
+        // this schema (runtime backstop behind the macro's compile-time
+        // rejections; covers hand-registered defs).
+        crate::transform::validate_registered(&schema)?;
+        Ok(schema)
     }
 
     /// Look up a table by name.

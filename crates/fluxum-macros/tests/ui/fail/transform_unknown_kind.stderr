@@ -1,0 +1,5 @@
+error: unknown normalize kind `hex`: expected `money`, `datetime`, or `string` (CT-021..CT-023)
+ --> tests/ui/fail/transform_unknown_kind.rs:9:5
+  |
+9 |     #[normalize(hex)]
+  |     ^^^^^^^^^^^^^^^^^

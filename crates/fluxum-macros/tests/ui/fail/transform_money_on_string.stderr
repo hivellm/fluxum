@@ -1,0 +1,5 @@
+error: `#[normalize(money)]` requires column `amount` to be `Decimal` (CT-021)
+ --> tests/ui/fail/transform_money_on_string.rs:9:5
+  |
+9 |     #[normalize(money, scale = 2)]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

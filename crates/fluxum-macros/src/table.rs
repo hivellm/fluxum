@@ -119,6 +119,8 @@ struct Column {
     /// The `#[rename(from = "old")]` source name, if present (SPEC-010
     /// MIG-020/MIG-021).
     rename_from: Option<(String, Span)>,
+    /// Parsed transform attributes, canonical CT-011 order (SPEC-017).
+    transforms: Vec<TransformDecl>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,6 +151,105 @@ struct IndexDecl {
     kind: IndexKind,
     columns: Vec<Ident>,
     span: Span,
+}
+
+// --- Column transforms (SPEC-017 CT-001..003) -------------------------------
+
+/// One parsed per-column transform attribute. Validated per column (CT-002)
+/// and against the table's key/index sets (CT-013) after all columns parse,
+/// then emitted as a `fluxum_core::transform::ColumnTransformDef` link-time
+/// registration in canonical order (normalize → encrypted → signed → masked →
+/// grant, CT-011).
+enum TransformDecl {
+    Money {
+        scale: u8,
+        currency: Option<String>,
+        span: Span,
+    },
+    Datetime {
+        span: Span,
+    },
+    Str {
+        form: StrForm,
+        case: StrCase,
+        trim: bool,
+        span: Span,
+    },
+    Encrypted {
+        key: String,
+        span: Span,
+    },
+    Signed {
+        by: SignedByDecl,
+        span: Span,
+    },
+    Masked {
+        strategy: MaskDecl,
+        span: Span,
+    },
+    Grant {
+        scope: GrantDecl,
+        span: Span,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum StrForm {
+    Nfc,
+    Nfkc,
+}
+
+#[derive(Clone, Copy)]
+enum StrCase {
+    None,
+    Fold,
+    Lower,
+}
+
+#[derive(Clone, Copy)]
+enum MaskDecl {
+    Null,
+    Redact,
+    Ciphertext,
+    Hash,
+}
+
+enum SignedByDecl {
+    Server,
+    Column(Ident),
+}
+
+enum GrantDecl {
+    Public,
+    Owner,
+    ServerPeer,
+    Role(String),
+}
+
+impl TransformDecl {
+    /// `(attribute name, canonical pipeline position)` — the dedup key
+    /// (CT-002) and the CT-011 ordering key.
+    fn family(&self) -> (&'static str, u8) {
+        match self {
+            Self::Money { .. } | Self::Datetime { .. } | Self::Str { .. } => ("#[normalize]", 0),
+            Self::Encrypted { .. } => ("#[encrypted]", 1),
+            Self::Signed { .. } => ("#[signed]", 2),
+            Self::Masked { .. } => ("#[masked]", 3),
+            Self::Grant { .. } => ("#[column_grant]", 4),
+        }
+    }
+
+    fn span(&self) -> Span {
+        match self {
+            Self::Money { span, .. }
+            | Self::Datetime { span }
+            | Self::Str { span, .. }
+            | Self::Encrypted { span, .. }
+            | Self::Signed { span, .. }
+            | Self::Masked { span, .. }
+            | Self::Grant { span, .. } => *span,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -274,12 +375,23 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         let mut auto_inc = None;
         let mut default = None;
         let mut rename_from = None;
+        let mut transforms: Vec<TransformDecl> = Vec::new();
         let mut kept: Vec<Attribute> = Vec::new();
         for attr in std::mem::take(&mut field.attrs) {
             if attr.path().is_ident("primary_key") {
                 primary_key = Some(attr.span());
             } else if attr.path().is_ident("auto_inc") {
                 auto_inc = Some(attr.span());
+            } else if attr.path().is_ident("normalize") {
+                transforms.push(parse_transform_normalize(&attr)?);
+            } else if attr.path().is_ident("encrypted") {
+                transforms.push(parse_transform_encrypted(&attr)?);
+            } else if attr.path().is_ident("signed") {
+                transforms.push(parse_transform_signed(&attr)?);
+            } else if attr.path().is_ident("masked") {
+                transforms.push(parse_transform_masked(&attr)?);
+            } else if attr.path().is_ident("column_grant") {
+                transforms.push(parse_transform_column_grant(&attr)?);
             } else if attr.path().is_ident("default") {
                 if default.is_some() {
                     return Err(syn::Error::new(attr.span(), "duplicate `#[default]`"));
@@ -312,6 +424,22 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 "expected a named field (DM-001)",
             ));
         };
+        // CT-002: at most one attribute of each transform family per column.
+        let mut seen_families = [false; 5];
+        for transform in &transforms {
+            let (name, family) = transform.family();
+            if seen_families[usize::from(family)] {
+                return Err(syn::Error::new(
+                    transform.span(),
+                    format!("duplicate `{name}` on one column (CT-002)"),
+                ));
+            }
+            seen_families[usize::from(family)] = true;
+        }
+        // CT-011 canonical pipeline order: normalize → encrypted → signed →
+        // masked → grant, regardless of declaration order.
+        transforms.sort_by_key(|t| t.family().1);
+
         let flux = parse_flux_type(&field.ty)?;
         columns.push(Column {
             ident,
@@ -321,6 +449,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             auto_inc,
             default,
             rename_from,
+            transforms,
         });
     }
     if columns.is_empty() {
@@ -610,6 +739,189 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         }
     }
 
+    // -- column transforms (SPEC-017 CT-011/013/021..023/030/033/040/041) -------
+    // Validate each column's transform pipeline against its type and the
+    // table's key/index sets, then emit one link-time ColumnTransformDef per
+    // transformed column, descriptors in canonical CT-011 order.
+    let mut transform_submits: Vec<TokenStream> = Vec::new();
+    {
+        let table_name = item.ident.to_string();
+        // Ordinals #[encrypted] may never touch (CT-013): keys + every index
+        // (B-tree AND spatial).
+        let mut encrypt_protected: Vec<u16> = pk_ordinals.clone();
+        encrypt_protected.extend(unique_ordinals.iter().flatten().copied());
+        encrypt_protected.extend(partition_ordinal);
+        for (_tag, ords) in &index_keys {
+            encrypt_protected.extend(ords.iter().copied());
+        }
+        let tf = quote!(::fluxum_core::transform);
+        for (i, column) in columns.iter().enumerate() {
+            if column.transforms.is_empty() {
+                continue;
+            }
+            let ord = u16::try_from(i).unwrap_or(u16::MAX);
+            let has_encrypted = column
+                .transforms
+                .iter()
+                .any(|t| matches!(t, TransformDecl::Encrypted { .. }));
+            let mut descriptors: Vec<TokenStream> = Vec::new();
+            for transform in &column.transforms {
+                let tokens = match transform {
+                    TransformDecl::Money {
+                        scale,
+                        currency,
+                        span,
+                    } => {
+                        if !matches!(column.flux, FluxTy::Decimal) {
+                            return Err(syn::Error::new(
+                                *span,
+                                format!(
+                                    "`#[normalize(money)]` requires column `{}` to be `Decimal` \
+                                     (CT-021)",
+                                    column.ident
+                                ),
+                            ));
+                        }
+                        let currency = match currency {
+                            Some(c) => quote!(::core::option::Option::Some(#c)),
+                            None => quote!(::core::option::Option::None),
+                        };
+                        quote! {
+                            #tf::TransformDescriptor::NormalizeMoney {
+                                scale: #scale, currency: #currency,
+                            }
+                        }
+                    }
+                    TransformDecl::Datetime { span } => {
+                        if !matches!(column.flux, FluxTy::Timestamp) {
+                            return Err(syn::Error::new(
+                                *span,
+                                format!(
+                                    "`#[normalize(datetime)]` requires column `{}` to be \
+                                     `Timestamp` (CT-022)",
+                                    column.ident
+                                ),
+                            ));
+                        }
+                        quote!(#tf::TransformDescriptor::NormalizeDatetime)
+                    }
+                    TransformDecl::Str {
+                        form,
+                        case,
+                        trim,
+                        span,
+                    } => {
+                        if !matches!(column.flux, FluxTy::Str) {
+                            return Err(syn::Error::new(
+                                *span,
+                                format!(
+                                    "`#[normalize(string)]` requires column `{}` to be `String` \
+                                     (CT-023)",
+                                    column.ident
+                                ),
+                            ));
+                        }
+                        let form = match form {
+                            StrForm::Nfc => quote!(#tf::StringForm::Nfc),
+                            StrForm::Nfkc => quote!(#tf::StringForm::Nfkc),
+                        };
+                        let case = match case {
+                            StrCase::None => quote!(#tf::CaseFold::None),
+                            StrCase::Fold => quote!(#tf::CaseFold::Fold),
+                            StrCase::Lower => quote!(#tf::CaseFold::Lower),
+                        };
+                        quote! {
+                            #tf::TransformDescriptor::NormalizeString {
+                                form: #form, case: #case, trim: #trim,
+                            }
+                        }
+                    }
+                    TransformDecl::Encrypted { key, span } => {
+                        if encrypt_protected.contains(&ord) {
+                            return Err(syn::Error::new(
+                                *span,
+                                format!(
+                                    "`#[encrypted]` cannot apply to column `{}`: encrypted \
+                                     columns cannot be a primary key, unique, index, partition, \
+                                     or spatial column (CT-013)",
+                                    column.ident
+                                ),
+                            ));
+                        }
+                        quote! {
+                            #tf::TransformDescriptor::Encrypted {
+                                scheme: #tf::CryptoScheme::Ecies, key: #key,
+                            }
+                        }
+                    }
+                    TransformDecl::Signed { by, span } => {
+                        let by_tokens = match by {
+                            SignedByDecl::Server => quote!(#tf::SignedBy::Server),
+                            SignedByDecl::Column(source) => {
+                                let source_ord =
+                                    ordinal_of(source, "`#[signed(by = ...)]` (CT-033)")?;
+                                if !matches!(
+                                    columns[usize::from(source_ord)].flux,
+                                    FluxTy::Identity
+                                ) {
+                                    return Err(syn::Error::new(
+                                        *span,
+                                        format!(
+                                            "`#[signed(by = {source})]` must reference an \
+                                             `Identity` column (CT-033)"
+                                        ),
+                                    ));
+                                }
+                                quote!(#tf::SignedBy::IdentityColumn(#source_ord))
+                            }
+                        };
+                        quote! {
+                            #tf::TransformDescriptor::Signed {
+                                scheme: #tf::SignScheme::Ed25519, by: #by_tokens,
+                            }
+                        }
+                    }
+                    TransformDecl::Masked { strategy, span } => {
+                        if matches!(strategy, MaskDecl::Ciphertext) && !has_encrypted {
+                            return Err(syn::Error::new(
+                                *span,
+                                "`#[masked(ciphertext)]` requires `#[encrypted]` on the same \
+                                 column (CT-041)",
+                            ));
+                        }
+                        let strategy = match strategy {
+                            MaskDecl::Null => quote!(#tf::MaskStrategy::Null),
+                            MaskDecl::Redact => quote!(#tf::MaskStrategy::Redact),
+                            MaskDecl::Ciphertext => quote!(#tf::MaskStrategy::Ciphertext),
+                            MaskDecl::Hash => quote!(#tf::MaskStrategy::Hash),
+                        };
+                        quote!(#tf::TransformDescriptor::Masked { strategy: #strategy })
+                    }
+                    TransformDecl::Grant { scope, .. } => {
+                        let scope = match scope {
+                            GrantDecl::Public => quote!(#tf::GrantScope::Public),
+                            GrantDecl::Owner => quote!(#tf::GrantScope::Owner),
+                            GrantDecl::ServerPeer => quote!(#tf::GrantScope::ServerPeer),
+                            GrantDecl::Role(role) => quote!(#tf::GrantScope::Role(#role)),
+                        };
+                        quote!(#tf::TransformDescriptor::Grant { select: #scope })
+                    }
+                };
+                descriptors.push(tokens);
+            }
+            let column_name = column.ident.to_string();
+            transform_submits.push(quote! {
+                ::fluxum_core::schema::inventory::submit! {
+                    #tf::ColumnTransformDef {
+                        table: #table_name,
+                        column: #column_name,
+                        transforms: &[#(#descriptors),*],
+                    }
+                }
+            });
+        }
+    }
+
     // -- visibility -------------------------------------------------------------
     let visibility_tokens = match &visibility {
         None => quote!(::fluxum_core::schema::VisibilityRule::PublicAll),
@@ -820,6 +1132,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 ::fluxum_core::schema::TableDef(&__FLUXUM_SCHEMA)
             }
 
+            #(#transform_submits)*
+
             #migration_meta
         };
     })
@@ -949,6 +1263,328 @@ fn parse_visibility(attr: &Attribute) -> syn::Result<Visibility> {
              (DM-061)",
         ))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Transform attribute parsers (SPEC-017 CT-001/CT-003)
+// ---------------------------------------------------------------------------
+
+/// A `name = ident` argument value, as a string.
+fn meta_value_ident(nv: &syn::MetaNameValue) -> Option<String> {
+    match &nv.value {
+        Expr::Path(p) => p.path.get_ident().map(ToString::to_string),
+        _ => None,
+    }
+}
+
+/// A `name = "literal"` argument value.
+fn meta_value_str(nv: &syn::MetaNameValue) -> Option<String> {
+    match &nv.value {
+        Expr::Lit(syn::ExprLit {
+            lit: Lit::Str(s), ..
+        }) => Some(s.value()),
+        _ => None,
+    }
+}
+
+/// `#[normalize(money, scale = N[, currency = "ISO"])]` ·
+/// `#[normalize(datetime)]` ·
+/// `#[normalize(string[, form = nfc|nfkc][, case = fold|lower|none][, trim = bool])]`
+/// (CT-021..CT-023).
+fn parse_transform_normalize(attr: &Attribute) -> syn::Result<TransformDecl> {
+    let span = attr.span();
+    let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+    let mut iter = metas.iter();
+    let kind = match iter.next() {
+        Some(Meta::Path(path)) => path
+            .get_ident()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    match kind.as_str() {
+        "money" => {
+            let mut scale: Option<u8> = None;
+            let mut currency: Option<String> = None;
+            for meta in iter {
+                let nv = meta.require_name_value()?;
+                if nv.path.is_ident("scale") {
+                    let Expr::Lit(syn::ExprLit {
+                        lit: Lit::Int(int), ..
+                    }) = &nv.value
+                    else {
+                        return Err(syn::Error::new(
+                            nv.span(),
+                            "`scale` must be an integer literal (CT-021)",
+                        ));
+                    };
+                    scale = Some(int.base10_parse::<u8>()?);
+                } else if nv.path.is_ident("currency") {
+                    currency = Some(meta_value_str(nv).ok_or_else(|| {
+                        syn::Error::new(
+                            nv.span(),
+                            "`currency` must be a string literal, e.g. `currency = \"USD\"` \
+                             (CT-021)",
+                        )
+                    })?);
+                } else {
+                    return Err(syn::Error::new(
+                        meta.span(),
+                        "unknown `#[normalize(money)]` argument: expected `scale` or `currency` \
+                         (CT-021)",
+                    ));
+                }
+            }
+            let Some(scale) = scale else {
+                return Err(syn::Error::new(
+                    span,
+                    "`#[normalize(money, scale = N)]` requires `scale` (CT-021)",
+                ));
+            };
+            Ok(TransformDecl::Money {
+                scale,
+                currency,
+                span,
+            })
+        }
+        "datetime" => {
+            if iter.next().is_some() {
+                return Err(syn::Error::new(
+                    span,
+                    "`#[normalize(datetime)]` takes no further arguments — `assume_tz` lands \
+                     with the timezone-aware parser (CT-022)",
+                ));
+            }
+            Ok(TransformDecl::Datetime { span })
+        }
+        "string" => {
+            let mut form = StrForm::Nfc;
+            let mut case = StrCase::None;
+            let mut trim = false;
+            for meta in iter {
+                let nv = meta.require_name_value()?;
+                if nv.path.is_ident("form") {
+                    form = match meta_value_ident(nv).as_deref() {
+                        Some("nfc") => StrForm::Nfc,
+                        Some("nfkc") => StrForm::Nfkc,
+                        _ => {
+                            return Err(syn::Error::new(
+                                nv.span(),
+                                "`form` must be `nfc` or `nfkc` (CT-023)",
+                            ));
+                        }
+                    };
+                } else if nv.path.is_ident("case") {
+                    case = match meta_value_ident(nv).as_deref() {
+                        Some("fold") => StrCase::Fold,
+                        Some("lower") => StrCase::Lower,
+                        Some("none") => StrCase::None,
+                        _ => {
+                            return Err(syn::Error::new(
+                                nv.span(),
+                                "`case` must be `fold`, `lower`, or `none` (CT-023)",
+                            ));
+                        }
+                    };
+                } else if nv.path.is_ident("trim") {
+                    let Expr::Lit(syn::ExprLit {
+                        lit: Lit::Bool(b), ..
+                    }) = &nv.value
+                    else {
+                        return Err(syn::Error::new(
+                            nv.span(),
+                            "`trim` must be `true` or `false` (CT-023)",
+                        ));
+                    };
+                    trim = b.value;
+                } else {
+                    return Err(syn::Error::new(
+                        meta.span(),
+                        "unknown `#[normalize(string)]` argument: expected `form`, `case`, or \
+                         `trim` (CT-023)",
+                    ));
+                }
+            }
+            Ok(TransformDecl::Str {
+                form,
+                case,
+                trim,
+                span,
+            })
+        }
+        other => Err(syn::Error::new(
+            span,
+            format!(
+                "unknown normalize kind `{other}`: expected `money`, `datetime`, or `string` \
+                 (CT-021..CT-023)"
+            ),
+        )),
+    }
+}
+
+/// `#[encrypted(ecies, key = "NAME")]` (CT-030).
+fn parse_transform_encrypted(attr: &Attribute) -> syn::Result<TransformDecl> {
+    let span = attr.span();
+    let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+    let mut iter = metas.iter();
+    match iter.next() {
+        Some(Meta::Path(p)) if p.is_ident("ecies") => {}
+        Some(meta) => {
+            return Err(syn::Error::new(
+                meta.span(),
+                format!(
+                    "unknown encryption scheme `{}`: expected `ecies` (CT-030)",
+                    meta.to_token_stream()
+                ),
+            ));
+        }
+        None => {
+            return Err(syn::Error::new(
+                span,
+                "expected `#[encrypted(ecies, key = \"NAME\")]` (CT-030)",
+            ));
+        }
+    }
+    let mut key: Option<String> = None;
+    for meta in iter {
+        let nv = meta.require_name_value()?;
+        if nv.path.is_ident("key") {
+            key = Some(meta_value_str(nv).ok_or_else(|| {
+                syn::Error::new(nv.span(), "`key` must be a string literal (CT-030)")
+            })?);
+        } else {
+            return Err(syn::Error::new(
+                meta.span(),
+                "unknown `#[encrypted]` argument: expected `key = \"NAME\"` (CT-030)",
+            ));
+        }
+    }
+    match key {
+        Some(key) if !key.is_empty() => Ok(TransformDecl::Encrypted { key, span }),
+        _ => Err(syn::Error::new(
+            span,
+            "`#[encrypted(ecies, key = \"NAME\")]` requires a non-empty key name (CT-030/CT-035)",
+        )),
+    }
+}
+
+/// `#[signed(ed25519, by = server | <identity column>)]` (CT-033).
+fn parse_transform_signed(attr: &Attribute) -> syn::Result<TransformDecl> {
+    let span = attr.span();
+    let metas = attr.parse_args_with(Punctuated::<Meta, Token![,]>::parse_terminated)?;
+    let mut iter = metas.iter();
+    match iter.next() {
+        Some(Meta::Path(p)) if p.is_ident("ed25519") => {}
+        Some(meta) => {
+            return Err(syn::Error::new(
+                meta.span(),
+                format!(
+                    "unknown signature scheme `{}`: expected `ed25519` (CT-033)",
+                    meta.to_token_stream()
+                ),
+            ));
+        }
+        None => {
+            return Err(syn::Error::new(
+                span,
+                "expected `#[signed(ed25519, by = server | <column>)]` (CT-033)",
+            ));
+        }
+    }
+    let mut by: Option<SignedByDecl> = None;
+    for meta in iter {
+        let nv = meta.require_name_value()?;
+        if nv.path.is_ident("by") {
+            let Expr::Path(p) = &nv.value else {
+                return Err(syn::Error::new(
+                    nv.span(),
+                    "`by` must be `server` or an `Identity` column name (CT-033)",
+                ));
+            };
+            let Some(ident) = p.path.get_ident() else {
+                return Err(syn::Error::new(
+                    nv.span(),
+                    "`by` must be `server` or an `Identity` column name (CT-033)",
+                ));
+            };
+            by = Some(if ident == "server" {
+                SignedByDecl::Server
+            } else {
+                SignedByDecl::Column(ident.clone())
+            });
+        } else {
+            return Err(syn::Error::new(
+                meta.span(),
+                "unknown `#[signed]` argument: expected `by = server | <column>` (CT-033)",
+            ));
+        }
+    }
+    let Some(by) = by else {
+        return Err(syn::Error::new(
+            span,
+            "`#[signed(ed25519, by = ...)]` requires `by` (CT-033)",
+        ));
+    };
+    Ok(TransformDecl::Signed { by, span })
+}
+
+/// `#[masked(null | redact | ciphertext | hash)]` (CT-041).
+fn parse_transform_masked(attr: &Attribute) -> syn::Result<TransformDecl> {
+    let span = attr.span();
+    let ident: Ident = attr.parse_args()?;
+    let strategy = match ident.to_string().as_str() {
+        "null" => MaskDecl::Null,
+        "redact" => MaskDecl::Redact,
+        "ciphertext" => MaskDecl::Ciphertext,
+        "hash" => MaskDecl::Hash,
+        other => {
+            return Err(syn::Error::new(
+                ident.span(),
+                format!(
+                    "unknown mask strategy `{other}`: expected `null`, `redact`, `ciphertext`, \
+                     or `hash` (CT-041)"
+                ),
+            ));
+        }
+    };
+    Ok(TransformDecl::Masked { strategy, span })
+}
+
+/// `#[column_grant(select = public | owner | server_peer | "role")]` (CT-040).
+fn parse_transform_column_grant(attr: &Attribute) -> syn::Result<TransformDecl> {
+    let span = attr.span();
+    let meta: Meta = attr.parse_args()?;
+    let nv = meta.require_name_value()?;
+    if !nv.path.is_ident("select") {
+        return Err(syn::Error::new(
+            meta.span(),
+            "expected `#[column_grant(select = public | owner | server_peer | \"role\")]` \
+             (CT-040)",
+        ));
+    }
+    let scope = if let Some(role) = meta_value_str(nv) {
+        if role.is_empty() {
+            return Err(syn::Error::new(
+                nv.span(),
+                "role name must be non-empty (CT-040)",
+            ));
+        }
+        GrantDecl::Role(role)
+    } else {
+        match meta_value_ident(nv).as_deref() {
+            Some("public") => GrantDecl::Public,
+            Some("owner") => GrantDecl::Owner,
+            Some("server_peer") => GrantDecl::ServerPeer,
+            _ => {
+                return Err(syn::Error::new(
+                    nv.span(),
+                    "`select` must be `public`, `owner`, `server_peer`, or a \"role\" string \
+                     (CT-040)",
+                ));
+            }
+        }
+    };
+    Ok(TransformDecl::Grant { scope, span })
 }
 
 // ---------------------------------------------------------------------------

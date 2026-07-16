@@ -158,7 +158,18 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
             let columns: Vec<Value> = table
                 .columns
                 .iter()
-                .map(|c| json!({ "name": c.name, "type": format!("{:?}", c.ty) }))
+                .map(|c| {
+                    let mut column = json!({ "name": c.name, "type": format!("{:?}", c.ty) });
+                    // SPEC-017 CT-050/CT-052: the column's transform pipeline
+                    // (descriptors — key names only, never key material).
+                    if let Some(transforms) =
+                        fluxum_core::transform::column_transforms(table.name, c.name)
+                    {
+                        column["transforms"] =
+                            Value::Array(transforms.iter().map(transform_json).collect());
+                    }
+                    column
+                })
                 .collect();
             json!({
                 "name": table.name,
@@ -176,6 +187,52 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
         None,
         json!({ "tables": tables, "reducers": reducers, "views": views }),
     )
+}
+
+/// One transform descriptor as `/schema` JSON (CT-052): the stable `kind` tag
+/// plus its parameters. Key **names** only — never key material.
+fn transform_json(descriptor: &fluxum_core::transform::TransformDescriptor) -> Value {
+    use fluxum_core::transform::{
+        CaseFold, GrantScope, SignedBy, StringForm, TransformDescriptor as D,
+    };
+    let kind = descriptor.kind();
+    match descriptor {
+        D::NormalizeMoney { scale, currency } => {
+            json!({ "kind": kind, "scale": scale, "currency": currency })
+        }
+        D::NormalizeDatetime => json!({ "kind": kind }),
+        D::NormalizeString { form, case, trim } => json!({
+            "kind": kind,
+            "form": match form { StringForm::Nfc => "nfc", StringForm::Nfkc => "nfkc" },
+            "case": match case {
+                CaseFold::None => "none",
+                CaseFold::Fold => "fold",
+                CaseFold::Lower => "lower",
+            },
+            "trim": trim,
+        }),
+        D::Encrypted { key, .. } => json!({ "kind": kind, "scheme": "ecies", "key": key }),
+        D::Signed { by, .. } => json!({
+            "kind": kind,
+            "scheme": "ed25519",
+            "by": match by {
+                SignedBy::Server => json!("server"),
+                SignedBy::IdentityColumn(ord) => json!({ "column": ord }),
+            },
+        }),
+        D::Masked { strategy } => {
+            json!({ "kind": kind, "strategy": format!("{strategy:?}").to_lowercase() })
+        }
+        D::Grant { select } => json!({
+            "kind": kind,
+            "select": match select {
+                GrantScope::Public => json!("public"),
+                GrantScope::Owner => json!("owner"),
+                GrantScope::ServerPeer => json!("server_peer"),
+                GrantScope::Role(role) => json!({ "role": role }),
+            },
+        }),
+    }
 }
 
 // --- POST /reducer/:name -------------------------------------------------------

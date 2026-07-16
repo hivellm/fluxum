@@ -5,6 +5,9 @@
 //! `#[normalize(datetime)]` apply these on the write path so the stored,
 //! indexed, and replicated value is already canonical.
 
+use unicode_normalization::UnicodeNormalization;
+
+use super::{CaseFold, StringForm};
 use crate::error::{FluxumError, Result};
 use crate::types::{Decimal, Timestamp};
 
@@ -81,6 +84,28 @@ pub const fn datetime_utc(ts: Timestamp) -> Timestamp {
     ts
 }
 
+/// Canonicalize a string column value (CT-023): optional trim, Unicode
+/// normalization to `form`, then case handling — so equality, `#[unique]`,
+/// and index keys operate on one canonical spelling (the `citext` analog).
+///
+/// Deterministic and pure (Unicode tables are compiled in, DST-safe).
+/// `CaseFold::Fold` and `CaseFold::Lower` both use Rust's full Unicode
+/// lowercase mapping in this version — the same choice PostgreSQL's `citext`
+/// makes (`lower()`), so `ß` stays `ß` rather than folding to `ss`; the
+/// distinction is kept in the descriptor so a future full case-fold can light
+/// up without a schema change.
+pub fn normalize_string(input: &str, form: StringForm, case: CaseFold, trim: bool) -> String {
+    let s = if trim { input.trim() } else { input };
+    let normalized: String = match form {
+        StringForm::Nfc => s.nfc().collect(),
+        StringForm::Nfkc => s.nfkc().collect(),
+    };
+    match case {
+        CaseFold::None => normalized,
+        CaseFold::Fold | CaseFold::Lower => normalized.to_lowercase(),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -134,5 +159,48 @@ mod tests {
         let ts = Timestamp::from_micros(1_700_000_000_000_000);
         assert_eq!(datetime_utc(ts), ts);
         assert_eq!(datetime_utc(ts).as_micros(), 1_700_000_000_000_000);
+    }
+
+    #[test]
+    fn string_normalizes_composed_and_decomposed_to_one_form() {
+        // "Café" spelled precomposed (é) vs decomposed (e + U+0301).
+        let composed = "Caf\u{e9}";
+        let decomposed = "Cafe\u{301}";
+        assert_ne!(composed, decomposed);
+        let a = normalize_string(composed, StringForm::Nfc, CaseFold::None, false);
+        let b = normalize_string(decomposed, StringForm::Nfc, CaseFold::None, false);
+        assert_eq!(a, b, "NFC unifies the two spellings");
+        assert_eq!(a, composed);
+    }
+
+    #[test]
+    fn string_nfkc_folds_compatibility_forms() {
+        // The "ﬁ" ligature decomposes to "fi" under NFKC but not NFC.
+        assert_eq!(
+            normalize_string("ﬁle", StringForm::Nfkc, CaseFold::None, false),
+            "file"
+        );
+        assert_eq!(
+            normalize_string("ﬁle", StringForm::Nfc, CaseFold::None, false),
+            "ﬁle"
+        );
+    }
+
+    #[test]
+    fn string_case_and_trim_apply_after_normalization() {
+        assert_eq!(
+            normalize_string("  HeLLo  ", StringForm::Nfc, CaseFold::Fold, true),
+            "hello"
+        );
+        assert_eq!(
+            normalize_string("İstanbul", StringForm::Nfc, CaseFold::Lower, false),
+            "i\u{307}stanbul",
+            "multi-char lowercase mappings are honored"
+        );
+        // No trim requested: whitespace preserved.
+        assert_eq!(
+            normalize_string(" x ", StringForm::Nfc, CaseFold::None, false),
+            " x "
+        );
     }
 }

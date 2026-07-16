@@ -1,0 +1,5 @@
+error: duplicate `#[encrypted]` on one column (CT-002)
+  --> tests/ui/fail/transform_duplicate_encrypted.rs:10:5
+   |
+10 |     #[encrypted(ecies, key = "b")]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

@@ -1,0 +1,5 @@
+error: `#[encrypted]` cannot apply to column `id`: encrypted columns cannot be a primary key, unique, index, partition, or spatial column (CT-013)
+ --> tests/ui/fail/transform_encrypted_on_pk.rs:8:5
+  |
+8 |     #[encrypted(ecies, key = "a")]
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

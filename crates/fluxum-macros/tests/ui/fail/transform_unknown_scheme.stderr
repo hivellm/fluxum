@@ -1,0 +1,5 @@
+error: unknown encryption scheme `rsa`: expected `ecies` (CT-030)
+ --> tests/ui/fail/transform_unknown_scheme.rs:9:17
+  |
+9 |     #[encrypted(rsa, key = "a")]
+  |                 ^^^

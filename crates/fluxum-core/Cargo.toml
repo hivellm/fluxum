@@ -24,6 +24,7 @@ sysinfo.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing.workspace = true
+unicode-normalization.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]

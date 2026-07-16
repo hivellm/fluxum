@@ -40,6 +40,11 @@ mod table;
 /// | `#[auto_inc]` | Server-assigned monotonic id; `u64` `#[primary_key]` only (DM-004) |
 /// | `#[default(value)]` | Backfill value: the schema diff auto-adds the column to existing rows (SPEC-010 MIG-021) |
 /// | `#[rename(from = "old")]` | Column was renamed from `old`: the schema diff renames it in place (SPEC-010 MIG-021) |
+/// | `#[normalize(money\|datetime\|string, …)]` | Deterministic value canonicalization (SPEC-017 CT-021..023) |
+/// | `#[encrypted(ecies, key = "NAME")]` | Declared at-rest field encryption; executes with the phase-3 crypto task (SPEC-017 CT-030) |
+/// | `#[signed(ed25519, by = server\|col)]` | Declared field signature (SPEC-017 CT-033) |
+/// | `#[masked(null\|redact\|ciphertext\|hash)]` | Unauthorized-read masking strategy (SPEC-017 CT-041) |
+/// | `#[column_grant(select = …)]` | Per-column read grant: `public`\|`owner`\|`server_peer`\|`"role"` (SPEC-017 CT-040) |
 ///
 /// # Additional struct attributes (written **below** `#[fluxum::table]`)
 ///
