@@ -66,6 +66,7 @@ pub mod simd;
 pub mod sql;
 pub mod store;
 pub mod subscription;
+pub mod transform;
 pub mod txn;
 pub mod types;
 
