@@ -366,6 +366,90 @@ pub fn is_computed(table: &str, column: &str) -> bool {
     computed_def(table, column).is_some()
 }
 
+/// A `#[check(expr)]` declarative constraint (SPEC-022 RV-030), registered at
+/// link time by `#[fluxum::table]`. The predicate is a macro-compiled function
+/// over the row's column values, validated on every write before merge — a
+/// `false` aborts the transaction with a typed 3101.
+#[derive(Debug)]
+pub struct CheckDef {
+    /// The `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// The column the check is declared on (error-message context).
+    pub column: &'static str,
+    /// The declared expression's source text (error-message context).
+    pub expr: &'static str,
+    /// Evaluate the predicate over the row's column values. `Ok(false)` is a
+    /// constraint violation; `Err` surfaces as-is (e.g. a decode failure).
+    pub check: fn(&[crate::store::RowValue]) -> Result<bool>,
+}
+
+inventory::collect!(CheckDef);
+
+/// Every registered `#[check]` def in this binary (linker order).
+pub fn registered_checks() -> impl Iterator<Item = &'static CheckDef> {
+    inventory::iter::<CheckDef>()
+}
+
+/// A `#[not_null]` column (SPEC-022 RV-030): the column is `Option`-typed for
+/// wire/migration compatibility, but writing `None` aborts the transaction
+/// with a typed 3103 — non-`Option` semantics enforced at commit time.
+#[derive(Debug)]
+pub struct NotNullDef {
+    /// The `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// The constrained column's name.
+    pub column: &'static str,
+    /// The constrained column's ordinal.
+    pub ordinal: u16,
+}
+
+inventory::collect!(NotNullDef);
+
+/// Every registered `#[not_null]` def in this binary (linker order).
+pub fn registered_not_nulls() -> impl Iterator<Item = &'static NotNullDef> {
+    inventory::iter::<NotNullDef>()
+}
+
+/// What deleting a referenced parent row does to its child rows
+/// (SPEC-022 RV-032).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefAction {
+    /// Reject the delete while any child row references the parent (default).
+    Restrict,
+    /// Delete the child rows in the same transaction (recursively).
+    Cascade,
+    /// Set the child rows' referencing column to `None` (the column must be
+    /// `Option`-typed; enforced at macro expansion).
+    SetNull,
+}
+
+/// A `#[references(Parent(col), on_delete = ...)]` foreign key (SPEC-022
+/// RV-030/032), registered at link time by `#[fluxum::table]`. The referenced
+/// column must be the parent's single-column primary key (validated at store
+/// assembly). Writes validate parent existence; parent deletes apply
+/// `on_delete` atomically within the same transaction.
+pub struct ForeignKeyDef {
+    /// The child `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// The child's referencing column name.
+    pub column: &'static str,
+    /// The child's referencing column ordinal.
+    pub ordinal: u16,
+    /// The referenced parent table's struct name.
+    pub parent_table: &'static str,
+    /// The referenced parent column's name (must be the parent's PK).
+    pub parent_column: &'static str,
+    /// The RV-032 referential action applied when the parent row is deleted.
+    pub on_delete: RefAction,
+}
+
+inventory::collect!(ForeignKeyDef);
+
+/// Every registered foreign-key def in this binary (linker order).
+pub fn registered_foreign_keys() -> impl Iterator<Item = &'static ForeignKeyDef> {
+    inventory::iter::<ForeignKeyDef>()
+}
+
 /// How a durable table's rows expire (SPEC-023 DMX-020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlKind {

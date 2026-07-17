@@ -129,6 +129,48 @@ struct Column {
     /// The `#[computed(expr)]` generation expression, if present (SPEC-022
     /// RV-050): a Rust expression over sibling columns, evaluated on write.
     computed: Option<(Expr, Span)>,
+    /// `#[check(expr)]` constraints (SPEC-022 RV-030): boolean Rust
+    /// expressions over this row's columns, validated on write.
+    checks: Vec<(Expr, Span)>,
+    /// Span of a `#[not_null]` attribute (RV-030), if present; requires an
+    /// `Option`-typed column.
+    not_null: Option<Span>,
+    /// A `#[references(Parent(col), on_delete = ...)]` foreign key (RV-030/
+    /// 032), if present.
+    references: Option<RefDecl>,
+}
+
+/// One parsed `#[references(Parent(col), on_delete = ...)]` declaration
+/// (SPEC-022 RV-030/032).
+struct RefDecl {
+    /// The referenced parent table's struct name.
+    parent: Ident,
+    /// The referenced parent column (must be the parent's PK; validated at
+    /// store assembly, where the parent's schema is in hand).
+    parent_column: Ident,
+    /// The RV-032 action: `restrict` (default) | `cascade` | `set_null`.
+    on_delete: RefActionTok,
+    span: Span,
+}
+
+/// Macro-side mirror of `fluxum_core::schema::RefAction`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RefActionTok {
+    Restrict,
+    Cascade,
+    SetNull,
+}
+
+impl RefActionTok {
+    /// Tokens constructing the matching `RefAction` variant.
+    fn tokens(self) -> TokenStream {
+        let path = quote!(::fluxum_core::schema::RefAction);
+        match self {
+            Self::Restrict => quote!(#path::Restrict),
+            Self::Cascade => quote!(#path::Cascade),
+            Self::SetNull => quote!(#path::SetNull),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -431,6 +473,9 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         let mut auto_inc = None;
         let mut default = None;
         let mut computed = None;
+        let mut checks: Vec<(Expr, Span)> = Vec::new();
+        let mut not_null = None;
+        let mut references = None;
         let mut rename_from = None;
         let mut transforms: Vec<TransformDecl> = Vec::new();
         let mut owner = None;
@@ -462,6 +507,19 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                     return Err(syn::Error::new(attr.span(), "duplicate `#[computed]`"));
                 }
                 computed = Some((attr.parse_args::<Expr>()?, attr.span()));
+            } else if attr.path().is_ident("check") {
+                checks.push((attr.parse_args::<Expr>()?, attr.span()));
+            } else if attr.path().is_ident("not_null") {
+                if not_null.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate `#[not_null]`"));
+                }
+                attr.meta.require_path_only()?;
+                not_null = Some(attr.span());
+            } else if attr.path().is_ident("references") {
+                if references.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate `#[references]`"));
+                }
+                references = Some(parse_references(&attr)?);
             } else if attr.path().is_ident("rename") {
                 if rename_from.is_some() {
                     return Err(syn::Error::new(attr.span(), "duplicate `#[rename]`"));
@@ -518,6 +576,9 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             transforms,
             owner,
             computed,
+            checks,
+            not_null,
+            references,
         });
     }
     if columns.is_empty() {
@@ -1222,6 +1283,131 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         }
     }
 
+    // -- declarative constraints (SPEC-022 RV-030/032) ---------------------------
+    // `#[check(expr)]` compiles to a link-time `CheckDef` whose predicate fn
+    // binds the referenced columns (self included) to their native types;
+    // `#[not_null]` and `#[references]` submit plain metadata defs. The store
+    // validates all three on every write, before merge.
+    let mut constraint_submits: Vec<TokenStream> = Vec::new();
+    {
+        let by_name: std::collections::HashMap<String, (u16, &FluxTy)> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    c.ident.to_string(),
+                    (u16::try_from(i).unwrap_or(u16::MAX), &c.flux),
+                )
+            })
+            .collect();
+        for (i, column) in columns.iter().enumerate() {
+            let ord = u16::try_from(i).unwrap_or(u16::MAX);
+            let self_name = column.ident.to_string();
+            for (check_idx, (expr, _span)) in column.checks.iter().enumerate() {
+                let mut bindings: Vec<TokenStream> = Vec::new();
+                for name in collect_idents(expr) {
+                    if let Some((sib_ord, sib_flux)) = by_name.get(&name) {
+                        let ident = format_ident!("{}", name);
+                        let idx = usize::from(*sib_ord);
+                        let extract =
+                            from_row_value(sib_flux, quote!((&__fx_values[#idx])), &name_str, &name);
+                        bindings.push(quote!(let #ident = #extract;));
+                    }
+                }
+                let expr_str = expr.to_token_stream().to_string();
+                let fn_ident = format_ident!(
+                    "__fx_check_{}_{}_{}",
+                    struct_ident,
+                    column.ident,
+                    check_idx
+                );
+                constraint_submits.push(quote! {
+                    #[allow(unused_variables, non_snake_case)]
+                    fn #fn_ident(
+                        __fx_values: &[::fluxum_core::store::RowValue],
+                    ) -> ::fluxum_core::error::Result<bool> {
+                        #(#bindings)*
+                        ::core::result::Result::Ok({ #expr })
+                    }
+                    ::fluxum_core::schema::inventory::submit! {
+                        ::fluxum_core::schema::CheckDef {
+                            table: #name_str,
+                            column: #self_name,
+                            expr: #expr_str,
+                            check: #fn_ident,
+                        }
+                    }
+                });
+            }
+            if let Some(span) = column.not_null {
+                if !matches!(column.flux, FluxTy::Opt(_)) {
+                    return Err(syn::Error::new(
+                        span,
+                        format!(
+                            "`#[not_null]` on non-Option column `{self_name}`: the type \
+                             already forbids None — the attribute is for Option-typed \
+                             columns kept nullable on the wire (RV-030)"
+                        ),
+                    ));
+                }
+                constraint_submits.push(quote! {
+                    ::fluxum_core::schema::inventory::submit! {
+                        ::fluxum_core::schema::NotNullDef {
+                            table: #name_str,
+                            column: #self_name,
+                            ordinal: #ord,
+                        }
+                    }
+                });
+            }
+            if let Some(decl) = &column.references {
+                if decl.on_delete == RefActionTok::SetNull
+                    && !matches!(column.flux, FluxTy::Opt(_))
+                {
+                    return Err(syn::Error::new(
+                        decl.span,
+                        format!(
+                            "`on_delete = set_null` requires `{self_name}` to be \
+                             Option-typed (RV-032)"
+                        ),
+                    ));
+                }
+                if column.computed.is_some() {
+                    return Err(syn::Error::new(
+                        decl.span,
+                        "a `#[computed]` column cannot declare `#[references]` — the \
+                         derivation, not the reducer, controls its value (RV-030)",
+                    ));
+                }
+                let parent = decl.parent.to_string();
+                let parent_column = decl.parent_column.to_string();
+                if parent == name_str {
+                    // Self-referential FKs are legal (tree shapes); only the
+                    // trivially impossible same-column case is rejected.
+                    if parent_column == self_name {
+                        return Err(syn::Error::new(
+                            decl.span,
+                            "`#[references]` cannot target the declaring column itself",
+                        ));
+                    }
+                }
+                let action = decl.on_delete.tokens();
+                constraint_submits.push(quote! {
+                    ::fluxum_core::schema::inventory::submit! {
+                        ::fluxum_core::schema::ForeignKeyDef {
+                            table: #name_str,
+                            column: #self_name,
+                            ordinal: #ord,
+                            parent_table: #parent,
+                            parent_column: #parent_column,
+                            on_delete: #action,
+                        }
+                    }
+                });
+            }
+        }
+    }
+
     let column_tokens = columns.iter().map(|c| {
         let name = c.ident.to_string();
         let ty = c.flux.tokens();
@@ -1411,6 +1597,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
             #(#computed_submits)*
 
+            #(#constraint_submits)*
+
             #migration_meta
         };
     })
@@ -1443,6 +1631,62 @@ fn collect_idents(expr: &Expr) -> std::collections::HashSet<String> {
     let mut out = std::collections::HashSet::new();
     walk(expr.to_token_stream(), &mut out);
     out
+}
+
+/// `#[references(Parent(col))]` or
+/// `#[references(Parent(col), on_delete = restrict|cascade|set_null)]`
+/// (SPEC-022 RV-030/032). The referenced column must be the parent's
+/// primary key — validated at store assembly, where the parent's schema is
+/// in hand.
+fn parse_references(attr: &Attribute) -> syn::Result<RefDecl> {
+    let span = attr.span();
+    attr.parse_args_with(|input: syn::parse::ParseStream| {
+        let parent: Ident = input.parse()?;
+        let content;
+        syn::parenthesized!(content in input);
+        let parent_column: Ident = content.parse()?;
+        if !content.is_empty() {
+            return Err(content.error(
+                "foreign keys reference exactly one column: `Parent(col)` (RV-030)",
+            ));
+        }
+        let mut on_delete = RefActionTok::Restrict;
+        if input.peek(syn::Token![,]) {
+            input.parse::<syn::Token![,]>()?;
+            let key: Ident = input.parse()?;
+            if key != "on_delete" {
+                return Err(syn::Error::new(
+                    key.span(),
+                    "expected `on_delete = restrict|cascade|set_null` (RV-032)",
+                ));
+            }
+            input.parse::<syn::Token![=]>()?;
+            let value: Ident = input.parse()?;
+            on_delete = match value.to_string().as_str() {
+                "restrict" => RefActionTok::Restrict,
+                "cascade" => RefActionTok::Cascade,
+                "set_null" => RefActionTok::SetNull,
+                other => {
+                    return Err(syn::Error::new(
+                        value.span(),
+                        format!(
+                            "unknown referential action `{other}`: expected `restrict`, \
+                             `cascade`, or `set_null` (RV-032)"
+                        ),
+                    ));
+                }
+            };
+        }
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after `on_delete = ...`"));
+        }
+        Ok(RefDecl {
+            parent,
+            parent_column,
+            on_delete,
+            span,
+        })
+    })
 }
 
 /// `#[default(expr)]` (SPEC-010 MIG-020): the backfill value used when the

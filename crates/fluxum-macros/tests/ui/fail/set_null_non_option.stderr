@@ -1,0 +1,5 @@
+error: `on_delete = set_null` requires `parent_id` to be Option-typed (RV-032)
+  --> tests/ui/fail/set_null_non_option.rs:15:5
+   |
+15 |     #[references(Parent(id), on_delete = set_null)]
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

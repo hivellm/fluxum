@@ -77,7 +77,7 @@ use fluxum_protocol::codes;
 
 use crate::error::{FluxumError, Result};
 use crate::schema::Table;
-use crate::store::{Row, TableId, Tx};
+use crate::store::{Row, TableId, TriggerKind, Tx};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
 pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
@@ -158,6 +158,61 @@ inventory::collect!(ReducerDef);
 /// order (the registry map is name-keyed; order is irrelevant).
 pub fn registered_reducers() -> impl Iterator<Item = &'static ReducerDef> {
     inventory::iter::<ReducerDef>()
+}
+
+/// The static handler shape the `#[fluxum::on_insert/on_update/on_delete]`
+/// macros emit (SPEC-022 RV-031): `(ctx, old row, new row)` — `old` is set
+/// for Update/Delete, `new` for Insert/Update; rows arrive decrypted.
+pub type TriggerFnPtr =
+    fn(&ReducerContext<'_, '_, '_>, Option<&Row>, Option<&Row>) -> Result<()>;
+
+/// One `#[fluxum::on_insert(Table)]` / `on_update` / `on_delete` hook in the
+/// link-time registry (SPEC-022 RV-031): dispatched by [`TxHandle`] inside
+/// the same transaction as the mutation that fired it, under the caller's
+/// identity — an `Err` rolls the whole transaction back.
+pub struct TriggerDef {
+    /// The `#[fluxum::table]` struct name the hook watches.
+    pub table: &'static str,
+    /// Which mutation fires the hook.
+    pub kind: TriggerKind,
+    /// The hook function's name (diagnostics).
+    pub name: &'static str,
+    /// The macro-generated dispatch glue (decode rows, call the function).
+    pub handler: TriggerFnPtr,
+}
+
+inventory::collect!(TriggerDef);
+
+/// Iterate every registered trigger hook in this binary (linker order).
+pub fn registered_triggers() -> impl Iterator<Item = &'static TriggerDef> {
+    inventory::iter::<TriggerDef>()
+}
+
+/// The link-time trigger map, keyed by table id (built once, lazily).
+fn trigger_map() -> &'static HashMap<TableId, Vec<&'static TriggerDef>> {
+    static MAP: std::sync::OnceLock<HashMap<TableId, Vec<&'static TriggerDef>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map: HashMap<TableId, Vec<&'static TriggerDef>> = HashMap::new();
+        for def in registered_triggers() {
+            map.entry(TableId::of(def.table)).or_default().push(def);
+        }
+        map
+    })
+}
+
+/// Whether `table` has any registered `#[fluxum::on_*]` hook (RV-031) — the
+/// store's write/delete paths record trigger events only when this holds.
+pub fn has_triggers(table: TableId) -> bool {
+    trigger_map().contains_key(&table)
+}
+
+/// The registered hooks of `(table, kind)`, in linker order.
+fn triggers_for(table: TableId, kind: TriggerKind) -> Vec<&'static TriggerDef> {
+    trigger_map()
+        .get(&table)
+        .map(|defs| defs.iter().copied().filter(|d| d.kind == kind).collect())
+        .unwrap_or_default()
 }
 
 /// One registered reducer: the dispatch body plus the optional
@@ -504,6 +559,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .insert(table_of::<T>(), row.into_values())?;
+        self.dispatch_triggers()?;
         T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
 
@@ -515,6 +571,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .upsert(table_of::<T>(), row.into_values())?;
+        self.dispatch_triggers()?;
         T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
 
@@ -522,8 +579,11 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     /// or pending) row was deleted; deleting a row this same transaction
     /// inserted cancels the insert entirely (STG-007).
     pub fn delete<T: Table>(&self, pk: T::Pk) -> Result<bool> {
-        self.exclusive()?
-            .delete(table_of::<T>(), &T::pk_values(&pk))
+        let deleted = self
+            .exclusive()?
+            .delete(table_of::<T>(), &T::pk_values(&pk))?;
+        self.dispatch_triggers()?;
+        Ok(deleted)
     }
 
     /// Delete every committed row matching `pred`; returns how many rows
@@ -543,6 +603,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
                 deleted += 1;
             }
         }
+        self.dispatch_triggers()?;
         Ok(deleted)
     }
 
@@ -648,6 +709,52 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     }
 
     // --- Internals -----------------------------------------------------------
+
+    /// SPEC-022 RV-031: drain the transaction's recorded mutation events and
+    /// run every registered `#[fluxum::on_*]` hook — inside this same
+    /// transaction, under the caller's identity. A hook's own mutations
+    /// dispatch recursively through its `ctx.tx` calls; the RED-005 depth
+    /// cap bounds runaway trigger→mutation→trigger recursion. A hook `Err`
+    /// propagates and rolls the whole transaction back.
+    fn dispatch_triggers(&self) -> Result<()> {
+        loop {
+            let events = self.exclusive()?.take_trigger_events();
+            if events.is_empty() {
+                return Ok(());
+            }
+            for event in events {
+                let defs = triggers_for(event.table, event.kind);
+                if defs.is_empty() {
+                    continue;
+                }
+                // Hooks see plaintext rows (SPEC-017 CT-031: server peers).
+                let decrypt = |row: &Option<Row>| -> Result<Option<Row>> {
+                    row.as_ref()
+                        .map(|r| self.shared()?.decrypt_stored(event.table, r))
+                        .transpose()
+                };
+                let old = decrypt(&event.old)?;
+                let new = decrypt(&event.new)?;
+                let depth = self.env.depth.get();
+                if depth >= MAX_CALL_DEPTH {
+                    return Err(FluxumError::query(
+                        codes::SYS_INTERNAL,
+                        format!(
+                            "trigger dispatch depth exceeded {MAX_CALL_DEPTH}: unbounded \
+                             mutation→trigger recursion (RV-031/RED-005)"
+                        ),
+                    ));
+                }
+                self.env.depth.set(depth + 1);
+                let ctx = self.env.context();
+                let result = defs
+                    .iter()
+                    .try_for_each(|def| (def.handler)(&ctx, old.as_ref(), new.as_ref()));
+                self.env.depth.set(depth);
+                result?;
+            }
+        }
+    }
 
     /// Committed rows of `T`'s table, cloned out (`Arc` bumps) so the
     /// transaction borrow is released before predicates or decoding run.

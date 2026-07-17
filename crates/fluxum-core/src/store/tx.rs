@@ -26,6 +26,34 @@ pub(crate) enum PendingOp {
     Update(Row),
 }
 
+/// Which mutation fired a declarative trigger (SPEC-022 RV-031).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TriggerKind {
+    /// A row was written to a previously unoccupied primary key.
+    Insert,
+    /// A visible row was replaced in place (upsert over an occupied key).
+    Update,
+    /// A visible row was deleted (including RV-032 cascade deletes).
+    Delete,
+}
+
+/// One recorded mutation awaiting `#[fluxum::on_insert/on_update/on_delete]`
+/// dispatch (SPEC-022 RV-031). Recorded by the write/delete paths only for
+/// tables with registered triggers; drained by the reducer layer's
+/// `TxHandle`, which runs the hooks inside this same transaction. Rows are
+/// as stored (`#[encrypted]` columns sealed) — dispatch decrypts.
+#[derive(Debug, Clone)]
+pub struct TriggerEvent {
+    /// The mutated table.
+    pub table: TableId,
+    /// Insert / Update / Delete.
+    pub kind: TriggerKind,
+    /// The visible row before the mutation (`Update`/`Delete`).
+    pub old: Option<Row>,
+    /// The row as stored after the mutation (`Insert`/`Update`).
+    pub new: Option<Row>,
+}
+
 /// Write buffer for the single in-flight transaction (STG-003).
 ///
 /// At most one exists per shard at any time; the guarantee is enforced by
@@ -40,6 +68,10 @@ pub struct TxState {
     /// Undo records for effects applied eagerly to committed structures
     /// (STG-007 rule 3). Replayed in reverse on rollback.
     pub(crate) undo_log: Vec<UndoRecord>,
+    /// Trigger events awaiting dispatch (RV-031), in mutation order.
+    /// Discarded with the `TxState` on rollback; a commit with undrained
+    /// events (raw-`Tx` callers outside the reducer layer) drops them.
+    pub(crate) trigger_events: Vec<TriggerEvent>,
 }
 
 impl TxState {
@@ -48,6 +80,7 @@ impl TxState {
             tx_id,
             tables: BTreeMap::new(),
             undo_log: Vec::new(),
+            trigger_events: Vec::new(),
         }
     }
 

@@ -13,6 +13,7 @@ mod flux_type;
 mod migration;
 mod reducer;
 mod table;
+mod trigger;
 
 /// Declares a Rust struct as a Fluxum database table (SPEC-001 DM-001).
 ///
@@ -43,6 +44,9 @@ mod table;
 /// | `#[owner]` | Ephemeral-table `ConnectionId` binding: the owner's rows are deleted on disconnect (SPEC-023 DMX-011) |
 /// | `#[default(value)]` | Backfill value: the schema diff auto-adds the column to existing rows (SPEC-010 MIG-021) |
 /// | `#[computed(expr)]` | Generated column: `expr` (a Rust expression over sibling columns) derives the value on write; read-only to reducers, stored/indexed/replicated like any column (SPEC-022 RV-050). Reference columns as real idents, not inline `{col}` format captures |
+/// | `#[check(expr)]` | Declarative constraint: `expr` (a boolean Rust expression over this row's columns) must hold on every write, or the transaction aborts with a typed 3101 (SPEC-022 RV-030). Repeatable |
+/// | `#[not_null]` | Rejects `None` on write for an `Option`-typed column (typed 3103) — non-`Option` semantics while staying nullable on the wire (RV-030) |
+/// | `#[references(Parent(col), on_delete = restrict\|cascade\|set_null)]` | Foreign key: every written value must name an existing `Parent` row by its primary key (typed 3102); deleting the parent applies the action atomically in the same transaction (RV-030/032, default `restrict`) |
 /// | `#[rename(from = "old")]` | Column was renamed from `old`: the schema diff renames it in place (SPEC-010 MIG-021) |
 /// | `#[normalize(money\|datetime\|string, …)]` | Deterministic value canonicalization (SPEC-017 CT-021..023) |
 /// | `#[encrypted(ecies, key = "NAME")]` | Declared at-rest field encryption; executes with the phase-3 crypto task (SPEC-017 CT-030) |
@@ -268,4 +272,35 @@ pub fn schedule(args: TokenStream, input: TokenStream) -> TokenStream {
 #[proc_macro_attribute]
 pub fn view(args: TokenStream, input: TokenStream) -> TokenStream {
     reducer::expand_view(args.into(), input.into()).into()
+}
+
+/// Declares an insert trigger (SPEC-022 RV-031):
+/// `#[fluxum::on_insert(Table)]` runs
+/// `fn(ctx: &ReducerContext, row: &Table) -> Result<(), String>` inside the
+/// same transaction as every insert into `Table` — including inserts made
+/// by other triggers. An `Err` rolls the whole transaction back. Mutations
+/// the hook makes through `ctx.tx` fire further triggers (depth-capped).
+#[proc_macro_attribute]
+pub fn on_insert(args: TokenStream, input: TokenStream) -> TokenStream {
+    trigger::expand(trigger::Kind::Insert, args.into(), input.into()).into()
+}
+
+/// Declares an update trigger (SPEC-022 RV-031):
+/// `#[fluxum::on_update(Table)]` runs
+/// `fn(ctx: &ReducerContext, old: &Table, new: &Table) -> Result<(), String>`
+/// inside the same transaction as every in-place replacement of a `Table`
+/// row (upsert over an occupied key, RV-032 `set_null` rewrites).
+#[proc_macro_attribute]
+pub fn on_update(args: TokenStream, input: TokenStream) -> TokenStream {
+    trigger::expand(trigger::Kind::Update, args.into(), input.into()).into()
+}
+
+/// Declares a delete trigger (SPEC-022 RV-031):
+/// `#[fluxum::on_delete(Table)]` runs
+/// `fn(ctx: &ReducerContext, row: &Table) -> Result<(), String>` inside the
+/// same transaction as every delete of a `Table` row — including RV-032
+/// cascade deletes.
+#[proc_macro_attribute]
+pub fn on_delete(args: TokenStream, input: TokenStream) -> TokenStream {
+    trigger::expand(trigger::Kind::Delete, args.into(), input.into()).into()
 }

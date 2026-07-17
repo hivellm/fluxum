@@ -89,6 +89,13 @@ pub const SQL_TYPE_MISMATCH: u16 = 3004;
 pub const SQL_NO_SPATIAL_INDEX: u16 = 3010;
 /// 3100 — `#[unique]` constraint violation (TXN-041).
 pub const SQL_UNIQUE_VIOLATION: u16 = 3100;
+/// 3101 — `#[check(expr)]` constraint violation (SPEC-022 RV-030).
+pub const TXN_CHECK_VIOLATION: u16 = 3101;
+/// 3102 — `#[references]` foreign-key violation: missing parent on write, or
+/// a `restrict` delete with live child rows (SPEC-022 RV-030/032).
+pub const TXN_FK_VIOLATION: u16 = 3102;
+/// 3103 — `None` written to a `#[not_null]` column (SPEC-022 RV-030).
+pub const TXN_NOT_NULL_VIOLATION: u16 = 3103;
 /// 3200 — transaction conflict (reserved; single-writer has none today).
 pub const TXN_CONFLICT: u16 = 3200;
 

@@ -90,8 +90,12 @@ pub fn expand_schedule(args: TokenStream, input: TokenStream) -> TokenStream {
 
 /// Shared shape validation: synchronous, non-generic, at least the context
 /// parameter, every later parameter a plain `ident: Type`. Returns the
-/// typed (ident, type) parameter list after the context.
-fn check_shape(item: &ItemFn, attribute: &str) -> syn::Result<Vec<(syn::Ident, syn::Type)>> {
+/// typed (ident, type) parameter list after the context. Shared with the
+/// RV-031 trigger attributes (`crate::trigger`).
+pub(crate) fn check_shape(
+    item: &ItemFn,
+    attribute: &str,
+) -> syn::Result<Vec<(syn::Ident, syn::Type)>> {
     if let Some(asyncness) = &item.sig.asyncness {
         return Err(syn::Error::new(
             asyncness.span(),

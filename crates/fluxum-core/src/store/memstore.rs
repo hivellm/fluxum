@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use arc_swap::ArcSwap;
 
+use fluxum_protocol::codes;
+
 use crate::error::{FluxumError, Result};
 use crate::index::{
     BTreeIndex, FullTextIndexState, IndexId, Rect, SpatialIndexState, SpatialPredicate,
@@ -17,7 +19,7 @@ use crate::store::committed::{CommittedState, Snapshot, TableState};
 use crate::store::row::{
     PkBytes, Row, RowValue, check_row, display_pk_of_row, encode_pk_of_row, encode_pk_values,
 };
-use crate::store::tx::{PendingOp, TableDiff, TxDiff, TxState};
+use crate::store::tx::{PendingOp, TableDiff, TriggerEvent, TriggerKind, TxDiff, TxState};
 use crate::store::unique::{self, UniqueIndex};
 
 /// Tuning knobs for a [`MemStore`] (SPEC-002 §8; wired into `config.yml`
@@ -139,6 +141,39 @@ pub struct MemStore {
     /// derivations applied on write, resolved from the link-time registry at
     /// construction (pure fns; no runtime attach).
     computed: HashMap<TableId, Vec<(u16, crate::schema::ComputeFn)>>,
+    /// `#[check(expr)]` constraints per table (SPEC-022 RV-030), validated on
+    /// every write before merge.
+    checks: HashMap<TableId, Vec<&'static crate::schema::CheckDef>>,
+    /// `#[not_null]` columns per table (RV-030): `Option`-typed columns that
+    /// reject `None` on write.
+    not_null: HashMap<TableId, Vec<&'static crate::schema::NotNullDef>>,
+    /// Outgoing foreign keys per child table (RV-030): parent existence is
+    /// validated on every child write.
+    fks_out: HashMap<TableId, Vec<ResolvedFk>>,
+    /// Incoming foreign keys per parent table (RV-032): the referential
+    /// action each parent delete applies to its child rows.
+    fks_in: HashMap<TableId, Vec<ResolvedFk>>,
+}
+
+/// A `#[references]` declaration resolved against the assembled catalog
+/// (SPEC-022 RV-030/032): both ends validated at store construction, so the
+/// write/delete hot paths never re-resolve names.
+#[derive(Debug, Clone, Copy)]
+struct ResolvedFk {
+    /// The child (referencing) table.
+    child: TableId,
+    /// The child table's schema.
+    child_schema: &'static TableSchema,
+    /// The child's referencing column ordinal.
+    child_ordinal: u16,
+    /// The child's referencing column name (error messages).
+    child_column: &'static str,
+    /// The parent (referenced) table; its single-column PK is the target.
+    parent: TableId,
+    /// The parent table's schema.
+    parent_schema: &'static TableSchema,
+    /// What a parent delete does to referencing child rows (RV-032).
+    on_delete: crate::schema::RefAction,
 }
 
 impl MemStore {
@@ -202,11 +237,17 @@ impl MemStore {
             }
         }
         let computed = build_computed(&catalog);
+        let (checks, not_null) = build_checks(&catalog);
+        let (fks_out, fks_in) = build_foreign_keys(&catalog)?;
         Ok(Self {
             catalog,
             blobs: std::sync::OnceLock::new(),
             transforms: std::sync::OnceLock::new(),
             computed,
+            checks,
+            not_null,
+            fks_out,
+            fks_in,
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -573,6 +614,12 @@ impl Tx<'_> {
             spatial.check_insert(schema.name, &values)?;
         }
         self.assign_auto_inc(table, schema, &mut values)?;
+        // RV-030: declarative `#[not_null]` / `#[check]` / `#[references]`
+        // constraints, validated eagerly at write time (like TXN-040/041) so
+        // the commit merge stays infallible — on the plaintext row, after
+        // computed derivation and auto-inc assignment, before `#[encrypted]`
+        // sealing.
+        self.check_constraints(table, schema, &values)?;
         let pk = encode_pk_of_row(schema, &values)?;
 
         // SPEC-017 CT-011/030: seal `#[encrypted]` columns after validation and
@@ -610,8 +657,22 @@ impl Tx<'_> {
         // overlay — so the commit merge stays validated by construction.
         self.check_unique(table, schema, &values, &pk)?;
 
+        // RV-031: the visible row this write replaces, captured before the
+        // buffer mutation so a trigger's `old` argument is the pre-write
+        // view. Only tables with registered triggers pay for the clone.
+        let wants_events = crate::reducer::has_triggers(table);
+        let old_visible: Option<Row> = if wants_events {
+            match (&pending, &committed_row) {
+                (Some(PendingOp::Insert(row) | PendingOp::Update(row)), _) => Some(row.clone()),
+                (Some(PendingOp::Delete), _) => None,
+                (None, committed) => committed.clone(),
+            }
+        } else {
+            None
+        };
+
         let ops = self.state.tables.entry(table).or_default();
-        match pending {
+        let stored = match pending {
             // Tx-deleted committed row: reinsert is allowed (STG-007).
             Some(PendingOp::Delete) => {
                 let committed = committed_row.ok_or_else(|| {
@@ -626,11 +687,11 @@ impl Tx<'_> {
                     // no-op; the committed row identity is preserved
                     // (STG-007 rule 1).
                     ops.remove(&pk);
-                    Ok(committed)
+                    committed
                 } else {
                     let row = Row::new(values);
                     ops.insert(pk, PendingOp::Update(row.clone()));
-                    Ok(row)
+                    row
                 }
             }
             // Upsert over this transaction's own pending write: the pending
@@ -640,30 +701,113 @@ impl Tx<'_> {
             Some(PendingOp::Insert(_)) => {
                 let row = Row::new(values);
                 ops.insert(pk, PendingOp::Insert(row.clone()));
-                Ok(row)
+                row
             }
             Some(PendingOp::Update(_)) => {
                 let row = Row::new(values);
                 ops.insert(pk, PendingOp::Update(row.clone()));
-                Ok(row)
+                row
             }
             None => {
                 if let Some(committed) = committed_row {
                     // Upsert over a committed row (TXN-040 exception).
                     if committed.values() == values.as_slice() {
                         // Identical content: structural no-op, committed row
-                        // identity preserved (STG-007 rule 1).
+                        // identity preserved (STG-007 rule 1) — no trigger
+                        // event either, nothing changed.
                         return Ok(committed);
                     }
                     let row = Row::new(values);
                     ops.insert(pk, PendingOp::Update(row.clone()));
-                    Ok(row)
+                    row
                 } else {
                     let row = Row::new(values);
                     ops.insert(pk, PendingOp::Insert(row.clone()));
-                    Ok(row)
+                    row
                 }
             }
+        };
+        if wants_events {
+            let kind = if old_visible.is_some() {
+                TriggerKind::Update
+            } else {
+                TriggerKind::Insert
+            };
+            self.state.trigger_events.push(TriggerEvent {
+                table,
+                kind,
+                old: old_visible,
+                new: Some(stored.clone()),
+            });
+        }
+        Ok(stored)
+    }
+
+    /// SPEC-022 RV-030: declarative constraints, validated eagerly at write
+    /// time. `#[not_null]` rejects `None`, `#[check]` predicates must hold,
+    /// and every `#[references]` value must name an overlay-visible parent
+    /// row. Violations abort the transaction with a typed error.
+    fn check_constraints(
+        &self,
+        table: TableId,
+        schema: &'static TableSchema,
+        values: &[RowValue],
+    ) -> Result<()> {
+        for def in self.store.not_null.get(&table).into_iter().flatten() {
+            if let Some(RowValue::Optional(None)) = values.get(usize::from(def.ordinal)) {
+                return Err(FluxumError::query(
+                    codes::TXN_NOT_NULL_VIOLATION,
+                    format!(
+                        "table `{}` column `{}`: None violates #[not_null] (RV-030)",
+                        def.table, def.column
+                    ),
+                ));
+            }
+        }
+        for def in self.store.checks.get(&table).into_iter().flatten() {
+            if !(def.check)(values)? {
+                return Err(FluxumError::query(
+                    codes::TXN_CHECK_VIOLATION,
+                    format!(
+                        "table `{}` column `{}`: #[check({})] violated (RV-030)",
+                        def.table, def.column, def.expr
+                    ),
+                ));
+            }
+        }
+        for fk in self.store.fks_out.get(&table).into_iter().flatten() {
+            let Some(value) = values.get(usize::from(fk.child_ordinal)) else {
+                continue; // arity already rejected by check_row
+            };
+            let target = match value {
+                // A None reference is explicitly unlinked — valid.
+                RowValue::Optional(None) => continue,
+                RowValue::Optional(Some(inner)) => inner.as_ref(),
+                other => other,
+            };
+            if !self.parent_exists(fk, target)? {
+                return Err(FluxumError::query(
+                    codes::TXN_FK_VIOLATION,
+                    format!(
+                        "table `{}` column `{}`: referenced `{}` row {target:?} does \
+                         not exist (#[references], RV-030)",
+                        schema.name, fk.child_column, fk.parent_schema.name
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Overlay-aware parent existence for an RV-030 foreign-key write: a
+    /// parent row this transaction inserted satisfies the reference; one it
+    /// deleted does not.
+    fn parent_exists(&self, fk: &ResolvedFk, value: &RowValue) -> Result<bool> {
+        let pk = encode_pk_values(fk.parent_schema, std::slice::from_ref(value))?;
+        match self.state.tables.get(&fk.parent).and_then(|ops| ops.get(&pk)) {
+            Some(PendingOp::Insert(_) | PendingOp::Update(_)) => Ok(true),
+            Some(PendingOp::Delete) => Ok(false),
+            None => Ok(self.base.table(fk.parent)?.rows.contains_key(&pk)),
         }
     }
 
@@ -729,32 +873,158 @@ impl Tx<'_> {
     ///
     /// Returns whether a (committed or pending) row was deleted. Deleting a
     /// row inserted by this same transaction cancels the insert entirely.
+    ///
+    /// SPEC-022 RV-032: deleting a row referenced by `#[references]` child
+    /// rows applies the declared referential action atomically within this
+    /// same transaction — `restrict` (the default) rejects the delete with a
+    /// typed 3102 while any child row still references it, `cascade` deletes
+    /// the referencing rows (transitively, via an explicit worklist — cycles
+    /// terminate because re-deleting an already-deleted row is a no-op), and
+    /// `set_null` clears the referencing column.
     pub fn delete(&mut self, table: TableId, pk_values: &[RowValue]) -> Result<bool> {
-        let schema = self.store.schema_of(table)?;
-        let pk = encode_pk_values(schema, pk_values)?;
-        let committed_has = self.base.table(table)?.rows.contains_key(&pk);
-        let ops = self.state.tables.entry(table).or_default();
-        match ops.get(&pk) {
-            // Insert-then-delete of a pending row cancels to a no-op.
-            Some(PendingOp::Insert(_)) => {
-                ops.remove(&pk);
-                Ok(true)
+        let Some(old) = self.delete_one(table, pk_values)? else {
+            return Ok(false);
+        };
+        let store = self.store;
+        // RV-032 worklist: every deleted row whose table has incoming
+        // references fans out its action; cascade pushes further entries.
+        let mut deleted: Vec<(TableId, Row)> = vec![(table, old)];
+        while let Some((parent, old_row)) = deleted.pop() {
+            let Some(fks) = store.fks_in.get(&parent) else {
+                continue;
+            };
+            for fk in fks {
+                // Single-column PK validated at store assembly.
+                let &[pk_ord] = fk.parent_schema.primary_key else {
+                    continue;
+                };
+                let parent_value = old_row.values()[usize::from(pk_ord)].clone();
+                self.apply_ref_action(fk, &parent_value, &mut deleted)?;
             }
-            // The committed row stays deleted; the pending replacement dies.
-            Some(PendingOp::Update(_)) => {
-                ops.insert(pk, PendingOp::Delete);
-                Ok(true)
-            }
-            Some(PendingOp::Delete) => Ok(false),
-            None => {
-                if committed_has {
-                    ops.insert(pk, PendingOp::Delete);
-                    Ok(true)
-                } else {
-                    Ok(false)
+        }
+        Ok(true)
+    }
+
+    /// Apply one RV-032 referential action: find every overlay-visible child
+    /// row referencing `parent_value` and restrict / cascade / set-null it.
+    fn apply_ref_action(
+        &mut self,
+        fk: &ResolvedFk,
+        parent_value: &RowValue,
+        deleted: &mut Vec<(TableId, Row)>,
+    ) -> Result<()> {
+        let children: Vec<Row> = self
+            .scan_all(fk.child)?
+            .filter(|row| {
+                fk_value_matches(row.values().get(usize::from(fk.child_ordinal)), parent_value)
+            })
+            .cloned()
+            .collect();
+        for child in children {
+            match fk.on_delete {
+                crate::schema::RefAction::Restrict => {
+                    return Err(FluxumError::query(
+                        codes::TXN_FK_VIOLATION,
+                        format!(
+                            "delete from `{}` restricted: `{}`.`{}` rows still reference \
+                             {parent_value:?} (on_delete = restrict, RV-032)",
+                            fk.parent_schema.name, fk.child_schema.name, fk.child_column
+                        ),
+                    ));
+                }
+                crate::schema::RefAction::Cascade => {
+                    let pk_vals: Vec<RowValue> = fk
+                        .child_schema
+                        .primary_key
+                        .iter()
+                        .map(|&ord| child.values()[usize::from(ord)].clone())
+                        .collect();
+                    if let Some(old) = self.delete_one(fk.child, &pk_vals)? {
+                        deleted.push((fk.child, old));
+                    }
+                }
+                crate::schema::RefAction::SetNull => {
+                    let mut vals = child.values().to_vec();
+                    // Stored rows carry `#[encrypted]` columns sealed —
+                    // unseal before the rewrite so `write` doesn't seal
+                    // ciphertext twice (SPEC-017 CT-011).
+                    if let Some(engine) = self.store.transforms.get()
+                        && engine.touches(fk.child)
+                    {
+                        let cpk = encode_pk_of_row(fk.child_schema, &vals)?;
+                        engine.on_read_row(fk.child, &mut vals, cpk.as_bytes(), true)?;
+                    }
+                    vals[usize::from(fk.child_ordinal)] = RowValue::Optional(None);
+                    self.write(fk.child, vals, true)?;
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Apply the buffer mutation for one delete, returning the previously
+    /// visible row (`None` = nothing to delete). Records the RV-031 trigger
+    /// event; RV-032 referential actions are [`Tx::delete`]'s worklist.
+    fn delete_one(&mut self, table: TableId, pk_values: &[RowValue]) -> Result<Option<Row>> {
+        let schema = self.store.schema_of(table)?;
+        let pk = encode_pk_values(schema, pk_values)?;
+        let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
+        let ops = self.state.tables.entry(table).or_default();
+        let old = match ops.get(&pk).cloned() {
+            // Insert-then-delete of a pending row cancels to a no-op.
+            Some(PendingOp::Insert(row)) => {
+                ops.remove(&pk);
+                Some(row)
+            }
+            // The committed row stays deleted; the pending replacement dies.
+            Some(PendingOp::Update(row)) => {
+                ops.insert(pk, PendingOp::Delete);
+                Some(row)
+            }
+            Some(PendingOp::Delete) => None,
+            None => {
+                if committed_row.is_some() {
+                    ops.insert(pk, PendingOp::Delete);
+                }
+                committed_row
+            }
+        };
+        if let Some(old_row) = &old
+            && crate::reducer::has_triggers(table)
+        {
+            self.state.trigger_events.push(TriggerEvent {
+                table,
+                kind: TriggerKind::Delete,
+                old: Some(old_row.clone()),
+                new: None,
+            });
+        }
+        Ok(old)
+    }
+
+    /// Drain the RV-031 trigger events recorded so far, in mutation order.
+    /// The reducer layer's `TxHandle` calls this after every mutation and
+    /// dispatches registered `#[fluxum::on_*]` hooks inside this same
+    /// transaction.
+    pub fn take_trigger_events(&mut self) -> Vec<TriggerEvent> {
+        std::mem::take(&mut self.state.trigger_events)
+    }
+
+    /// Decrypt a stored row's `#[encrypted]` columns (SPEC-017 CT-031) for
+    /// the RV-031 trigger dispatch path; a no-op without a transform engine
+    /// or when the table has no encrypted column.
+    pub(crate) fn decrypt_stored(&self, table: TableId, row: &Row) -> Result<Row> {
+        let Some(engine) = self.store.transforms.get() else {
+            return Ok(row.clone());
+        };
+        if !engine.touches(table) {
+            return Ok(row.clone());
+        }
+        let schema = self.store.schema_of(table)?;
+        let mut values = row.values().to_vec();
+        let pk = encode_pk_of_row(schema, &values)?;
+        engine.on_read_row(table, &mut values, pk.as_bytes(), true)?;
+        Ok(Row::new(values))
     }
 
     /// Point lookup against the committed snapshot captured at `begin`
@@ -1198,6 +1468,127 @@ fn build_computed(
         cols.sort_by_key(|(ord, _)| *ord);
     }
     out
+}
+
+/// Resolve the `#[check]` and `#[not_null]` constraints for every table in
+/// `catalog` from the link-time registry (SPEC-022 RV-030).
+type BuiltChecks = (
+    HashMap<TableId, Vec<&'static crate::schema::CheckDef>>,
+    HashMap<TableId, Vec<&'static crate::schema::NotNullDef>>,
+);
+
+fn build_checks(catalog: &HashMap<TableId, &'static TableSchema>) -> BuiltChecks {
+    let mut checks: HashMap<TableId, Vec<&'static crate::schema::CheckDef>> = HashMap::new();
+    for def in crate::schema::registered_checks() {
+        let id = TableId::of(def.table);
+        if catalog.contains_key(&id) {
+            checks.entry(id).or_default().push(def);
+        }
+    }
+    let mut not_null: HashMap<TableId, Vec<&'static crate::schema::NotNullDef>> = HashMap::new();
+    for def in crate::schema::registered_not_nulls() {
+        let id = TableId::of(def.table);
+        if catalog.contains_key(&id) {
+            not_null.entry(id).or_default().push(def);
+        }
+    }
+    (checks, not_null)
+}
+
+/// Resolve every `#[references]` declaration whose child table is assembled
+/// (SPEC-022 RV-030/032), validating both ends: the parent table must be in
+/// the same shard's schema, the referenced column must be the parent's
+/// single-column primary key, and the child column's type must match it
+/// (directly, or as `Option<parent type>`). Returns `(by child, by parent)`.
+type BuiltFks = (
+    HashMap<TableId, Vec<ResolvedFk>>,
+    HashMap<TableId, Vec<ResolvedFk>>,
+);
+
+/// Whether a child row's referencing value matches the deleted parent key
+/// (RV-032): direct equality, or `Some(parent)` for an `Option`-typed column.
+fn fk_value_matches(value: Option<&RowValue>, parent: &RowValue) -> bool {
+    match value {
+        Some(RowValue::Optional(Some(inner))) => inner.as_ref() == parent,
+        Some(other) => other == parent,
+        None => false,
+    }
+}
+
+fn build_foreign_keys(catalog: &HashMap<TableId, &'static TableSchema>) -> Result<BuiltFks> {
+    let mut fks_out: HashMap<TableId, Vec<ResolvedFk>> = HashMap::new();
+    let mut fks_in: HashMap<TableId, Vec<ResolvedFk>> = HashMap::new();
+    for def in crate::schema::registered_foreign_keys() {
+        let child = TableId::of(def.table);
+        let Some(child_schema) = catalog.get(&child).copied() else {
+            continue;
+        };
+        let parent = TableId::of(def.parent_table);
+        let invalid = |detail: String| {
+            FluxumError::query(
+                codes::SCHEMA_INVALID,
+                format!(
+                    "table `{}` column `{}`: invalid `#[references({}({}))]`: {detail} (RV-030)",
+                    def.table, def.column, def.parent_table, def.parent_column
+                ),
+            )
+        };
+        let parent_schema = catalog.get(&parent).copied().ok_or_else(|| {
+            invalid(format!(
+                "referenced table `{}` is not in the assembled schema",
+                def.parent_table
+            ))
+        })?;
+        let &[parent_pk_ord] = parent_schema.primary_key else {
+            return Err(invalid(format!(
+                "referenced table `{}` has a composite primary key — foreign keys \
+                 target single-column primary keys only",
+                def.parent_table
+            )));
+        };
+        let parent_col = &parent_schema.columns[usize::from(parent_pk_ord)];
+        if parent_col.name != def.parent_column {
+            return Err(invalid(format!(
+                "referenced column `{}` is not `{}`'s primary key (`{}`) — foreign \
+                 keys target the parent's primary key",
+                def.parent_column, def.parent_table, parent_col.name
+            )));
+        }
+        let child_col = child_schema
+            .columns
+            .get(usize::from(def.ordinal))
+            .ok_or_else(|| invalid(format!("column ordinal {} out of range", def.ordinal)))?;
+        let child_ty = match &child_col.ty {
+            crate::schema::FluxType::Option(inner) => *inner,
+            other => other,
+        };
+        if *child_ty != parent_col.ty {
+            return Err(invalid(format!(
+                "type mismatch: `{}` is {:?} but `{}`.`{}` is {:?}",
+                def.column, child_col.ty, def.parent_table, def.parent_column, parent_col.ty
+            )));
+        }
+        if def.on_delete == crate::schema::RefAction::SetNull
+            && !matches!(child_col.ty, crate::schema::FluxType::Option(_))
+        {
+            return Err(invalid(format!(
+                "`on_delete = set_null` requires `{}` to be Option-typed",
+                def.column
+            )));
+        }
+        let resolved = ResolvedFk {
+            child,
+            child_schema,
+            child_ordinal: def.ordinal,
+            child_column: def.column,
+            parent,
+            parent_schema,
+            on_delete: def.on_delete,
+        };
+        fks_out.entry(child).or_default().push(resolved);
+        fks_in.entry(parent).or_default().push(resolved);
+    }
+    Ok((fks_out, fks_in))
 }
 
 /// The empty full-text indexes of `table`, one per `#[fulltext(...)]`

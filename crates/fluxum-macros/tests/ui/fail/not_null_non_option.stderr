@@ -1,0 +1,5 @@
+error: `#[not_null]` on non-Option column `name`: the type already forbids None — the attribute is for Option-typed columns kept nullable on the wire (RV-030)
+ --> tests/ui/fail/not_null_non_option.rs:9:5
+  |
+9 |     #[not_null]
+  |     ^^^^^^^^^^^
