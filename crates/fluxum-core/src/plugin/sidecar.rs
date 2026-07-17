@@ -50,7 +50,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,10 @@ use fluxum_protocol::plugin_rpc::{
 
 use crate::store::PkBytes;
 
-use super::{Capability, FtQuery, Fusion, PluginCtx, PluginError, PluginInstance, Retriever,
-            ScoreReranker, Scored};
+use super::{
+    Capability, FtQuery, Fusion, PluginCtx, PluginError, PluginInstance, Retriever, ScoreReranker,
+    Scored,
+};
 
 /// Consecutive failures that open the breaker (PLG-031).
 pub const FAILURE_THRESHOLD: u32 = 5;
@@ -272,9 +274,7 @@ impl Breaker {
             }
             Some(_) => BreakerState::Open,
         };
-        stats
-            .breaker_state
-            .store(state as u8, Ordering::Relaxed);
+        stats.breaker_state.store(state as u8, Ordering::Relaxed);
         state
     }
 
@@ -378,7 +378,11 @@ impl SidecarProxy {
     /// Issue one request and await its response, bounded by `timeout`.
     fn call(&self, request: PluginRequest) -> Result<Vec<Candidate>, PluginError> {
         self.stats.calls.fetch_add(1, Ordering::Relaxed);
-        if self.breaker.admit(&self.stats, self.config.breaker_cooldown) == BreakerState::Open {
+        if self
+            .breaker
+            .admit(&self.stats, self.config.breaker_cooldown)
+            == BreakerState::Open
+        {
             // Fail fast: the point of the breaker is that a dead sidecar
             // costs one timeout per cooldown, not one per query.
             self.stats.note_error(SidecarErrorReason::BreakerOpen);
@@ -421,12 +425,13 @@ impl SidecarProxy {
         let expected = request.call_id();
         let response = self.recv(conn, deadline)?;
         match response {
-            PluginResponse::Candidates(Candidates { call_id, candidates })
-                if Some(call_id) == expected =>
-            {
-                Ok(candidates)
+            PluginResponse::Candidates(Candidates {
+                call_id,
+                candidates,
+            }) if Some(call_id) == expected => Ok(candidates),
+            PluginResponse::Error(err) => {
+                Err(self.error(SidecarErrorReason::Refused, &err.message))
             }
-            PluginResponse::Error(err) => Err(self.error(SidecarErrorReason::Refused, &err.message)),
             PluginResponse::Candidates(c) => Err(self.error(
                 SidecarErrorReason::Protocol,
                 &format!(
@@ -443,8 +448,9 @@ impl SidecarProxy {
 
     /// Dial and handshake, inside the call's remaining budget.
     fn connect(&self, deadline: Instant) -> Result<Conn, PluginError> {
-        let remaining = Self::remaining(deadline)
-            .ok_or_else(|| self.error(SidecarErrorReason::Timeout, "budget spent before connect"))?;
+        let remaining = Self::remaining(deadline).ok_or_else(|| {
+            self.error(SidecarErrorReason::Timeout, "budget spent before connect")
+        })?;
         let addr = self
             .config
             .endpoint

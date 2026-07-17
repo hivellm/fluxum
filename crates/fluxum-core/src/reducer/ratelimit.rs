@@ -109,7 +109,10 @@ pub struct RateLimiter {
 impl std::fmt::Debug for RateLimiter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RateLimiter")
-            .field("global_enabled", &self.shard_max_reducers_per_sec().is_some())
+            .field(
+                "global_enabled",
+                &self.shard_max_reducers_per_sec().is_some(),
+            )
             .field("exempt_identities", &self.exempt.len())
             .finish_non_exhaustive()
     }

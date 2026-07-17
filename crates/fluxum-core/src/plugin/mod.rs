@@ -41,9 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-pub use sidecar::{
-    BreakerState, SidecarConfig, SidecarErrorReason, SidecarProxy, SidecarStats,
-};
+pub use sidecar::{BreakerState, SidecarConfig, SidecarErrorReason, SidecarProxy, SidecarStats};
 
 use serde::Serialize;
 
@@ -800,36 +798,35 @@ impl PluginRegistry {
                 sidecar_errors: Vec::new(),
             })
             .collect();
-        out.extend(self.plugins.iter().map(|plugin| PluginInfo {
-            name: plugin.name.clone(),
-            capability: plugin.capability.name(),
-            placement: plugin.capability.placement(),
-            host: match &plugin.host {
-                BoundHost::InProcess { feature } => format!("in_process(feature={feature})"),
-                BoundHost::Sidecar {
-                    endpoint,
-                    timeout_ms,
-                } => format!("sidecar(endpoint={endpoint}, timeout_ms={timeout_ms})"),
-            },
-            health: if plugin.state.is_disabled() {
-                "disabled".to_owned()
-            } else {
-                "active".to_owned()
-            },
-            panics: plugin.state.panics(),
-            errors: plugin.state.errors(),
-            tables: plugin.tables.clone(),
-            columns: plugin.columns.clone(),
-            detail: String::new(),
-            breaker: plugin
-                .sidecar
-                .as_ref()
-                .map(|s| s.breaker_state().as_str()),
-            sidecar_errors: plugin
-                .sidecar
-                .as_ref()
-                .map(|s| s.by_reason())
-                .unwrap_or_default(),
+        out.extend(self.plugins.iter().map(|plugin| {
+            PluginInfo {
+                name: plugin.name.clone(),
+                capability: plugin.capability.name(),
+                placement: plugin.capability.placement(),
+                host: match &plugin.host {
+                    BoundHost::InProcess { feature } => format!("in_process(feature={feature})"),
+                    BoundHost::Sidecar {
+                        endpoint,
+                        timeout_ms,
+                    } => format!("sidecar(endpoint={endpoint}, timeout_ms={timeout_ms})"),
+                },
+                health: if plugin.state.is_disabled() {
+                    "disabled".to_owned()
+                } else {
+                    "active".to_owned()
+                },
+                panics: plugin.state.panics(),
+                errors: plugin.state.errors(),
+                tables: plugin.tables.clone(),
+                columns: plugin.columns.clone(),
+                detail: String::new(),
+                breaker: plugin.sidecar.as_ref().map(|s| s.breaker_state().as_str()),
+                sidecar_errors: plugin
+                    .sidecar
+                    .as_ref()
+                    .map(|s| s.by_reason())
+                    .unwrap_or_default(),
+            }
         }));
         out
     }

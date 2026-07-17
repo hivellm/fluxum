@@ -296,7 +296,9 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
                      # TYPE fluxum_plugin_sidecar_errors_total counter\n",
                 );
                 for plugin in &sidecars {
-                    let Some(stats) = &plugin.sidecar else { continue };
+                    let Some(stats) = &plugin.sidecar else {
+                        continue;
+                    };
                     for (reason, count) in stats.by_reason() {
                         text.push_str(&format!(
                             "fluxum_plugin_sidecar_errors_total{{plugin=\"{}\", reason=\"{reason}\"}} {count}\n",
@@ -310,7 +312,9 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
                      # TYPE fluxum_plugin_sidecar_calls_total counter\n",
                 );
                 for plugin in &sidecars {
-                    let Some(stats) = &plugin.sidecar else { continue };
+                    let Some(stats) = &plugin.sidecar else {
+                        continue;
+                    };
                     text.push_str(&format!(
                         "fluxum_plugin_sidecar_calls_total{{plugin=\"{}\"}} {}\n",
                         plugin.name,
@@ -323,10 +327,11 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
                      # TYPE fluxum_plugin_sidecar_breaker_open gauge\n",
                 );
                 for plugin in &sidecars {
-                    let Some(stats) = &plugin.sidecar else { continue };
-                    let open = u8::from(
-                        stats.breaker_state() == fluxum_core::plugin::BreakerState::Open,
-                    );
+                    let Some(stats) = &plugin.sidecar else {
+                        continue;
+                    };
+                    let open =
+                        u8::from(stats.breaker_state() == fluxum_core::plugin::BreakerState::Open);
                     text.push_str(&format!(
                         "fluxum_plugin_sidecar_breaker_open{{plugin=\"{}\"}} {open}\n",
                         plugin.name,

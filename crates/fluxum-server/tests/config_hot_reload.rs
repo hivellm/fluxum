@@ -160,7 +160,10 @@ async fn a_changed_port_is_rejected_and_no_reloadable_key_moves() {
         "server:\n  http_port: 19999\nobservability:\n  slow_reducer_threshold_us: 111\n",
     );
     let err = ctx.reload_config().expect_err("a frozen key changed");
-    assert!(err.contains("server.http_port"), "names the offender: {err}");
+    assert!(
+        err.contains("server.http_port"),
+        "names the offender: {err}"
+    );
     assert!(
         err.contains("Restart to apply"),
         "tells the operator what to do: {err}"

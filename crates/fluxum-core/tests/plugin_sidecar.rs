@@ -12,8 +12,8 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -262,11 +262,7 @@ fn proxy(endpoint: String, token: Option<&str>) -> Arc<SidecarProxy> {
     proxy_with(Capability::ScoreReranker, endpoint, token)
 }
 
-fn proxy_with(
-    capability: Capability,
-    endpoint: String,
-    token: Option<&str>,
-) -> Arc<SidecarProxy> {
+fn proxy_with(capability: Capability, endpoint: String, token: Option<&str>) -> Arc<SidecarProxy> {
     Arc::new(SidecarProxy::new(SidecarConfig {
         name: "reranker".into(),
         capability,
@@ -397,7 +393,9 @@ fn a_sidecar_restart_costs_one_call_not_the_binding() {
     let dead = FakeSidecar::start(Behavior::Hangup);
     let proxy_dead = proxy(dead.endpoint(), None);
     // The sidecar accepts and closes: the handshake dies on EOF.
-    let err = proxy_dead.rerank(&query(), scored(&[1]), &ctx()).unwrap_err();
+    let err = proxy_dead
+        .rerank(&query(), scored(&[1]), &ctx())
+        .unwrap_err();
     assert!(err.to_string().contains("transport"), "{err}");
     drop(dead);
 
@@ -679,7 +677,10 @@ fn a_successful_call_resets_the_failure_run() {
             err += 1;
         }
     }
-    assert!(ok > 0 && err > 0, "the sidecar really did flap: {ok} ok, {err} err");
+    assert!(
+        ok > 0 && err > 0,
+        "the sidecar really did flap: {ok} ok, {err} err"
+    );
     assert_eq!(
         proxy.stats().breaker_state(),
         BreakerState::Closed,
@@ -765,7 +766,10 @@ fn seeded(schema: &Schema) -> MemStore {
 }
 
 /// A manager wired to a sidecar-hosted reranker at `endpoint`.
-fn manager_with(schema: &Arc<Schema>, endpoint: &str) -> (SubscriptionManager, Arc<PluginRegistry>) {
+fn manager_with(
+    schema: &Arc<Schema>,
+    endpoint: &str,
+) -> (SubscriptionManager, Arc<PluginRegistry>) {
     let registry =
         Arc::new(PluginRegistry::build(schema, &config_with_sidecar(endpoint, None)).unwrap());
     let mut manager = SubscriptionManager::new(Arc::clone(schema), SubscriptionLimits::default());

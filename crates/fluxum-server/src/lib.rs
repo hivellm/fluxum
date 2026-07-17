@@ -104,7 +104,11 @@ fn render_reloadable(config: &fluxum_core::config::Config) -> serde_json::Value 
                 None => &serde_json::Value::Null,
             };
         }
-        let source = config.sources.get(*key).copied().unwrap_or(ValueSource::Default);
+        let source = config
+            .sources
+            .get(*key)
+            .copied()
+            .unwrap_or(ValueSource::Default);
         out.insert(
             (*key).to_owned(),
             serde_json::json!({
