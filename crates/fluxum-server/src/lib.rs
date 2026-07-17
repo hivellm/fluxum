@@ -117,6 +117,9 @@ pub struct ShardContext {
     ttl_sweeper_started: std::sync::atomic::AtomicBool,
     /// The shard's blob store (SPEC-023 DMX-040), once installed.
     blob_store: std::sync::OnceLock<Arc<fluxum_core::commitlog::BlobStore>>,
+    /// The validated plugin registry (SPEC-020), once installed: drives
+    /// `GET /plugins` introspection and hot disable (PLG-060/061).
+    plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -175,7 +178,22 @@ impl ShardContext {
             sweeper_started: std::sync::atomic::AtomicBool::new(false),
             ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
+            plugins: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the validated plugin registry (SPEC-020 PLG-032): built by
+    /// `PluginRegistry::build(schema, config)` at assembly — a validation
+    /// failure there aborts startup before this is reached. Enables
+    /// `GET /plugins` and the hot disable/enable endpoints (PLG-060/061).
+    /// A second call is ignored.
+    pub fn set_plugins(&self, registry: Arc<fluxum_core::plugin::PluginRegistry>) {
+        let _ = self.plugins.set(registry);
+    }
+
+    /// The installed plugin registry, if any.
+    pub fn plugins(&self) -> Option<&Arc<fluxum_core::plugin::PluginRegistry>> {
+        self.plugins.get()
     }
 
     /// Install the shard's blob store (SPEC-023 DMX-040): attaches it to the

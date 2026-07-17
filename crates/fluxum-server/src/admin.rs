@@ -10,6 +10,8 @@
 //! | POST | `/reducer/:name` | call a reducer (JSON args → JSON result) |
 //! | POST | `/query`         | one-off read-only SQL → JSON rows |
 //! | GET  | `/view/:name`    | call a `#[fluxum::view]` → JSON |
+//! | GET  | `/plugins`       | active plugins + adopted seams (SPEC-020 PLG-060; never secrets) |
+//! | POST | `/plugins/:name/disable` | hot circuit-break without restart (PLG-061); `/enable` reverts |
 //!
 //! Every response uses the RPC-052 envelope
 //! (`{ "success": bool, "request_id"?, "payload"|"error" }`); the paths are
@@ -87,7 +89,40 @@ pub async fn dispatch(
         ("POST", ["reducer", name]) => reducer_call(ctx, name, body).await,
         ("POST", ["query"]) => query(ctx, body).await,
         ("GET", ["view", name]) => view(ctx, name).await,
+        ("GET", ["plugins"]) => plugins(ctx),
+        ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
+        ("POST", ["plugins", name, "enable"]) => plugin_set_disabled(ctx, name, false),
         _ => AdminResponse::err(404, None, "not found"),
+    }
+}
+
+// --- GET /plugins (SPEC-020 PLG-060) --------------------------------------------
+
+/// List active plugins and adopted seams: name, capability, host, placement,
+/// health, meters, scope — never key material or tokens.
+fn plugins(ctx: &Arc<ShardContext>) -> AdminResponse {
+    let report = ctx
+        .plugins()
+        .map(|registry| registry.report())
+        .unwrap_or_default();
+    match serde_json::to_value(&report) {
+        Ok(payload) => AdminResponse::ok(None, json!({ "plugins": payload })),
+        Err(e) => AdminResponse::err(500, None, format!("plugin report serialization: {e}")),
+    }
+}
+
+/// Hot-disable / re-enable a plugin without a core restart (PLG-061).
+fn plugin_set_disabled(ctx: &Arc<ShardContext>, name: &str, disabled: bool) -> AdminResponse {
+    let Some(registry) = ctx.plugins() else {
+        return AdminResponse::err(404, None, "no plugin registry installed");
+    };
+    if registry.set_disabled(name, disabled) {
+        AdminResponse::ok(
+            None,
+            json!({ "plugin": name, "disabled": disabled }),
+        )
+    } else {
+        AdminResponse::err(404, None, format!("unknown plugin `{name}`"))
     }
 }
 
@@ -95,7 +130,14 @@ pub async fn dispatch(
 pub fn is_admin_path(path: &str) -> bool {
     matches!(
         split_path(path).as_slice(),
-        ["health"] | ["metrics"] | ["schema"] | ["query"] | ["reducer", _] | ["view", _]
+        ["health"]
+            | ["metrics"]
+            | ["schema"]
+            | ["query"]
+            | ["reducer", _]
+            | ["view", _]
+            | ["plugins"]
+            | ["plugins", _, "disable" | "enable"]
     )
 }
 
@@ -141,6 +183,35 @@ fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
         shard = health.shard_id,
         tx = health.last_tx_id,
     );
+    let mut text = text;
+    // SPEC-020 PLG-030: per-plugin panic/error meters.
+    if let Some(registry) = ctx.plugins() {
+        let bound = registry.plugins();
+        if !bound.is_empty() {
+            text.push_str(
+                "# HELP fluxum_plugin_panics_total Panics caught per plugin (PLG-030).\n\
+                 # TYPE fluxum_plugin_panics_total counter\n",
+            );
+            for plugin in bound {
+                text.push_str(&format!(
+                    "fluxum_plugin_panics_total{{plugin=\"{}\"}} {}\n",
+                    plugin.name,
+                    plugin.state.panics()
+                ));
+            }
+            text.push_str(
+                "# HELP fluxum_plugin_errors_total Non-panic plugin errors (PLG-031).\n\
+                 # TYPE fluxum_plugin_errors_total counter\n",
+            );
+            for plugin in bound {
+                text.push_str(&format!(
+                    "fluxum_plugin_errors_total{{plugin=\"{}\"}} {}\n",
+                    plugin.name,
+                    plugin.state.errors()
+                ));
+            }
+        }
+    }
     AdminResponse {
         status: 200,
         body: Value::String(text), // the caller serves it as text/plain

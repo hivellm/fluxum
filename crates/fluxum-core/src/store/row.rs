@@ -305,6 +305,14 @@ impl PkBytes {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    /// Build from raw encoded key bytes — the plugin/RPC boundary
+    /// (SPEC-020): e.g. a retriever plugin returning candidate keys it
+    /// received over Plugin RPC. The bytes must be a key previously encoded
+    /// by this schema; nothing is validated here.
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
+        Self(bytes.into())
+    }
 }
 
 impl fmt::Display for PkBytes {

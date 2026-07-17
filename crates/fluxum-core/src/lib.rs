@@ -60,6 +60,7 @@ pub mod error;
 pub mod hw;
 pub mod index;
 pub mod migration;
+pub mod plugin;
 pub mod reducer;
 pub mod scheduler;
 pub mod schema;

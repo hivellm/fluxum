@@ -461,9 +461,68 @@ pub struct Config {
     pub logging: LoggingConfig,
     /// Field-level crypto keys for column transforms (SPEC-017 §5).
     pub transforms: TransformsConfig,
+    /// Plugin manifest (SPEC-020 PLG-032): validated by
+    /// `PluginRegistry::build` at assembly — capability exists, placement
+    /// legal for the host, in-proc feature compiled, applies_to targets
+    /// exist. Any violation aborts startup.
+    pub plugins: Vec<PluginDecl>,
     /// Provenance of every non-default key (`key.path` → source).
     #[serde(skip)]
     pub sources: BTreeMap<String, ValueSource>,
+}
+
+/// One `plugins:` manifest entry (SPEC-020 PLG-032).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginDecl {
+    /// The plugin's name — for an in-process plugin, the link-time
+    /// registered name; unique across the manifest.
+    pub name: String,
+    /// The bound capability (`score_reranker`, `retriever`, `fusion`,
+    /// `stream_sink`, …) — the set is closed (PLG-003).
+    pub capability: String,
+    /// Hosting mode.
+    pub host: PluginHost,
+    /// The tables/columns the plugin applies to (empty = unscoped).
+    #[serde(default)]
+    pub applies_to: PluginScope,
+}
+
+/// How a plugin is hosted (PLG-030/031).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PluginHost {
+    /// Compiled into the binary behind a Cargo feature (PLG-030).
+    InProcess {
+        /// The gating feature name (documentation/introspection; the gate
+        /// itself is whether the plugin's link-time def exists).
+        #[serde(default)]
+        feature: String,
+    },
+    /// A separate process called over Plugin RPC (PLG-031). Never legal
+    /// for a WritePath capability (PLG-021).
+    Sidecar {
+        /// The sidecar endpoint (`host:port`).
+        endpoint: String,
+        /// Per-call timeout in milliseconds (ReadPath/OffPath calls).
+        #[serde(default = "default_plugin_timeout_ms")]
+        timeout_ms: u64,
+    },
+}
+
+/// Default sidecar per-call timeout (PLG-031).
+fn default_plugin_timeout_ms() -> u64 {
+    50
+}
+
+/// The `applies_to` scope of a plugin binding (PLG-032).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PluginScope {
+    /// Table struct names the plugin applies to.
+    pub tables: Vec<String>,
+    /// Column names within those tables (requires `tables`).
+    pub columns: Vec<String>,
 }
 
 /// Named cryptographic keys for column transforms (SPEC-017 CT-035): the

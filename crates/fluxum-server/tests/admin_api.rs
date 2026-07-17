@@ -144,6 +144,109 @@ async fn start() -> http::HttpServer {
         .unwrap()
 }
 
+// --- GET /plugins + hot disable (SPEC-020 PLG-060/061) --------------------------
+
+#[tokio::test]
+async fn plugins_endpoint_reports_and_hot_disables() {
+    use fluxum_core::config::{Config, PluginDecl, PluginHost, PluginScope};
+    use fluxum_core::plugin::PluginRegistry;
+
+    // Assemble a shard with a validated registry installed: one sidecar
+    // retriever scoped to Chat (the assembly-time PLG-032 flow).
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let schema = Schema::from_tables([&CHAT]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log = Arc::new(
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            1,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
+    );
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let engine = ReducerEngine::new(
+        pipeline,
+        Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap()),
+        LifecycleHooks::none(),
+        SHARD,
+        fluxum_core::auth::server_identity("admin-test"),
+    );
+    let subs = SubscriptionManager::new(Arc::new(schema.clone()), SubscriptionLimits::default());
+    let auth = Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
+    let ctx = ShardContext::new(engine, subs, auth, SHARD, 256);
+
+    let config = Config {
+        plugins: vec![PluginDecl {
+            name: "vec_hybrid".into(),
+            capability: "retriever".into(),
+            host: PluginHost::Sidecar {
+                endpoint: "127.0.0.1:15811".into(),
+                timeout_ms: 60,
+            },
+            applies_to: PluginScope {
+                tables: vec!["Chat".into()],
+                columns: vec![],
+            },
+        }],
+        ..Config::default()
+    };
+    let registry = Arc::new(PluginRegistry::build(&schema, &config).unwrap());
+    ctx.set_plugins(registry);
+    let server = http::serve(ctx, "127.0.0.1:0", HttpOptions::default())
+        .await
+        .unwrap();
+
+    // PLG-060: name, capability, host, placement, health, scope — listed.
+    let resp = request(server.local_addr, "GET", "/plugins", None).await;
+    assert_eq!(resp.status, 200);
+    let body = resp.json();
+    let plugins = body["payload"]["plugins"].as_array().unwrap();
+    let hybrid = plugins
+        .iter()
+        .find(|p| p["name"] == "vec_hybrid")
+        .expect("manifest plugin listed");
+    assert_eq!(hybrid["capability"], "retriever");
+    assert_eq!(hybrid["placement"], "read_path");
+    assert_eq!(hybrid["health"], "active");
+    assert!(hybrid["host"].as_str().unwrap().contains("127.0.0.1:15811"));
+    assert_eq!(hybrid["tables"][0], "Chat");
+    // The adopted auth seam appears too (PLG-002).
+    assert!(
+        plugins.iter().any(|p| p["capability"] == "auth" && p["host"] == "builtin"),
+        "{plugins:?}"
+    );
+
+    // PLG-061: hot disable without a core restart, then re-enable.
+    let resp = request(server.local_addr, "POST", "/plugins/vec_hybrid/disable", None).await;
+    assert_eq!(resp.status, 200);
+    let resp = request(server.local_addr, "GET", "/plugins", None).await;
+    let body = resp.json();
+    let health = body["payload"]["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "vec_hybrid")
+        .unwrap()["health"]
+        .clone();
+    assert_eq!(health, "disabled");
+    let resp = request(server.local_addr, "POST", "/plugins/vec_hybrid/enable", None).await;
+    assert_eq!(resp.status, 200);
+    let resp = request(server.local_addr, "POST", "/plugins/ghost/disable", None).await;
+    assert_eq!(resp.status, 404, "unknown plugin");
+
+    // PLG-030 meters ride /metrics.
+    let resp = request(server.local_addr, "GET", "/metrics", None).await;
+    let text = resp.text();
+    assert!(
+        text.contains("fluxum_plugin_panics_total{plugin=\"vec_hybrid\"} 0"),
+        "{text}"
+    );
+}
+
 // --- A curl-like HTTP client ---------------------------------------------------
 
 struct Resp {
