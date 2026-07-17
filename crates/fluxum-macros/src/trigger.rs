@@ -92,9 +92,8 @@ fn try_expand(kind: Kind, args: TokenStream, input: TokenStream) -> syn::Result<
     let glue_ident = format_ident!("__fx_trigger_{}", fn_ident);
     let variant = kind.variant();
 
-    let missing = |which: &str| {
-        format!("{attribute} dispatched without {which} row (RV-031 invariant)")
-    };
+    let missing =
+        |which: &str| format!("{attribute} dispatched without {which} row (RV-031 invariant)");
     let body = match kind {
         Kind::Insert => {
             let msg = missing("a new");

@@ -147,11 +147,19 @@ fn traversal_is_an_index_scan_and_subscriptions_deliver_live_diffs() {
             &store.snapshot(),
         )
         .unwrap();
-    assert_eq!(subscribed.initial.tables[0].inserts.len(), 2, "current neighbors");
+    assert_eq!(
+        subscribed.initial.tables[0].inserts.len(),
+        2,
+        "current neighbors"
+    );
 
     let deltas = manager.on_commit(&add_edge(&store, 1, 12, 7)).unwrap();
     assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].subscribers, vec![7], "edge add reaches the subscriber");
+    assert_eq!(
+        deltas[0].subscribers,
+        vec![7],
+        "edge add reaches the subscriber"
+    );
 
     let deltas = manager.on_commit(&add_edge(&store, 2, 21, 1)).unwrap();
     assert!(deltas.is_empty(), "another node's edges never fan out here");
@@ -165,5 +173,9 @@ fn traversal_is_an_index_scan_and_subscriptions_deliver_live_diffs() {
     .unwrap();
     let deltas = manager.on_commit(&tx.commit().unwrap()).unwrap();
     assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].update.deletes.len(), 1, "edge removal = delete diff");
+    assert_eq!(
+        deltas[0].update.deletes.len(),
+        1,
+        "edge removal = delete diff"
+    );
 }

@@ -103,10 +103,15 @@ fn as_of_tx_reads_each_retained_version_and_bounds_the_window() {
     let t3 = commit_body(&store, owner, "v3");
 
     // Window = 2: t2 and t3 retained; t1 pruned (RV-020).
-    let read =
-        |sql: &str| body_as_of(&manager, &store, sub(), sql);
-    assert_eq!(read(&format!("SELECT * FROM Doc AS OF TX {t2}")), Some("v2".into()));
-    assert_eq!(read(&format!("SELECT * FROM Doc AS OF TX {t3}")), Some("v3".into()));
+    let read = |sql: &str| body_as_of(&manager, &store, sub(), sql);
+    assert_eq!(
+        read(&format!("SELECT * FROM Doc AS OF TX {t2}")),
+        Some("v2".into())
+    );
+    assert_eq!(
+        read(&format!("SELECT * FROM Doc AS OF TX {t3}")),
+        Some("v3".into())
+    );
     // Newer than every commit = the live state.
     assert_eq!(
         read(&format!("SELECT * FROM Doc AS OF TX {}", t3 + 100)),
@@ -115,7 +120,10 @@ fn as_of_tx_reads_each_retained_version_and_bounds_the_window() {
     // Older than the window: typed 3020, never a silent approximation.
     let err = store.snapshot_as_of(AsOfPoint::Tx(t1)).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("temporal window") || msg.contains("retained"), "{msg}");
+    assert!(
+        msg.contains("temporal window") || msg.contains("retained"),
+        "{msg}"
+    );
     assert_eq!(err.query_code(), Some(3020), "{msg}");
 
     // Timestamp form: far future = live; epoch 0 = out of window.
@@ -160,7 +168,12 @@ fn as_of_reads_honor_rls_exactly_like_live_reads() {
         None
     );
     assert_eq!(
-        body_as_of(&manager, &store, Subscriber::client(stranger), "SELECT * FROM Doc"),
+        body_as_of(
+            &manager,
+            &store,
+            Subscriber::client(stranger),
+            "SELECT * FROM Doc"
+        ),
         None
     );
 

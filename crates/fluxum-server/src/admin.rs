@@ -118,10 +118,7 @@ fn plugin_set_disabled(ctx: &Arc<ShardContext>, name: &str, disabled: bool) -> A
         return AdminResponse::err(404, None, "no plugin registry installed");
     };
     if registry.set_disabled(name, disabled) {
-        AdminResponse::ok(
-            None,
-            json!({ "plugin": name, "disabled": disabled }),
-        )
+        AdminResponse::ok(None, json!({ "plugin": name, "disabled": disabled }))
     } else {
         AdminResponse::err(404, None, format!("unknown plugin `{name}`"))
     }

@@ -219,10 +219,13 @@ fn foreign_key_write_requires_visible_parent() {
     let registry = ReducerRegistry::new();
 
     // No Customer 7 anywhere → typed FK violation.
-    let err = commit(&store, &registry, |ctx| ctx.tx.insert(order(1, 7, 1)))
-        .expect_err("missing parent");
+    let err =
+        commit(&store, &registry, |ctx| ctx.tx.insert(order(1, 7, 1))).expect_err("missing parent");
     let msg = err.to_string();
-    assert!(msg.contains("#[references]") && msg.contains("Customer"), "{msg}");
+    assert!(
+        msg.contains("#[references]") && msg.contains("Customer"),
+        "{msg}"
+    );
 
     // A parent inserted earlier in the SAME transaction satisfies the
     // reference (overlay-aware, RV-030).
@@ -273,7 +276,10 @@ fn restrict_blocks_delete_while_children_exist() {
     let err = commit(&store, &registry, |ctx| ctx.tx.delete::<Order>(1))
         .expect_err("shipment restricts the order delete");
     let msg = err.to_string();
-    assert!(msg.contains("restrict") && msg.contains("Shipment"), "{msg}");
+    assert!(
+        msg.contains("restrict") && msg.contains("Shipment"),
+        "{msg}"
+    );
 
     // Removing the child first unblocks the delete — in the same tx.
     commit(&store, &registry, |ctx| {
@@ -308,8 +314,7 @@ fn cascade_deletes_children_in_the_same_transaction() {
     );
     // The cascade fired the Order delete triggers too (RV-031).
     let audits = commit(&store, &registry, |ctx| {
-        ctx.tx
-            .scan_where::<AuditLog>(|a| a.action == "delete")
+        ctx.tx.scan_where::<AuditLog>(|a| a.action == "delete")
     })
     .unwrap();
     let mut deleted: Vec<u64> = audits.iter().map(|a| a.order_id).collect();
@@ -378,11 +383,7 @@ fn cascade_and_trigger_writes_share_one_commit_diff() {
     .unwrap();
     let diff = tx.commit().unwrap();
 
-    let of = |name: &str| {
-        diff.tables
-            .iter()
-            .find(|t| t.table_id == TableId::of(name))
-    };
+    let of = |name: &str| diff.tables.iter().find(|t| t.table_id == TableId::of(name));
     let customer = of("Customer").expect("customer delete in diff");
     let orders = of("Order").expect("cascaded order delete in diff");
     let audit = of("AuditLog").expect("trigger's audit insert in diff");

@@ -28,6 +28,37 @@ use crate::store::{RowValue, TableId};
 /// A shard's stable identifier (SHD-010).
 pub type ShardId = u32;
 
+/// The `__handoff__` marker table (SHD-041 step 4): one row per entity with
+/// a handoff in flight on this shard. Include it in the assembled schema of
+/// every sharded deployment (like `__schedule__`/`__schema_meta__`).
+pub static HANDOFF_TABLE: crate::schema::TableSchema = crate::schema::TableSchema {
+    name: "__handoff__",
+    columns: &[
+        crate::schema::ColumnSchema {
+            name: "entity_key",
+            ty: crate::schema::FluxType::Str,
+        },
+        crate::schema::ColumnSchema {
+            name: "state",
+            ty: crate::schema::FluxType::Str,
+        },
+    ],
+    primary_key: &[0],
+    auto_inc: None,
+    access: crate::schema::TableAccess::Private,
+    partition_by: None,
+    unique: &[],
+    indexes: &[],
+    visibility: crate::schema::VisibilityRule::PublicAll,
+};
+
+/// Encode an entity's partition-key values into the stable byte identity
+/// used for handoff bookkeeping and queue keying (FluxBIN — the same
+/// encoding the hash strategy routes over).
+pub fn encode_entity_key(values: &[RowValue]) -> Result<Vec<u8>> {
+    crate::store::row::encode_row(values)
+}
+
 /// One table's partition strategy (SHD-002/012).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PartitionStrategy {
@@ -153,10 +184,7 @@ impl ShardRouter {
             // is configured per table via ShardingConfig, SHD-013).
             partitioning.insert(
                 TableId::of(table.name),
-                (
-                    PartitionStrategy::Hash { shard_count },
-                    vec![ordinal],
-                ),
+                (PartitionStrategy::Hash { shard_count }, vec![ordinal]),
             );
         }
         Self {
@@ -171,6 +199,25 @@ impl ShardRouter {
         self.partitioning.insert(table, (strategy, key));
     }
 
+    /// Every partitioned table and its key ordinals — the partition domain
+    /// an entity's row set spans (SHD-043).
+    pub fn partitioned_tables(&self) -> Vec<(TableId, Vec<u16>)> {
+        self.partitioning
+            .iter()
+            .map(|(table, (_, key))| (*table, key.clone()))
+            .collect()
+    }
+
+    /// Resolve an entity key directly (tables of one partition domain share
+    /// the strategy, SHD-043) — the SHD-011/044 routing entry for
+    /// entity-keyed calls.
+    pub fn shard_of_key(&self, key: &[RowValue]) -> Result<ShardId> {
+        let Some((strategy, _)) = self.partitioning.values().next() else {
+            return Ok(self.default_shard);
+        };
+        strategy.shard_for(key)
+    }
+
     /// The shard owning `row` of `table` (SHD-012): the table's strategy
     /// over its key columns, or the default shard for unpartitioned tables
     /// (SHD-004). Global tables answer the authoritative shard (SHD-030).
@@ -180,9 +227,7 @@ impl ShardRouter {
         table: TableId,
         values: &[RowValue],
     ) -> Result<ShardId> {
-        if let Some(table_schema) = schema
-            .tables()
-            .find(|t| TableId::of(t.name) == table)
+        if let Some(table_schema) = schema.tables().find(|t| TableId::of(t.name) == table)
             && table_schema.access == TableAccess::Global
         {
             return Ok(self.authoritative_global);
@@ -193,14 +238,11 @@ impl ShardRouter {
         let key: Vec<RowValue> = key_ordinals
             .iter()
             .map(|&ordinal| {
-                values
-                    .get(usize::from(ordinal))
-                    .cloned()
-                    .ok_or_else(|| {
-                        FluxumError::Storage(format!(
-                            "partition key ordinal {ordinal} missing from the row (SHD-001)"
-                        ))
-                    })
+                values.get(usize::from(ordinal)).cloned().ok_or_else(|| {
+                    FluxumError::Storage(format!(
+                        "partition key ordinal {ordinal} missing from the row (SHD-001)"
+                    ))
+                })
             })
             .collect::<Result<_>>()?;
         strategy.shard_for(&key)

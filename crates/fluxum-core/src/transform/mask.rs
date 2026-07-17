@@ -117,9 +117,9 @@ pub fn authorized(
         GrantScope::Public => true,
         GrantScope::ServerPeer => false,
         GrantScope::Role(role) => roles.iter().any(|r| r == role),
-        GrantScope::Owner => owner.is_some_and(|ordinal| {
-            row.value(ordinal) == Some(&RowValue::Identity(*viewer))
-        }),
+        GrantScope::Owner => {
+            owner.is_some_and(|ordinal| row.value(ordinal) == Some(&RowValue::Identity(*viewer)))
+        }
     }
 }
 
@@ -155,9 +155,7 @@ pub fn mask_value(policy: &ColumnPolicy, original: &RowValue, current: &RowValue
             };
             let digest = Sha256::digest(&bytes);
             match policy.ty {
-                FluxType::Str => {
-                    RowValue::Str(digest.iter().map(|b| format!("{b:02x}")).collect())
-                }
+                FluxType::Str => RowValue::Str(digest.iter().map(|b| format!("{b:02x}")).collect()),
                 FluxType::Bytes => RowValue::Bytes(digest.to_vec()),
                 _ => redacted(policy.ty),
             }
@@ -182,9 +180,7 @@ fn redacted(ty: &FluxType) -> RowValue {
         FluxType::Str => RowValue::Str(String::new()),
         FluxType::Bytes | FluxType::CrdtText => RowValue::Bytes(Vec::new()),
         FluxType::Identity => RowValue::Identity(Identity::from_bytes([0; 32])),
-        FluxType::ConnectionId => {
-            RowValue::ConnectionId(crate::types::ConnectionId::new(0))
-        }
+        FluxType::ConnectionId => RowValue::ConnectionId(crate::types::ConnectionId::new(0)),
         FluxType::EntityId => RowValue::EntityId(crate::types::EntityId::new(0)),
         FluxType::Timestamp => RowValue::Timestamp(crate::types::Timestamp::from_micros(0)),
         FluxType::Decimal => RowValue::Decimal(crate::types::Decimal::from_parts(0, 0)),

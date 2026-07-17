@@ -629,10 +629,7 @@ impl MemStore {
     /// there is the current one); a point older than the retained window is
     /// a typed 3020 (RV-020's bound is real, never silently approximated).
     pub fn snapshot_as_of(&self, point: AsOfPoint) -> Result<Snapshot> {
-        let history = self
-            .history
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
         let (Some(oldest), Some(newest)) = (history.front(), history.back()) else {
             return Err(FluxumError::query(
                 codes::SQL_AS_OF_OUT_OF_WINDOW,
@@ -1204,6 +1201,90 @@ impl Tx<'_> {
         Ok(old)
     }
 
+    /// SHD-041 steps 2–3: read every row of the entity's row set — each
+    /// `(table, key ordinals)` domain member's committed rows whose
+    /// partition key equals `key` — and serialize it as the opaque handoff
+    /// buffer (`rmp` of `(table id, FluxBIN rows)` pairs, deterministic
+    /// table order).
+    pub fn handoff_export(
+        &self,
+        tables: &[(TableId, Vec<u16>)],
+        key: &[RowValue],
+    ) -> Result<Vec<u8>> {
+        let mut export: Vec<(u32, Vec<Vec<u8>>)> = Vec::new();
+        let mut sorted: Vec<&(TableId, Vec<u16>)> = tables.iter().collect();
+        sorted.sort_by_key(|(table, _)| table.as_u32());
+        for (table, key_ordinals) in sorted {
+            let mut rows = Vec::new();
+            for row in self.scan(*table)? {
+                let matches = key_ordinals
+                    .iter()
+                    .zip(key)
+                    .all(|(&ordinal, want)| row.value(ordinal) == Some(want));
+                if matches {
+                    rows.push(crate::store::row::encode_row(row.values())?);
+                }
+            }
+            export.push((table.as_u32(), rows));
+        }
+        rmp_serde::to_vec(&export)
+            .map_err(|e| FluxumError::Storage(format!("handoff export encode failed: {e}")))
+    }
+
+    /// SHD-041 step 7: deserialize a handoff buffer and insert every row of
+    /// the row set into THIS shard's buffered transaction. Rows re-validate
+    /// through the ordinary write path (constraints, indexes on commit).
+    pub fn handoff_import(&mut self, buffer: &[u8]) -> Result<u64> {
+        let export: Vec<(u32, Vec<Vec<u8>>)> = rmp_serde::from_slice(buffer)
+            .map_err(|e| FluxumError::Storage(format!("handoff import decode failed: {e}")))?;
+        let mut imported = 0u64;
+        for (table_raw, rows) in export {
+            let table = TableId::from_raw(table_raw);
+            let schema = self.store.schema_of(table)?;
+            for bytes in rows {
+                let row = crate::store::row::decode_row(schema, &bytes)?;
+                self.upsert(table, row.values().to_vec())?;
+                imported += 1;
+            }
+        }
+        Ok(imported)
+    }
+
+    /// SHD-041 step 10: delete the entity's rows from this shard (the
+    /// cleanup half). Returns how many rows were deleted.
+    pub fn handoff_delete(
+        &mut self,
+        tables: &[(TableId, Vec<u16>)],
+        key: &[RowValue],
+    ) -> Result<u64> {
+        let mut deleted = 0u64;
+        for (table, key_ordinals) in tables {
+            let schema = self.store.schema_of(*table)?;
+            let victims: Vec<Vec<RowValue>> = self
+                .scan(*table)?
+                .filter(|row| {
+                    key_ordinals
+                        .iter()
+                        .zip(key)
+                        .all(|(&ordinal, want)| row.value(ordinal) == Some(want))
+                })
+                .map(|row| {
+                    schema
+                        .primary_key
+                        .iter()
+                        .map(|&ordinal| row.values()[usize::from(ordinal)].clone())
+                        .collect()
+                })
+                .collect();
+            for pk in victims {
+                if self.delete(*table, &pk)? {
+                    deleted += 1;
+                }
+            }
+        }
+        Ok(deleted)
+    }
+
     /// Drain the RV-031 trigger events recorded so far, in mutation order.
     /// The reducer layer's `TxHandle` calls this after every mutation and
     /// dispatches registered `#[fluxum::on_*]` hooks inside this same
@@ -1552,11 +1633,7 @@ impl Tx<'_> {
                 .history
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            history.push_back((
-                tx_id,
-                crate::types::Timestamp::now().as_micros(),
-                published,
-            ));
+            history.push_back((tx_id, crate::types::Timestamp::now().as_micros(), published));
             while history.len() > self.store.options.temporal_window {
                 history.pop_front();
             }

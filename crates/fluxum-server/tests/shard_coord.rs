@@ -102,7 +102,9 @@ impl Table for Cfg {
 fn set_cfg(ctx: &ReducerContext<'_, '_, '_>, args: &[FluxValue]) -> Result<()> {
     let (Some(FluxValue::Str(key)), Some(FluxValue::I64(value))) = (args.first(), args.get(1))
     else {
-        return Err(fluxum_core::FluxumError::Reducer("set_cfg(key, value)".into()));
+        return Err(fluxum_core::FluxumError::Reducer(
+            "set_cfg(key, value)".into(),
+        ));
     };
     ctx.tx.upsert(Cfg {
         key: key.clone(),
@@ -154,9 +156,12 @@ fn boot_shard(dir: &std::path::Path, shard_id: ShardId) -> ShardHost {
         )
         .unwrap(),
     );
-    let (pipeline, worker) =
-        TxPipeline::new(Arc::clone(&store), Arc::clone(&log), TxPipelineOptions::default())
-            .unwrap();
+    let (pipeline, worker) = TxPipeline::new(
+        Arc::clone(&store),
+        Arc::clone(&log),
+        TxPipelineOptions::default(),
+    )
+    .unwrap();
     tokio::spawn(worker.run());
     let engine = ReducerEngine::new(
         pipeline,
@@ -186,7 +191,12 @@ async fn single_and_multi_shard_boot_with_global_replication() {
     // Single-shard boot works (the degenerate deployment).
     let single = coord(dir.path(), 1);
     single
-        .call(0, caller(0), "set_cfg", &[FluxValue::Str("a".into()), FluxValue::I64(1)])
+        .call(
+            0,
+            caller(0),
+            "set_cfg",
+            &[FluxValue::Str("a".into()), FluxValue::I64(1)],
+        )
         .await
         .unwrap();
 
@@ -196,7 +206,12 @@ async fn single_and_multi_shard_boot_with_global_replication() {
     let multi = coord(dir2.path(), 2);
     assert_eq!(multi.shard_ids().collect::<Vec<_>>(), vec![0, 1]);
     multi
-        .call(0, caller(0), "set_cfg", &[FluxValue::Str("mode".into()), FluxValue::I64(7)])
+        .call(
+            0,
+            caller(0),
+            "set_cfg",
+            &[FluxValue::Str("mode".into()), FluxValue::I64(7)],
+        )
         .await
         .unwrap();
     let replica = multi.host(1).unwrap();
@@ -218,13 +233,15 @@ async fn single_and_multi_shard_boot_with_global_replication() {
 
     // SHD-031: a global write attempted on the replica errors.
     let err = multi
-        .call(1, caller(1), "set_cfg", &[FluxValue::Str("x".into()), FluxValue::I64(1)])
+        .call(
+            1,
+            caller(1),
+            "set_cfg",
+            &[FluxValue::Str("x".into()), FluxValue::I64(1)],
+        )
         .await
         .unwrap_err();
-    assert!(
-        err.to_string().contains("authoritative shard"),
-        "{err}"
-    );
+    assert!(err.to_string().contains("authoritative shard"), "{err}");
     // ...and the authoritative copy is unchanged everywhere.
     let auth_row = multi
         .host(0)
@@ -232,7 +249,12 @@ async fn single_and_multi_shard_boot_with_global_replication() {
         .store()
         .snapshot()
         .query_pk(
-            multi.host(0).unwrap().store().table_id("ServerCfg").unwrap(),
+            multi
+                .host(0)
+                .unwrap()
+                .store()
+                .table_id("ServerCfg")
+                .unwrap(),
             &[RowValue::Str("mode".into())],
         )
         .unwrap()
@@ -251,7 +273,12 @@ async fn shards_are_independent_under_panic_and_load() {
 
     // …and shard 1 keeps serving global reads and its own work unaffected.
     multi
-        .call(0, caller(0), "set_cfg", &[FluxValue::Str("after".into()), FluxValue::I64(1)])
+        .call(
+            0,
+            caller(0),
+            "set_cfg",
+            &[FluxValue::Str("after".into()), FluxValue::I64(1)],
+        )
         .await
         .unwrap();
     let replica = multi.host(1).unwrap();
@@ -286,7 +313,11 @@ fn router_places_rows_per_strategy_and_globals_on_the_authority() {
     let note = fluxum_core::store::TableId::of("Note");
     assert_eq!(
         router
-            .shard_of_row(&schema, note, &[RowValue::U64(9), RowValue::Str("x".into())])
+            .shard_of_row(
+                &schema,
+                note,
+                &[RowValue::U64(9), RowValue::Str("x".into())]
+            )
             .unwrap(),
         0
     );

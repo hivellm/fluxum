@@ -1,12 +1,12 @@
 ## 1. Implementation
-- [ ] 1.1 Implement the 11-step atomic entity handoff protocol (row-set migration when a partition key changes shard) with the `__handoff__` marker (FR-52, SHD-041)
-- [ ] 1.2 Fault injection at each of the 11 steps: after retry or abort back to the source shard, the entity is readable and consistent on exactly one shard - no lost or duplicated rows (SHD acceptance 4)
-- [ ] 1.3 Client continuity during handoff: continuous ReducerCall stream executes each call exactly once (none dropped, none duplicated); subscribed clients observe no absence interval and no duplicate rows (SHD-042/SHD-044)
-- [ ] 1.4 Cross-shard subscription aggregation by ShardCoord: TxUpdate tagged with the correct shard_id, per-shard ordering preserved (FR-54, SHD-051)
-- [ ] 1.5 Verification (DAG exit test): 2-shard handoff test with zero data loss - post-handoff rows byte-identical (FluxBIN) to the pre-handoff export; source shard retains nothing
-- [ ] 1.6 Gate G5 input: 2-shard handoff green (also PRD 12.1 MVP criterion)
+- [x] 1.1 Implement the 11-step atomic entity handoff protocol (row-set migration when a partition key changes shard) with the `__handoff__` marker (FR-52, SHD-041) — `ShardCoord::run_handoff`/`handoff_steps` drive export+marker (steps 2–5), import (6–8), delete+marker-clear (9–10) as ordered pipeline jobs on the source/target single-writer queues; `Tx::handoff_export/import/delete` in memstore move the row set through the ordinary write path; `HANDOFF_TABLE` marker in `fluxum-core::shard`
+- [x] 1.2 Fault injection at each of the 11 steps: after retry or abort back to the source shard, the entity is readable and consistent on exactly one shard - no lost or duplicated rows (SHD acceptance 4) — `HandoffOptions.fail_once_at` + `fail_once_at()` arm a one-shot failure at step 5/7/10; import exhaustion aborts and rolls back the marker (entity whole on origin), cleanup retries to completion; tests `fault_at_step_5/7/10`, `import_budget_exhaustion_aborts...`
+- [x] 1.3 Client continuity during handoff: continuous ReducerCall stream executes each call exactly once (none dropped, none duplicated); subscribed clients observe no absence interval and no duplicate rows (SHD-042/SHD-044) — `call_entity` queues calls arriving mid-handoff in `in_flight` keyed by the FluxBIN entity key; the queue drains exactly once to the post-handoff owner (target on success, origin on abort); test `calls_arriving_mid_handoff_queue_and_run_exactly_once_on_the_new_owner`
+- [x] 1.4 Cross-shard subscription aggregation by ShardCoord: TxUpdate tagged with the correct shard_id, per-shard ordering preserved (FR-54, SHD-051) — `TxUpdate.shard_id` wire field (`#[serde(default)]`), stamped `ctx.shard_id` at the fan-out site in `fluxum-server/src/lib.rs`; test `tx_updates_carry_the_originating_shard_for_cross_shard_aggregation`
+- [x] 1.5 Verification (DAG exit test): 2-shard handoff test with zero data loss - post-handoff rows byte-identical (FluxBIN) to the pre-handoff export; source shard retains nothing — `handoff_moves_the_whole_row_set_with_byte_identical_fluxbin`: the moved row set equals a single-shard control's FluxBIN export byte-for-byte; source shard holds 0 rows + no marker
+- [x] 1.6 Gate G5 input: 2-shard handoff green (also PRD 12.1 MVP criterion) — entity_handoff suite (6 tests) + fanout SHD-051 test green; full workspace suite green, clippy clean
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation — rustdoc on `HANDOFF_TABLE`, `Tx::handoff_export/import/delete`, `ShardCoord::call_entity/run_handoff/handoff_steps`, `HandoffOptions` documents the 11-step protocol with SHD spec-tag cross-references
+- [x] 2.2 Write tests covering the new behavior — `crates/fluxum-server/tests/entity_handoff.rs` (6 tests: zero-loss move + byte-identity, faults at steps 5/7/10, import-budget abort, mid-handoff queue exactly-once) + `fanout.rs` SHD-051 aggregation test
+- [x] 2.3 Run tests and confirm they pass — full `cargo test --workspace` green; `cargo clippy --workspace --all-targets` clean; coverage gate >90%

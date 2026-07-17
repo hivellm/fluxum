@@ -84,10 +84,14 @@ fn concurrent_editors_converge_through_reducer_calls_in_either_order() {
     let bob_bytes = encode_ops(&bob_view.local_insert(1, "yz", bob_actor).unwrap());
 
     // Shard one applies Alice then Bob; shard two applies Bob then Alice.
-    commit(&store_one, &registry, |ctx| apply_edit(ctx, 1, &alice_bytes));
+    commit(&store_one, &registry, |ctx| {
+        apply_edit(ctx, 1, &alice_bytes)
+    });
     commit(&store_one, &registry, |ctx| apply_edit(ctx, 1, &bob_bytes));
     commit(&store_two, &registry, |ctx| apply_edit(ctx, 1, &bob_bytes));
-    commit(&store_two, &registry, |ctx| apply_edit(ctx, 1, &alice_bytes));
+    commit(&store_two, &registry, |ctx| {
+        apply_edit(ctx, 1, &alice_bytes)
+    });
 
     let one = commit(&store_one, &registry, |ctx| {
         Ok(ctx.tx.query_pk::<Doc>(1)?.unwrap())

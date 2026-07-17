@@ -247,12 +247,20 @@ async fn plugins_endpoint_reports_and_hot_disables() {
     assert_eq!(hybrid["tables"][0], "Chat");
     // The adopted auth seam appears too (PLG-002).
     assert!(
-        plugins.iter().any(|p| p["capability"] == "auth" && p["host"] == "builtin"),
+        plugins
+            .iter()
+            .any(|p| p["capability"] == "auth" && p["host"] == "builtin"),
         "{plugins:?}"
     );
 
     // PLG-061: hot disable without a core restart, then re-enable.
-    let resp = request(server.local_addr, "POST", "/plugins/vec_hybrid/disable", None).await;
+    let resp = request(
+        server.local_addr,
+        "POST",
+        "/plugins/vec_hybrid/disable",
+        None,
+    )
+    .await;
     assert_eq!(resp.status, 200);
     let resp = request(server.local_addr, "GET", "/plugins", None).await;
     let body = resp.json();
@@ -264,7 +272,13 @@ async fn plugins_endpoint_reports_and_hot_disables() {
         .unwrap()["health"]
         .clone();
     assert_eq!(health, "disabled");
-    let resp = request(server.local_addr, "POST", "/plugins/vec_hybrid/enable", None).await;
+    let resp = request(
+        server.local_addr,
+        "POST",
+        "/plugins/vec_hybrid/enable",
+        None,
+    )
+    .await;
     assert_eq!(resp.status, 200);
     let resp = request(server.local_addr, "POST", "/plugins/ghost/disable", None).await;
     assert_eq!(resp.status, 404, "unknown plugin");

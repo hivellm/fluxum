@@ -183,6 +183,7 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
                         reducer_name,
                         caller,
                         duration_us,
+                        shard_id: 0,
                         tables,
                     })
                 }

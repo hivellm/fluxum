@@ -21,9 +21,9 @@
 //!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
 pub mod admin;
-pub mod shard;
 pub mod http;
 pub mod session;
+pub mod shard;
 pub mod tcp;
 
 use std::collections::HashMap;
@@ -363,7 +363,10 @@ pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
             };
 
             for delta in deltas {
-                let tx_update = SubscriptionManager::tx_update(&diff, &delta);
+                let mut tx_update = SubscriptionManager::tx_update(&diff, &delta);
+                // SPEC-007 SHD-051: tag the originating shard so a client
+                // subscribed on several shards can attribute per-shard order.
+                tx_update.shard_id = ctx.shard_id;
                 let body = match ServerMessage::TxUpdate(tx_update).encode() {
                     Ok(body) => body,
                     Err(_) => continue,

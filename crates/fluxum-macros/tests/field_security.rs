@@ -152,8 +152,12 @@ fn diffs_project_per_viewer_and_masked_only_changes_stay_silent() {
     let (store, mut manager) = payroll_setup();
     let sql = "SELECT * FROM Payroll";
     manager.subscribe(1, hr(), sql, &store.snapshot()).unwrap();
-    manager.subscribe(2, intern(), sql, &store.snapshot()).unwrap();
-    manager.subscribe(3, peer(), sql, &store.snapshot()).unwrap();
+    manager
+        .subscribe(2, intern(), sql, &store.snapshot())
+        .unwrap();
+    manager
+        .subscribe(3, peer(), sql, &store.snapshot())
+        .unwrap();
 
     // Insert: three distinct caller-scoped buckets, one delta each.
     let registry = ReducerRegistry::new();
@@ -270,7 +274,10 @@ fn crypto_composes_with_grants_and_verified_siblings() {
     assert_eq!(row["ledger"], "credit 100");
     assert_eq!(row["ledger_verified"], true);
     assert_eq!(row["receipt"], "paid in full");
-    assert_eq!(row["receipt_verified"], true, "per-identity key verifies (CT-037)");
+    assert_eq!(
+        row["receipt_verified"], true,
+        "per-identity key verifies (CT-037)"
+    );
 
     // An unauthorized client gets the sealed envelope, never plaintext
     // (CT-012: masking + ciphertext strategy).

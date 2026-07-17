@@ -40,8 +40,7 @@ fn bob() -> Identity {
 }
 
 fn setup() -> (MemStore, SubscriptionManager) {
-    let schema =
-        Arc::new(Schema::from_tables([ProjectMember::SCHEMA, Document::SCHEMA]).unwrap());
+    let schema = Arc::new(Schema::from_tables([ProjectMember::SCHEMA, Document::SCHEMA]).unwrap());
     let store = MemStore::new(&schema).unwrap();
     let manager = SubscriptionManager::new(Arc::clone(&schema), SubscriptionLimits::default());
     (store, manager)
@@ -98,13 +97,23 @@ fn doc_ids(manager: &SubscriptionManager, store: &MemStore, viewer: Identity) ->
 #[test]
 fn initial_data_is_scoped_by_membership_and_server_peers_bypass() {
     let (store, manager) = setup();
-    manager.on_commit(&add_member(&store, 1, 10, alice())).unwrap();
+    manager
+        .on_commit(&add_member(&store, 1, 10, alice()))
+        .unwrap();
     manager.on_commit(&add_doc(&store, 100, 10)).unwrap();
     manager.on_commit(&add_doc(&store, 200, 20)).unwrap();
     // (init_views also works for pre-existing state — exercised below.)
 
-    assert_eq!(doc_ids(&manager, &store, alice()), vec![100], "member scope");
-    assert_eq!(doc_ids(&manager, &store, bob()), Vec::<u64>::new(), "non-member sees nothing");
+    assert_eq!(
+        doc_ids(&manager, &store, alice()),
+        vec![100],
+        "member scope"
+    );
+    assert_eq!(
+        doc_ids(&manager, &store, bob()),
+        Vec::<u64>::new(),
+        "non-member sees nothing"
+    );
 
     // Server peers bypass relational RLS like owner_only (SUB-031).
     let result = manager
@@ -124,14 +133,20 @@ fn membership_index_rebuilds_from_preexisting_rows() {
     add_member(&store, 1, 10, alice());
     add_doc(&store, 100, 10);
     manager.init_views(&store.snapshot()).unwrap();
-    assert_eq!(doc_ids(&manager, &store, alice()), vec![100], "rebuilt (RV-041)");
+    assert_eq!(
+        doc_ids(&manager, &store, alice()),
+        vec![100],
+        "rebuilt (RV-041)"
+    );
     assert!(doc_ids(&manager, &store, bob()).is_empty());
 }
 
 #[test]
 fn diffs_are_scoped_and_membership_changes_flip_later_commits() {
     let (store, mut manager) = setup();
-    manager.on_commit(&add_member(&store, 1, 10, alice())).unwrap();
+    manager
+        .on_commit(&add_member(&store, 1, 10, alice()))
+        .unwrap();
 
     // Two subscribers on the SAME SQL: caller-scoped buckets (RV-040).
     manager
@@ -154,15 +169,28 @@ fn diffs_are_scoped_and_membership_changes_flip_later_commits() {
     // A project-10 doc reaches Alice only.
     let deltas = manager.on_commit(&add_doc(&store, 100, 10)).unwrap();
     assert_eq!(deltas.len(), 1, "one caller-scoped bucket matched");
-    assert_eq!(deltas[0].subscribers, vec![1], "only the member (RV-040 diffs)");
+    assert_eq!(
+        deltas[0].subscribers,
+        vec![1],
+        "only the member (RV-040 diffs)"
+    );
 
     // Bob joins project 10: visibility flips for LATER commits.
-    let deltas = manager.on_commit(&add_member(&store, 2, 10, bob())).unwrap();
-    assert!(deltas.is_empty(), "the membership row itself is not a Document delta");
+    let deltas = manager
+        .on_commit(&add_member(&store, 2, 10, bob()))
+        .unwrap();
+    assert!(
+        deltas.is_empty(),
+        "the membership row itself is not a Document delta"
+    );
     let deltas = manager.on_commit(&add_doc(&store, 101, 10)).unwrap();
     let mut reached: Vec<u128> = deltas.iter().flat_map(|d| d.subscribers.clone()).collect();
     reached.sort_unstable();
-    assert_eq!(reached, vec![1, 2], "both members now receive project-10 docs");
+    assert_eq!(
+        reached,
+        vec![1, 2],
+        "both members now receive project-10 docs"
+    );
 
     // Bob leaves: later commits stop reaching him.
     {

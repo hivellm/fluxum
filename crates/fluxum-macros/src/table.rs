@@ -192,7 +192,10 @@ enum Visibility {
     ShardLocal,
     Custom(Ident),
     /// `member_of(Table, key)` — relational visibility (SPEC-022 RV-040).
-    MemberOf { table: Ident, key: Ident },
+    MemberOf {
+        table: Ident,
+        key: Ident,
+    },
 }
 
 // Domain index names (SPEC-001/SPEC-008); the shared "Tree" postfix is intrinsic.
@@ -1336,18 +1339,18 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                     if let Some((sib_ord, sib_flux)) = by_name.get(&name) {
                         let ident = format_ident!("{}", name);
                         let idx = usize::from(*sib_ord);
-                        let extract =
-                            from_row_value(sib_flux, quote!((&__fx_values[#idx])), &name_str, &name);
+                        let extract = from_row_value(
+                            sib_flux,
+                            quote!((&__fx_values[#idx])),
+                            &name_str,
+                            &name,
+                        );
                         bindings.push(quote!(let #ident = #extract;));
                     }
                 }
                 let expr_str = expr.to_token_stream().to_string();
-                let fn_ident = format_ident!(
-                    "__fx_check_{}_{}_{}",
-                    struct_ident,
-                    column.ident,
-                    check_idx
-                );
+                let fn_ident =
+                    format_ident!("__fx_check_{}_{}_{}", struct_ident, column.ident, check_idx);
                 constraint_submits.push(quote! {
                     #[allow(unused_variables, non_snake_case)]
                     fn #fn_ident(
@@ -1388,8 +1391,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 });
             }
             if let Some(decl) = &column.references {
-                if decl.on_delete == RefActionTok::SetNull
-                    && !matches!(column.flux, FluxTy::Opt(_))
+                if decl.on_delete == RefActionTok::SetNull && !matches!(column.flux, FluxTy::Opt(_))
                 {
                     return Err(syn::Error::new(
                         decl.span,
@@ -1739,9 +1741,9 @@ fn parse_references(attr: &Attribute) -> syn::Result<RefDecl> {
         syn::parenthesized!(content in input);
         let parent_column: Ident = content.parse()?;
         if !content.is_empty() {
-            return Err(content.error(
-                "foreign keys reference exactly one column: `Parent(col)` (RV-030)",
-            ));
+            return Err(
+                content.error("foreign keys reference exactly one column: `Parent(col)` (RV-030)")
+            );
         }
         let mut on_delete = RefActionTok::Restrict;
         if input.peek(syn::Token![,]) {

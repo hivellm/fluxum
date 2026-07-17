@@ -31,7 +31,10 @@ fn hash_routing_is_deterministic_with_golden_vectors() {
     // Distinct-type keys with equal payloads hash differently (FluxBIN
     // encodes the type shape).
     assert!(
-        (0..64u64).map(|n| shard(RowValue::U64(n))).collect::<std::collections::HashSet<_>>().len()
+        (0..64u64)
+            .map(|n| shard(RowValue::U64(n)))
+            .collect::<std::collections::HashSet<_>>()
+            .len()
             > 1,
         "keys spread across shards"
     );

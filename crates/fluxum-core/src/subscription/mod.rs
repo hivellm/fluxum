@@ -884,6 +884,7 @@ impl SubscriptionManager {
             reducer_name: String::new(),
             caller: [0u8; 32],
             duration_us: 0,
+            shard_id: 0,
             tables: vec![(*delta.update).clone()],
         }
     }

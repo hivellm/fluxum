@@ -78,10 +78,7 @@ pub fn expand_view(args: TokenStream, input: TokenStream) -> TokenStream {
 /// [, asc], limit = N)]` on a unit struct (SPEC-022 RV-010/012): submits a
 /// link-time `MaterializedViewDef` named after the struct. Column existence
 /// and types are validated at assembly, where the schema is in hand.
-fn try_expand_materialized_view(
-    args: TokenStream,
-    input: TokenStream,
-) -> syn::Result<TokenStream> {
+fn try_expand_materialized_view(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
     use syn::parse::Parser;
 
     let item: syn::ItemStruct = syn::parse2(input).map_err(|_| {
@@ -205,10 +202,16 @@ fn parse_mv_aggregate(expr: &syn::Expr) -> syn::Result<TokenStream> {
         syn::Expr::Path(p) if p.path.is_ident("count") => Ok(quote!(#path::Count)),
         syn::Expr::Call(call) => {
             let syn::Expr::Path(func) = call.func.as_ref() else {
-                return Err(syn::Error::new(call.span(), "expected sum|avg|min|max(col)"));
+                return Err(syn::Error::new(
+                    call.span(),
+                    "expected sum|avg|min|max(col)",
+                ));
             };
             let Some(kind) = func.path.get_ident().map(ToString::to_string) else {
-                return Err(syn::Error::new(call.span(), "expected sum|avg|min|max(col)"));
+                return Err(syn::Error::new(
+                    call.span(),
+                    "expected sum|avg|min|max(col)",
+                ));
             };
             let column = match call.args.first() {
                 Some(syn::Expr::Path(p)) if call.args.len() == 1 => {

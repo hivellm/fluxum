@@ -429,7 +429,12 @@ impl Snapshot {
         };
         let index = IndexId::of(state.schema.name, &[from_column.name]);
         Ok(state
-            .index_scan(index, std::slice::from_ref(from), Bound::Unbounded, Bound::Unbounded)?
+            .index_scan(
+                index,
+                std::slice::from_ref(from),
+                Bound::Unbounded,
+                Bound::Unbounded,
+            )?
             .cloned()
             .collect())
     }

@@ -76,16 +76,16 @@ fn top_row(bytes: &[u8]) -> (u32, u64) {
 #[test]
 fn aggregates_maintain_incrementally_with_group_scoped_deltas() {
     let (store, mut manager) = setup();
-    manager.on_commit(&commit_scores(
-        &store,
-        &[(1, "eu", 10), (2, "eu", 20), (3, "us", 5)],
-    ))
-    .unwrap();
+    manager
+        .on_commit(&commit_scores(
+            &store,
+            &[(1, "eu", 10), (2, "eu", 20), (3, "us", 5)],
+        ))
+        .unwrap();
 
     // Subscribe AFTER some commits: InitialData is the current view.
     let initial = manager.subscribe_view(7, "PointsByRegion").unwrap();
-    let mut groups: Vec<(String, i64)> =
-        initial.tables[0].inserts.iter().map(agg_row).collect();
+    let mut groups: Vec<(String, i64)> = initial.tables[0].inserts.iter().map(agg_row).collect();
     groups.sort();
     assert_eq!(groups, vec![("eu".into(), 30), ("us".into(), 5)]);
 
@@ -97,7 +97,10 @@ fn aggregates_maintain_incrementally_with_group_scoped_deltas() {
     let update = deltas[0].update.as_ref();
     assert_eq!(update.table_name, "PointsByRegion");
     assert_eq!(update.inserts.len(), 1, "only the affected group (RV-011)");
-    assert_eq!(agg_row(update.inserts.iter().next().unwrap()), ("eu".into(), 37));
+    assert_eq!(
+        agg_row(update.inserts.iter().next().unwrap()),
+        ("eu".into(), 37)
+    );
     assert_eq!(update.deletes.len(), 1, "the group's previous row retires");
     assert_eq!(deltas[0].subscribers, vec![7]);
 
@@ -136,7 +139,13 @@ fn leaderboard_window_emits_bounded_rank_deltas() {
     manager
         .on_commit(&commit_scores(
             &store,
-            &[(1, "eu", 100), (2, "eu", 90), (3, "eu", 80), (4, "eu", 70), (5, "eu", 60)],
+            &[
+                (1, "eu", 100),
+                (2, "eu", 90),
+                (3, "eu", 80),
+                (4, "eu", 70),
+                (5, "eu", 60),
+            ],
         ))
         .unwrap();
 
@@ -176,7 +185,11 @@ fn leaderboard_window_emits_bounded_rank_deltas() {
     let update = deltas[0].update.as_ref();
     let mut inserted: Vec<(u32, u64)> = update.inserts.iter().map(top_row).collect();
     inserted.sort_unstable();
-    assert_eq!(inserted, vec![(1, 95), (2, 90), (3, 80)], "window shifted up");
+    assert_eq!(
+        inserted,
+        vec![(1, 95), (2, 90), (3, 80)],
+        "window shifted up"
+    );
 
     manager.validate_views(&store.snapshot()).unwrap();
 }

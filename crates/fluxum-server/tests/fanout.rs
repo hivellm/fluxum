@@ -78,13 +78,17 @@ struct Harness {
 }
 
 async fn start(commit_capacity: usize) -> Harness {
+    start_on_shard(commit_capacity, SHARD).await
+}
+
+async fn start_on_shard(commit_capacity: usize, shard: u32) -> Harness {
     let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
     let schema = Schema::from_tables([&CHAT, &MARKER]).unwrap();
     let store = Arc::new(MemStore::new(&schema).unwrap());
     let log = Arc::new(
         CommitLog::open(
             &dir.path().join("log"),
-            SHARD,
+            shard,
             1,
             CommitLogOptions::default(),
         )
@@ -97,12 +101,12 @@ async fn start(commit_capacity: usize) -> Harness {
         pipeline,
         Arc::new(ReducerRegistry::from_defs([]).unwrap()),
         LifecycleHooks::none(),
-        SHARD,
+        shard,
         fluxum_core::auth::server_identity("fanout-test"),
     );
     let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
     let auth = Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
-    let ctx = ShardContext::new(engine, subs, auth, SHARD, commit_capacity);
+    let ctx = ShardContext::new(engine, subs, auth, shard, commit_capacity);
     let server = tcp::serve(Arc::clone(&ctx), "127.0.0.1:0", TcpOptions::default())
         .await
         .unwrap();
@@ -392,4 +396,49 @@ async fn a_closed_sink_is_evicted_without_disturbing_the_healthy_subscriber() {
         .expect("delivery continues past the closed sink");
     assert_eq!(update.tx_id, tx_id);
     h.server.shutdown();
+}
+
+// --- SPEC-007 SHD-051 (T5.5 exit 1.4): cross-shard subscription aggregation --------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tx_updates_carry_the_originating_shard_for_cross_shard_aggregation() {
+    // A query spanning shards = one subscription per shard; the client
+    // aggregates the streams. Every TxUpdate must carry its originating
+    // shard so attribution (and per-shard ordering) is unambiguous.
+    let a = start_on_shard(64, 3).await;
+    let b = start_on_shard(64, 7).await;
+    let mut sub_a = Client::subscribed(a.server.local_addr, "SELECT * FROM Chat").await;
+    let mut sub_b = Client::subscribed(b.server.local_addr, "SELECT * FROM Chat").await;
+
+    let diff = commit_row(&a.store, "Chat", 1, "from shard 3");
+    a.ctx.publish_commit(diff);
+    let diff = commit_row(&b.store, "Chat", 2, "from shard 7");
+    b.ctx.publish_commit(diff);
+
+    let from_a = sub_a
+        .recv_update(Duration::from_secs(3))
+        .await
+        .expect("shard 3 update");
+    let from_b = sub_b
+        .recv_update(Duration::from_secs(3))
+        .await
+        .expect("shard 7 update");
+    assert_eq!(from_a.shard_id, 3, "SHD-051 shard tag");
+    assert_eq!(from_b.shard_id, 7, "SHD-051 shard tag");
+
+    // Aggregation key: (shard_id, tx_id) — per-shard order is preserved,
+    // and a second commit on one shard advances only that shard's stream.
+    let diff = commit_row(&a.store, "Chat", 5, "again from 3");
+    let second_tx = diff.tx_id;
+    a.ctx.publish_commit(diff);
+    let second = sub_a
+        .recv_update(Duration::from_secs(3))
+        .await
+        .expect("second shard 3 update");
+    assert_eq!(second.shard_id, 3);
+    assert!(second.tx_id > from_a.tx_id);
+    assert_eq!(second.tx_id, second_tx);
+
+    a.server.shutdown();
+    b.server.shutdown();
 }

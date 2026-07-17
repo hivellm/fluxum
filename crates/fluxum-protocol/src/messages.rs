@@ -265,6 +265,12 @@ pub struct TxUpdate {
     pub caller: [u8; 32],
     /// Reducer execution time in microseconds.
     pub duration_us: u32,
+    /// The originating shard (SPEC-007 SHD-051): a client subscribed on
+    /// several shards receives separate `TxUpdate`s, each tagged so
+    /// per-shard ordering is attributable. `0` for single-shard
+    /// deployments; `#[serde(default)]` keeps pre-field frames decoding.
+    #[serde(default)]
+    pub shard_id: u32,
     /// Row diffs, one entry per affected subscribed table.
     pub tables: Vec<TableUpdate>,
 }
