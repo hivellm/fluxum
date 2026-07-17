@@ -141,6 +141,7 @@ fn sidecar(name: &str, capability: &str) -> PluginDecl {
         PluginHost::Sidecar {
             endpoint: "127.0.0.1:15810".into(),
             timeout_ms: 40,
+            token: None,
         },
     )
 }
@@ -261,8 +262,19 @@ fn a_legal_set_builds_and_reports() {
     assert!(bound.instance.is_some(), "in-proc instance constructed");
     let side = registry.get("vec_hybrid").unwrap();
     assert!(
-        side.instance.is_none(),
-        "sidecar proxy is the phase-5 task; binding validates only"
+        side.instance.is_some(),
+        "a sidecar binding carries a live proxy instance (PLG-031)"
+    );
+    assert!(
+        side.sidecar.is_some(),
+        "a sidecar binding carries breaker/error stats"
+    );
+    // Nothing was dialed: `build()` must not fail because a sidecar happens
+    // to be down at startup — it degrades at call time instead.
+    assert_eq!(
+        side.sidecar.as_ref().unwrap().calls(),
+        0,
+        "build() must not dial the sidecar"
     );
 
     let report = registry.report();

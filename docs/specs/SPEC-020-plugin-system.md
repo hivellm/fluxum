@@ -149,7 +149,9 @@ pub trait StreamSink: Send + Sync {
       applies_to: { tables: [Item], columns: [description] }
     - name: vectorizer_hybrid
       capability: retriever            # + fusion (default RRF)
-      host: { kind: sidecar, endpoint: "127.0.0.1:15811", timeout_ms: 60 }
+      # token: the shared secret the sidecar authenticates this host with
+      # (PLG-031); omit for a loopback/same-pod endpoint. Never logged.
+      host: { kind: sidecar, endpoint: "127.0.0.1:15811", timeout_ms: 60, token: "…" }
       applies_to: { tables: [Item] }
     - name: vectorizer_ingest
       capability: stream_sink          # CDC → Vectorizer embedding pipeline

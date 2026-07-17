@@ -528,6 +528,12 @@ pub enum PluginHost {
         /// Per-call timeout in milliseconds (ReadPath/OffPath calls).
         #[serde(default = "default_plugin_timeout_ms")]
         timeout_ms: u64,
+        /// Shared secret the sidecar authenticates this host with (PLG-031),
+        /// sent in the Plugin RPC handshake. `None` leaves the sidecar
+        /// unauthenticated — only appropriate for a loopback/same-pod
+        /// endpoint. Never logged or reported by `GET /plugins`.
+        #[serde(default)]
+        token: Option<String>,
     },
 }
 

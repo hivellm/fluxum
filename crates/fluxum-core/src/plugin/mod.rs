@@ -27,14 +27,23 @@
 //! time ([`InProcPluginDef`], the DM-040 `inventory` pattern): when the
 //! Cargo feature is off, the def simply does not exist in the binary, and a
 //! manifest entry naming it fails [`PluginRegistry::build`] with a
-//! descriptive error. Sidecar hosting (process-isolated Plugin RPC,
-//! PLG-031) is declared and validated here; the generic RPC proxy is the
-//! phase-5 `plugin-sidecar-host` task — until it lands, a sidecar binding
-//! validates but carries no live instance.
+//! descriptive error. Sidecar hosting is process isolation over Plugin RPC
+//! (PLG-031): [`sidecar::SidecarProxy`] implements the capability trait by
+//! calling out to the configured endpoint, so everything above a binding
+//! sees one `Arc<dyn ScoreReranker>` and cannot tell the two hosts apart —
+//! including the ReadPath call sites, whose existing "keep the base result
+//! on error" path is exactly what a timing-out sidecar degrades through.
+
+pub mod sidecar;
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+pub use sidecar::{
+    BreakerState, SidecarConfig, SidecarErrorReason, SidecarProxy, SidecarStats,
+};
 
 use serde::Serialize;
 
@@ -441,8 +450,8 @@ pub enum BoundHost {
         feature: String,
     },
     /// A separate process at `endpoint`, called over Plugin RPC with
-    /// `timeout_ms` per ReadPath/OffPath call (PLG-031; proxy lands with
-    /// the phase-5 sidecar-host task).
+    /// `timeout_ms` per ReadPath/OffPath call by a [`sidecar::SidecarProxy`]
+    /// (PLG-031).
     Sidecar {
         /// The sidecar's RPC endpoint.
         endpoint: String,
@@ -463,11 +472,17 @@ pub struct BoundPlugin {
     pub tables: Vec<String>,
     /// The columns the plugin applies to (empty = whole tables).
     pub columns: Vec<String>,
-    /// The constructed instance — in-process only; a sidecar binding
-    /// carries `None` until the phase-5 proxy task lands.
+    /// The constructed instance: the compiled plugin for an in-process
+    /// host, a [`SidecarProxy`] for a sidecar one. `None` only for a
+    /// sidecar binding whose capability has no Plugin RPC wire yet
+    /// (`stream_sink`, `key_provider`) — legal and introspectable, never
+    /// called.
     pub instance: Option<PluginInstance>,
     /// Runtime disable flag + meters, shared with invocation sites.
     pub state: Arc<PluginState>,
+    /// The sidecar's breaker state + per-reason error counters (PLG-031),
+    /// shared with its proxy. `None` for an in-process host.
+    pub sidecar: Option<Arc<SidecarStats>>,
 }
 
 /// An adopted built-in seam (PLG-002), introspected alongside manifest
@@ -510,6 +525,13 @@ pub struct PluginInfo {
     /// Human-readable detail (adopted seams: scope/key ids — never key
     /// material or tokens, PLG-060).
     pub detail: String,
+    /// A sidecar's circuit-breaker state (`closed`|`open`|`half_open`);
+    /// `None` for a built-in seam or in-process plugin (PLG-031).
+    pub breaker: Option<&'static str>,
+    /// A sidecar's `(reason, count)` error breakdown — the
+    /// `fluxum_plugin_sidecar_errors_total{plugin, reason}` series. Empty
+    /// unless this is a sidecar binding.
+    pub sidecar_errors: Vec<(&'static str, u64)>,
 }
 
 /// The unified plugin registry (PLG-001/002): every validated manifest
@@ -582,10 +604,12 @@ impl PluginRegistry {
         })?;
 
         // PLG-020/021: placement legality for the host.
+        let mut stats: Option<Arc<SidecarStats>> = None;
         let (host, instance) = match &decl.host {
             PluginHost::Sidecar {
                 endpoint,
                 timeout_ms,
+                token,
             } => {
                 if !capability.sidecar_allowed() {
                     return Err(fail(format!(
@@ -598,13 +622,43 @@ impl PluginRegistry {
                 if endpoint.is_empty() {
                     return Err(fail("sidecar host needs an `endpoint` (PLG-032)".into()));
                 }
+                if *timeout_ms == 0 {
+                    return Err(fail(
+                        "sidecar `timeout_ms` must be non-zero — a ReadPath call with no \
+                         budget would block the query thread on a hung sidecar (PLG-031)"
+                            .into(),
+                    ));
+                }
+                let proxy = Arc::new(SidecarProxy::new(SidecarConfig {
+                    name: decl.name.clone(),
+                    capability,
+                    endpoint: endpoint.clone(),
+                    timeout: Duration::from_millis(*timeout_ms),
+                    token: token.clone(),
+                    breaker_cooldown: sidecar::BREAKER_COOLDOWN,
+                }));
+                stats = Some(proxy.stats());
+                // `instance()` is `None` for a capability with no ReadPath
+                // wire yet (`stream_sink`, `key_provider`): the manifest
+                // binding is legal and introspectable, but nothing can call
+                // it until the task that builds its wire lands. That is the
+                // same shape the sidecar bindings had before this proxy —
+                // validated, not live.
+                let instance = Arc::clone(&proxy).instance();
+                if instance.is_none() {
+                    tracing::warn!(
+                        plugin = %decl.name,
+                        capability = capability.name(),
+                        "sidecar binding validated but has no Plugin RPC wire yet \
+                         (PLG-031 models the ReadPath capabilities); it will never be called"
+                    );
+                }
                 (
                     BoundHost::Sidecar {
                         endpoint: endpoint.clone(),
                         timeout_ms: *timeout_ms,
                     },
-                    // The generic RPC proxy is the phase-5 sidecar-host task.
-                    None,
+                    instance,
                 )
             }
             PluginHost::InProcess { feature } => {
@@ -675,6 +729,7 @@ impl PluginRegistry {
             columns: decl.applies_to.columns.clone(),
             instance,
             state: Arc::new(PluginState::default()),
+            sidecar: stats,
         })
     }
 
@@ -688,11 +743,13 @@ impl PluginRegistry {
         &self.plugins
     }
 
-    /// The first active (not disabled) in-process binding of `capability`
-    /// whose `applies_to` scope covers `(table, column)` — an empty scope
-    /// covers everything. The ReadPath query hooks (PLG-040/041) resolve
-    /// their plugin through this; sidecar bindings carry no instance until
-    /// the phase-5 proxy lands and are skipped here.
+    /// The first active (not disabled) binding of `capability` whose
+    /// `applies_to` scope covers `(table, column)` — an empty scope covers
+    /// everything. The ReadPath query hooks (PLG-040/041) resolve their
+    /// plugin through this, and a sidecar resolves the same way an
+    /// in-process plugin does: the host is the proxy's business, not the
+    /// caller's. A binding with no instance (a sidecar capability whose wire
+    /// has not landed) is skipped.
     pub fn readpath_binding(
         &self,
         capability: Capability,
@@ -739,6 +796,8 @@ impl PluginRegistry {
                 tables: Vec::new(),
                 columns: Vec::new(),
                 detail: seam.detail.clone(),
+                breaker: None,
+                sidecar_errors: Vec::new(),
             })
             .collect();
         out.extend(self.plugins.iter().map(|plugin| PluginInfo {
@@ -762,6 +821,15 @@ impl PluginRegistry {
             tables: plugin.tables.clone(),
             columns: plugin.columns.clone(),
             detail: String::new(),
+            breaker: plugin
+                .sidecar
+                .as_ref()
+                .map(|s| s.breaker_state().as_str()),
+            sidecar_errors: plugin
+                .sidecar
+                .as_ref()
+                .map(|s| s.by_reason())
+                .unwrap_or_default(),
         }));
         out
     }

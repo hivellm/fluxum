@@ -217,6 +217,7 @@ async fn plugins_endpoint_reports_and_hot_disables() {
             host: PluginHost::Sidecar {
                 endpoint: "127.0.0.1:15811".into(),
                 timeout_ms: 60,
+                token: Some("s3cret".into()),
             },
             applies_to: PluginScope {
                 tables: vec!["Chat".into()],
@@ -245,6 +246,9 @@ async fn plugins_endpoint_reports_and_hot_disables() {
     assert_eq!(hybrid["health"], "active");
     assert!(hybrid["host"].as_str().unwrap().contains("127.0.0.1:15811"));
     assert_eq!(hybrid["tables"][0], "Chat");
+    // PLG-031: a sidecar binding reports its breaker state, closed until it
+    // has failed — nothing was dialed at build.
+    assert_eq!(hybrid["breaker"], "closed", "{hybrid}");
     // The adopted auth seam appears too (PLG-002).
     assert!(
         plugins
@@ -288,6 +292,22 @@ async fn plugins_endpoint_reports_and_hot_disables() {
     let text = resp.text();
     assert!(
         text.contains("fluxum_plugin_panics_total{plugin=\"vec_hybrid\"} 0"),
+        "{text}"
+    );
+    // PLG-031: the sidecar breakdown is emitted for every reason label even
+    // while healthy, so an alert never goes stale-for-lack-of-series.
+    assert!(
+        text.contains(
+            "fluxum_plugin_sidecar_errors_total{plugin=\"vec_hybrid\", reason=\"timeout\"} 0"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("fluxum_plugin_sidecar_breaker_open{plugin=\"vec_hybrid\"} 0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("fluxum_plugin_sidecar_calls_total{plugin=\"vec_hybrid\"} 0"),
         "{text}"
     );
 }
