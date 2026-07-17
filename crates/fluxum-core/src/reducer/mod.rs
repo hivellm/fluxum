@@ -61,7 +61,10 @@
 pub mod args;
 pub mod engine;
 pub mod ratelimit;
+pub mod stdlib;
 pub mod view;
+
+pub use stdlib::Rng;
 
 use std::cell::{Cell, Ref, RefCell, RefMut};
 use std::collections::HashMap;
@@ -338,11 +341,15 @@ pub fn with_context<'t, 's, R>(
     tx: &'t mut Tx<'s>,
     body: impl FnOnce(&ReducerContext<'_, 't, 's>) -> Result<R>,
 ) -> Result<R> {
+    // SEC-020: seed the transaction's RNG from (tx_id, shard_id) before the
+    // Tx is moved behind the RefCell.
+    let seed = stdlib::seed_from(tx.tx_id(), caller.shard_id);
     let env = TxEnv {
         tx: RefCell::new(tx),
         registry,
         caller,
         depth: Cell::new(0),
+        rng: stdlib::Rng::new(seed),
     };
     let ctx = env.context();
     body(&ctx)
@@ -356,6 +363,10 @@ struct TxEnv<'t, 's> {
     registry: &'t ReducerRegistry,
     caller: ReducerCaller,
     depth: Cell<u32>,
+    /// The deterministic per-transaction RNG (SEC-020), seeded from
+    /// `(tx_id, shard_id)` and shared by the whole call tree so nested
+    /// reducers draw from one reproducible stream.
+    rng: stdlib::Rng,
 }
 
 impl<'t, 's> TxEnv<'t, 's> {
@@ -425,6 +436,47 @@ impl ReducerContext<'_, '_, '_> {
             shard_id: self.shard_id,
         })?;
         Ok(())
+    }
+
+    /// The transaction's deterministic RNG (SPEC-026 SEC-020), seeded from
+    /// `(tx_id, shard_id)` and shared across the whole reducer call tree.
+    ///
+    /// Use this instead of `rand::random`/`OsRng`: reducer output must be
+    /// reproducible under commit-log replay and deterministic simulation
+    /// (SEC-021), which OS entropy breaks. The same transaction always yields
+    /// the same sequence.
+    ///
+    /// ```ignore
+    /// let roll = ctx.rng().below(6) + 1;      // fair d6, deterministic
+    /// let jitter = ctx.rng().range(-50, 50);  // deterministic jitter
+    /// ```
+    pub fn rng(&self) -> &Rng {
+        &self.tx.env.rng
+    }
+
+    /// Floor `ctx.timestamp` to a multiple of `interval` — deterministic
+    /// time-bucketing (SEC-020) that never reads the wall clock. Returns the
+    /// bucket's start in µs since the Unix epoch. A zero interval returns the
+    /// raw timestamp. Correct for pre-epoch (negative) timestamps.
+    pub fn time_bucket(&self, interval: std::time::Duration) -> i64 {
+        let micros = self.timestamp.as_micros();
+        let step = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+        if step <= 0 {
+            return micros;
+        }
+        micros - micros.rem_euclid(step)
+    }
+
+    /// The index of the `interval`-sized bucket that `ctx.timestamp` falls in
+    /// (SEC-020): `floor(timestamp / interval)`. A zero interval yields `0`.
+    /// Correct for pre-epoch (negative) timestamps.
+    pub fn bucket_index(&self, interval: std::time::Duration) -> i64 {
+        let micros = self.timestamp.as_micros();
+        let step = i64::try_from(interval.as_micros()).unwrap_or(i64::MAX);
+        if step <= 0 {
+            return 0;
+        }
+        micros.div_euclid(step)
     }
 }
 

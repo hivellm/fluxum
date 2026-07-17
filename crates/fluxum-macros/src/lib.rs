@@ -169,6 +169,18 @@ pub fn migration(args: TokenStream, input: TokenStream) -> TokenStream {
 /// are rejected with a wire-ready 429 before any `TxState` exists.
 /// Server-to-server identities are exempt (AUTH-062).
 ///
+/// # Determinism (SPEC-026 SEC-021)
+///
+/// A reducer MUST be deterministic — the same inputs produce the same writes
+/// on every shard and every re-execution (commit-log replay, deterministic
+/// simulation). **Do not** call `rand`/`OsRng` or read the wall clock
+/// (`SystemTime::now`, `Instant::now`) inside a reducer: both are ambient
+/// non-determinism that breaks replay. Use the determinism-preserving stdlib
+/// instead — [`ReducerContext::rng`](../fluxum_core/reducer/struct.ReducerContext.html#method.rng)
+/// for randomness (seeded from the transaction's `(tx_id, shard_id)`) and
+/// [`ReducerContext::time_bucket`](../fluxum_core/reducer/struct.ReducerContext.html#method.time_bucket)
+/// / `bucket_index` for logical time derived from `ctx.timestamp`.
+///
 /// # Example
 ///
 /// ```ignore
