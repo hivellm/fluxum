@@ -2,8 +2,8 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%20(edition%202024)-orange.svg)](rust-toolchain.toml)
-[![Status](https://img.shields.io/badge/status-design%20phase-yellow.svg)](#-project-status)
-[![Specs](https://img.shields.io/badge/specs-16%20documents-blue.svg)](docs/specs/README.md)
+[![Status](https://img.shields.io/badge/status-in%20development%20(phase%205)-green.svg)](#-project-status)
+[![Specs](https://img.shields.io/badge/specs-28%20documents-blue.svg)](docs/specs/README.md)
 [![Version](https://img.shields.io/badge/version-0.1.0--alpha-blue.svg)](CHANGELOG.md)
 
 > **Database as a Server for Realtime Applications**
@@ -115,6 +115,28 @@ real time.
 - **Composite primary keys** — `#[fluxum::table(primary_key(a, b))]` (SpacetimeDB can't)
 - **`#[index(btree(...))]`** — single and multi-column secondary indexes
 - **`#[fluxum::migration(version = N)]`** — schema migration with automatic diff and safe auto-apply
+- **`#[fulltext]` columns** — native inverted index; `WHERE col MATCH 'query'` with BM25 ranking,
+  no external search engine
+- **Column transforms** — `#[transform(...)]` field-level encryption / hashing pipelines with a
+  pluggable key provider (SPEC-017)
+
+### Query & Full-Text Search
+- **Index-aware query planner** — chooses PK, secondary, spatial, or full-text access paths and
+  prunes on selectivity (SPEC-018)
+- **Full-text `MATCH`** — BM25-ranked lexical search over `#[fulltext]` columns, `ORDER BY SCORE`,
+  with optional re-rank and hybrid (lexical + dense) fusion via the plugin system (SPEC-019)
+- **Reactive materialized views** — declared aggregate/derived views maintained incrementally on
+  commit and subscribable like any table (SPEC-022)
+
+### Extensibility (Plugin System, SPEC-020)
+- **Closed capability set** — every extension point is a reviewed trait with a fixed placement
+  class (WritePath / ReadPath / OffPath); no arbitrary "run any code" hook
+- **In-process plugins** — feature-gated native Rust registered at link time, run under
+  `catch_unwind` isolation (a panic disables the plugin, never crashes the shard)
+- **Out-of-process sidecars** — heavy/optional plugins (model re-rankers, a Vectorizer client) run
+  as a separate process over Plugin RPC; per-call timeout, graceful degradation to the base result,
+  and a circuit breaker keep a slow or dead sidecar from ever breaking a query. The core binary
+  stays lean (no model runtime, no weights in-image)
 
 ### SDKs (5 languages)
 - **JavaScript/TypeScript** · **Python** · **Go** · **Rust** · **C#** — generated from
@@ -346,22 +368,25 @@ Full rationale: [gaps analysis](docs/analysis/README.md).
 
 ## 📊 Project Status
 
-**Phase: Design** — architecture, PRD, DAG, and the 13 implementation specs are complete.
-Rust implementation starts at [DAG Phase 0](docs/DAG.md).
+**Phase: In development** — the storage engine, execution/reducer runtime, subscriptions, and the
+transport/scale layer are implemented and under test (line coverage held above 90%). Work is now in
+[Phase 5](docs/DAG.md) with the SDK/hardening and replication phases ahead.
 
 | Track | Status |
 |-------|--------|
 | SpacetimeDB / Convex / SurrealDB reference analysis | ✅ Done |
-| Architecture document | ✅ Done |
-| PRD + implementation DAG + 16 specs | ✅ Done |
-| Phase 0 — workspace bootstrap + hardware probe | 📋 Planned |
-| Phase 1 — macros, FluxBIN codec, auth | 📋 Planned |
-| Phase 2 — storage engine (tiered + compression + SIMD) | 📋 Planned |
-| Phase 3 — transactions + reducer runtime | 📋 Planned |
-| Phase 4 — subscriptions + fan-out | 📋 Planned |
-| Phase 5 — FluxRPC transports + sharding | 📋 Planned |
-| Phase 6 — TS/Rust SDKs + PostgreSQL parity + hardening → 0.1.0 | 📋 Planned |
+| Architecture · PRD · implementation DAG · 28 specs | ✅ Done |
+| Phase 0 — bootstrap (workspace + hardware probe) | ✅ Done |
+| Phase 1 — foundation (macros, FluxBIN codec, auth, column transforms) | ✅ Done |
+| Phase 2 — storage core (tiered + compression + SIMD + full-text index) | ✅ Done |
+| Phase 3 — execution core (transactions, reducer runtime, plugin framework) | ✅ Done |
+| Phase 4 — subscriptions + fan-out, query planner, full-text MATCH, reactive views | ✅ Done |
+| Phase 5 — transport & scale (FluxRPC, sharding, plugin sidecar, ops/hot-reload) | 🔄 In progress |
+| Phase 6 — developer experience & hardening (TS/Rust SDKs + PostgreSQL parity) → 0.1.0 | 📋 Planned |
 | Phase 7 — replica sets, backup/PITR, Python/Go/C# SDKs, 1B-row soak → 0.2.0 | 📋 Planned |
+
+Remaining in Phase 5: audit-trail/event-sourcing, connection-abuse protection, database
+namespaces/multitenancy, and per-tenant resource quotas.
 
 ---
 
@@ -371,7 +396,7 @@ Rust implementation starts at [DAG Phase 0](docs/DAG.md).
 - [PRD](docs/PRD.md) — product requirements (FR/NFR), success metrics, risks, MVP criteria
 - [Implementation DAG](docs/DAG.md) — dependency graph, 8 phases, gates, critical path
 - [Roadmap](docs/ROADMAP.md) — milestones to 0.1.0 and 0.2.0, parallel tracks, post-launch backlog
-- [Spec index](docs/specs/README.md) — 16 normative implementation specs (SPEC-001…SPEC-016)
+- [Spec index](docs/specs/README.md) — 28 normative implementation specs (SPEC-001…SPEC-028)
 - [SpacetimeDB source dossier](docs/analysis/spacetimedb-code/README.md) — deep analysis of the real v2.7.0 codebase (~237k LOC); hard problems + adoptions in [10-hard-problems](docs/analysis/spacetimedb-code/10-hard-problems.md)
 - [Reference analysis](docs/analysis/README.md) — SpacetimeDB, Convex, SurrealDB design studies
 - [Contributing](CONTRIBUTING.md) — setup, conventions, spec-driven development
