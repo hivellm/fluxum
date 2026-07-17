@@ -112,6 +112,9 @@ pub struct ShardContext {
     /// Whether the DMX-011 ephemeral TTL sweeper has been spawned (both
     /// transports request it on serve; only the first call spawns).
     sweeper_started: std::sync::atomic::AtomicBool,
+    /// Whether the DMX-020 row-TTL sweeper has been spawned (idempotent, as
+    /// above).
+    ttl_sweeper_started: std::sync::atomic::AtomicBool,
     /// The shard's blob store (SPEC-023 DMX-040), once installed.
     blob_store: std::sync::OnceLock<Arc<fluxum_core::commitlog::BlobStore>>,
 }
@@ -170,6 +173,7 @@ impl ShardContext {
             next_connection_id: AtomicU64::new(1),
             last_tx_id: AtomicU64::new(0),
             sweeper_started: std::sync::atomic::AtomicBool::new(false),
+            ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
         })
     }
@@ -214,6 +218,49 @@ impl ShardContext {
                     Ok(None) => {}
                     Err(e) => {
                         tracing::warn!(target: "fluxum::server", error = %e, "ephemeral sweep failed");
+                    }
+                }
+            }
+        });
+    }
+
+    /// Start the row-TTL sweeper (SPEC-023 DMX-020) if any registered table
+    /// declares `#[ttl(...)]`. Idempotent (only the first call spawns). A
+    /// backlog that hits the batch cap keeps sweeping without the full cadence
+    /// wait, so a mass expiry drains promptly without one giant delete (DMX-021);
+    /// its delete diffs fan out like any commit.
+    pub fn start_ttl_sweeper(self: &Arc<Self>) {
+        if self
+            .ttl_sweeper_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let Some(sweeper) =
+            fluxum_core::scheduler::TtlSweeper::from_registered(self.engine.pipeline().clone())
+        else {
+            return;
+        };
+        let ctx = Arc::clone(self);
+        tokio::spawn(async move {
+            let cadence = sweeper.cadence();
+            loop {
+                tokio::time::sleep(cadence).await;
+                // Drain the backlog: keep sweeping while a pass hits the cap.
+                loop {
+                    match sweeper.sweep_once().await {
+                        Ok((receipt, more)) => {
+                            if let Some(receipt) = receipt {
+                                ctx.publish_commit(receipt.diff);
+                            }
+                            if !more {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "fluxum::server", error = %e, "row-TTL sweep failed");
+                            break;
+                        }
                     }
                 }
             }

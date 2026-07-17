@@ -82,6 +82,7 @@ pub async fn serve(
     crate::spawn_fanout(Arc::clone(&ctx), shutdown.clone());
     // Ephemeral TTL sweeper (DMX-011) — idempotent across transports.
     ctx.start_ephemeral_sweeper();
+    ctx.start_ttl_sweeper();
 
     // Accept loop.
     let accept_ctx = Arc::clone(&ctx);

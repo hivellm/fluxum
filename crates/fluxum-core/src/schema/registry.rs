@@ -73,6 +73,8 @@ impl Schema {
         crate::transform::validate_registered(&schema)?;
         // SPEC-023 DMX-011: ephemeral cleanup metadata must resolve too.
         crate::schema::validate_registered_ephemeral(&schema)?;
+        // SPEC-023 DMX-020: row-TTL metadata must resolve too.
+        crate::schema::validate_registered_ttl(&schema)?;
         Ok(schema)
     }
 

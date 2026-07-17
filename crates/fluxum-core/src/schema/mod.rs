@@ -327,6 +327,86 @@ pub fn ephemeral_def(table: &str) -> Option<&'static EphemeralDef> {
     registered_ephemeral().find(|def| def.table == table)
 }
 
+/// How a durable table's rows expire (SPEC-023 DMX-020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TtlKind {
+    /// Expire when the named `Timestamp` column is at or before the sweep
+    /// time — an **absolute** expiry stored in the row (restart-safe, exact).
+    Field {
+        /// Ordinal of the expiry `Timestamp` column.
+        column: u16,
+    },
+    /// Expire `after_us` microseconds after the row's last observed write — a
+    /// **sliding** TTL tracked by an in-memory witness (best-effort; the age
+    /// resets on restart, like the DMX-011 ephemeral sweeper).
+    After {
+        /// Row lifetime in microseconds since the last write.
+        after_us: i64,
+    },
+}
+
+/// Row-TTL metadata of one durable table (SPEC-023 DMX-020), registered at
+/// link time by `#[fluxum::table]` when it declares `#[ttl(...)]`. Kept off
+/// [`TableSchema`] in a side registry, like [`EphemeralDef`] and the SPEC-017
+/// transforms, so the additive metadata costs no change at construction sites.
+pub struct TtlDef {
+    /// The `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// How its rows expire.
+    pub kind: TtlKind,
+}
+
+inventory::collect!(TtlDef);
+
+/// Every registered row-TTL def in this binary (linker order).
+pub fn registered_ttl() -> impl Iterator<Item = &'static TtlDef> {
+    inventory::iter::<TtlDef>()
+}
+
+/// The row-TTL metadata of `table`, if registered.
+pub fn ttl_def(table: &str) -> Option<&'static TtlDef> {
+    registered_ttl().find(|def| def.table == table)
+}
+
+/// Startup validation of every registered [`TtlDef`] against an assembled
+/// schema (DMX-020 backstop; defs for tables outside `schema` are skipped).
+pub(crate) fn validate_registered_ttl(schema: &Schema) -> Result<()> {
+    use crate::error::FluxumError;
+    for def in registered_ttl() {
+        let Some(table) = schema.table(def.table) else {
+            continue;
+        };
+        // TTL is for durable tables; ephemeral tables use `expire_after`.
+        if table.is_ephemeral() {
+            return Err(FluxumError::Schema(format!(
+                "table `{}`: #[ttl] is for durable tables — ephemeral tables use \
+                 `expire_after` (DMX-020)",
+                def.table
+            )));
+        }
+        match def.kind {
+            TtlKind::Field { column } => {
+                let ty = table.column(column).map(|c| &c.ty);
+                if !matches!(ty, Some(FluxType::Timestamp)) {
+                    return Err(FluxumError::Schema(format!(
+                        "table `{}`: #[ttl(field)] column must be a `Timestamp` (DMX-020)",
+                        def.table
+                    )));
+                }
+            }
+            TtlKind::After { after_us } => {
+                if after_us <= 0 {
+                    return Err(FluxumError::Schema(format!(
+                        "table `{}`: #[ttl(after)] must be positive (DMX-020)",
+                        def.table
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Startup validation of every registered [`EphemeralDef`] against an
 /// assembled schema (DMX-011 backstop; defs for tables outside `schema` are
 /// skipped — the registry is process-global, schemas may be subsets).

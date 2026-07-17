@@ -46,6 +46,25 @@ Given `Session` has `#[ttl(after="30m")]`
 When a session row's age exceeds 30 minutes
 Then it is deleted by a background transaction and its subscribers receive the delete.
 
+#### Implementation status (phase 3 — complete)
+- **Declaration** ([macros/src/table.rs](../../crates/fluxum-macros/src/table.rs)): `#[ttl(col)]` (the
+  column must be a `Timestamp`, checked at compile time) and `#[ttl(after = "30m")]`; at most one
+  `#[ttl]` per table. Registered as a link-time `TtlDef` side registry
+  ([schema/mod.rs](../../crates/fluxum-core/src/schema/mod.rs)) with a schema-assembly backstop
+  (Timestamp type, positive duration, not on an ephemeral table).
+- **Two expiry modes**: `#[ttl(col)]` is an **absolute** expiry stored in the row — restart-safe and
+  exact (the sweep deletes rows whose `Timestamp` column is `<= now`). `#[ttl(after)]` is a **sliding**
+  window since the last write, tracked by the same in-memory identity witness as the DMX-011 ephemeral
+  sweeper — best-effort, and the age resets on restart (industry-standard approximate TTL). A row
+  rewritten with changed data refreshes its window.
+- **Sweeper** ([scheduler/mod.rs `TtlSweeper`](../../crates/fluxum-core/src/scheduler/mod.rs)): scans a
+  wait-free snapshot, then deletes in one ordinary transaction, re-verifying each row so a write that
+  raced the snapshot wins — at-least-once and idempotent (a re-sweep of an already-deleted or refreshed
+  row is a no-op). Each pass is bounded to `TTL_SWEEP_BATCH` (1024) rows; a larger backlog drains across
+  successive passes so a mass expiry never stalls the single writer (DMX-021). The delete diffs fan out
+  to subscribers like any commit. Started per shard on serve
+  (`ShardContext::start_ttl_sweeper`), mirroring the ephemeral sweeper.
+
 ## 4. Rich column types (`DMX-03x`)
 
 ### Requirement: Enums, tagged unions, nested structs

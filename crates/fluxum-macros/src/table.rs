@@ -373,6 +373,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
     let mut unique: Vec<Vec<Ident>> = Vec::new();
     let mut indexes: Vec<IndexDecl> = Vec::new();
     let mut visibility: Option<Visibility> = None;
+    let mut ttl: Option<(TtlForm, Span)> = None;
     let mut kept_attrs: Vec<Attribute> = Vec::new();
 
     for attr in std::mem::take(&mut item.attrs) {
@@ -399,6 +400,14 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                 ));
             }
             visibility = Some(parse_visibility(&attr)?);
+        } else if attr.path().is_ident("ttl") {
+            if ttl.is_some() {
+                return Err(syn::Error::new(
+                    attr.span(),
+                    "duplicate `#[ttl]`: a table declares at most one TTL rule (DMX-020)",
+                ));
+            }
+            ttl = Some((parse_ttl(&attr)?, attr.span()));
         } else {
             kept_attrs.push(attr);
         }
@@ -1060,6 +1069,39 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             None
         };
 
+    // `#[ttl(...)]` registers a row-TTL def (SPEC-023 DMX-020). `#[ttl(col)]`
+    // resolves the column to an ordinal and requires a `Timestamp` type; the
+    // `after` form carries its microseconds directly.
+    let ttl_submit: Option<TokenStream> = match &ttl {
+        None => None,
+        Some((form, _span)) => {
+            let table_name = item.ident.to_string();
+            let kind = match form {
+                TtlForm::Field(col) => {
+                    let ord = ordinal_of(col, "`#[ttl(col)]` (DMX-020)")?;
+                    if !matches!(columns[usize::from(ord)].flux, FluxTy::Timestamp) {
+                        return Err(syn::Error::new(
+                            col.span(),
+                            format!("`#[ttl]` column `{col}` must be a `Timestamp` (DMX-020)"),
+                        ));
+                    }
+                    quote!(::fluxum_core::schema::TtlKind::Field { column: #ord })
+                }
+                TtlForm::After(us) => {
+                    quote!(::fluxum_core::schema::TtlKind::After { after_us: #us })
+                }
+            };
+            Some(quote! {
+                ::fluxum_core::schema::inventory::submit! {
+                    ::fluxum_core::schema::TtlDef {
+                        table: #table_name,
+                        kind: #kind,
+                    }
+                }
+            })
+        }
+    };
+
     // -- visibility -------------------------------------------------------------
     let visibility_tokens = match &visibility {
         None => quote!(::fluxum_core::schema::VisibilityRule::PublicAll),
@@ -1274,6 +1316,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
             #ephemeral_submit
 
+            #ttl_submit
+
             #migration_meta
         };
     })
@@ -1424,6 +1468,57 @@ fn parse_fulltext(attr: &Attribute) -> syn::Result<IndexDecl> {
         columns: vec![column],
         span: attr.span(),
     })
+}
+
+/// A parsed `#[ttl(...)]` declaration (SPEC-023 DMX-020), resolved to a
+/// [`TtlDef`](fluxum_core::schema::TtlDef) in codegen.
+enum TtlForm {
+    /// `#[ttl(col)]` — expire when the named `Timestamp` column is past.
+    Field(Ident),
+    /// `#[ttl(after = "30m")]` — expire N µs after the last write.
+    After(i64),
+}
+
+/// `#[ttl(col)]` (absolute expiry from a `Timestamp` column) or
+/// `#[ttl(after = "30m")]` (sliding TTL since last write) — SPEC-023 DMX-020.
+fn parse_ttl(attr: &Attribute) -> syn::Result<TtlForm> {
+    let meta: Meta = attr.parse_args().map_err(|_| {
+        syn::Error::new(
+            attr.span(),
+            "expected `#[ttl(column)]` or `#[ttl(after = \"30m\")]` (DMX-020)",
+        )
+    })?;
+    match meta {
+        Meta::Path(path) => {
+            let ident = path.get_ident().cloned().ok_or_else(|| {
+                syn::Error::new(
+                    path.span(),
+                    "`#[ttl(column)]` expects a column name (DMX-020)",
+                )
+            })?;
+            Ok(TtlForm::Field(ident))
+        }
+        Meta::NameValue(nv) if nv.path.is_ident("after") => {
+            let Expr::Lit(syn::ExprLit {
+                lit: Lit::Str(text),
+                ..
+            }) = &nv.value
+            else {
+                return Err(syn::Error::new(
+                    nv.value.span(),
+                    "`after` must be a duration string like \"30m\", \"10s\", \"500ms\" (DMX-020)",
+                ));
+            };
+            Ok(TtlForm::After(parse_duration_us(
+                &text.value(),
+                text.span(),
+            )?))
+        }
+        _ => Err(syn::Error::new(
+            meta.span(),
+            "expected `#[ttl(column)]` or `#[ttl(after = \"30m\")]` (DMX-020)",
+        )),
+    }
 }
 
 /// `#[visibility(owner_only(col) | public_all | shard_local | custom(f))]`

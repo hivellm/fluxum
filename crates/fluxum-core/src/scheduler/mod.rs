@@ -778,3 +778,227 @@ impl EphemeralSweeper {
         Ok(Some(receipt))
     }
 }
+
+/// The largest number of rows one [`TtlSweeper`] pass deletes in a single
+/// transaction (DMX-021) — a backlog drains across successive passes so a
+/// mass expiry never stalls the single writer with one giant delete.
+pub const TTL_SWEEP_BATCH: usize = 1024;
+
+/// How a swept table decides a row is expired (SPEC-023 DMX-020).
+#[derive(Clone, Copy)]
+enum TtlMode {
+    /// Expire when the row's `Timestamp` column at `ordinal` is `<= now`
+    /// (absolute expiry stored in the row; restart-safe).
+    Field { ordinal: u16 },
+    /// Expire `after_us` after the row's last observed write (sliding TTL via
+    /// an in-memory witness; best-effort, resets on restart).
+    After { after_us: i64 },
+}
+
+#[derive(Clone, Copy)]
+struct TtlTable {
+    table: TableId,
+    schema: &'static TableSchema,
+    mode: TtlMode,
+}
+
+/// Row-TTL sweeper for durable tables declaring `#[ttl(...)]` (SPEC-023
+/// DMX-020/021). A background worker deletes expired rows in ordinary
+/// transactions whose delete diffs fan out to subscribers like any commit;
+/// deletion is at-least-once and idempotent (a re-sweep of an already-deleted
+/// row is a no-op), and each pass is bounded to [`TTL_SWEEP_BATCH`] rows so a
+/// large expired backlog drains across passes without stalling the writer.
+///
+/// Two expiry modes (per `#[ttl]` form): an **absolute** `Timestamp` column
+/// (`#[ttl(col)]`, restart-safe) or a **sliding** window since the last write
+/// (`#[ttl(after = "…")]`, tracked by an identity witness exactly like the
+/// [`EphemeralSweeper`]).
+pub struct TtlSweeper {
+    pipeline: TxPipeline,
+    tables: Vec<TtlTable>,
+    witnesses: Mutex<HashMap<(TableId, PkBytes), Witness>>,
+    max_batch: usize,
+}
+
+impl TtlSweeper {
+    /// Build a sweeper for every registered `#[ttl]` table that resolves
+    /// against `pipeline`'s store. `None` when no table declares a TTL.
+    pub fn from_registered(pipeline: TxPipeline) -> Option<Self> {
+        let store = Arc::clone(pipeline.store());
+        let tables: Vec<TtlTable> = crate::schema::registered_ttl()
+            .filter_map(|def| {
+                let table = store.table_id(def.table)?;
+                let schema = store.table_schema(table)?;
+                let mode = match def.kind {
+                    crate::schema::TtlKind::Field { column } => TtlMode::Field { ordinal: column },
+                    crate::schema::TtlKind::After { after_us } => TtlMode::After { after_us },
+                };
+                Some(TtlTable {
+                    table,
+                    schema,
+                    mode,
+                })
+            })
+            .collect();
+        if tables.is_empty() {
+            return None;
+        }
+        Some(Self {
+            pipeline,
+            tables,
+            witnesses: Mutex::new(HashMap::new()),
+            max_batch: TTL_SWEEP_BATCH,
+        })
+    }
+
+    /// Build a sweeper over an explicit table list with a chosen batch cap —
+    /// the test seam (`from_registered` is the production path that reads the
+    /// link-time `#[ttl]` registry). `max_batch` is clamped to at least 1.
+    #[doc(hidden)]
+    pub fn for_tables_test(
+        pipeline: TxPipeline,
+        tables: Vec<(TableId, &'static TableSchema, crate::schema::TtlKind)>,
+        max_batch: usize,
+    ) -> Self {
+        let tables = tables
+            .into_iter()
+            .map(|(table, schema, kind)| TtlTable {
+                table,
+                schema,
+                mode: match kind {
+                    crate::schema::TtlKind::Field { column } => TtlMode::Field { ordinal: column },
+                    crate::schema::TtlKind::After { after_us } => TtlMode::After { after_us },
+                },
+            })
+            .collect();
+        Self {
+            pipeline,
+            tables,
+            witnesses: Mutex::new(HashMap::new()),
+            max_batch: max_batch.max(1),
+        }
+    }
+
+    /// The recommended sweep interval: a quarter of the shortest sliding TTL
+    /// (absolute-expiry tables have no intrinsic cadence), clamped to
+    /// `[100 ms, 5 s]`.
+    pub fn cadence(&self) -> Duration {
+        let min_us = self
+            .tables
+            .iter()
+            .filter_map(|t| match t.mode {
+                TtlMode::After { after_us } => Some(after_us),
+                TtlMode::Field { .. } => None,
+            })
+            .min()
+            .unwrap_or(4_000_000);
+        Duration::from_micros(u64::try_from(min_us / 4).unwrap_or(1_000_000))
+            .clamp(Duration::from_millis(100), Duration::from_secs(5))
+    }
+
+    /// One sweep at the wall clock. Returns `(receipt, more_pending)`: when
+    /// `more_pending` is true the batch cap was hit and the caller should
+    /// sweep again promptly to drain the backlog (DMX-021).
+    pub async fn sweep_once(&self) -> Result<(Option<CommitReceipt>, bool)> {
+        self.sweep_once_at(Timestamp::now()).await
+    }
+
+    /// One bounded sweep pass at `now` (injectable for tests): find up to
+    /// `max_batch` expired rows on a wait-free snapshot, then delete them in
+    /// one transaction, re-verifying each so a racing write wins.
+    pub async fn sweep_once_at(&self, now: Timestamp) -> Result<(Option<CommitReceipt>, bool)> {
+        // Phase 1 — collect doomed rows from a snapshot (no transaction).
+        let snapshot = self.pipeline.store().snapshot();
+        let mut doomed: Vec<(TtlTable, Vec<RowValue>, Row)> = Vec::new();
+        let mut capped = false;
+        {
+            let mut witnesses = self.witnesses.lock().unwrap_or_else(|e| e.into_inner());
+            let mut live: HashSet<(TableId, PkBytes)> = HashSet::new();
+            'scan: for entry in &self.tables {
+                for row in snapshot.scan(entry.table)? {
+                    let pk = crate::store::row::encode_pk_of_row(entry.schema, row.values())?;
+                    let key = (entry.table, pk);
+                    live.insert(key.clone());
+                    let expired = match entry.mode {
+                        TtlMode::Field { ordinal } => {
+                            matches!(row.value(ordinal), Some(RowValue::Timestamp(ts))
+                                if ts.as_micros() <= now.as_micros())
+                        }
+                        TtlMode::After { after_us } => match witnesses.get(&key) {
+                            Some(witness) if witness.row.same_identity(row) => {
+                                now.as_micros() - witness.changed_at.as_micros() > after_us
+                            }
+                            // New or rewritten row: refresh the witness, not due.
+                            _ => {
+                                witnesses.insert(
+                                    key.clone(),
+                                    Witness {
+                                        row: row.clone(),
+                                        changed_at: now,
+                                    },
+                                );
+                                false
+                            }
+                        },
+                    };
+                    if expired {
+                        let pk_values = entry
+                            .schema
+                            .primary_key
+                            .iter()
+                            .filter_map(|&ord| row.value(ord).cloned())
+                            .collect();
+                        doomed.push((*entry, pk_values, row.clone()));
+                        if doomed.len() >= self.max_batch {
+                            capped = true;
+                            break 'scan;
+                        }
+                    }
+                }
+            }
+            // Sliding-TTL witnesses for rows gone from the snapshot are dropped.
+            witnesses.retain(|key, _| live.contains(key));
+        }
+        if doomed.is_empty() {
+            return Ok((None, false));
+        }
+
+        // Phase 2 — delete in one ordinary transaction, re-verifying each row
+        // so a write that raced the snapshot survives (idempotent, DMX-020).
+        let plan: Vec<(TtlTable, Vec<RowValue>, Row)> = doomed.clone();
+        let now_us = now.as_micros();
+        let receipt = self
+            .pipeline
+            .call(Box::new(move |tx| {
+                for (entry, pk_values, witness) in &plan {
+                    let Some(current) = tx.query_pk(entry.table, pk_values)? else {
+                        continue; // already gone — idempotent no-op
+                    };
+                    let still_expired = match entry.mode {
+                        TtlMode::Field { ordinal } => {
+                            matches!(current.value(ordinal), Some(RowValue::Timestamp(ts))
+                                if ts.as_micros() <= now_us)
+                        }
+                        // Sliding TTL: identity match means it was not rewritten.
+                        TtlMode::After { .. } => current.same_identity(witness),
+                    };
+                    if still_expired {
+                        tx.delete(entry.table, pk_values)?;
+                    }
+                }
+                Ok(())
+            }))
+            .await?;
+
+        // Deleted sliding-TTL rows lose their witness (a survivor re-registers).
+        {
+            let mut witnesses = self.witnesses.lock().unwrap_or_else(|e| e.into_inner());
+            for (entry, pk_values, _) in &doomed {
+                if let Ok(pk) = crate::store::row::encode_pk_values(entry.schema, pk_values) {
+                    witnesses.remove(&(entry.table, pk));
+                }
+            }
+        }
+        Ok((Some(receipt), capped))
+    }
+}

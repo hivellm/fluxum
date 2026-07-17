@@ -1,0 +1,5 @@
+error: `#[ttl]` column `expires_at` must be a `Timestamp` (DMX-020)
+ --> tests/ui/fail/ttl_not_timestamp.rs:7:7
+  |
+7 | #[ttl(expires_at)]
+  |       ^^^^^^^^^^
