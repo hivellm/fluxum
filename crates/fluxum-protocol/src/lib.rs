@@ -18,6 +18,7 @@ pub mod codes;
 pub mod fluxbin;
 pub mod frame;
 pub mod messages;
+pub mod plugin_rpc;
 pub mod rowlist;
 mod tagged;
 pub mod value;
