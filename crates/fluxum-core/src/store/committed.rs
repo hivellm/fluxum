@@ -366,6 +366,20 @@ impl Snapshot {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
     }
 
+    /// The committed row at an already-encoded primary key — the plugin
+    /// boundary's row resolution (SPEC-020 PLG-041: a retriever returns
+    /// encoded candidate keys).
+    pub(crate) fn row_by_encoded_pk(&self, table: TableId, pk: &PkBytes) -> Result<Option<Row>> {
+        Ok(self.state.table(table)?.rows.get(pk).cloned())
+    }
+
+    /// Encode primary-key values into the table's stable [`PkBytes`] — the
+    /// key currency of the plugin boundary (SPEC-020: a retriever names
+    /// candidate rows by encoded key; `Scored.pk` carries this).
+    pub fn encode_pk(&self, table: TableId, pk_values: &[RowValue]) -> Result<PkBytes> {
+        encode_pk_values(self.state.table(table)?.schema, pk_values)
+    }
+
     /// Evaluate a `MATCH` predicate through the table's `#[fulltext]` index
     /// (SPEC-019 FTS-030): boolean AND-of-items + BM25 scores, resolved from
     /// the posting lists — never a table scan. Errors when no full-text

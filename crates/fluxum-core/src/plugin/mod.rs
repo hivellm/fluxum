@@ -257,6 +257,10 @@ pub trait StreamSink: Send + Sync {
     fn checkpoint(&self) -> Offset;
 }
 
+/// PLG-040: how many BM25 candidates feed a bound [`ScoreReranker`]
+/// (`rerank_candidate_k`; a manifest override is a follow-up).
+pub const RERANK_CANDIDATE_K: usize = 100;
+
 /// The default [`Fusion`]: Reciprocal Rank Fusion — rank-based, so no
 /// score-scale normalization between BM25 and a dense retriever is needed
 /// (PLG-041). `score(d) = Σ_lists 1 / (k + rank_d)` with the standard
@@ -683,6 +687,26 @@ impl PluginRegistry {
     /// Every bound plugin.
     pub fn plugins(&self) -> &[BoundPlugin] {
         &self.plugins
+    }
+
+    /// The first active (not disabled) in-process binding of `capability`
+    /// whose `applies_to` scope covers `(table, column)` — an empty scope
+    /// covers everything. The ReadPath query hooks (PLG-040/041) resolve
+    /// their plugin through this; sidecar bindings carry no instance until
+    /// the phase-5 proxy lands and are skipped here.
+    pub fn readpath_binding(
+        &self,
+        capability: Capability,
+        table: &str,
+        column: &str,
+    ) -> Option<&BoundPlugin> {
+        self.plugins.iter().find(|plugin| {
+            plugin.capability == capability
+                && plugin.instance.is_some()
+                && !plugin.state.is_disabled()
+                && (plugin.tables.is_empty() || plugin.tables.iter().any(|t| t == table))
+                && (plugin.columns.is_empty() || plugin.columns.iter().any(|c| c == column))
+        })
     }
 
     /// Hot-disable or re-enable a plugin without a core restart (PLG-061).

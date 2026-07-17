@@ -215,6 +215,10 @@ pub struct FtsQuery {
     /// The column's analyzer — used to re-analyze delta rows for the
     /// FTS-042 boolean live match.
     pub analyzer: Analyzer,
+    /// The raw MATCH string as written — handed to ReadPath plugins
+    /// (SPEC-020 PLG-040/041) so a model/retriever sees the user's query,
+    /// not the analyzed terms.
+    pub raw: String,
 }
 
 impl FtsQuery {
@@ -299,6 +303,7 @@ impl FtsQuery {
             column,
             items,
             analyzer,
+            raw: raw.to_owned(),
         })
     }
 

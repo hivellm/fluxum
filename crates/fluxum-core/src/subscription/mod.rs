@@ -173,6 +173,10 @@ pub struct SubscriptionManager {
     /// The analyzers of every `#[fulltext]` column, per table — used to
     /// analyze delta rows during candidate selection.
     fts_analyzers: HashMap<TableId, Vec<(u16, crate::index::Analyzer)>>,
+    /// The validated plugin registry (SPEC-020), once installed: the
+    /// ReadPath query hooks (PLG-040/041) resolve rerank/retrieve/fusion
+    /// bindings through it. `None` = hooks absent, pure BM25.
+    plugins: Option<Arc<crate::plugin::PluginRegistry>>,
     /// Which columns of a table carry a search arg, with a refcount so a
     /// column is probed only while some plan indexes it (drives per-delta
     /// probing without scanning all search args).
@@ -229,10 +233,18 @@ impl SubscriptionManager {
             fts_terms: HashMap::new(),
             fts_prefixes: HashMap::new(),
             fts_analyzers,
+            plugins: None,
             indexed_columns: HashMap::new(),
             table_watchers: HashMap::new(),
             next_query_id: HashMap::new(),
         }
+    }
+
+    /// Install the validated plugin registry (SPEC-020 PLG-040/041): binds
+    /// `score_reranker` / `retriever` / `fusion` plugins into the MATCH
+    /// snapshot path. Called at assembly, before serving.
+    pub fn set_plugins(&mut self, plugins: Arc<crate::plugin::PluginRegistry>) {
+        self.plugins = Some(plugins);
     }
 
     /// The assembled schema (for HTTP admin `/schema` introspection).
@@ -581,6 +593,15 @@ impl SubscriptionManager {
                 let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
                 if descending { ord.reverse() } else { ord }
             });
+            // SPEC-020 PLG-040/041: with a score-ranked MATCH, apply the
+            // bound ReadPath hooks — retriever+fusion, then reranker over
+            // the top-K. Snapshot-only; every failure falls back to the
+            // BM25 order (never an error to the caller).
+            if let (Some(fts), Some(registry)) = (&plan.fts, &self.plugins) {
+                paired = self.apply_read_hooks(
+                    registry, fts, schema, paired, viewer, snapshot, table_id, plan,
+                )?;
+            }
             for (row, score) in paired {
                 rows.push(row);
                 scores.push(score);
@@ -621,6 +642,130 @@ impl SubscriptionManager {
             },
             scores,
         ))
+    }
+
+    /// SPEC-020 PLG-040/041: the ReadPath query hooks over a score-ranked
+    /// MATCH result (best-first). Order of application: retriever + fusion
+    /// (hybrid lexical+dense, PLG-041), then the reranker over the top-K
+    /// (PLG-040). Every failure or panic degrades to the list as it stood —
+    /// the caller never sees an error from a plugin (the isolation guard
+    /// meters and, on panic, disables it). Hooks apply to descending score
+    /// order only (best-first ranking is what they reorder).
+    #[allow(clippy::too_many_arguments)]
+    fn apply_read_hooks(
+        &self,
+        registry: &crate::plugin::PluginRegistry,
+        fts: &crate::index::FtsQuery,
+        schema: &TableSchema,
+        paired: Vec<(Row, f64)>,
+        viewer: Option<&Identity>,
+        snapshot: &Snapshot,
+        table_id: TableId,
+        plan: &CompiledPlan,
+    ) -> Result<Vec<(Row, f64)>> {
+        use crate::plugin::{
+            Capability, FtQuery, Fusion, PluginCtx, PluginInstance, RERANK_CANDIDATE_K,
+            ReciprocalRankFusion, Scored,
+        };
+        if plan.order_by_score != Some(true) {
+            return Ok(paired); // hooks reorder best-first rankings only
+        }
+        let column_name = schema.columns[usize::from(fts.column)].name;
+        let query = FtQuery {
+            table: schema.name.to_owned(),
+            column: column_name.to_owned(),
+            query: fts.raw.clone(),
+            limit: plan.limit.map_or(0, |n| n as usize),
+        };
+        let ctx = PluginCtx {
+            identity: viewer.copied().unwrap_or(Identity::from_bytes([0u8; 32])),
+            is_server_peer: false,
+            shard_id: 0,
+        };
+        let mut paired = paired;
+
+        // PLG-041: hybrid retrieval — external top-K fused with the BM25
+        // list (default Reciprocal Rank Fusion). A dense-only candidate is
+        // admitted (that is the point of hybrid) but still passes the
+        // ordinary filters and RLS; a retriever failure leaves BM25 intact.
+        if let Some(binding) =
+            registry.readpath_binding(Capability::Retriever, schema.name, column_name)
+            && let Some(PluginInstance::Retriever(retriever)) = &binding.instance
+            && let Ok(dense) = binding
+                .state
+                .guard(&binding.name, || retriever.retrieve(&query, RERANK_CANDIDATE_K, &ctx))
+        {
+            let mut by_pk: HashMap<Vec<u8>, Row> = HashMap::new();
+            let mut lexical = Vec::with_capacity(paired.len());
+            for (row, score) in &paired {
+                let pk = encode_pk_of_row(schema, row.values())?;
+                lexical.push(Scored {
+                    pk: pk.clone(),
+                    score: *score,
+                });
+                by_pk.insert(pk.as_bytes().to_vec(), row.clone());
+            }
+            let default_fusion = ReciprocalRankFusion::default();
+            let fused = if let Some(fusion_binding) =
+                registry.readpath_binding(Capability::Fusion, schema.name, column_name)
+                && let Some(PluginInstance::Fusion(fusion)) = &fusion_binding.instance
+            {
+                fusion_binding
+                    .state
+                    .guard(&fusion_binding.name, || Ok(fusion.fuse(&lexical, &dense, &ctx)))
+                    .unwrap_or_else(|_| default_fusion.fuse(&lexical, &dense, &ctx))
+            } else {
+                default_fusion.fuse(&lexical, &dense, &ctx)
+            };
+            let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
+            let mut out = Vec::with_capacity(fused.len());
+            for scored in fused {
+                if let Some(row) = by_pk.remove(scored.pk.as_bytes()) {
+                    out.push((row, scored.score));
+                } else if let Some(row) = snapshot.row_by_encoded_pk(table_id, &scored.pk)?
+                    && keep(&row)
+                {
+                    out.push((row, scored.score));
+                }
+            }
+            paired = out;
+        }
+
+        // PLG-040: rerank the top-K candidates; the reranker's order is
+        // authoritative for those K, the tail keeps the base order. Rows
+        // outside the handed candidates are dropped defensively — a
+        // reranker reorders, it never injects.
+        if let Some(binding) =
+            registry.readpath_binding(Capability::ScoreReranker, schema.name, column_name)
+            && let Some(PluginInstance::ScoreReranker(reranker)) = &binding.instance
+        {
+            let k = RERANK_CANDIDATE_K.min(paired.len());
+            let mut by_pk: HashMap<Vec<u8>, Row> = HashMap::new();
+            let mut candidates = Vec::with_capacity(k);
+            for (row, score) in paired.iter().take(k) {
+                let pk = encode_pk_of_row(schema, row.values())?;
+                candidates.push(Scored {
+                    pk: pk.clone(),
+                    score: *score,
+                });
+                by_pk.insert(pk.as_bytes().to_vec(), row.clone());
+            }
+            if let Ok(reordered) = binding
+                .state
+                .guard(&binding.name, || reranker.rerank(&query, candidates, &ctx))
+            {
+                let tail = paired.split_off(k);
+                let mut out = Vec::with_capacity(reordered.len() + tail.len());
+                for scored in reordered {
+                    if let Some(row) = by_pk.remove(scored.pk.as_bytes()) {
+                        out.push((row, scored.score));
+                    }
+                }
+                out.extend(tail);
+                paired = out;
+            }
+        }
+        Ok(paired)
     }
 
     // --- Commit evaluation (SUB-021) ----------------------------------------
