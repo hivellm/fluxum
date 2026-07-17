@@ -402,6 +402,7 @@ mod tests {
                 .iter()
                 .map(|(name, t)| ((*name).to_owned(), t.clone()))
                 .collect(),
+            transforms: std::collections::BTreeMap::new(),
         }
     }
 

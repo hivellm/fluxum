@@ -62,28 +62,43 @@ use crate::types::Identity;
 /// `#[visibility]` filter; the manager cannot tell a server identity from
 /// its bytes alone, so the transport (which holds the
 /// [`crate::auth::Authenticator`]) supplies this flag.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Subscriber {
     /// The caller's 256-bit identity (SPEC-009).
     pub identity: Identity,
     /// Whether this identity is a trusted server peer (RLS bypass, SUB-031).
     pub is_server_peer: bool,
+    /// The caller's RBAC roles (AUTH-070) — what `#[column_grant(select =
+    /// "role")]` resolves against (SPEC-017 CT-040). Empty for role-less
+    /// callers; cheap to clone.
+    pub roles: Arc<[String]>,
 }
 
 impl Subscriber {
-    /// A regular client subscriber (RLS applies).
+    /// A regular client subscriber (RLS applies), no roles.
     pub fn client(identity: Identity) -> Self {
         Self {
             identity,
             is_server_peer: false,
+            roles: Arc::from([]),
         }
     }
 
-    /// A server-peer subscriber (RLS bypass, SUB-031).
+    /// A client subscriber carrying its auth-layer roles (CT-040).
+    pub fn client_with_roles(identity: Identity, roles: impl Into<Arc<[String]>>) -> Self {
+        Self {
+            identity,
+            is_server_peer: false,
+            roles: roles.into(),
+        }
+    }
+
+    /// A server-peer subscriber (RLS + grant bypass, SUB-031/AUTH-062).
     pub fn server_peer(identity: Identity) -> Self {
         Self {
             identity,
             is_server_peer: true,
+            roles: Arc::from([]),
         }
     }
 }
@@ -143,6 +158,10 @@ struct QueryState {
     plan: Arc<CompiledPlan>,
     subscribers: HashSet<u128>,
     viewer: Option<Identity>,
+    /// The bucket viewer's RBAC roles (CT-040 grants) — folded into the
+    /// effective hash, so differently-privileged viewers never share a
+    /// bucket or its encodes.
+    roles: Arc<[String]>,
 }
 
 /// One shared, pre-encoded per-query delta produced by the fan-out
@@ -197,6 +216,13 @@ pub struct SubscriptionManager {
     /// ReadPath query hooks (PLG-040/041) resolve rerank/retrieve/fusion
     /// bindings through it. `None` = hooks absent, pure BM25.
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
+    /// SPEC-017 §6: per-table column policies (grants + masks), resolved at
+    /// construction. Empty for schemas without non-public grants.
+    column_policies: HashMap<TableId, crate::transform::mask::TablePolicy>,
+    /// The transform engine (SPEC-017 §5), once installed: read surfaces
+    /// decrypt `#[encrypted]` columns for authorized callers (CT-031)
+    /// before masking projects the rest.
+    transforms: Option<Arc<crate::transform::engine::TransformEngine>>,
     /// The materialized-view engine (SPEC-022 RV-010..013) — empty until
     /// [`SubscriptionManager::init_views`] resolves and rebuilds it.
     matviews: matview::MatViewEngine,
@@ -225,6 +251,7 @@ pub struct SubscriptionManager {
 impl SubscriptionManager {
     /// Build an empty manager over an assembled schema.
     pub fn new(schema: Arc<Schema>, limits: SubscriptionLimits) -> Self {
+        let schema_for_policies = Arc::clone(&schema);
         // FTS-042: pre-resolve the analyzer of every #[fulltext] column so
         // candidate selection can analyze delta rows without schema walks.
         let mut fts_analyzers: HashMap<TableId, Vec<(u16, crate::index::Analyzer)>> =
@@ -306,6 +333,8 @@ impl SubscriptionManager {
             fts_prefixes: HashMap::new(),
             fts_analyzers,
             plugins: None,
+            column_policies: crate::transform::mask::resolve_policies(&schema_for_policies),
+            transforms: None,
             matviews: matview::MatViewEngine::default(),
             membership_specs,
             members: std::sync::Mutex::new(member_sets),
@@ -436,6 +465,55 @@ impl SubscriptionManager {
         self.plugins = Some(plugins);
     }
 
+    /// Install the transform engine (SPEC-017 §5/§6): read surfaces decrypt
+    /// `#[encrypted]` columns (CT-031) before grant-driven masking projects
+    /// unauthorized ones (CT-040/041). Called at assembly, with the same
+    /// engine attached to the store.
+    pub fn set_transforms(&mut self, engine: Arc<crate::transform::engine::TransformEngine>) {
+        self.transforms = Some(engine);
+    }
+
+    /// SPEC-017 §6: decrypt-then-mask one row for a viewer. `viewer = None`
+    /// (public plan or server-peer bucket) reads raw — still decrypted when
+    /// an engine is installed (a public grant means everyone is authorized,
+    /// CT-040 default). The masked substitute for an unauthorized column is
+    /// computed from the ORIGINAL stored value (the `ciphertext` strategy
+    /// exposes the sealed envelope) and the decrypted value (`hash`), never
+    /// leaking plaintext (CT-012/041).
+    fn project_row(
+        &self,
+        table_id: TableId,
+        schema: &TableSchema,
+        row: &Row,
+        viewer: Option<&Identity>,
+        roles: &[String],
+    ) -> Result<Row> {
+        let policy = self.column_policies.get(&table_id);
+        let engine = self
+            .transforms
+            .as_ref()
+            .filter(|engine| engine.touches(table_id));
+        if policy.is_none() && engine.is_none() {
+            return Ok(row.clone());
+        }
+        let mut values = row.values().to_vec();
+        if let Some(engine) = engine {
+            let pk = encode_pk_of_row(schema, row.values())?;
+            engine.on_read_row(table_id, &mut values, pk.as_bytes(), true)?;
+        }
+        if let (Some(policy), Some(viewer)) = (policy, viewer) {
+            for column in &policy.columns {
+                if !crate::transform::mask::authorized(column, policy.owner, viewer, roles, row) {
+                    let idx = usize::from(column.ordinal);
+                    let original = &row.values()[idx];
+                    values[idx] =
+                        crate::transform::mask::mask_value(column, original, &values[idx]);
+                }
+            }
+        }
+        Ok(Row::new(values))
+    }
+
     /// The assembled schema (for HTTP admin `/schema` introspection).
     pub fn schema(&self) -> &Schema {
         &self.schema
@@ -491,7 +569,7 @@ impl SubscriptionManager {
 
         // Caller-parameterization (SUB-030/031): an `owner_only` plan is
         // per-viewer unless the caller is a server peer (bypass).
-        let (hash, viewer) = self.effective_key(&plan, subscriber);
+        let (hash, viewer, roles) = self.effective_key(&plan, &subscriber);
 
         // Admission (SUB-044): reject before any mutation. A brand-new query
         // bucket adds a plan; re-subscribing to an existing one does not.
@@ -504,7 +582,7 @@ impl SubscriptionManager {
             return Err(limit_exceeded("max_compiled_plans"));
         }
 
-        let (initial, _) = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
+        let (initial, _) = self.initial_data(&plan, viewer.as_ref(), &roles, snapshot)?;
 
         // Register: shared plan + pruning-index membership on first sighting.
         if let Some(state) = self.queries.get_mut(&hash) {
@@ -520,6 +598,7 @@ impl SubscriptionManager {
                     plan,
                     subscribers,
                     viewer,
+                    roles,
                 },
             );
         }
@@ -544,23 +623,32 @@ impl SubscriptionManager {
     fn effective_key(
         &self,
         plan: &CompiledPlan,
-        subscriber: Subscriber,
-    ) -> (QueryHash, Option<Identity>) {
+        subscriber: &Subscriber,
+    ) -> (QueryHash, Option<Identity>, Arc<[String]>) {
         if !plan.caller_scoped {
-            return (plan.query_hash, None);
+            return (plan.query_hash, None, Arc::from([]));
         }
         if subscriber.is_server_peer {
-            // Server peers bypass RLS and share one bucket that sees all
-            // rows matching the predicate (SUB-031).
+            // Server peers bypass RLS and grants, sharing one bucket that
+            // sees every matching row raw (SUB-031/AUTH-062).
             let hash = QueryHash(
                 crate::simd::global().hash64(b"__fluxum_server_peer__", plan.query_hash.0),
             );
-            (hash, None)
+            (hash, None, Arc::from([]))
         } else {
-            let hash = QueryHash(
-                crate::simd::global().hash64(subscriber.identity.as_bytes(), plan.query_hash.0),
-            );
-            (hash, Some(subscriber.identity))
+            // CT-040: roles change the projection, so they fold into the
+            // bucket key — differently-privileged viewers never share an
+            // encode.
+            let mut hash =
+                crate::simd::global().hash64(subscriber.identity.as_bytes(), plan.query_hash.0);
+            for role in subscriber.roles.iter() {
+                hash = crate::simd::global().hash64(role.as_bytes(), hash);
+            }
+            (
+                QueryHash(hash),
+                Some(subscriber.identity),
+                Arc::clone(&subscriber.roles),
+            )
         }
     }
 
@@ -627,8 +715,10 @@ impl SubscriptionManager {
                 ),
             ));
         }
-        let (_, viewer) = self.effective_key(&plan, subscriber);
-        Ok(self.initial_data(&plan, viewer.as_ref(), snapshot)?.0)
+        let (_, viewer, roles) = self.effective_key(&plan, &subscriber);
+        Ok(self
+            .initial_data(&plan, viewer.as_ref(), &roles, snapshot)?
+            .0)
     }
 
     /// Run a one-off read (SUB-025) and return the rows as JSON — the shape
@@ -649,8 +739,8 @@ impl SubscriptionManager {
                 format!("table `{}` is not public", table.name),
             ));
         }
-        let (_, viewer) = self.effective_key(&plan, subscriber);
-        let (initial, scores) = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
+        let (_, viewer, roles) = self.effective_key(&plan, &subscriber);
+        let (initial, scores) = self.initial_data(&plan, viewer.as_ref(), &roles, snapshot)?;
         let mut columns: Vec<&str> = table.columns.iter().map(|c| c.name).collect();
         // FTS-041: the opt-in `_score` projection on the JSON read surface.
         let with_score = plan.select_score && scores.len() == initial.tables[0].inserts.len();
@@ -658,11 +748,39 @@ impl SubscriptionManager {
             columns.push("_score");
         }
         let mut rows = Vec::new();
+        let table_id = plan.table_ids[0];
+        // CT-034: the `<field>_verified` projection siblings — re-verify
+        // the STORED (sealed) row for every `#[signed]` column.
+        let verify_engine = self
+            .transforms
+            .as_ref()
+            .filter(|engine| engine.touches(table_id));
         for (index, bytes) in initial.tables[0].inserts.iter().enumerate() {
             let row = crate::store::row::decode_row(table, bytes)?;
             let mut object = serde_json::Map::new();
             for (column, value) in table.columns.iter().zip(row.values()) {
                 object.insert(column.name.to_owned(), row_value_to_json(value));
+            }
+            if let Some(engine) = verify_engine {
+                // PK columns are never transformed (CT-013), so the decoded
+                // row's key resolves the original stored row.
+                let pk_values: Vec<crate::store::RowValue> = table
+                    .primary_key
+                    .iter()
+                    .map(|&ord| row.values()[usize::from(ord)].clone())
+                    .collect();
+                if let Some(stored) = snapshot.query_pk(table_id, &pk_values)? {
+                    let pk = encode_pk_of_row(table, stored.values())?;
+                    for (ordinal, verified) in
+                        engine.verify_outcomes(table_id, stored.values(), pk.as_bytes())
+                    {
+                        let name = table.columns[usize::from(ordinal)].name;
+                        object.insert(
+                            format!("{name}_verified"),
+                            serde_json::Value::Bool(verified),
+                        );
+                    }
+                }
             }
             if with_score {
                 object.insert("_score".to_owned(), serde_json::json!(scores[index]));
@@ -693,7 +811,9 @@ impl SubscriptionManager {
             if state.subscribers.is_empty() {
                 continue;
             }
-            let Some(update) = self.evaluate(&state.plan, state.viewer.as_ref(), diff)? else {
+            let Some(update) =
+                self.evaluate(&state.plan, state.viewer.as_ref(), &state.roles, diff)?
+            else {
                 continue;
             };
             let mut subscribers: Vec<u128> = state.subscribers.iter().copied().collect();
@@ -777,6 +897,7 @@ impl SubscriptionManager {
         &self,
         plan: &CompiledPlan,
         viewer: Option<&Identity>,
+        roles: &[String],
         snapshot: &Snapshot,
     ) -> Result<(InitialData, Vec<f64>)> {
         let table_id = plan.table_ids[0];
@@ -869,6 +990,12 @@ impl SubscriptionManager {
             rows.truncate(limit as usize);
             scores.truncate(limit as usize);
         }
+
+        // SPEC-017 §6: decrypt-then-mask before the wire (CT-031/040/041).
+        let rows: Vec<Row> = rows
+            .iter()
+            .map(|row| self.project_row(table_id, schema, row, viewer, roles))
+            .collect::<Result<_>>()?;
 
         let inserts = encode_full_rows(&rows)?;
         Ok((
@@ -1023,6 +1150,7 @@ impl SubscriptionManager {
         &self,
         plan: &CompiledPlan,
         viewer: Option<&Identity>,
+        roles: &[String],
         diff: &TxDiff,
     ) -> Result<Option<TableUpdate>> {
         let table_id = plan.table_ids[0];
@@ -1054,12 +1182,60 @@ impl SubscriptionManager {
         }
 
         let schema = self.table_schema(table_id)?;
+        // SPEC-017 §6 (CT-041/042): project each matched insert for THIS
+        // viewer, and suppress an update pair whose projected content did
+        // not change — a masked-column-only change must not leak that
+        // something changed to an unauthorized subscriber.
+        let has_policy = self.column_policies.contains_key(&table_id)
+            || self
+                .transforms
+                .as_ref()
+                .is_some_and(|engine| engine.touches(table_id));
+        let mut suppressed: HashSet<Vec<u8>> = HashSet::new();
+        let projected_inserts: Vec<Row> = if has_policy {
+            let old_by_pk: HashMap<&[u8], &Row> = table_diff
+                .deletes
+                .iter()
+                .map(|(pk, old)| (pk.as_bytes(), old))
+                .collect();
+            let mut out = Vec::with_capacity(matched_inserts.len());
+            for row in &matched_inserts {
+                let projected = self.project_row(table_id, schema, row, viewer, roles)?;
+                if viewer.is_some() {
+                    let pk = encode_pk_of_row(schema, row.values())?;
+                    if let Some(old) = old_by_pk.get(pk.as_bytes()) {
+                        let old_projected =
+                            self.project_row(table_id, schema, old, viewer, roles)?;
+                        if old_projected == projected {
+                            suppressed.insert(pk.as_bytes().to_vec());
+                            continue;
+                        }
+                    }
+                }
+                out.push(projected);
+            }
+            out
+        } else {
+            matched_inserts.iter().map(|row| (*row).clone()).collect()
+        };
+        let matched_deletes: Vec<&Row> = matched_deletes
+            .into_iter()
+            .filter(|old| {
+                encode_pk_of_row(schema, old.values())
+                    .map_or(true, |pk| !suppressed.contains(pk.as_bytes()))
+            })
+            .collect();
+        if projected_inserts.is_empty() && matched_deletes.is_empty() {
+            return Ok(None);
+        }
+
         // SPEC-023 DMX-061: a CrdtText column of an in-place replacement
         // fans out as the compact tagged op diff, never the whole document.
         let inserts = match crdt_ordinals(schema) {
-            ords if ords.is_empty() => encode_full_row_refs(&matched_inserts)?,
+            ords if ords.is_empty() => encode_full_rows(&projected_inserts)?,
             ords => {
-                let rows = crdt_patch_rows(schema, &ords, &matched_inserts, table_diff)?;
+                let refs: Vec<&Row> = projected_inserts.iter().collect();
+                let rows = crdt_patch_rows(schema, &ords, &refs, table_diff)?;
                 encode_full_rows(&rows)?
             }
         };
@@ -1484,15 +1660,6 @@ fn crdt_patch_rows(
 
 /// Encode owned rows as a full-row FluxBIN `RowList` (RPC-041).
 fn encode_full_rows(rows: &[Row]) -> Result<RowList> {
-    let mut builder = RowListBuilder::new();
-    for row in rows {
-        builder.push_row(&encode_row(row.values())?);
-    }
-    Ok(builder.finish())
-}
-
-/// Encode borrowed rows as a full-row FluxBIN `RowList`.
-fn encode_full_row_refs(rows: &[&Row]) -> Result<RowList> {
     let mut builder = RowListBuilder::new();
     for row in rows {
         builder.push_row(&encode_row(row.values())?);

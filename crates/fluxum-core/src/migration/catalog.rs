@@ -199,6 +199,13 @@ impl From<&TableSchema> for StoredTable {
 pub struct StoredCatalog {
     /// Table name → persisted layout.
     pub tables: BTreeMap<String, StoredTable>,
+    /// SPEC-017 CT-060: the write-transform fingerprint of every column
+    /// whose stored bytes a transform shapes (`table.column` → descriptor
+    /// rendering). A binary started against data written under a different
+    /// set aborts with a descriptive error instead of misreading rows.
+    /// `#[serde(default)]` keeps catalogs written before this field decode.
+    #[serde(default)]
+    pub transforms: BTreeMap<String, String>,
 }
 
 /// Whether `name` is a runtime-owned system table (`__…__`), excluded from
@@ -211,12 +218,40 @@ impl StoredCatalog {
     /// Snapshot the layout of every application table of an assembled
     /// schema.
     pub fn from_schema(schema: &Schema) -> Self {
+        // CT-060: fingerprint the transforms that shape stored bytes
+        // (encryption/signing — read-path grants and masks change nothing
+        // at rest and stay out of the compatibility contract).
+        let mut transforms = BTreeMap::new();
+        for def in crate::transform::registered_column_transforms() {
+            if schema.table(def.table).is_none() || is_system_table(def.table) {
+                continue;
+            }
+            let stored_shaping: Vec<String> = def
+                .transforms
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t,
+                        crate::transform::TransformDescriptor::Encrypted { .. }
+                            | crate::transform::TransformDescriptor::Signed { .. }
+                    )
+                })
+                .map(|t| format!("{t:?}"))
+                .collect();
+            if !stored_shaping.is_empty() {
+                transforms.insert(
+                    format!("{}.{}", def.table, def.column),
+                    stored_shaping.join("+"),
+                );
+            }
+        }
         Self {
             tables: schema
                 .tables()
                 .filter(|table| !is_system_table(table.name))
                 .map(|table| (table.name.to_owned(), StoredTable::from(table)))
                 .collect(),
+            transforms,
         }
     }
 

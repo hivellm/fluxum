@@ -184,6 +184,33 @@ impl<'a> MigrationRunner<'a> {
             );
         }
 
+        // SPEC-017 CT-060: data written under a different write-transform
+        // set (encryption/signing) cannot be read by this binary — abort
+        // with the exact divergence instead of misdecoding rows. Catalogs
+        // from before the fingerprint decode as empty and are grandfathered.
+        if !working.transforms.is_empty() && working.transforms != compiled.transforms {
+            let mut lines = String::new();
+            for (column, stored) in &working.transforms {
+                match compiled.transforms.get(column) {
+                    Some(now) if now == stored => {}
+                    Some(now) => {
+                        lines.push_str(&format!("  {column}: stored {stored} → compiled {now}\n"));
+                    }
+                    None => lines.push_str(&format!("  {column}: stored {stored} → removed\n")),
+                }
+            }
+            for (column, now) in &compiled.transforms {
+                if !working.transforms.contains_key(column) {
+                    lines.push_str(&format!("  {column}: added {now}\n"));
+                }
+            }
+            return Err(FluxumError::Schema(format!(
+                "stored data was written under a different column-transform set — rewrite \
+                 or migrate the data before changing #[encrypted]/#[signed] declarations \
+                 (CT-060):\n{lines}"
+            )));
+        }
+
         // MIG-020: diff what is now stored against the compiled schema.
         let changes = diff_catalogs_with(&working, &compiled, meta);
 
@@ -564,7 +591,10 @@ mod tests {
     fn task_catalog() -> StoredCatalog {
         let mut tables = BTreeMap::new();
         tables.insert("Task".to_owned(), stored_task());
-        StoredCatalog { tables }
+        StoredCatalog {
+            tables,
+            transforms: BTreeMap::new(),
+        }
     }
 
     fn apply(

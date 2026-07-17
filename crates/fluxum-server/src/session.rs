@@ -171,6 +171,8 @@ impl Session {
         let subscriber = Subscriber {
             identity: outcome.identity,
             is_server_peer: outcome.bypass_rls,
+            // SPEC-017 CT-040: the auth layer's roles drive column grants.
+            roles: outcome.roles.clone().into(),
         };
         self.state = SessionState::Authenticated { caller, subscriber };
         Routed::reply(ServerMessage::AuthResult(AuthResult {
@@ -230,7 +232,7 @@ impl Session {
         let mut manager = self.ctx.subscriptions.lock().await;
         let mut responses = Vec::with_capacity(queries.len());
         for sql in queries {
-            match manager.subscribe(connection, subscriber, &sql, &snapshot) {
+            match manager.subscribe(connection, subscriber.clone(), &sql, &snapshot) {
                 Ok(mut subscribed) => {
                     subscribed.initial.id = id;
                     responses.push(ServerMessage::InitialData(subscribed.initial));
@@ -284,7 +286,7 @@ impl Session {
                     timestamp: Timestamp::now(),
                     ..*caller
                 },
-                *subscriber,
+                subscriber.clone(),
                 caller.connection_id.as_u128(),
             ),
             SessionState::Unauthenticated => {

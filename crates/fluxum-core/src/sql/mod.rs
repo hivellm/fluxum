@@ -354,8 +354,13 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
     // per-identity subscription bucket (the subscription manager folds the
     // identity into the dedup key and carries the viewer per bucket).
     let rls = compile_visibility(table);
-    let caller_scoped =
-        rls.is_some() || matches!(table.visibility, VisibilityRule::MemberOf { .. });
+    // Caller-parameterized when RLS filters rows (owner_only), membership
+    // scopes them (RV-040), or a non-public column grant masks per viewer
+    // (SPEC-017 CT-040 — each viewer's projection differs, so buckets and
+    // their encodes cannot be shared).
+    let caller_scoped = rls.is_some()
+        || matches!(table.visibility, VisibilityRule::MemberOf { .. })
+        || crate::transform::mask::has_column_grants(table);
 
     // QP-041: an explicit ORDER BY tiebreak must be the primary key, same
     // direction — it is implicit otherwise, so the total order is fixed.

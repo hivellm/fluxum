@@ -47,6 +47,8 @@ pub const SIGNATURE_LEN: usize = 64;
 /// A named Ed25519 signing key for `#[signed(ed25519, by = server)]`
 /// (SPEC-017 CT-033/035). Holds the server's signing key; the verifying
 /// (public) key is derived. Signing-key bytes are zeroized on drop.
+/// `Clone` supports the CT-037 per-identity derivation path.
+#[derive(Clone)]
 pub struct SignKey {
     id: String,
     signing: SigningKey,

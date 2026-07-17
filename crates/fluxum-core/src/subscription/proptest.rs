@@ -211,7 +211,7 @@ fn ten_thousand_mutations_keep_every_client_cache_equal_to_server_state() {
             Subscriber::client(owner_ids[(conn as usize) % owner_ids.len()])
         };
         let sub = mgr
-            .subscribe(conn, subscriber, &sql, &store.snapshot())
+            .subscribe(conn, subscriber.clone(), &sql, &store.snapshot())
             .unwrap();
         let mut client = ModelClient {
             subscriber,
@@ -278,7 +278,7 @@ fn ten_thousand_mutations_keep_every_client_cache_equal_to_server_state() {
         let snapshot = store.snapshot();
         for client in &clients {
             let server = mgr
-                .snapshot_result(client.subscriber, &client.sql, &snapshot)
+                .snapshot_result(client.subscriber.clone(), &client.sql, &snapshot)
                 .unwrap();
             let mut expected: Vec<(Vec<u8>, Vec<RowValue>)> =
                 decode_full_rows(client.table, &server.tables[0].inserts)

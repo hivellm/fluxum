@@ -13,6 +13,7 @@
 
 pub mod crypto;
 pub mod engine;
+pub mod mask;
 pub mod normalize;
 
 pub use normalize::{datetime_utc, money_from_minor_units, money_from_str, normalize_string};

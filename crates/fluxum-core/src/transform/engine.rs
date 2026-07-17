@@ -45,6 +45,10 @@ const SERVER_SIGN_KEY_ID: &str = "server";
 enum SignBy {
     /// `by = server` — the server Ed25519 key signs and verifies.
     Server,
+    /// `by = <Identity column>` (CT-037): a per-identity key derived from
+    /// the server master key signs and verifies, bound to the row's
+    /// identity column at the given ordinal.
+    Identity(u16),
 }
 
 /// One column's compiled crypto plan.
@@ -138,12 +142,21 @@ impl TransformEngine {
                     }
                     Some(SignBy::Server)
                 }
-                Some(SignedBy::IdentityColumn(_)) => {
-                    return Err(FluxumError::Config(format!(
-                        "table `{}` column `{}`: #[signed(by = <Identity column>)] (per-identity \
-                         keys) is a phase-4 follow-up; use `by = server` for now (CT-033)",
-                        def.table, def.column
-                    )));
+                // CT-037: per-identity keys are DERIVED from the server
+                // master key (a deterministic Ed25519-signature PRF over
+                // the identity), so the same config key material serves
+                // both modes; a pluggable KeyProvider (KMS) rides the
+                // SPEC-020 sidecar host.
+                Some(SignedBy::IdentityColumn(ordinal)) => {
+                    if server_sign_key.is_none() {
+                        return Err(FluxumError::Config(format!(
+                            "table `{}` column `{}`: #[signed(by = <Identity column>)] derives \
+                             per-identity keys from the Ed25519 master key with id \
+                             `{SERVER_SIGN_KEY_ID}` — configure it (CT-035/037)",
+                            def.table, def.column
+                        )));
+                    }
+                    Some(SignBy::Identity(ordinal))
                 }
             };
 
@@ -261,6 +274,9 @@ impl TransformEngine {
         };
         for &ordinal in ordinals {
             let plan = &self.columns[&(table, ordinal)];
+            // CT-033/037: resolve the signer BEFORE borrowing the slot —
+            // per-identity keys read the row's identity column.
+            let signer = self.signer_for(plan, values)?;
             let Some(slot) = values.get_mut(usize::from(ordinal)) else {
                 continue;
             };
@@ -272,11 +288,11 @@ impl TransformEngine {
             if let Some(key_name) = &plan.encrypt_key {
                 bytes = ecies_seal(self.ecies_key(key_name)?, &bytes, &ctx)?;
             }
-            // 2. Sign (CT-033): append an Ed25519 signature over ctx ‖ bytes.
-            if let Some(SignBy::Server) = plan.sign {
+            // 2. Sign (CT-033/037): append an Ed25519 signature over ctx ‖ bytes.
+            if let Some(signer) = &signer {
                 let mut msg = ctx.clone();
                 msg.extend_from_slice(&bytes);
-                let sig = self.server_sign_key()?.sign(&msg);
+                let sig = signer.sign(&msg);
                 bytes.extend_from_slice(&sig);
             }
             if plan.has_executor() {
@@ -284,6 +300,83 @@ impl TransformEngine {
             }
         }
         Ok(())
+    }
+
+    /// The signing key of `plan` for one row (CT-033/037): the server key,
+    /// or a per-identity key derived from it via the row's identity column.
+    fn signer_for(&self, plan: &ColumnPlan, values: &[RowValue]) -> Result<Option<SignKey>> {
+        match plan.sign {
+            None => Ok(None),
+            Some(SignBy::Server) => Ok(Some(self.server_sign_key()?.clone())),
+            Some(SignBy::Identity(ordinal)) => {
+                let Some(RowValue::Identity(identity)) = values.get(usize::from(ordinal)) else {
+                    return Err(FluxumError::Storage(format!(
+                        "#[signed(by = <column>)]: column ordinal {ordinal} does not hold an \
+                         Identity value (CT-037)"
+                    )));
+                };
+                Ok(Some(self.identity_sign_key(identity.as_bytes())))
+            }
+        }
+    }
+
+    /// CT-037: derive a per-identity Ed25519 key from the server master —
+    /// `seed = SHA-256(master.sign("fluxum-ct037" ‖ identity))`. The
+    /// deterministic Ed25519 signature acts as a keyed PRF: only the
+    /// master-key holder can derive any identity's key, and the same
+    /// identity always derives the same key. A pluggable KMS `KeyProvider`
+    /// rides the SPEC-020 sidecar host.
+    fn identity_sign_key(&self, identity: &[u8; 32]) -> SignKey {
+        use sha2::{Digest, Sha256};
+        let master = match self.server_sign_key() {
+            Ok(master) => master,
+            // Build validated the master's presence; unreachable in practice.
+            Err(_) => return SignKey::new("identity-derived", [0u8; 32]),
+        };
+        let mut msg = b"fluxum-ct037-identity-key".to_vec();
+        msg.extend_from_slice(identity);
+        let prf = master.sign(&msg);
+        let seed: [u8; 32] = Sha256::digest(prf).into();
+        SignKey::new("identity-derived", seed)
+    }
+
+    /// CT-034: re-verify each `#[signed]` column of a STORED row (sealed
+    /// values), returning `(ordinal, verified)` — the `<field>_verified`
+    /// projection sibling on the JSON read surface. Non-destructive.
+    pub fn verify_outcomes(
+        &self,
+        table: TableId,
+        values: &[RowValue],
+        pk_bytes: &[u8],
+    ) -> Vec<(u16, bool)> {
+        let Some(ordinals) = self.tables.get(&table) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for &ordinal in ordinals {
+            let plan = &self.columns[&(table, ordinal)];
+            if plan.sign.is_none() {
+                continue;
+            }
+            let verified = (|| -> Option<bool> {
+                let signer = self.signer_for(plan, values).ok()??;
+                let Some(RowValue::Bytes(stored)) = values.get(usize::from(ordinal)) else {
+                    return Some(false);
+                };
+                if stored.len() < SIGNATURE_LEN {
+                    return Some(false);
+                }
+                let split = stored.len() - SIGNATURE_LEN;
+                let mut sig = [0u8; SIGNATURE_LEN];
+                sig.copy_from_slice(&stored[split..]);
+                let mut msg = Self::context(table, ordinal, pk_bytes);
+                msg.extend_from_slice(&stored[..split]);
+                Some(signer.verify(&msg, &sig))
+            })()
+            .unwrap_or(false);
+            out.push((ordinal, verified));
+        }
+        out
     }
 
     /// Apply the read-path executors to `values` in place (CT-031/034):
@@ -306,6 +399,8 @@ impl TransformEngine {
             if plan.encrypt_key.is_some() && !authorized {
                 continue;
             }
+            // CT-033/037: resolve the verifier before borrowing the slot.
+            let signer = self.signer_for(plan, values)?;
             let Some(slot) = values.get_mut(usize::from(ordinal)) else {
                 continue;
             };
@@ -316,7 +411,7 @@ impl TransformEngine {
             let ctx = Self::context(table, ordinal, pk_bytes);
 
             // 1. Verify + strip the signature (CT-034 — never drop the row).
-            if let Some(SignBy::Server) = plan.sign {
+            if let Some(signer) = &signer {
                 if bytes.len() < SIGNATURE_LEN {
                     self.read_errors.fetch_add(1, Ordering::Relaxed);
                     return Err(FluxumError::Storage(format!(
@@ -331,7 +426,7 @@ impl TransformEngine {
                 bytes.truncate(split);
                 let mut msg = ctx.clone();
                 msg.extend_from_slice(&bytes);
-                if !self.server_sign_key()?.verify(&msg, &sig) {
+                if !signer.verify(&msg, &sig) {
                     self.verify_failures.fetch_add(1, Ordering::Relaxed);
                     // CT-034: record the failure, still expose the field.
                 }

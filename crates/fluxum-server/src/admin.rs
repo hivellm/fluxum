@@ -186,6 +186,19 @@ fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
         tx = health.last_tx_id,
     );
     let mut text = text;
+    // SPEC-017 CT-014/034: transform read-error and signature-verify meters.
+    if let Some(engine) = ctx.store().transform_engine() {
+        text.push_str(&format!(
+            "# HELP fluxum_transform_read_errors_total Read-path transform errors (CT-014).\n\
+             # TYPE fluxum_transform_read_errors_total counter\n\
+             fluxum_transform_read_errors_total {}\n\
+             # HELP fluxum_signature_verify_failures_total Signature verifications that failed (CT-034).\n\
+             # TYPE fluxum_signature_verify_failures_total counter\n\
+             fluxum_signature_verify_failures_total {}\n",
+            engine.read_errors(),
+            engine.verify_failures(),
+        ));
+    }
     // SPEC-020 PLG-030: per-plugin panic/error meters.
     if let Some(registry) = ctx.plugins() {
         let bound = registry.plugins();
