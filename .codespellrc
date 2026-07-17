@@ -7,4 +7,8 @@ skip = *.lock,*.json,*.map,*.yaml,*.yml,*.csv,*.bib,target,node_modules,.git,dis
 #   implementors (verbatim quote from SpacetimeDB source), statics (Rust plural of
 #   `static` items), FluxBIN/BSATN/SATS/UzDB/msgpack (format names), plus the rulebook
 #   defaults (crate, ser, deser, ...).
-ignore-words-list = crate,ser,deser,upToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,statics,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack
+#   Intentional terms flagged as typos:
+#     keep-alives (valid plural, RPC-001), unparseable (valid variant),
+#     lits (SQL AST literals), caf (from the "Café" Unicode-normalization test),
+#     runn (Porter-stemmer output for "running", not a typo).
+ignore-words-list = crate,ser,deser,upToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,statics,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack,keep-alives,unparseable,lits,caf,runn
