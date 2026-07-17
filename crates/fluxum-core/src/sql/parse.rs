@@ -43,12 +43,33 @@ impl std::fmt::Display for Lit {
     }
 }
 
-/// One WHERE condition (SUB-010).
+/// One WHERE condition (SUB-010; comparison operators per SPEC-018 QP-030).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CondAst {
     Eq(String, Lit),
     In(String, Vec<Lit>),
     Between(String, Lit, Lit),
+    Cmp(String, CmpOp, Lit),
+}
+
+/// A QP-030 comparison operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CmpOp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+impl std::fmt::Display for CmpOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+        })
+    }
 }
 
 /// One spatial clause (SUB-011).
@@ -65,7 +86,13 @@ pub(crate) struct QueryAst {
     pub conditions: Vec<CondAst>,
     pub spatial: Option<SpatialAst>,
     pub order_by: Option<(String, bool)>, // (column, descending)
+    /// An explicit second `ORDER BY` term (SPEC-018 QP-041): must name the
+    /// primary key with the same direction — validated at compile, where
+    /// the schema is in hand. The PK tiebreak is implicit when omitted.
+    pub order_tiebreak: Option<(String, bool)>,
     pub limit: Option<u32>,
+    /// `AFTER (order value, pk value)` keyset cursor (QP-040).
+    pub after: Option<(Lit, Lit)>,
 }
 
 /// SUB-012 constructs plus common SQL that is outside the subset, each with
@@ -155,18 +182,18 @@ impl<'t> Parser<'t> {
         }
 
         let mut order_by = None;
+        let mut order_tiebreak = None;
         if self.peek_keyword("ORDER") {
             self.pos += 1;
             self.expect_keyword("BY")?;
-            let column = self.expect_ident("a column name")?;
-            let mut descending = false;
-            if self.peek_keyword("ASC") {
-                self.pos += 1;
-            } else if self.peek_keyword("DESC") {
-                self.pos += 1;
-                descending = true;
-            }
+            let (column, descending) = self.parse_order_term()?;
             order_by = Some((column, descending));
+            // QP-041: at most one explicit tiebreak term (the primary key —
+            // validated at compile time against the schema).
+            if matches!(self.tokens.get(self.pos), Some(Token::Comma)) {
+                self.pos += 1;
+                order_tiebreak = Some(self.parse_order_term()?);
+            }
         }
 
         let mut limit = None;
@@ -188,6 +215,35 @@ impl<'t> Parser<'t> {
             }
         }
 
+        // QP-040: the keyset cursor — `AFTER (order value, pk value)`.
+        let mut after = None;
+        if self.peek_keyword("AFTER") {
+            self.pos += 1;
+            if order_by.is_none() {
+                return Err(unsupported(
+                    "AFTER requires ORDER BY on an indexed column (QP-040)",
+                ));
+            }
+            if !matches!(self.next(), Some(Token::LParen)) {
+                return Err(unsupported("AFTER takes `(order value, pk value)`"));
+            }
+            let order_value = self.parse_literal()?;
+            if !matches!(self.next(), Some(Token::Comma)) {
+                return Err(unsupported("AFTER takes `(order value, pk value)`"));
+            }
+            let pk_value = self.parse_literal()?;
+            if !matches!(self.next(), Some(Token::RParen)) {
+                return Err(unsupported("expected `)` closing the AFTER cursor"));
+            }
+            after = Some((order_value, pk_value));
+        } else if self.peek_keyword("OFFSET") {
+            // QP-040: OFFSET is deliberately absent — linear and unstable
+            // under concurrent writes; keyset is the sanctioned primitive.
+            return Err(unsupported(
+                "OFFSET (use keyset pagination: ORDER BY … LIMIT n AFTER (value, pk), QP-040)",
+            ));
+        }
+
         if let Some(extra) = self.tokens.get(self.pos) {
             // A rejected construct after the parsed prefix (e.g. `... GROUP
             // BY c`, `... JOIN t`) gets its named SUB-012 diagnostic.
@@ -205,8 +261,23 @@ impl<'t> Parser<'t> {
             conditions,
             spatial,
             order_by,
+            order_tiebreak,
             limit,
+            after,
         })
+    }
+
+    /// One `ORDER BY` term: `ident [ASC | DESC]`.
+    fn parse_order_term(&mut self) -> Result<(String, bool)> {
+        let column = self.expect_ident("a column name")?;
+        let mut descending = false;
+        if self.peek_keyword("ASC") {
+            self.pos += 1;
+        } else if self.peek_keyword("DESC") {
+            self.pos += 1;
+            descending = true;
+        }
+        Ok((column, descending))
     }
 
     fn parse_condition(&mut self) -> Result<CondAst> {
@@ -238,8 +309,13 @@ impl<'t> Parser<'t> {
                 let high = self.parse_literal()?;
                 Ok(CondAst::Between(column, low, high))
             }
+            // SPEC-018 QP-030: the four comparison operators.
+            Some(Token::Lt) => Ok(CondAst::Cmp(column, CmpOp::Lt, self.parse_literal()?)),
+            Some(Token::Le) => Ok(CondAst::Cmp(column, CmpOp::Le, self.parse_literal()?)),
+            Some(Token::Gt) => Ok(CondAst::Cmp(column, CmpOp::Gt, self.parse_literal()?)),
+            Some(Token::Ge) => Ok(CondAst::Cmp(column, CmpOp::Ge, self.parse_literal()?)),
             other => Err(unsupported(format!(
-                "expected =, IN, or BETWEEN after `{column}`, got {}",
+                "expected =, IN, BETWEEN, <, >, <=, or >= after `{column}`, got {}",
                 display_token(other)
             ))),
         }

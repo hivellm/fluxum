@@ -50,7 +50,7 @@ use crate::error::{FluxumError, Result};
 use crate::schema::{Schema, TableSchema};
 use crate::sql::{AccessPath, CompiledPlan, QueryHash, SpatialConstraint, compile};
 use crate::store::committed::Snapshot;
-use crate::store::row::{encode_pk_of_row, encode_row};
+use crate::store::row::{encode_pk_of_row, encode_pk_values, encode_row};
 use crate::store::{Row, TableId, TxDiff};
 use crate::types::Identity;
 
@@ -484,7 +484,7 @@ impl SubscriptionManager {
                 })
                 .collect(),
             (None, AccessPath::IndexScan(scan)) => {
-                index_scan_rows(plan, scan, viewer, snapshot, table_id)?
+                index_scan_rows(plan, scan, viewer, snapshot, table_id, schema)?
             }
             (None, AccessPath::FullScan) => snapshot
                 .scan(table_id)?
@@ -753,11 +753,49 @@ fn index_scan_rows(
     viewer: Option<&Identity>,
     snapshot: &Snapshot,
     table_id: TableId,
+    schema: &TableSchema,
 ) -> Result<Vec<Row>> {
     use std::sync::atomic::Ordering as AtomicOrdering;
+    // QP-040/041: the AFTER cursor's bound already seeks to the order
+    // value; what remains is skipping rows AT the cursor value up to (and
+    // including) the cursor's primary key — the `(value = c AND pk ≤ k)`
+    // residue of the keyset predicate (`pk ≥ k` for a DESC walk). The
+    // tiebreak compares ENCODED PK bytes, because that is the total order
+    // the index actually yields within one key — the cursor is unambiguous
+    // exactly because the walk and the comparison share one order.
+    let cursor_boundary: Option<crate::store::PkBytes> = plan
+        .cursor
+        .as_ref()
+        .map(|cursor| encode_pk_values(schema, std::slice::from_ref(&cursor.pk_value)))
+        .transpose()?;
+    let cursor_skip = |row: &Row| -> bool {
+        let (Some(cursor), Some(boundary), Some(order)) =
+            (&plan.cursor, &cursor_boundary, plan.order_by)
+        else {
+            return false;
+        };
+        let Some(value) = row.value(order.column) else {
+            return false;
+        };
+        if crate::sql::cmp_row_values(value, &cursor.order_value)
+            != Some(std::cmp::Ordering::Equal)
+        {
+            return false;
+        }
+        let Ok(row_pk) = encode_pk_of_row(schema, row.values()) else {
+            return false;
+        };
+        match row_pk.as_bytes().cmp(boundary.as_bytes()) {
+            std::cmp::Ordering::Equal => true,
+            std::cmp::Ordering::Less => !order.descending,
+            std::cmp::Ordering::Greater => order.descending,
+        }
+    };
     let residual_keep = |row: &Row| {
         QUERY_ROWS_SCANNED.fetch_add(1, AtomicOrdering::Relaxed);
-        plan.residual.as_ref().is_none_or(|f| f(row)) && visible(plan, row, viewer)
+        !cursor_skip(row)
+            && plan.residual.as_ref().is_none_or(|f| f(row))
+            && visible(plan, row, viewer)
     };
     // QP-021: early stop only when the scan order IS the result order.
     let early_stop = if plan.ordered_by_index {

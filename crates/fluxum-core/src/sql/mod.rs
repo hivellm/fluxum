@@ -43,7 +43,7 @@ use crate::store::{Row, RowValue, TableId};
 use crate::types::Identity;
 
 use lexer::unsupported;
-use parse::{CondAst, Lit, QueryAst, SpatialAst};
+use parse::{CmpOp, CondAst, Lit, QueryAst, SpatialAst};
 
 /// Compiled predicate over a stored row (SUB-020).
 pub type FilterFn = Box<dyn Fn(&Row) -> bool + Send + Sync>;
@@ -294,6 +294,69 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
     // identity into the dedup key and carries the viewer per bucket).
     let rls = compile_visibility(table);
 
+    // QP-041: an explicit ORDER BY tiebreak must be the primary key, same
+    // direction — it is implicit otherwise, so the total order is fixed.
+    if let Some((tiebreak_col, tiebreak_desc)) = &ast.order_tiebreak {
+        let &[pk_ordinal] = table.primary_key else {
+            return Err(unsupported(
+                "an ORDER BY tiebreak requires a single-column primary key (QP-041)",
+            ));
+        };
+        let (ordinal, _) = resolve_column(table, tiebreak_col)?;
+        if ordinal != pk_ordinal {
+            return Err(unsupported(format!(
+                "the ORDER BY tiebreak must be the primary key `{}` (QP-041)",
+                table.columns[usize::from(pk_ordinal)].name
+            )));
+        }
+        if order_by.map(|o| o.descending) != Some(*tiebreak_desc) {
+            return Err(unsupported(
+                "the ORDER BY tiebreak direction must match the first term (QP-041)",
+            ));
+        }
+    }
+
+    // QP-040: compile the AFTER cursor — typed values, index-served order
+    // required, and the seek folded into the scan's bound on the order
+    // column (the `value = c AND pk <= k` residue is skipped in-scan).
+    let mut access = access;
+    let mut cursor = None;
+    if let Some((order_lit, pk_lit)) = &ast.after {
+        let Some(order) = order_by else {
+            return Err(unsupported("AFTER requires ORDER BY (QP-040)"));
+        };
+        if !ordered_by_index {
+            return Err(unsupported(
+                "AFTER requires ORDER BY on an indexed column (QP-040)",
+            ));
+        }
+        let &[pk_ordinal] = table.primary_key else {
+            return Err(unsupported(
+                "AFTER requires a single-column primary key (QP-041)",
+            ));
+        };
+        let order_column = &table.columns[usize::from(order.column)];
+        let order_value = coerce(table, order_column.name, order_lit, &order_column.ty)?;
+        let pk_column = &table.columns[usize::from(pk_ordinal)];
+        let pk_value = coerce(table, pk_column.name, pk_lit, &pk_column.ty)?;
+        if let AccessPath::IndexScan(scan) = &mut access {
+            let prefix_len = scan.probes.first().map_or(0, Vec::len);
+            if scan.columns.get(prefix_len).copied() == Some(order.column) {
+                if order.descending {
+                    scan.upper =
+                        tighter_upper(scan.upper.clone(), Bound::Included(order_value.clone()));
+                } else {
+                    scan.lower =
+                        tighter_lower(scan.lower.clone(), Bound::Included(order_value.clone()));
+                }
+            }
+        }
+        cursor = Some(Keyset {
+            order_value,
+            pk_value,
+        });
+    }
+
     Ok(CompiledPlan {
         query_id: 0,
         table_ids: vec![table_id],
@@ -309,7 +372,7 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         residual,
         residual_desc,
         ordered_by_index,
-        cursor: None,
+        cursor,
     })
 }
 
@@ -380,19 +443,41 @@ fn plan_access(
             }
             break;
         }
-        // QP-010/012: at most one range, on the column right after the
-        // equality prefix.
+        // QP-010/012/030: one bounded interval on the column right after
+        // the equality prefix — every BETWEEN and comparison condition on
+        // that column folds (intersects) into it, so `price >= a AND
+        // price <= b` pushes down exactly like `price BETWEEN a AND b`.
         let mut lower: Bound<RowValue> = Bound::Unbounded;
         let mut upper: Bound<RowValue> = Bound::Unbounded;
         let mut has_range = false;
         if let Some(&range_col) = columns.get(prefix_len) {
-            let between = conditions.iter().enumerate().find(|(i, cond)| {
-                !consumed.contains(i)
-                    && matches!(cond, CompiledCond::Between(ord, _, _) if *ord == range_col)
-            });
-            if let Some((i, CompiledCond::Between(_, low, high))) = between {
-                lower = Bound::Included(low.clone());
-                upper = Bound::Included(high.clone());
+            for (i, cond) in conditions.iter().enumerate() {
+                if consumed.contains(&i) {
+                    continue;
+                }
+                match cond {
+                    CompiledCond::Between(ord, low, high) if *ord == range_col => {
+                        lower = tighter_lower(lower, Bound::Included(low.clone()));
+                        upper = tighter_upper(upper, Bound::Included(high.clone()));
+                    }
+                    CompiledCond::Cmp(ord, op, value) if *ord == range_col => {
+                        match op {
+                            CmpOp::Gt => {
+                                lower = tighter_lower(lower, Bound::Excluded(value.clone()));
+                            }
+                            CmpOp::Ge => {
+                                lower = tighter_lower(lower, Bound::Included(value.clone()));
+                            }
+                            CmpOp::Lt => {
+                                upper = tighter_upper(upper, Bound::Excluded(value.clone()));
+                            }
+                            CmpOp::Le => {
+                                upper = tighter_upper(upper, Bound::Included(value.clone()));
+                            }
+                        }
+                    }
+                    _ => continue,
+                }
                 consumed.push(i);
                 has_range = true;
             }
@@ -436,6 +521,45 @@ fn plan_access(
     match best {
         Some((_, plan, consumed, ordered)) => (AccessPath::IndexScan(plan), consumed, ordered),
         None => (AccessPath::FullScan, Vec::new(), false),
+    }
+}
+
+/// The tighter of two lower bounds (the greater value; on equal values
+/// `Excluded` is tighter). Mixed-variant values keep `a` (cannot happen for
+/// same-column bounds).
+fn tighter_lower(a: Bound<RowValue>, b: Bound<RowValue>) -> Bound<RowValue> {
+    match (&a, &b) {
+        (Bound::Unbounded, _) => b,
+        (_, Bound::Unbounded) => a,
+        (
+            Bound::Included(x) | Bound::Excluded(x),
+            Bound::Included(y) | Bound::Excluded(y),
+        ) => match cmp_values(x, y) {
+            Some(Ordering::Less) => b,
+            Some(Ordering::Greater) | None => a,
+            Some(Ordering::Equal) => {
+                if matches!(a, Bound::Excluded(_)) { a } else { b }
+            }
+        },
+    }
+}
+
+/// The tighter of two upper bounds (the smaller value; on equal values
+/// `Excluded` is tighter).
+fn tighter_upper(a: Bound<RowValue>, b: Bound<RowValue>) -> Bound<RowValue> {
+    match (&a, &b) {
+        (Bound::Unbounded, _) => b,
+        (_, Bound::Unbounded) => a,
+        (
+            Bound::Included(x) | Bound::Excluded(x),
+            Bound::Included(y) | Bound::Excluded(y),
+        ) => match cmp_values(x, y) {
+            Some(Ordering::Greater) => b,
+            Some(Ordering::Less) | None => a,
+            Some(Ordering::Equal) => {
+                if matches!(a, Bound::Excluded(_)) { a } else { b }
+            }
+        },
     }
 }
 
@@ -483,6 +607,10 @@ pub fn explain(schema: &Schema, sql: &str) -> Result<serde_json::Value> {
             "descending": o.descending,
         })),
         "limit": plan.limit,
+        "cursor": plan.cursor.as_ref().map(|c| json!({
+            "order_value": format!("{:?}", c.order_value),
+            "pk_value": format!("{:?}", c.pk_value),
+        })),
     }))
 }
 
@@ -509,6 +637,8 @@ enum CompiledCond {
     Eq(u16, RowValue),
     In(u16, Vec<RowValue>),
     Between(u16, RowValue, RowValue),
+    /// A QP-030 comparison (`<`, `<=`, `>`, `>=`).
+    Cmp(u16, CmpOp, RowValue),
 }
 
 impl CompiledCond {
@@ -521,6 +651,7 @@ impl CompiledCond {
             Self::Between(ord, low, high) => {
                 format!("{} BETWEEN {low:?} AND {high:?}", name(*ord))
             }
+            Self::Cmp(ord, op, value) => format!("{} {op} {value:?}", name(*ord)),
         }
     }
 
@@ -533,6 +664,17 @@ impl CompiledCond {
                     cmp_values(v, low),
                     Some(Ordering::Greater | Ordering::Equal)
                 ) && matches!(cmp_values(v, high), Some(Ordering::Less | Ordering::Equal))
+            }),
+            Self::Cmp(ordinal, op, bound) => row.value(*ordinal).is_some_and(|v| {
+                let Some(ord) = cmp_values(v, bound) else {
+                    return false;
+                };
+                match op {
+                    CmpOp::Lt => ord == Ordering::Less,
+                    CmpOp::Le => ord != Ordering::Greater,
+                    CmpOp::Gt => ord == Ordering::Greater,
+                    CmpOp::Ge => ord != Ordering::Less,
+                }
             }),
         }
     }
@@ -563,6 +705,21 @@ fn compile_condition(table: &TableSchema, cond: &CondAst) -> Result<CompiledCond
                 ordinal,
                 coerce(table, column, low, ty)?,
                 coerce(table, column, high, ty)?,
+            ))
+        }
+        // SPEC-018 QP-030/032: comparison operators, same type discipline
+        // as BETWEEN (schema-typed coercion; no order over Bool/Option/List).
+        CondAst::Cmp(column, op, lit) => {
+            let (ordinal, ty) = resolve_column(table, column)?;
+            if matches!(ty, FluxType::Option(_) | FluxType::List(_) | FluxType::Bool) {
+                return Err(unsupported(format!(
+                    "`{op}` is not defined over column `{column}` of type {ty:?} (QP-032)"
+                )));
+            }
+            Ok(CompiledCond::Cmp(
+                ordinal,
+                *op,
+                coerce(table, column, lit, ty)?,
             ))
         }
     }
@@ -724,6 +881,9 @@ fn normalize(ast: &QueryAst) -> String {
             CondAst::Between(column, low, high) => {
                 let _ = write!(out, "{column} BETWEEN {low} AND {high}");
             }
+            CondAst::Cmp(column, op, lit) => {
+                let _ = write!(out, "{column} {op} {lit}");
+            }
         }
     }
     match ast.spatial {
@@ -741,9 +901,21 @@ fn normalize(ast: &QueryAst) -> String {
             " ORDER BY {column} {}",
             if *descending { "DESC" } else { "ASC" }
         );
+        // QP-041: the PK tiebreak is implicit; an explicit one renders so
+        // equal queries normalize identically only when truly equal.
+        if let Some((tiebreak, tb_desc)) = &ast.order_tiebreak {
+            let _ = write!(
+                out,
+                ", {tiebreak} {}",
+                if *tb_desc { "DESC" } else { "ASC" }
+            );
+        }
     }
     if let Some(limit) = ast.limit {
         let _ = write!(out, " LIMIT {limit}");
+    }
+    if let Some((order_value, pk_value)) = &ast.after {
+        let _ = write!(out, " AFTER ({order_value}, {pk_value})");
     }
     out
 }

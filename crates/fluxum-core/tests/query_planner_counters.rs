@@ -124,4 +124,20 @@ fn pushdown_scans_the_bounded_range_and_top_n_never_sorts() {
     // A full scan touches the whole table (the baseline the index beats).
     let (_, scanned, _) = run("SELECT * FROM Item WHERE listed_at = 3");
     assert_eq!(scanned, 1_000, "FullScan baseline");
+
+    // SPEC-018 QP-040 acceptance 6: page N+1 through an AFTER cursor is a
+    // bounded index seek — rows-scanned ≈ page size, independent of N.
+    // Page deep into the category (page 8 of 10) and compare with page 1.
+    let (rows, first_page_scanned, sorts) =
+        run("SELECT * FROM Item WHERE category = 'c7' ORDER BY price ASC LIMIT 10");
+    assert_eq!((rows, sorts), (10, 0));
+    let (rows, deep_page_scanned, sorts) = run(
+        "SELECT * FROM Item WHERE category = 'c7' ORDER BY price ASC LIMIT 10 AFTER (69, 770)",
+    );
+    assert_eq!((rows, sorts), (10, 0));
+    assert!(
+        deep_page_scanned <= first_page_scanned + 1,
+        "deep page cost ({deep_page_scanned}) ≈ page size, not O(N · page) \
+         (first page: {first_page_scanned})"
+    );
 }

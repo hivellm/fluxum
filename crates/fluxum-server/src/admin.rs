@@ -258,7 +258,17 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
     views.sort_unstable();
     AdminResponse::ok(
         None,
-        json!({ "tables": tables, "reducers": reducers, "views": views }),
+        json!({
+            "tables": tables,
+            "reducers": reducers,
+            "views": views,
+            // SPEC-018 QP-031: the query surface SDK codegen documents —
+            // the extended operator set plus keyset pagination (no OFFSET).
+            "query": {
+                "operators": ["=", "IN", "BETWEEN", "<", ">", "<=", ">="],
+                "pagination": "keyset: ORDER BY <indexed col> [, <pk>] LIMIT n AFTER (value, pk)",
+            },
+        }),
     )
 }
 

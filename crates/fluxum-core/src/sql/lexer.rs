@@ -38,6 +38,14 @@ pub(crate) enum Token {
     Comma,
     /// `=`
     Eq,
+    /// `<` (SPEC-018 QP-030)
+    Lt,
+    /// `<=`
+    Le,
+    /// `>`
+    Gt,
+    /// `>=`
+    Ge,
 }
 
 impl std::fmt::Display for Token {
@@ -52,6 +60,10 @@ impl std::fmt::Display for Token {
             Self::RParen => write!(f, ")"),
             Self::Comma => write!(f, ","),
             Self::Eq => write!(f, "="),
+            Self::Lt => write!(f, "<"),
+            Self::Le => write!(f, "<="),
+            Self::Gt => write!(f, ">"),
+            Self::Ge => write!(f, ">="),
         }
     }
 }
@@ -139,11 +151,29 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<Token>> {
                 ));
             }
             b'/' | b'#' => return Err(unsupported("SQL comments are not allowed")),
-            b'<' | b'>' | b'!' => {
-                return Err(unsupported(format!(
-                    "comparison operator `{}` (the subset supports =, IN, BETWEEN)",
-                    char::from(c)
-                )));
+            // SPEC-018 QP-030: the four comparison operators.
+            b'<' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::Le);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Lt);
+                    i += 1;
+                }
+            }
+            b'>' => {
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::Ge);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Gt);
+                    i += 1;
+                }
+            }
+            b'!' => {
+                return Err(unsupported(
+                    "operator `!=` (the subset supports =, IN, BETWEEN, <, >, <=, >=)",
+                ));
             }
             other => {
                 return Err(unsupported(format!(

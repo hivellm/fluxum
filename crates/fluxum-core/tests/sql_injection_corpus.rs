@@ -79,11 +79,10 @@ const HOSTILE: &[&str] = &[
     "SELECT * FROM Account WHERE NOT id = 1",
     "SELECT * FROM Account WHERE balance IS NULL",
     "SELECT * FROM Account WHERE balance = NULL",
-    "SELECT * FROM Account WHERE id > 5",
-    "SELECT * FROM Account WHERE id < 5",
+    // (`<`, `>`, `<=`, `>=` joined the subset with SPEC-018 QP-030 — legal
+    // usage is pinned by tests/keyset_pagination.rs; negations stay out.)
     "SELECT * FROM Account WHERE id != 5",
     "SELECT * FROM Account WHERE id <> 5",
-    "SELECT * FROM Account WHERE id >= 5",
     // --- malformed structure ---
     "",
     "   ",
