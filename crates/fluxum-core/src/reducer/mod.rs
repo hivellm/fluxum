@@ -82,7 +82,10 @@ use crate::types::{ConnectionId, Identity, Timestamp};
 
 pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
 pub use ratelimit::{RateLimiter, RateLimiterOptions};
-pub use view::{ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry};
+pub use view::{
+    MaterializedViewDef, MvAggregate, MvTopN, ReadOnlyTxHandle, ViewContext, ViewDef,
+    ViewRegistry, registered_materialized_views,
+};
 
 /// Maximum reducer-calls-reducer nesting depth (RED-005 guard).
 ///

@@ -72,6 +72,177 @@ pub fn expand_view(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
+/// `#[fluxum::view(materialized, table = T, aggregate = sum(col) |
+/// count | avg(col) | min(col) | max(col) [, group_by = col])]` or
+/// `#[fluxum::view(materialized, table = T, order_by = col [, desc]
+/// [, asc], limit = N)]` on a unit struct (SPEC-022 RV-010/012): submits a
+/// link-time `MaterializedViewDef` named after the struct. Column existence
+/// and types are validated at assembly, where the schema is in hand.
+fn try_expand_materialized_view(
+    args: TokenStream,
+    input: TokenStream,
+) -> syn::Result<TokenStream> {
+    use syn::parse::Parser;
+
+    let item: syn::ItemStruct = syn::parse2(input).map_err(|_| {
+        syn::Error::new(
+            args.span(),
+            "#[fluxum::view(materialized, …)] annotates a unit struct (RV-010)",
+        )
+    })?;
+    let name = item.ident.to_string();
+
+    let mut table: Option<String> = None;
+    let mut aggregate: Option<TokenStream> = None;
+    let mut group_by: Option<String> = None;
+    let mut order_by: Option<String> = None;
+    let mut descending = false;
+    let mut limit: Option<u32> = None;
+
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("materialized") {
+            return Ok(());
+        }
+        if meta.path.is_ident("table") {
+            let ident: syn::Ident = meta.value()?.parse()?;
+            table = Some(ident.to_string());
+            return Ok(());
+        }
+        if meta.path.is_ident("aggregate") {
+            let expr: syn::Expr = meta.value()?.parse()?;
+            aggregate = Some(parse_mv_aggregate(&expr)?);
+            return Ok(());
+        }
+        if meta.path.is_ident("group_by") {
+            let ident: syn::Ident = meta.value()?.parse()?;
+            group_by = Some(ident.to_string());
+            return Ok(());
+        }
+        if meta.path.is_ident("order_by") {
+            let ident: syn::Ident = meta.value()?.parse()?;
+            order_by = Some(ident.to_string());
+            return Ok(());
+        }
+        if meta.path.is_ident("desc") {
+            descending = true;
+            return Ok(());
+        }
+        if meta.path.is_ident("asc") {
+            descending = false;
+            return Ok(());
+        }
+        if meta.path.is_ident("limit") {
+            let lit: syn::LitInt = meta.value()?.parse()?;
+            limit = Some(lit.base10_parse()?);
+            return Ok(());
+        }
+        Err(meta.error(
+            "unknown materialized-view argument: expected table, aggregate, group_by, \
+             order_by, desc/asc, limit (RV-010)",
+        ))
+    });
+    parser.parse2(args.clone())?;
+
+    let Some(table) = table else {
+        return Err(syn::Error::new(
+            args.span(),
+            "materialized views need `table = <Table>` (RV-010)",
+        ));
+    };
+    let (aggregate_tokens, top_n_tokens) = match (&aggregate, &order_by, limit) {
+        (Some(agg), None, None) => (
+            quote!(::core::option::Option::Some(#agg)),
+            quote!(::core::option::Option::None),
+        ),
+        (None, Some(column), Some(n)) => (
+            quote!(::core::option::Option::None),
+            quote! {
+                ::core::option::Option::Some(::fluxum_core::reducer::MvTopN {
+                    column: #column,
+                    descending: #descending,
+                    limit: #n,
+                })
+            },
+        ),
+        _ => {
+            return Err(syn::Error::new(
+                args.span(),
+                "declare `aggregate = …` (with optional group_by) OR `order_by = … , \
+                 limit = N` — exactly one (RV-010/012)",
+            ));
+        }
+    };
+    if group_by.is_some() && aggregate.is_none() {
+        return Err(syn::Error::new(
+            args.span(),
+            "`group_by` applies to aggregate views only (RV-010)",
+        ));
+    }
+    let group_tokens = match &group_by {
+        Some(column) => quote!(::core::option::Option::Some(#column)),
+        None => quote!(::core::option::Option::None),
+    };
+
+    Ok(quote! {
+        #item
+
+        ::fluxum_core::schema::inventory::submit! {
+            ::fluxum_core::reducer::MaterializedViewDef {
+                name: #name,
+                table: #table,
+                aggregate: #aggregate_tokens,
+                group_by: #group_tokens,
+                top_n: #top_n_tokens,
+            }
+        }
+    })
+}
+
+/// Parse `count` | `sum(col)` | `avg(col)` | `min(col)` | `max(col)`.
+fn parse_mv_aggregate(expr: &syn::Expr) -> syn::Result<TokenStream> {
+    let path = quote!(::fluxum_core::reducer::MvAggregate);
+    match expr {
+        syn::Expr::Path(p) if p.path.is_ident("count") => Ok(quote!(#path::Count)),
+        syn::Expr::Call(call) => {
+            let syn::Expr::Path(func) = call.func.as_ref() else {
+                return Err(syn::Error::new(call.span(), "expected sum|avg|min|max(col)"));
+            };
+            let Some(kind) = func.path.get_ident().map(ToString::to_string) else {
+                return Err(syn::Error::new(call.span(), "expected sum|avg|min|max(col)"));
+            };
+            let column = match call.args.first() {
+                Some(syn::Expr::Path(p)) if call.args.len() == 1 => {
+                    p.path.get_ident().map(ToString::to_string)
+                }
+                _ => None,
+            };
+            let Some(column) = column else {
+                return Err(syn::Error::new(
+                    call.span(),
+                    "aggregate takes exactly one column name (RV-010)",
+                ));
+            };
+            let variant = match kind.as_str() {
+                "sum" => quote!(Sum),
+                "avg" => quote!(Avg),
+                "min" => quote!(Min),
+                "max" => quote!(Max),
+                other => {
+                    return Err(syn::Error::new(
+                        call.span(),
+                        format!("unknown aggregate `{other}`: count, sum, avg, min, max (RV-010)"),
+                    ));
+                }
+            };
+            Ok(quote!(#path::#variant(#column)))
+        }
+        other => Err(syn::Error::new(
+            other.span(),
+            "expected `count` or `sum|avg|min|max(col)` (RV-010)",
+        )),
+    }
+}
+
 /// Entry point for `#[fluxum::tick(rate = N)]`.
 pub fn expand_tick(args: TokenStream, input: TokenStream) -> TokenStream {
     match try_expand_tick(args, input) {
@@ -304,6 +475,12 @@ fn try_expand_lifecycle(
 }
 
 fn try_expand_view(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
+    // SPEC-022 RV-010: `#[fluxum::view(materialized, …)]` on a unit struct
+    // declares an incrementally-maintained pushed view.
+    let args_str = args.to_string();
+    if args_str.starts_with("materialized") {
+        return try_expand_materialized_view(args, input);
+    }
     reject_args(&args, "view", "")?;
     let item: ItemFn = syn::parse2(input)?;
     let params = check_shape(&item, "view")?;

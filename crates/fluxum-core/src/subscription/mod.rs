@@ -40,6 +40,8 @@ pub use sendbuffer::{
     BLOCKED_DROP_AFTER, DropReason, Message, Offered, SubscriberBuffer, SubscriberDropCounter, Tier,
 };
 
+mod matview;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -177,6 +179,13 @@ pub struct SubscriptionManager {
     /// ReadPath query hooks (PLG-040/041) resolve rerank/retrieve/fusion
     /// bindings through it. `None` = hooks absent, pure BM25.
     plugins: Option<Arc<crate::plugin::PluginRegistry>>,
+    /// The materialized-view engine (SPEC-022 RV-010..013) — empty until
+    /// [`SubscriptionManager::init_views`] resolves and rebuilds it.
+    matviews: matview::MatViewEngine,
+    /// View subscribers, per view name (RV-011).
+    view_subs: HashMap<String, HashSet<u128>>,
+    /// The views each connection subscribes to (disconnect cleanup).
+    conn_views: HashMap<u128, HashSet<String>>,
     /// Which columns of a table carry a search arg, with a refcount so a
     /// column is probed only while some plan indexes it (drives per-delta
     /// probing without scanning all search args).
@@ -234,10 +243,66 @@ impl SubscriptionManager {
             fts_prefixes: HashMap::new(),
             fts_analyzers,
             plugins: None,
+            matviews: matview::MatViewEngine::default(),
+            view_subs: HashMap::new(),
+            conn_views: HashMap::new(),
             indexed_columns: HashMap::new(),
             table_watchers: HashMap::new(),
             next_query_id: HashMap::new(),
         }
+    }
+
+    /// Resolve the registered `#[fluxum::view(materialized)]` declarations
+    /// and rebuild their state from `snapshot` (SPEC-022 RV-010/013 — the
+    /// startup/recovery path). Call at assembly, before serving; without
+    /// it, materialized views are inactive.
+    pub fn init_views(&mut self, snapshot: &Snapshot) -> Result<()> {
+        self.matviews = matview::MatViewEngine::init(&self.schema, snapshot)?;
+        Ok(())
+    }
+
+    /// RV-013 validation seam: assert every view's incremental state equals
+    /// a bit-identical fresh rebuild from `snapshot`.
+    pub fn validate_views(&self, snapshot: &Snapshot) -> Result<()> {
+        self.matviews.validate_against(snapshot)
+    }
+
+    /// Subscribe `connection` to a materialized view (RV-011): returns the
+    /// current view rows as `InitialData`; subsequent changes arrive as
+    /// `TxUpdate`s through the ordinary fan-out.
+    pub fn subscribe_view(&mut self, connection: u128, name: &str) -> Result<InitialData> {
+        let Some(update) = self.matviews.snapshot_rows(name)? else {
+            return Err(FluxumError::query(
+                codes::REDUCER_UNKNOWN_VIEW,
+                format!("unknown materialized view `{name}` (RV-011)"),
+            ));
+        };
+        self.view_subs
+            .entry(name.to_owned())
+            .or_default()
+            .insert(connection);
+        self.conn_views
+            .entry(connection)
+            .or_default()
+            .insert(name.to_owned());
+        Ok(InitialData {
+            id: 0,
+            schema_version: 0,
+            tables: vec![update],
+        })
+    }
+
+    /// Drop `connection`'s subscription to view `name`. Returns whether it
+    /// existed.
+    pub fn unsubscribe_view(&mut self, connection: u128, name: &str) -> bool {
+        let existed = self
+            .view_subs
+            .get_mut(name)
+            .is_some_and(|subs| subs.remove(&connection));
+        if let Some(views) = self.conn_views.get_mut(&connection) {
+            views.remove(name);
+        }
+        existed
     }
 
     /// Install the validated plugin registry (SPEC-020 PLG-040/041): binds
@@ -395,6 +460,17 @@ impl SubscriptionManager {
 
     /// Drop every subscription of `connection` (SUB-005 disconnect cleanup).
     pub fn disconnect(&mut self, connection: u128) {
+        // Materialized-view subscriptions die with the connection (RV-011).
+        if let Some(views) = self.conn_views.remove(&connection) {
+            for name in views {
+                if let Some(subs) = self.view_subs.get_mut(&name) {
+                    subs.remove(&connection);
+                    if subs.is_empty() {
+                        self.view_subs.remove(&name);
+                    }
+                }
+            }
+        }
         let Some(handles) = self.connections.remove(&connection) else {
             return;
         };
@@ -500,6 +576,24 @@ impl SubscriptionManager {
             subscribers.sort_unstable();
             deltas.push(QueryDelta {
                 query_hash: hash,
+                update: Arc::new(update),
+                subscribers,
+            });
+        }
+        // SPEC-022 RV-010/011: feed the materialized-view engine EVERY
+        // commit (state correctness is independent of subscribers) and fan
+        // out changed view rows to view subscribers, O(affected groups).
+        for (name, update) in self.matviews.on_commit(diff)? {
+            let Some(subs) = self.view_subs.get(&name) else {
+                continue;
+            };
+            if subs.is_empty() {
+                continue;
+            }
+            let mut subscribers: Vec<u128> = subs.iter().copied().collect();
+            subscribers.sort_unstable();
+            deltas.push(QueryDelta {
+                query_hash: QueryHash(crate::simd::global().hash64(name.as_bytes(), 0x4D56)),
                 update: Arc::new(update),
                 subscribers,
             });

@@ -91,6 +91,71 @@ pub fn registered_views() -> impl Iterator<Item = &'static ViewDef> {
     inventory::iter::<ViewDef>()
 }
 
+// ---------------------------------------------------------------------------
+// Materialized views (SPEC-022 RV-010..013)
+// ---------------------------------------------------------------------------
+
+/// The aggregate of a `#[fluxum::view(materialized)]` declaration (RV-010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MvAggregate {
+    /// `count` — rows per group.
+    Count,
+    /// `sum(col)` — numeric column sum.
+    Sum(&'static str),
+    /// `avg(col)` — numeric column mean.
+    Avg(&'static str),
+    /// `min(col)`.
+    Min(&'static str),
+    /// `max(col)`.
+    Max(&'static str),
+}
+
+impl MvAggregate {
+    /// The aggregated column, if the function takes one.
+    pub fn column(&self) -> Option<&'static str> {
+        match self {
+            Self::Count => None,
+            Self::Sum(c) | Self::Avg(c) | Self::Min(c) | Self::Max(c) => Some(c),
+        }
+    }
+}
+
+/// The sorted-window shape of a top-N materialized view (RV-012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MvTopN {
+    /// The sort column.
+    pub column: &'static str,
+    /// `true` = highest first (the leaderboard shape).
+    pub descending: bool,
+    /// Window size.
+    pub limit: u32,
+}
+
+/// One `#[fluxum::view(materialized, …)]` in the link-time registry
+/// (SPEC-022 RV-010): a view over one base table with either an aggregate
+/// (+ optional `GROUP BY`) or a sorted top-N window — maintained
+/// incrementally from commit delta rows by the subscription manager's view
+/// engine, never by re-scanning.
+pub struct MaterializedViewDef {
+    /// The view's name — the subscription key and the pushed `table_name`.
+    pub name: &'static str,
+    /// The base `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// The aggregate (`None` for a top-N window view).
+    pub aggregate: Option<MvAggregate>,
+    /// `GROUP BY` column (aggregate views only; `None` = one global group).
+    pub group_by: Option<&'static str>,
+    /// The sorted window (top-N views only).
+    pub top_n: Option<MvTopN>,
+}
+
+inventory::collect!(MaterializedViewDef);
+
+/// Iterate every registered materialized view in this binary.
+pub fn registered_materialized_views() -> impl Iterator<Item = &'static MaterializedViewDef> {
+    inventory::iter::<MaterializedViewDef>()
+}
+
 /// Name → view map (RED-030): populated at startup, dispatched by the HTTP
 /// admin API (phase 5).
 #[derive(Default)]
