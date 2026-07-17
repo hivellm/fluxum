@@ -32,11 +32,12 @@ mod parse;
 
 use std::cmp::Ordering;
 use std::fmt;
+use std::ops::Bound;
 
 use fluxum_protocol::codes;
 
 use crate::error::{FluxumError, Result};
-use crate::index::Rect;
+use crate::index::{IndexId, Rect};
 use crate::schema::{FluxType, IndexSchema, Schema, TableSchema, VisibilityRule};
 use crate::store::{Row, RowValue, TableId};
 use crate::types::Identity;
@@ -114,6 +115,65 @@ pub struct CompiledPlan {
     pub query_hash: QueryHash,
     /// Whitespace- and keyword-case-normalized query text.
     pub normalized: String,
+    /// SPEC-018 QP-001/050: how the snapshot evaluator reads candidate rows.
+    /// Rule-based, deterministic for a given schema + normalized query, and
+    /// transparent (QP-002): `IndexScan` and `FullScan` always yield the
+    /// same row set — `residual` re-checks what the bounds don't guarantee.
+    pub access: AccessPath,
+    /// The conditions NOT covered by the index bounds (QP-010) — applied
+    /// per row an `IndexScan` yields. `filter` stays the complete predicate
+    /// (used by `FullScan` and by `TxUpdate` delta evaluation, QP-003).
+    pub residual: Option<FilterFn>,
+    /// Human-readable residual conditions (QP-051 explain surface).
+    pub residual_desc: Vec<String>,
+    /// QP-020: the index scan already yields rows in the query's `ORDER BY`
+    /// order (DESC served by a reverse walk) — skip the in-RAM sort and
+    /// allow the QP-021 index-ordered top-N early stop.
+    pub ordered_by_index: bool,
+    /// QP-040 `AFTER` keyset cursor slot — parsed and planned by the
+    /// keyset-pagination task; carried here so the extension stays additive
+    /// (QP-050). Always `None` until that task lands.
+    pub cursor: Option<Keyset>,
+}
+
+/// How the snapshot evaluator reads a plan's candidate rows (QP-001).
+#[derive(Debug, Clone, PartialEq)]
+pub enum AccessPath {
+    /// Iterate the primary row map and filter per row (today's behavior).
+    FullScan,
+    /// One or more bounded B-tree index scans (QP-010/011).
+    IndexScan(IndexScanPlan),
+}
+
+/// The bounded-scan shape an `IndexScan` executes (QP-010/011/012): an
+/// equality prefix (several probes under `IN` expansion), plus at most one
+/// range on the next index column — the single-range shape
+/// `Snapshot::index_scan` natively supports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexScanPlan {
+    /// The chosen index (STG-051 stable id).
+    pub index_id: IndexId,
+    /// The index's key column ordinals, declaration order.
+    pub columns: Vec<u16>,
+    /// Equality probes: each is one `index_scan` prefix. `IN` on a prefix
+    /// column multiplies probes (QP-011), pre-sorted in memcomparable key
+    /// order so the merged result streams in index order.
+    pub probes: Vec<Vec<RowValue>>,
+    /// Lower bound on the column after the equality prefix.
+    pub lower: Bound<RowValue>,
+    /// Upper bound on the column after the equality prefix.
+    pub upper: Bound<RowValue>,
+}
+
+/// A keyset cursor (QP-040/041): the `(ORDER BY value, primary key)` of the
+/// previous page's last row. Parsing/planning lands with the phase-4
+/// keyset-pagination task.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Keyset {
+    /// The last row's `ORDER BY` column value.
+    pub order_value: RowValue,
+    /// The last row's primary-key value (the QP-041 tiebreak).
+    pub pk_value: RowValue,
 }
 
 impl fmt::Debug for CompiledPlan {
@@ -129,6 +189,9 @@ impl fmt::Debug for CompiledPlan {
             .field("spatial", &self.spatial)
             .field("query_hash", &self.query_hash)
             .field("normalized", &self.normalized)
+            .field("access", &self.access)
+            .field("has_residual", &self.residual.is_some())
+            .field("ordered_by_index", &self.ordered_by_index)
             .finish()
     }
 }
@@ -189,6 +252,33 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
     let normalized = normalize(&ast);
     let query_hash = QueryHash(crate::simd::global().hash64(normalized.as_bytes(), 0));
 
+    // SPEC-018 QP-001: rule-based access-path selection at compile time.
+    // Spatial queries keep their dedicated index path (SUB-022) untouched.
+    let (access, consumed, ordered_by_index) = if spatial.is_some() {
+        (AccessPath::FullScan, Vec::new(), false)
+    } else {
+        plan_access(table, &conditions, order_by.as_ref())
+    };
+    // QP-010: the residual filter re-checks everything the index bounds do
+    // not guarantee — the transparency invariant (QP-002) rests on it.
+    let residual_conds: Vec<CompiledCond> = conditions
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !consumed.contains(i))
+        .map(|(_, cond)| cond.clone())
+        .collect();
+    let residual_desc: Vec<String> = residual_conds
+        .iter()
+        .map(|cond| cond.describe(table))
+        .collect();
+    let residual: Option<FilterFn> = if residual_conds.is_empty() {
+        None
+    } else {
+        Some(Box::new(move |row: &Row| {
+            residual_conds.iter().all(|cond| cond.matches(row))
+        }))
+    };
+
     let filter: Option<FilterFn> = if conditions.is_empty() {
         None
     } else {
@@ -215,7 +305,185 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         spatial,
         query_hash,
         normalized,
+        access,
+        residual,
+        residual_desc,
+        ordered_by_index,
+        cursor: None,
     })
+}
+
+/// The `IN` probe-expansion cap (QP-011): `col IN (v1..vk)` on prefix
+/// columns expands to at most this many bounded scans; beyond it, the `IN`
+/// stays a residual filter over a broader scan.
+pub const INDEX_IN_EXPANSION_MAX: usize = 128;
+
+/// SPEC-018 QP-001: pick the access path for `conditions` + `order_by`.
+/// For each declared B-tree index: longest equality prefix (`=`, with `IN`
+/// multiplying probes up to [`INDEX_IN_EXPANSION_MAX`]), then at most one
+/// range (`BETWEEN`) on the next key column (QP-012). Score by
+/// `(prefix length, range-binds-next, order-served)`; ties break by index
+/// declaration order, so the plan is deterministic for a schema + query
+/// (SUB-020 dedup stability). Returns `(path, consumed condition indexes,
+/// ordered_by_index)`.
+fn plan_access(
+    table: &TableSchema,
+    conditions: &[CompiledCond],
+    order_by: Option<&OrderSpec>,
+) -> (AccessPath, Vec<usize>, bool) {
+    /// One scored candidate: `(score, plan, consumed conds, order served)`.
+    type Candidate = ((usize, bool, bool), IndexScanPlan, Vec<usize>, bool);
+    let mut best: Option<Candidate> = None;
+    for index in table.indexes {
+        let IndexSchema::BTree { columns } = index else {
+            continue;
+        };
+        let mut consumed: Vec<usize> = Vec::new();
+        let mut probes: Vec<Vec<RowValue>> = vec![Vec::new()];
+        let mut prefix_len = 0usize;
+        for &col in *columns {
+            let eq = conditions.iter().enumerate().find(|(i, cond)| {
+                !consumed.contains(i) && matches!(cond, CompiledCond::Eq(ord, _) if *ord == col)
+            });
+            if let Some((i, CompiledCond::Eq(_, value))) = eq {
+                for probe in &mut probes {
+                    probe.push(value.clone());
+                }
+                consumed.push(i);
+                prefix_len += 1;
+                continue;
+            }
+            let in_cond = conditions.iter().enumerate().find(|(i, cond)| {
+                !consumed.contains(i) && matches!(cond, CompiledCond::In(ord, _) if *ord == col)
+            });
+            if let Some((i, CompiledCond::In(_, values))) = in_cond {
+                // QP-011: expand IN into per-value probes, capped; past the
+                // cap the IN (and everything after it) stays residual.
+                if probes.len().saturating_mul(values.len().max(1)) > INDEX_IN_EXPANSION_MAX
+                    || values.is_empty()
+                {
+                    break;
+                }
+                probes = probes
+                    .into_iter()
+                    .flat_map(|probe| {
+                        values.iter().map(move |value| {
+                            let mut next = probe.clone();
+                            next.push(value.clone());
+                            next
+                        })
+                    })
+                    .collect();
+                consumed.push(i);
+                prefix_len += 1;
+                continue;
+            }
+            break;
+        }
+        // QP-010/012: at most one range, on the column right after the
+        // equality prefix.
+        let mut lower: Bound<RowValue> = Bound::Unbounded;
+        let mut upper: Bound<RowValue> = Bound::Unbounded;
+        let mut has_range = false;
+        if let Some(&range_col) = columns.get(prefix_len) {
+            let between = conditions.iter().enumerate().find(|(i, cond)| {
+                !consumed.contains(i)
+                    && matches!(cond, CompiledCond::Between(ord, _, _) if *ord == range_col)
+            });
+            if let Some((i, CompiledCond::Between(_, low, high))) = between {
+                lower = Bound::Included(low.clone());
+                upper = Bound::Included(high.clone());
+                consumed.push(i);
+                has_range = true;
+            }
+        }
+        // QP-020: order served when the single probe's next index column IS
+        // the ORDER BY column (DESC via reverse walk), or the ORDER BY
+        // column sits inside the equality prefix (all values equal — any
+        // order serves it).
+        let ordered = order_by.is_some_and(|order| {
+            probes.len() == 1
+                && (columns.get(prefix_len).copied() == Some(order.column)
+                    || columns[..prefix_len].contains(&order.column))
+        });
+        if prefix_len == 0 && !has_range && !ordered {
+            continue; // the index contributes nothing for this query
+        }
+        let score = (prefix_len, has_range, ordered);
+        if best.as_ref().is_none_or(|(s, ..)| score > *s) {
+            let names: Vec<&str> = columns
+                .iter()
+                .map(|&ord| table.columns[usize::from(ord)].name)
+                .collect();
+            let mut plan = IndexScanPlan {
+                index_id: IndexId::of(table.name, &names),
+                columns: columns.to_vec(),
+                probes,
+                lower,
+                upper,
+            };
+            // QP-011: probes stream in memcomparable key order.
+            plan.probes.sort_by_cached_key(|probe| {
+                let mut key = Vec::new();
+                for value in probe {
+                    crate::index::btree::encode_value(value, &mut key);
+                }
+                key
+            });
+            best = Some((score, plan, consumed, ordered));
+        }
+    }
+    match best {
+        Some((_, plan, consumed, ordered)) => (AccessPath::IndexScan(plan), consumed, ordered),
+        None => (AccessPath::FullScan, Vec::new(), false),
+    }
+}
+
+/// QP-051: the `EXPLAIN` surface — compile `sql` and describe the chosen
+/// access path (index, probes, bounds, residual, order servicing) without
+/// executing it. Served by the HTTP admin `POST /query/explain`.
+pub fn explain(schema: &Schema, sql: &str) -> Result<serde_json::Value> {
+    use serde_json::json;
+    let plan = compile(schema, sql)?;
+    let table = schema
+        .tables()
+        .find(|t| TableId::of(t.name) == plan.table_ids[0])
+        .ok_or_else(|| FluxumError::Storage("explain: table vanished".into()))?;
+    let bound = |b: &Bound<RowValue>, name: &str| match b {
+        Bound::Unbounded => json!(null),
+        Bound::Included(v) => json!(format!("{name} {v:?} (inclusive)")),
+        Bound::Excluded(v) => json!(format!("{name} {v:?} (exclusive)")),
+    };
+    let access = match &plan.access {
+        AccessPath::FullScan => json!({ "kind": "full_scan" }),
+        AccessPath::IndexScan(scan) => {
+            let columns: Vec<&str> = scan
+                .columns
+                .iter()
+                .map(|&ord| table.columns[usize::from(ord)].name)
+                .collect();
+            json!({
+                "kind": "index_scan",
+                "index": columns,
+                "probes": scan.probes.len(),
+                "equality_prefix_len": scan.probes.first().map_or(0, Vec::len),
+                "lower": bound(&scan.lower, ">="),
+                "upper": bound(&scan.upper, "<="),
+            })
+        }
+    };
+    Ok(json!({
+        "table": table.name,
+        "normalized": plan.normalized,
+        "access": access,
+        "residual": plan.residual_desc,
+        "ordered_by_index": plan.ordered_by_index,
+        "order_by": plan.order_by.map(|o| json!({
+            "column": table.columns[usize::from(o.column)].name,
+            "descending": o.descending,
+        })),
+        "limit": plan.limit,
+    }))
 }
 
 /// Compile a table's [`VisibilityRule`] into the [`RlsFn`] applied per
@@ -236,6 +504,7 @@ fn compile_visibility(table: &TableSchema) -> Option<RlsFn> {
 
 /// One compiled WHERE condition with literals already coerced to the
 /// column's type — evaluation is a typed value comparison, never a cast.
+#[derive(Clone)]
 enum CompiledCond {
     Eq(u16, RowValue),
     In(u16, Vec<RowValue>),
@@ -243,6 +512,18 @@ enum CompiledCond {
 }
 
 impl CompiledCond {
+    /// Human-readable rendering for the QP-051 explain surface.
+    fn describe(&self, table: &TableSchema) -> String {
+        let name = |ord: u16| table.columns[usize::from(ord)].name;
+        match self {
+            Self::Eq(ord, value) => format!("{} = {value:?}", name(*ord)),
+            Self::In(ord, values) => format!("{} IN ({} values)", name(*ord), values.len()),
+            Self::Between(ord, low, high) => {
+                format!("{} BETWEEN {low:?} AND {high:?}", name(*ord))
+            }
+        }
+    }
+
     fn matches(&self, row: &Row) -> bool {
         match self {
             Self::Eq(ordinal, value) => row.value(*ordinal) == Some(value),
@@ -645,6 +926,11 @@ mod tests {
             spatial: None,
             query_hash: QueryHash(7),
             normalized: "SELECT * FROM Rich LIMIT 5".to_owned(),
+            access: AccessPath::FullScan,
+            residual: None,
+            residual_desc: vec![],
+            ordered_by_index: false,
+            cursor: None,
         };
         let debug = format!("{plan:?}");
         assert!(debug.contains("has_filter"), "{debug}");

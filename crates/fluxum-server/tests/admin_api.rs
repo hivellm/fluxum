@@ -144,6 +144,37 @@ async fn start() -> http::HttpServer {
         .unwrap()
 }
 
+// --- POST /query/explain (SPEC-018 QP-051) ---------------------------------------
+
+#[tokio::test]
+async fn query_explain_reports_the_access_path() {
+    let server = start().await;
+    let resp = request(
+        server.local_addr,
+        "POST",
+        "/query/explain",
+        Some(r#"{"sql": "SELECT * FROM Chat WHERE text = 'hi' LIMIT 3"}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200);
+    let body = resp.json();
+    assert_eq!(body["success"], true);
+    let report = &body["payload"];
+    assert_eq!(report["table"], "Chat");
+    assert_eq!(report["access"]["kind"], "full_scan", "Chat has no index");
+    assert_eq!(report["limit"], 3);
+
+    // Compile failures surface as 400s, not executions.
+    let resp = request(
+        server.local_addr,
+        "POST",
+        "/query/explain",
+        Some(r#"{"sql": "SELECT * FROM Nope"}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+}
+
 // --- GET /plugins + hot disable (SPEC-020 PLG-060/061) --------------------------
 
 #[tokio::test]

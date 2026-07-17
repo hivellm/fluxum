@@ -48,7 +48,7 @@ use fluxum_protocol::{InitialData, RowList, RowListBuilder, TableUpdate, TxUpdat
 
 use crate::error::{FluxumError, Result};
 use crate::schema::{Schema, TableSchema};
-use crate::sql::{CompiledPlan, QueryHash, SpatialConstraint, compile};
+use crate::sql::{AccessPath, CompiledPlan, QueryHash, SpatialConstraint, compile};
 use crate::store::committed::Snapshot;
 use crate::store::row::{encode_pk_of_row, encode_row};
 use crate::store::{Row, TableId, TxDiff};
@@ -468,26 +468,41 @@ impl SubscriptionManager {
         let table_id = plan.table_ids[0];
         let schema = self.table_schema(table_id)?;
 
-        // Candidate rows: spatial clauses go through the index (SUB-022);
-        // otherwise a full committed scan, filtered by the predicate and the
-        // row-level visibility filter for this viewer (SUB-030). `viewer` is
-        // `None` for a public query or a server-peer bypass — no RLS.
+        // Candidate rows: spatial clauses go through the spatial index
+        // (SUB-022); an `IndexScan` plan goes through its bounded B-tree
+        // scans (SPEC-018 QP-010); otherwise a full committed scan. Every
+        // path applies RLS for this viewer (SUB-030) — `viewer` is `None`
+        // for a public query or a server-peer bypass.
         let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
-        let mut rows: Vec<Row> = match &plan.spatial {
-            Some(constraint) => self
+        let mut rows: Vec<Row> = match (&plan.spatial, &plan.access) {
+            (Some(constraint), _) => self
                 .spatial_candidates(snapshot, table_id, *constraint)?
                 .into_iter()
-                .filter(|row| keep(row))
+                .filter(|row| {
+                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    keep(row)
+                })
                 .collect(),
-            None => snapshot
+            (None, AccessPath::IndexScan(scan)) => {
+                index_scan_rows(plan, scan, viewer, snapshot, table_id)?
+            }
+            (None, AccessPath::FullScan) => snapshot
                 .scan(table_id)?
-                .filter(|row| keep(row))
+                .filter(|row| {
+                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    keep(row)
+                })
                 .cloned()
                 .collect(),
         };
 
-        // ORDER BY / LIMIT apply to InitialData ONLY (SUB-013).
-        if let Some(order) = plan.order_by {
+        // ORDER BY / LIMIT apply to InitialData ONLY (SUB-013). QP-020: an
+        // index-served order skips the in-RAM sort — the scan already
+        // streamed rows in order (DESC via the reverse walk).
+        if let Some(order) = plan.order_by
+            && !plan.ordered_by_index
+        {
+            QUERY_SORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             rows.sort_by(|a, b| {
                 let ord = a
                     .value(order.column)
@@ -715,6 +730,79 @@ impl SubscriptionManager {
             SpatialConstraint::Region(rect) => snapshot.spatial_region(table_id, rect),
             SpatialConstraint::Radius { x, y, r } => snapshot.spatial_radius(table_id, x, y, r),
         }
+    }
+}
+
+/// Rows touched by snapshot-read candidate selection (SPEC-018 acceptance
+/// 2/3: proves range pushdown reads O(bounded range), not O(table)).
+/// Process-global, relaxed — a observability counter, never control flow.
+pub static QUERY_ROWS_SCANNED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+/// In-RAM sorts performed for `ORDER BY` (SPEC-018 QP-020: an index-served
+/// order must leave this untouched).
+pub static QUERY_SORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Execute an `IndexScan` plan (SPEC-018 QP-010/011/020/021/022): one
+/// bounded scan per probe, residual filter + RLS applied per yielded row —
+/// and, when the order is index-served with a `LIMIT`, an early stop after
+/// the first `n` authorized rows (top-N reads O(n + skipped), and RLS runs
+/// *before* counting toward the limit so a page is never short, QP-022).
+fn index_scan_rows(
+    plan: &CompiledPlan,
+    scan: &crate::sql::IndexScanPlan,
+    viewer: Option<&Identity>,
+    snapshot: &Snapshot,
+    table_id: TableId,
+) -> Result<Vec<Row>> {
+    use std::sync::atomic::Ordering as AtomicOrdering;
+    let residual_keep = |row: &Row| {
+        QUERY_ROWS_SCANNED.fetch_add(1, AtomicOrdering::Relaxed);
+        plan.residual.as_ref().is_none_or(|f| f(row)) && visible(plan, row, viewer)
+    };
+    // QP-021: early stop only when the scan order IS the result order.
+    let early_stop = if plan.ordered_by_index {
+        plan.limit.map(|n| n as usize)
+    } else {
+        None
+    };
+    let descending = plan.order_by.is_some_and(|o| o.descending) && plan.ordered_by_index;
+    let mut rows: Vec<Row> = Vec::new();
+    'probes: for probe in &scan.probes {
+        let lower = bound_ref(&scan.lower);
+        let upper = bound_ref(&scan.upper);
+        let iter = snapshot.index_scan(table_id, scan.index_id, probe, lower, upper)?;
+        if descending {
+            // DESC is served by walking the bounded range in reverse: the
+            // range itself stays bounded, so the read cost is unchanged.
+            let range: Vec<&Row> = iter.collect();
+            for row in range.into_iter().rev() {
+                if residual_keep(row) {
+                    rows.push(row.clone());
+                    if early_stop.is_some_and(|n| rows.len() >= n) {
+                        break 'probes;
+                    }
+                }
+            }
+        } else {
+            for row in iter {
+                if residual_keep(row) {
+                    rows.push(row.clone());
+                    if early_stop.is_some_and(|n| rows.len() >= n) {
+                        break 'probes;
+                    }
+                }
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Borrow a `Bound<RowValue>` as the `Bound<&RowValue>` the scan API takes.
+fn bound_ref(bound: &std::ops::Bound<crate::store::RowValue>) -> std::ops::Bound<&crate::store::RowValue> {
+    match bound {
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+        std::ops::Bound::Included(v) => std::ops::Bound::Included(v),
+        std::ops::Bound::Excluded(v) => std::ops::Bound::Excluded(v),
     }
 }
 

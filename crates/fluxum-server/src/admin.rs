@@ -88,6 +88,7 @@ pub async fn dispatch(
         ("GET", ["schema"]) => schema(ctx).await,
         ("POST", ["reducer", name]) => reducer_call(ctx, name, body).await,
         ("POST", ["query"]) => query(ctx, body).await,
+        ("POST", ["query", "explain"]) => query_explain(ctx, body).await,
         ("GET", ["view", name]) => view(ctx, name).await,
         ("GET", ["plugins"]) => plugins(ctx),
         ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
@@ -134,6 +135,7 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["metrics"]
             | ["schema"]
             | ["query"]
+            | ["query", "explain"]
             | ["reducer", _]
             | ["view", _]
             | ["plugins"]
@@ -372,6 +374,28 @@ async fn query(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
     let manager = ctx.subscriptions.lock().await;
     match manager.query_json(subscriber, &sql, &snapshot) {
         Ok(result) => AdminResponse::ok(request_id.as_deref(), result),
+        Err(e) => AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string()),
+    }
+}
+
+// --- POST /query/explain (SPEC-018 QP-051) ---------------------------------------
+
+/// Compile the query and describe its access path — chosen index, probes,
+/// bounds, residual conditions, index-served order — without executing it.
+async fn query_explain(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
+    let (request_id, payload) = match parse_request(body) {
+        Ok(pair) => pair,
+        Err(e) => return AdminResponse::err(400, None, e),
+    };
+    let sql = match payload.get("sql").and_then(Value::as_str) {
+        Some(sql) => sql.to_owned(),
+        None => {
+            return AdminResponse::err(400, request_id.as_deref(), "payload.sql (string) required");
+        }
+    };
+    let manager = ctx.subscriptions.lock().await;
+    match fluxum_core::sql::explain(manager.schema(), &sql) {
+        Ok(report) => AdminResponse::ok(request_id.as_deref(), report),
         Err(e) => AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string()),
     }
 }
