@@ -21,6 +21,7 @@
 //!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
 pub mod admin;
+pub mod shard;
 pub mod http;
 pub mod session;
 pub mod tcp;

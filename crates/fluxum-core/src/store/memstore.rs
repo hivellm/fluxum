@@ -165,6 +165,11 @@ pub struct MemStore {
     /// each tagged `(tx_id, commit timestamp µs)`. `AS OF` reads resolve
     /// here ([`MemStore::snapshot_as_of`]).
     history: Mutex<std::collections::VecDeque<(u64, i64, Arc<CommittedState>)>>,
+    /// SPEC-007 SHD-031: `false` on non-authoritative shards — a reducer
+    /// writing a `#[fluxum::table(global)]` row there errors instead of
+    /// diverging from the authoritative copy. Default `true` (single-shard
+    /// deployments and the authoritative shard).
+    global_writes_allowed: std::sync::atomic::AtomicBool,
 }
 
 /// The point an `AS OF` read resolves to (SPEC-022 RV-021).
@@ -271,6 +276,7 @@ impl MemStore {
             fks_out,
             fks_in,
             history: Mutex::new(std::collections::VecDeque::new()),
+            global_writes_allowed: std::sync::atomic::AtomicBool::new(true),
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -531,6 +537,92 @@ impl MemStore {
         })
     }
 
+    /// SPEC-007 SHD-031: mark this store a non-authoritative replica for
+    /// `#[fluxum::table(global)]` tables — reducer writes to them error,
+    /// and mutations arrive only through
+    /// [`MemStore::apply_replicated_diff`]. Called by `ShardCoord` at
+    /// assembly for every shard except the authoritative one.
+    pub fn set_global_replica(&self) {
+        self.global_writes_allowed
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// SPEC-007 SHD-030: apply a replicated global-table mutation to this
+    /// replica's `CommittedState` — indexes maintained like a commit merge,
+    /// but NO commit-log entry and NO tx-id consumption (the authoritative
+    /// shard's log is the durable record). Only global tables in `diff` are
+    /// applied; everything else is ignored.
+    pub fn apply_replicated_diff(&self, diff: &TxDiff) -> Result<()> {
+        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut tables = self.committed.load_full().tables.clone();
+        let mut touched = false;
+        for table_diff in &diff.tables {
+            let Some(schema) = self.catalog.get(&table_diff.table_id) else {
+                continue;
+            };
+            if schema.access != crate::schema::TableAccess::Global {
+                continue;
+            }
+            let Some(slot) = tables.get_mut(&table_diff.table_id) else {
+                continue;
+            };
+            let table = Arc::make_mut(slot);
+            for (pk, _old) in &table_diff.deletes {
+                if let Some(existing) = table.rows.remove(pk) {
+                    for constraint in &mut table.unique {
+                        constraint.remove(&existing, pk)?;
+                    }
+                    for index in table.indexes.values_mut() {
+                        index.remove(&existing, pk)?;
+                    }
+                    if let Some(spatial) = &mut table.spatial {
+                        spatial.remove_row(&existing, pk)?;
+                    }
+                    for fulltext in &mut table.fulltext {
+                        fulltext.remove_row(&existing, pk)?;
+                    }
+                }
+            }
+            for row in &table_diff.inserts {
+                let pk = encode_pk_of_row(schema, row.values())?;
+                // An in-place replacement arrives as delete+insert; a bare
+                // insert over an existing key (replays) removes first.
+                if let Some(existing) = table.rows.remove(&pk) {
+                    for constraint in &mut table.unique {
+                        constraint.remove(&existing, &pk)?;
+                    }
+                    for index in table.indexes.values_mut() {
+                        index.remove(&existing, &pk)?;
+                    }
+                    if let Some(spatial) = &mut table.spatial {
+                        spatial.remove_row(&existing, &pk)?;
+                    }
+                    for fulltext in &mut table.fulltext {
+                        fulltext.remove_row(&existing, &pk)?;
+                    }
+                }
+                for index in table.indexes.values_mut() {
+                    index.insert(row, pk.clone())?;
+                }
+                for constraint in &mut table.unique {
+                    constraint.insert(row, pk.clone())?;
+                }
+                if let Some(spatial) = &mut table.spatial {
+                    spatial.insert_row(row, pk.clone())?;
+                }
+                for fulltext in &mut table.fulltext {
+                    fulltext.insert_row(row, pk.clone())?;
+                }
+                table.rows.insert(pk, row.clone());
+            }
+            touched = true;
+        }
+        if touched {
+            self.committed.store(Arc::new(CommittedState { tables }));
+        }
+        Ok(())
+    }
+
     /// SPEC-022 RV-021: the committed state at an earlier point — the
     /// newest retained snapshot at or before `point`. `AS OF` a point newer
     /// than every retained commit answers with the LIVE snapshot (the state
@@ -653,6 +745,18 @@ impl Tx<'_> {
     /// for an occupied primary key.
     fn write(&mut self, table: TableId, mut values: Vec<RowValue>, replace: bool) -> Result<Row> {
         let schema = self.store.schema_of(table)?;
+        // SPEC-007 SHD-031: global tables are writable only on the
+        // authoritative shard; replicas receive mutations via replication.
+        if schema.access == crate::schema::TableAccess::Global
+            && !self
+                .store
+                .global_writes_allowed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(FluxumError::Reducer(
+                "global table writes must execute on the authoritative shard".into(),
+            ));
+        }
         // RV-050: derive every `#[computed]` column from the other columns,
         // overwriting whatever the reducer set (the column is read-only). Runs
         // before validation so the derived value is what gets type-checked,
@@ -1054,6 +1158,17 @@ impl Tx<'_> {
     /// event; RV-032 referential actions are [`Tx::delete`]'s worklist.
     fn delete_one(&mut self, table: TableId, pk_values: &[RowValue]) -> Result<Option<Row>> {
         let schema = self.store.schema_of(table)?;
+        // SPEC-007 SHD-031: deletes are writes too.
+        if schema.access == crate::schema::TableAccess::Global
+            && !self
+                .store
+                .global_writes_allowed
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(FluxumError::Reducer(
+                "global table writes must execute on the authoritative shard".into(),
+            ));
+        }
         let pk = encode_pk_values(schema, pk_values)?;
         let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
         let ops = self.state.tables.entry(table).or_default();

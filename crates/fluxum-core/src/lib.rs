@@ -65,6 +65,7 @@ pub mod plugin;
 pub mod reducer;
 pub mod scheduler;
 pub mod schema;
+pub mod shard;
 pub mod simd;
 pub mod sql;
 pub mod store;
