@@ -94,6 +94,19 @@ struct HttpSession {
     last_active: Instant,
 }
 
+/// Why a GET stream ended — it decides the session's fate (SPEC-021
+/// CS-021).
+#[derive(Debug, Clone, Copy)]
+enum GetExit {
+    /// The client's socket died mid-stream: a blip. The session, its
+    /// subscriptions and their retained delta windows survive so the client
+    /// can reattach and `Resume`; the sweeper expires it if it never does.
+    Detached,
+    /// Idle expiry, server shutdown, or the fan-out dropping this consumer:
+    /// the session is over — deregister and run `on_disconnect` (RED-012).
+    Expired,
+}
+
 /// HTTP transport state over a shard.
 struct HttpState {
     ctx: Arc<ShardContext>,
@@ -139,6 +152,8 @@ pub async fn serve(
     // Ephemeral TTL sweeper (DMX-011) — idempotent across transports.
     ctx.start_ephemeral_sweeper();
     ctx.start_ttl_sweeper();
+    // RPC-060 expiry for sessions no GET stream is timing (SPEC-021 CS-021).
+    spawn_session_sweeper(Arc::clone(&state), shutdown.clone());
 
     let accept_shutdown = shutdown.clone();
     tokio::spawn(async move {
@@ -447,6 +462,7 @@ async fn handle_get(
     let mut keepalive_timer = tokio::time::interval(keepalive);
     keepalive_timer.tick().await; // consume the immediate first tick
 
+    let mut exit = GetExit::Expired;
     let result = loop {
         let idle_deadline = idle.map(|d| Instant::now() + d);
         tokio::select! {
@@ -455,6 +471,9 @@ async fn handle_get(
             frame = out_rx.recv() => match frame {
                 Some(frame) => {
                     if write_chunk(&mut stream, &frame).await.is_err() {
+                        // The client vanished mid-stream: a transport blip,
+                        // not a goodbye (SPEC-021 CS-021).
+                        exit = GetExit::Detached;
                         break Ok(());
                     }
                 }
@@ -463,6 +482,7 @@ async fn handle_get(
             _ = keepalive_timer.tick() => {
                 // Zero-length keep-alive frame (RPC-001/006).
                 if write_chunk(&mut stream, &FrameCodec::keepalive()).await.is_err() {
+                    exit = GetExit::Detached;
                     break Ok(());
                 }
             }
@@ -476,9 +496,35 @@ async fn handle_get(
         }
     };
 
+    // SPEC-021 CS-021: a stream the client dropped only *detaches* — the
+    // session, its subscriptions and their retained delta windows stay put
+    // so a reconnecting client can `Resume` from its offset instead of
+    // re-downloading the snapshot. Give the receiver back so the next GET
+    // with this token reattaches and drains what queued meanwhile. The
+    // session still dies on idle (the sweeper below owns that once no
+    // stream is holding the timer), which is where `on_disconnect` fires.
+    if matches!(exit, GetExit::Detached)
+        && let Some(session) = state.sessions.lock().await.get_mut(&token)
+    {
+        session.out_rx = Some(out_rx);
+        return result;
+    }
+
     // Terminate the chunked body and evict the session.
     let _ = write_last_chunk(&mut stream).await;
-    let evicted = state.sessions.lock().await.remove(&token);
+    evict_session(state, &token, connection_id).await;
+    result
+}
+
+/// Retire a session for good: drop it from the registry, deregister its
+/// connection and subscriptions, and run the RED-012 `on_disconnect` hooks,
+/// publishing their diff so a presence cleanup reaches the remaining
+/// subscribers.
+async fn evict_session(state: &Arc<HttpState>, token: &str, connection_id: u128) {
+    let evicted = state.sessions.lock().await.remove(token);
+    if evicted.is_none() {
+        return; // already retired (a racing sweep or stream teardown)
+    }
     state.ctx.metrics().note_disconnect(); // OBS-040
     state.ctx.connections.remove(connection_id).await;
     state
@@ -487,8 +533,6 @@ async fn handle_get(
         .lock()
         .await
         .disconnect(connection_id);
-    // RED-012: run the `on_disconnect` hooks and publish their diff to the
-    // remaining subscribers (a presence cleanup must reach them).
     if let Some(session) = evicted
         && let SessionState::Authenticated { caller, .. } = &session.state
     {
@@ -505,7 +549,41 @@ async fn handle_get(
             }
         }
     }
-    result
+}
+
+/// RPC-060 for sessions with no stream holding the idle timer: a session
+/// that is detached (its client blipped away, SPEC-021 CS-021) or was minted
+/// but never attached has nobody running the in-stream deadline, so this
+/// sweeper retires it once it goes idle. Without it, a client that never
+/// comes back would pin its subscriptions — and their retained delta windows
+/// — forever, and its `on_disconnect` would never fire.
+fn spawn_session_sweeper(state: Arc<HttpState>, shutdown: Arc<Notify>) {
+    let Some(idle) = state.options.idle_timeout else {
+        return; // idle expiry disabled
+    };
+    tokio::spawn(async move {
+        // Check at a fraction of the deadline so eviction is timely without
+        // busy-waiting.
+        let tick = (idle / 4).max(Duration::from_millis(50));
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => break,
+                () = tokio::time::sleep(tick) => {}
+            }
+            let stale: Vec<(String, u128)> = {
+                let sessions = state.sessions.lock().await;
+                sessions
+                    .iter()
+                    // `out_rx` present = no live GET stream draining it.
+                    .filter(|(_, s)| s.out_rx.is_some() && s.last_active.elapsed() >= idle)
+                    .map(|(token, s)| (token.clone(), s.connection_id))
+                    .collect()
+            };
+            for (token, connection_id) in stale {
+                evict_session(&state, &token, connection_id).await;
+            }
+        }
+    });
 }
 
 // --- HTTP/1.1 request parsing --------------------------------------------------

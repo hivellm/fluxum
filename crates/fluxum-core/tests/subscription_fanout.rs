@@ -268,9 +268,14 @@ fn identical_queries_share_one_plan_and_one_encoding() {
     assert_eq!(deltas[0].subscribers.len(), 1_000);
     let update = Arc::clone(&deltas[0].update);
     assert_eq!(rowlist_len(&update.inserts), 1);
+    // Three holders — the delta, this test's clone, and the SPEC-021 CS-021
+    // resume window that retains the encoded update for replay. Still ONE
+    // encoding shared by all 1,000 subscribers: the SUB-024 invariant is
+    // that the bytes are never copied per subscriber, not that exactly two
+    // things reference them.
     assert_eq!(
         Arc::strong_count(&deltas[0].update),
-        2,
+        3,
         "shared, not copied"
     );
 }
@@ -400,6 +405,7 @@ fn admission_caps_reject_with_429_leaving_existing_subscriptions_intact() {
     let limits = SubscriptionLimits {
         max_subscriptions_per_connection: 2,
         max_compiled_plans: 3,
+        ..SubscriptionLimits::default()
     };
     let mut mgr = SubscriptionManager::new(schema(), limits);
 

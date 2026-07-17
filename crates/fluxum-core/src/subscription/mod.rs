@@ -134,6 +134,11 @@ pub struct SubscriptionLimits {
     pub max_subscriptions_per_connection: usize,
     /// Max unique `QueryState` entries shard-wide (default 100,000).
     pub max_compiled_plans: usize,
+    /// SPEC-021 CS-021: how many committed deltas each query retains for
+    /// resumption (default 256). A `Resume` whose `from_offset` predates the
+    /// retained window falls back to a full snapshot + cache reset
+    /// (CS-022) — this bounds the memory a resumable subscription costs.
+    pub resume_window_deltas: usize,
 }
 
 impl Default for SubscriptionLimits {
@@ -141,6 +146,7 @@ impl Default for SubscriptionLimits {
         Self {
             max_subscriptions_per_connection: 1_000,
             max_compiled_plans: 100_000,
+            resume_window_deltas: 256,
         }
     }
 }
@@ -162,6 +168,63 @@ struct QueryState {
     /// effective hash, so differently-privileged viewers never share a
     /// bucket or its encodes.
     roles: Arc<[String]>,
+}
+
+/// One query's bounded retained-delta window (SPEC-021 CS-021): the last
+/// `resume_window_deltas` committed updates, each tagged with the offset it
+/// committed at, so a reconnecting client can replay from where it left off
+/// instead of re-downloading the snapshot.
+#[derive(Debug, Default)]
+struct DeltaWindow {
+    /// `(offset, shared update)`, ascending by offset.
+    entries: std::collections::VecDeque<(u64, Arc<TableUpdate>)>,
+    /// The highest offset evicted from `entries` (0 = nothing evicted yet).
+    ///
+    /// A resume is serviceable iff `from_offset >= trimmed_before`: the
+    /// client has already applied everything up to `from_offset`, so it only
+    /// needs offsets *after* it — and every such offset is still retained
+    /// exactly when `from_offset` is at or past the last eviction (CS-022).
+    trimmed_before: u64,
+}
+
+impl DeltaWindow {
+    /// Retain one committed delta, evicting the oldest past `cap`.
+    fn push(&mut self, offset: u64, update: Arc<TableUpdate>, cap: usize) {
+        self.entries.push_back((offset, update));
+        while self.entries.len() > cap.max(1) {
+            if let Some((evicted, _)) = self.entries.pop_front() {
+                self.trimmed_before = evicted;
+            }
+        }
+    }
+
+    /// Whether every delta after `from_offset` is still retained.
+    fn can_resume(&self, from_offset: u64) -> bool {
+        from_offset >= self.trimmed_before
+    }
+
+    /// The retained updates committed strictly after `from_offset`.
+    fn since(&self, from_offset: u64) -> Vec<(u64, Arc<TableUpdate>)> {
+        self.entries
+            .iter()
+            .filter(|(offset, _)| *offset > from_offset)
+            .cloned()
+            .collect()
+    }
+}
+
+/// The server's answer to a [`Resume`](fluxum_protocol::Resume) (SPEC-021
+/// CS-021/CS-022).
+#[derive(Debug)]
+pub enum Resumed {
+    /// The offset was inside the retained window: replay only these deltas
+    /// (ascending by offset), then continue with live `TxUpdate`s. Empty
+    /// means the client was already up to date.
+    Deltas(Vec<(u64, Arc<TableUpdate>)>),
+    /// The offset predated the retained window (CS-022): the client must
+    /// clear its cache for this query and replay from this snapshot, whose
+    /// `cache_reset` flag is set.
+    Reset(Box<InitialData>),
 }
 
 /// One shared, pre-encoded per-query delta produced by the fan-out
@@ -197,6 +260,13 @@ pub struct SubscriptionManager {
     limits: SubscriptionLimits,
     /// One entry per unique query (SUB-020).
     queries: HashMap<QueryHash, QueryState>,
+    /// SPEC-021 CS-020: the highest offset committed on this shard — the
+    /// cursor stamped on `InitialData`/`TxUpdate` and echoed by `Resume`.
+    /// Interior-mutable so `on_commit(&self)` can advance it.
+    last_offset: std::sync::atomic::AtomicU64,
+    /// SPEC-021 CS-021: per-query retained delta windows, maintained by
+    /// `on_commit(&self)` — hence the mutex (the `members` pattern).
+    windows: std::sync::Mutex<HashMap<QueryHash, DeltaWindow>>,
     /// Per-connection: `query_id` → the query it handles (Unsubscribe/cleanup).
     connections: HashMap<u128, HashMap<u32, QueryHash>>,
     /// Value-level pruning index (SUB-023): `(table, column, encoded value)`
@@ -327,6 +397,8 @@ impl SubscriptionManager {
             schema,
             limits,
             queries: HashMap::new(),
+            last_offset: std::sync::atomic::AtomicU64::new(0),
+            windows: std::sync::Mutex::new(HashMap::new()),
             connections: HashMap::new(),
             search_args: HashMap::new(),
             fts_terms: HashMap::new(),
@@ -441,6 +513,8 @@ impl SubscriptionManager {
         Ok(InitialData {
             id: 0,
             schema_version: 0,
+            tx_offset: self.current_offset(),
+            cache_reset: false,
             tables: vec![update],
         })
     }
@@ -652,6 +726,69 @@ impl SubscriptionManager {
         }
     }
 
+    /// Resume subscription `query_id` on `connection` from `from_offset`
+    /// (SPEC-021 CS-021/CS-022).
+    ///
+    /// Returns [`Resumed::Deltas`] — only the committed updates after
+    /// `from_offset`, ascending — when the offset is still inside the
+    /// query's retained window; the caller ships them as `TxUpdate`s and
+    /// live updates continue normally. When the offset predates the window
+    /// (its deltas were evicted, CS-022) the answer is [`Resumed::Reset`]: a
+    /// full snapshot with `cache_reset` set, which the client applies after
+    /// clearing its cache.
+    ///
+    /// `query_id` is resolved against `connection`'s registered
+    /// subscriptions, so this only serves a session that outlived the
+    /// transport blip; an unknown `query_id` is `None` and the client must
+    /// `Subscribe` afresh.
+    pub fn resume(
+        &self,
+        connection: u128,
+        query_id: u32,
+        from_offset: u64,
+        snapshot: &Snapshot,
+    ) -> Result<Option<Resumed>> {
+        let Some(hash) = self
+            .connections
+            .get(&connection)
+            .and_then(|handles| handles.get(&query_id))
+            .copied()
+        else {
+            return Ok(None);
+        };
+        let Some(state) = self.queries.get(&hash) else {
+            return Ok(None);
+        };
+
+        let resumable = {
+            let windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+            match windows.get(&hash) {
+                // CS-022: the client's offset fell out of the window.
+                Some(window) if !window.can_resume(from_offset) => None,
+                Some(window) => Some(window.since(from_offset)),
+                // Nothing retained yet: the query has produced no delta since
+                // it was registered, so there is nothing to replay.
+                None => Some(Vec::new()),
+            }
+        };
+
+        match resumable {
+            Some(deltas) => Ok(Some(Resumed::Deltas(deltas))),
+            None => {
+                // Rebuild the snapshot for this bucket's viewer and mark it a
+                // cache reset so the SDK clears before applying (CS-022).
+                let (mut initial, _) =
+                    self.initial_data(&state.plan, state.viewer.as_ref(), &state.roles, snapshot)?;
+                initial.cache_reset = true;
+                initial.tx_offset = self.current_offset();
+                for table in &mut initial.tables {
+                    table.query_id = query_id;
+                }
+                Ok(Some(Resumed::Reset(Box::new(initial))))
+            }
+        }
+    }
+
     /// Drop the subscription `query_id` on `connection` (SUB-004). Returns
     /// whether it existed. Removing the last subscriber of a query evicts
     /// the shared plan and its pruning-index entries.
@@ -794,6 +931,13 @@ impl SubscriptionManager {
         }))
     }
 
+    /// The highest offset committed on this shard (SPEC-021 CS-020) — the
+    /// cursor stamped on every `InitialData`/`TxUpdate` and echoed back by
+    /// [`Resume`](fluxum_protocol::Resume).
+    pub fn current_offset(&self) -> u64 {
+        self.last_offset.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Evaluate a commit against the candidate plans and produce one shared,
     /// once-encoded [`QueryDelta`] per matched query (SUB-021..024).
     ///
@@ -801,7 +945,15 @@ impl SubscriptionManager {
     /// rows are evaluated; a query whose matched inserts and deletes are both
     /// empty produces nothing. Ordering: deltas come back sorted by
     /// `QueryHash` for deterministic tests.
+    ///
+    /// Each produced delta is also retained in its query's bounded resume
+    /// window (SPEC-021 CS-021) and the shard's offset advances to this
+    /// commit's `tx_id`.
     pub fn on_commit(&self, diff: &TxDiff) -> Result<Vec<QueryDelta>> {
+        // CS-020: the offset advances with every commit, whether or not any
+        // query matched — it is the shard's cursor, not a per-query counter.
+        self.last_offset
+            .fetch_max(diff.tx_id, std::sync::atomic::Ordering::Relaxed);
         let candidates = self.candidate_plans(diff);
         let mut deltas = Vec::new();
         for hash in candidates {
@@ -818,9 +970,19 @@ impl SubscriptionManager {
             };
             let mut subscribers: Vec<u128> = state.subscribers.iter().copied().collect();
             subscribers.sort_unstable();
+            let update = Arc::new(update);
+            // CS-021: retain it for resumption, evicting past the bound.
+            {
+                let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+                windows.entry(hash).or_default().push(
+                    diff.tx_id,
+                    Arc::clone(&update),
+                    self.limits.resume_window_deltas,
+                );
+            }
             deltas.push(QueryDelta {
                 query_hash: hash,
-                update: Arc::new(update),
+                update,
                 subscribers,
             });
         }
@@ -885,6 +1047,9 @@ impl SubscriptionManager {
             caller: [0u8; 32],
             duration_us: 0,
             shard_id: 0,
+            // CS-020: the resume cursor. It mirrors `tx_id` today; clients
+            // retain this field (not `tx_id`) and echo it in `Resume`.
+            tx_offset: diff.tx_id,
             tables: vec![(*delta.update).clone()],
         }
     }
@@ -1003,6 +1168,9 @@ impl SubscriptionManager {
             InitialData {
                 id: 0,
                 schema_version: 0,
+                // CS-020: the snapshot's resume cursor.
+                tx_offset: self.current_offset(),
+                cache_reset: false,
                 tables: vec![TableUpdate {
                     table_id: table_id.as_u32(),
                     table_name: schema.name.to_owned(),
@@ -1450,6 +1618,12 @@ impl SubscriptionManager {
             let plan = Arc::clone(&state.plan);
             self.queries.remove(&hash);
             self.deindex_plan(hash, &plan);
+            // The bucket is gone, so its retained resume window is dead
+            // weight (SPEC-021 CS-021): free it with the plan.
+            self.windows
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&hash);
         }
     }
 

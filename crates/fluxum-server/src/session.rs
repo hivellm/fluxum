@@ -18,10 +18,10 @@ use std::sync::Arc;
 
 use fluxum_core::FluxumError;
 use fluxum_core::reducer::{FluxValue, ReducerCaller};
-use fluxum_core::subscription::Subscriber;
+use fluxum_core::subscription::{Resumed, Subscriber};
 use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_protocol::{
-    AuthResult, ClientMessage, ErrorMessage, ReducerResult, ServerMessage, codes,
+    AuthResult, ClientMessage, ErrorMessage, ReducerResult, ServerMessage, TxUpdate, codes,
 };
 
 use crate::ShardContext;
@@ -146,6 +146,10 @@ impl Session {
             ClientMessage::SubscribeSingle(sub) => self.subscribe(sub.id, vec![sub.query]).await,
             ClientMessage::Unsubscribe(unsub) => self.unsubscribe(unsub.query_ids).await,
             ClientMessage::OneOffQuery(query) => self.one_off_query(query.id, query.sql).await,
+            ClientMessage::Resume(resume) => {
+                self.resume(resume.id, resume.query_id, resume.from_offset)
+                    .await
+            }
         }
     }
 
@@ -236,6 +240,52 @@ impl Session {
     /// (SUB-001/002). A batch registers in order; the first failure is
     /// reported and the rest are not attempted (already-registered queries
     /// in the batch stay registered).
+    /// SPEC-021 CS-021/CS-022: replay a subscription from the client's
+    /// retained offset instead of re-sending its snapshot.
+    ///
+    /// Inside the retained window the reply is only the deltas after
+    /// `from_offset`, as `TxUpdate`s carrying the offset each committed at;
+    /// live updates then continue on the normal fan-out path. Outside it,
+    /// the reply is a full `InitialData` with `cache_reset` set (CS-022). An
+    /// unknown `query_id` — a session that did not outlive the blip — is a
+    /// 404 telling the client to `Subscribe` afresh.
+    async fn resume(&self, id: u32, query_id: u32, from_offset: u64) -> Routed {
+        let (_, _, connection) = self.authed();
+        let snapshot = self.ctx.store().snapshot();
+        let manager = self.ctx.subscriptions.lock().await;
+        match manager.resume(connection, query_id, from_offset, &snapshot) {
+            Ok(Some(Resumed::Deltas(deltas))) => Routed {
+                responses: deltas
+                    .into_iter()
+                    .map(|(offset, update)| {
+                        ServerMessage::TxUpdate(TxUpdate {
+                            tx_id: offset,
+                            timestamp: 0,
+                            reducer_name: String::new(),
+                            caller: [0u8; 32],
+                            duration_us: 0,
+                            shard_id: self.ctx.shard_id,
+                            tx_offset: offset,
+                            tables: vec![(*update).clone()],
+                        })
+                    })
+                    .collect(),
+                commit: None,
+            },
+            Ok(Some(Resumed::Reset(initial))) => {
+                let mut initial = *initial;
+                initial.id = id;
+                Routed::reply(ServerMessage::InitialData(initial))
+            }
+            Ok(None) => Routed::reply(error(
+                Some(id),
+                codes::SUB_UNKNOWN_QUERY_ID,
+                "unknown query_id: subscribe again (the session did not survive)",
+            )),
+            Err(e) => Routed::reply(from_error(Some(id), &e)),
+        }
+    }
+
     async fn subscribe(&self, id: u32, queries: Vec<String>) -> Routed {
         let (_, subscriber, connection) = self.authed();
         let snapshot = self.ctx.store().snapshot();
@@ -331,6 +381,7 @@ fn request_id(message: &ClientMessage) -> u32 {
         ClientMessage::SubscribeSingle(m) => m.id,
         ClientMessage::Unsubscribe(m) => m.id,
         ClientMessage::OneOffQuery(m) => m.id,
+        ClientMessage::Resume(m) => m.id,
     }
 }
 

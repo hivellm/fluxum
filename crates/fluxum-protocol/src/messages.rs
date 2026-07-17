@@ -183,6 +183,30 @@ pub struct Unsubscribe {
     pub query_ids: Vec<u32>,
 }
 
+/// RPC-026 / SPEC-021 CS-021 — resume a live subscription from a retained
+/// offset instead of re-downloading its snapshot.
+///
+/// The server replies with only the committed deltas after `from_offset`
+/// for that compiled query (as `TxUpdate`s), followed by live updates. If
+/// `from_offset` predates the retained delta window it answers a full
+/// [`InitialData`] with [`InitialData::cache_reset`] set (CS-022).
+///
+/// `query_id` is resolved against the sending session's registered
+/// subscriptions, so resumption requires a session that outlived the
+/// transport blip (the Streamable HTTP GET reconnect); a brand-new session
+/// has no prior `query_id` and must `Subscribe` afresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Resume {
+    /// Request id.
+    pub id: u32,
+    /// The subscription to resume — a `query_id` this session already holds
+    /// (from `InitialData.tables[n].query_id`).
+    pub query_id: u32,
+    /// The highest offset the client has already applied for this query
+    /// (`InitialData.tx_offset` or the last `TxUpdate.tx_offset`).
+    pub from_offset: u64,
+}
+
 /// RPC-025 — one-shot read-only query; no subscription is registered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OneOffQuery {
@@ -228,6 +252,18 @@ pub struct InitialData {
     pub id: u32,
     /// Server's current schema version (RPC-043).
     pub schema_version: u32,
+    /// The monotonic per-shard offset this snapshot reflects (SPEC-021
+    /// CS-020): the client retains it per subscription and replays from it
+    /// with [`Resume`]. `#[serde(default)]` keeps pre-field frames decoding
+    /// (CS-023: additive).
+    #[serde(default)]
+    pub tx_offset: u64,
+    /// Set when this snapshot answers a [`Resume`] whose `from_offset`
+    /// predated the retained delta window (SPEC-021 CS-022): the SDK MUST
+    /// clear its cache for the query and replay from this snapshot rather
+    /// than merging it.
+    #[serde(default)]
+    pub cache_reset: bool,
     /// One entry per query.
     pub tables: Vec<TableUpdate>,
 }
@@ -271,6 +307,14 @@ pub struct TxUpdate {
     /// deployments; `#[serde(default)]` keeps pre-field frames decoding.
     #[serde(default)]
     pub shard_id: u32,
+    /// The monotonic per-shard resume cursor for this commit (SPEC-021
+    /// CS-020). It currently mirrors [`TxUpdate::tx_id`], but it is the
+    /// documented cursor clients retain and echo in [`Resume::from_offset`]
+    /// — the offset space is free to diverge from tx ids later without
+    /// breaking resumption. `#[serde(default)]` keeps pre-field frames
+    /// decoding (CS-023: additive).
+    #[serde(default)]
+    pub tx_offset: u64,
     /// Row diffs, one entry per affected subscribed table.
     pub tables: Vec<TableUpdate>,
 }
@@ -371,6 +415,8 @@ tagged_enum! {
         "Unsubscribe" => Unsubscribe(Unsubscribe),
         /// RPC-025.
         "OneOffQuery" => OneOffQuery(OneOffQuery),
+        /// RPC-026 / SPEC-021 CS-021.
+        "Resume" => Resume(Resume),
     }
 }
 

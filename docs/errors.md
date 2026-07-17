@@ -169,6 +169,13 @@ table is not visible to client subscriptions
 - severity: `error` · retryable: `false` · HTTP 403
 - details keys: `table`
 
+## 6002 `SUB_UNKNOWN_QUERY_ID`
+
+unknown query_id: subscribe again
+
+- severity: `error` · retryable: `false` · HTTP 404
+- details keys: `query_id`
+
 ## 7000 `STORAGE_INTERNAL`
 
 internal storage failure

@@ -129,6 +129,10 @@ pub const REDUCER_UNKNOWN_VIEW: u16 = 5006;
 pub const SUB_LIMIT_EXCEEDED: u16 = 6000;
 /// 6001 — subscription to a non-public table (SUB-005).
 pub const SUB_TABLE_NOT_PUBLIC: u16 = 6001;
+/// 6002 — `Resume` named a `query_id` this session does not hold (SPEC-021
+/// CS-021): the subscription did not outlive the disconnect, so the client
+/// must `Subscribe` afresh rather than resume.
+pub const SUB_UNKNOWN_QUERY_ID: u16 = 6002;
 
 // --- 7xxx STORAGE_ ----------------------------------------------------------
 
@@ -398,6 +402,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         details_keys: &["table"],
         message_template: "table is not visible to client subscriptions",
         http_status: 403,
+    },
+    CatalogEntry {
+        code: SUB_UNKNOWN_QUERY_ID,
+        name: "SUB_UNKNOWN_QUERY_ID",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: None,
+        details_keys: &["query_id"],
+        message_template: "unknown query_id: subscribe again",
+        http_status: 404,
     },
     CatalogEntry {
         code: STORAGE_INTERNAL,

@@ -123,6 +123,14 @@ fn client_message() -> impl Strategy<Value = ClientMessage> {
             .prop_map(|(id, query_ids)| ClientMessage::Unsubscribe(Unsubscribe { id, query_ids })),
         (any::<u32>(), ".{0,24}")
             .prop_map(|(id, sql)| ClientMessage::OneOffQuery(OneOffQuery { id, sql })),
+        // SPEC-021 CS-021: the additive Resume message.
+        (any::<u32>(), any::<u32>(), any::<u64>()).prop_map(|(id, query_id, from_offset)| {
+            ClientMessage::Resume(fluxum_protocol::Resume {
+                id,
+                query_id,
+                from_offset,
+            })
+        }),
     ]
 }
 
@@ -158,12 +166,17 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
         (
             any::<u32>(),
             any::<u32>(),
+            any::<u64>(),
+            any::<bool>(),
             prop::collection::vec(table_update(), 0..3)
         )
-            .prop_map(|(id, schema_version, tables)| {
+            .prop_map(|(id, schema_version, tx_offset, cache_reset, tables)| {
                 ServerMessage::InitialData(InitialData {
                     id,
                     schema_version,
+                    // SPEC-021 CS-020/CS-022 additions roundtrip too.
+                    tx_offset,
+                    cache_reset,
                     tables,
                 })
             }),
@@ -173,17 +186,30 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
             ".{0,16}",
             prop::array::uniform32(any::<u8>()),
             any::<u32>(),
+            any::<u32>(),
+            any::<u64>(),
             prop::collection::vec(table_update(), 0..3)
         )
             .prop_map(
-                |(tx_id, timestamp, reducer_name, caller, duration_us, tables)| {
+                |(
+                    tx_id,
+                    timestamp,
+                    reducer_name,
+                    caller,
+                    duration_us,
+                    shard_id,
+                    tx_offset,
+                    tables,
+                )| {
                     ServerMessage::TxUpdate(TxUpdate {
                         tx_id,
                         timestamp,
                         reducer_name,
                         caller,
                         duration_us,
-                        shard_id: 0,
+                        // SHD-051 + SPEC-021 CS-020 additions roundtrip too.
+                        shard_id,
+                        tx_offset,
                         tables,
                     })
                 }
