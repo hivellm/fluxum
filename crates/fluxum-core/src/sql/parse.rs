@@ -43,13 +43,16 @@ impl std::fmt::Display for Lit {
     }
 }
 
-/// One WHERE condition (SUB-010; comparison operators per SPEC-018 QP-030).
+/// One WHERE condition (SUB-010; comparison operators per SPEC-018 QP-030;
+/// `MATCH` per SPEC-019 FTS-030).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum CondAst {
     Eq(String, Lit),
     In(String, Vec<Lit>),
     Between(String, Lit, Lit),
     Cmp(String, CmpOp, Lit),
+    /// `col MATCH 'raw query'` — analyzed at compile time (FTS-030).
+    Match(String, String),
 }
 
 /// A QP-030 comparison operator.
@@ -93,6 +96,8 @@ pub(crate) struct QueryAst {
     pub limit: Option<u32>,
     /// `AFTER (order value, pk value)` keyset cursor (QP-040).
     pub after: Option<(Lit, Lit)>,
+    /// `SELECT *, SCORE` — opt-in `_score` projection (FTS-041).
+    pub select_score: bool,
 }
 
 /// SUB-012 constructs plus common SQL that is outside the subset, each with
@@ -149,6 +154,13 @@ impl<'t> Parser<'t> {
             return Err(unsupported(
                 "subscriptions project whole rows: write SELECT *",
             ));
+        }
+        // FTS-041: `SELECT *, SCORE` opts into the `_score` projection.
+        let mut select_score = false;
+        if matches!(self.tokens.get(self.pos), Some(Token::Comma)) {
+            self.pos += 1;
+            self.expect_keyword("SCORE")?;
+            select_score = true;
         }
         self.expect_keyword("FROM")?;
         let table = self.expect_ident("a table name")?;
@@ -264,6 +276,7 @@ impl<'t> Parser<'t> {
             order_tiebreak,
             limit,
             after,
+            select_score,
         })
     }
 
@@ -314,8 +327,16 @@ impl<'t> Parser<'t> {
             Some(Token::Le) => Ok(CondAst::Cmp(column, CmpOp::Le, self.parse_literal()?)),
             Some(Token::Gt) => Ok(CondAst::Cmp(column, CmpOp::Gt, self.parse_literal()?)),
             Some(Token::Ge) => Ok(CondAst::Cmp(column, CmpOp::Ge, self.parse_literal()?)),
+            // SPEC-019 FTS-030: full-text MATCH over a #[fulltext] column.
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("MATCH") => match self.next() {
+                Some(Token::Str(query)) => Ok(CondAst::Match(column, query.clone())),
+                other => Err(unsupported(format!(
+                    "MATCH takes a quoted query string, got {}",
+                    display_token(other)
+                ))),
+            },
             other => Err(unsupported(format!(
-                "expected =, IN, BETWEEN, <, >, <=, or >= after `{column}`, got {}",
+                "expected =, IN, BETWEEN, MATCH, <, >, <=, or >= after `{column}`, got {}",
                 display_token(other)
             ))),
         }

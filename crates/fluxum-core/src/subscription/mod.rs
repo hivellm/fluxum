@@ -163,6 +163,16 @@ pub struct SubscriptionManager {
     /// Value-level pruning index (SUB-023): `(table, column, encoded value)`
     /// → plans. The value key is FluxBIN bytes (see [`ValueKey`]).
     search_args: HashMap<(TableId, u16, ValueKey), HashSet<QueryHash>>,
+    /// FTS-042 term→plans pruning: a MATCH plan registers its query terms
+    /// (a phrase registers its first term) so only plans whose terms appear
+    /// in a delta row's analyzed text are evaluated.
+    fts_terms: HashMap<(TableId, String), HashSet<QueryHash>>,
+    /// FTS-031 prefix registrations, scanned linearly per delta term
+    /// (prefixes are few; exact terms dominate).
+    fts_prefixes: HashMap<TableId, Vec<(String, QueryHash)>>,
+    /// The analyzers of every `#[fulltext]` column, per table — used to
+    /// analyze delta rows during candidate selection.
+    fts_analyzers: HashMap<TableId, Vec<(u16, crate::index::Analyzer)>>,
     /// Which columns of a table carry a search arg, with a refcount so a
     /// column is probed only while some plan indexes it (drives per-delta
     /// probing without scanning all search args).
@@ -176,12 +186,49 @@ pub struct SubscriptionManager {
 impl SubscriptionManager {
     /// Build an empty manager over an assembled schema.
     pub fn new(schema: Arc<Schema>, limits: SubscriptionLimits) -> Self {
+        // FTS-042: pre-resolve the analyzer of every #[fulltext] column so
+        // candidate selection can analyze delta rows without schema walks.
+        let mut fts_analyzers: HashMap<TableId, Vec<(u16, crate::index::Analyzer)>> =
+            HashMap::new();
+        for table in schema.tables() {
+            for index in table.indexes {
+                if let crate::schema::IndexSchema::FullText {
+                    column,
+                    language,
+                    stop_words,
+                    stemming,
+                } = index
+                {
+                    fts_analyzers
+                        .entry(TableId::of(table.name))
+                        .or_default()
+                        .push((
+                            *column,
+                            crate::index::Analyzer {
+                                language: match language {
+                                    crate::schema::FullTextLanguage::Simple => {
+                                        crate::index::Language::Simple
+                                    }
+                                    crate::schema::FullTextLanguage::English => {
+                                        crate::index::Language::English
+                                    }
+                                },
+                                stop_words: *stop_words,
+                                stemming: *stemming,
+                            },
+                        ));
+                }
+            }
+        }
         Self {
             schema,
             limits,
             queries: HashMap::new(),
             connections: HashMap::new(),
             search_args: HashMap::new(),
+            fts_terms: HashMap::new(),
+            fts_prefixes: HashMap::new(),
+            fts_analyzers,
             indexed_columns: HashMap::new(),
             table_watchers: HashMap::new(),
             next_query_id: HashMap::new(),
@@ -256,7 +303,7 @@ impl SubscriptionManager {
             return Err(limit_exceeded("max_compiled_plans"));
         }
 
-        let initial = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
+        let (initial, _) = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
 
         // Register: shared plan + pruning-index membership on first sighting.
         if let Some(state) = self.queries.get_mut(&hash) {
@@ -369,7 +416,7 @@ impl SubscriptionManager {
             ));
         }
         let (_, viewer) = self.effective_key(&plan, subscriber);
-        self.initial_data(&plan, viewer.as_ref(), snapshot)
+        Ok(self.initial_data(&plan, viewer.as_ref(), snapshot)?.0)
     }
 
     /// Run a one-off read (SUB-025) and return the rows as JSON — the shape
@@ -390,14 +437,23 @@ impl SubscriptionManager {
                 format!("table `{}` is not public", table.name),
             ));
         }
-        let initial = self.snapshot_result(subscriber, sql, snapshot)?;
-        let columns: Vec<&str> = table.columns.iter().map(|c| c.name).collect();
+        let (_, viewer) = self.effective_key(&plan, subscriber);
+        let (initial, scores) = self.initial_data(&plan, viewer.as_ref(), snapshot)?;
+        let mut columns: Vec<&str> = table.columns.iter().map(|c| c.name).collect();
+        // FTS-041: the opt-in `_score` projection on the JSON read surface.
+        let with_score = plan.select_score && scores.len() == initial.tables[0].inserts.len();
+        if with_score {
+            columns.push("_score");
+        }
         let mut rows = Vec::new();
-        for bytes in initial.tables[0].inserts.iter() {
+        for (index, bytes) in initial.tables[0].inserts.iter().enumerate() {
             let row = crate::store::row::decode_row(table, bytes)?;
             let mut object = serde_json::Map::new();
             for (column, value) in table.columns.iter().zip(row.values()) {
                 object.insert(column.name.to_owned(), row_value_to_json(value));
+            }
+            if with_score {
+                object.insert("_score".to_owned(), serde_json::json!(scores[index]));
             }
             rows.push(serde_json::Value::Object(object));
         }
@@ -459,23 +515,41 @@ impl SubscriptionManager {
 
     // --- InitialData (SUB-002/013) ------------------------------------------
 
+    /// Returns the encoded snapshot plus, for a MATCH plan, the BM25 scores
+    /// parallel to the encoded rows (consumed by the `_score` projection on
+    /// the JSON read surface; empty when not applicable).
     fn initial_data(
         &self,
         plan: &CompiledPlan,
         viewer: Option<&Identity>,
         snapshot: &Snapshot,
-    ) -> Result<InitialData> {
+    ) -> Result<(InitialData, Vec<f64>)> {
         let table_id = plan.table_ids[0];
         let schema = self.table_schema(table_id)?;
 
         // Candidate rows: spatial clauses go through the spatial index
-        // (SUB-022); an `IndexScan` plan goes through its bounded B-tree
-        // scans (SPEC-018 QP-010); otherwise a full committed scan. Every
-        // path applies RLS for this viewer (SUB-030) — `viewer` is `None`
-        // for a public query or a server-peer bypass.
+        // (SUB-022); a `MATCH` goes through the inverted index (SPEC-019
+        // FTS-030 — never a full scan); an `IndexScan` plan goes through its
+        // bounded B-tree scans (SPEC-018 QP-010); otherwise a full committed
+        // scan. Every path applies RLS for this viewer (SUB-030) — `viewer`
+        // is `None` for a public query or a server-peer bypass.
         let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
-        let mut rows: Vec<Row> = match (&plan.spatial, &plan.access) {
-            (Some(constraint), _) => self
+        // BM25 scores parallel to `rows`, present only for a MATCH plan
+        // (FTS-040/041); dropped unless SCORE ordering/projection needs them.
+        let mut scores: Vec<f64> = Vec::new();
+        let mut rows: Vec<Row> = match (&plan.fts, &plan.spatial, &plan.access) {
+            (Some(fts), None, _) => {
+                let mut rows = Vec::new();
+                for (row, score) in snapshot.fulltext_match(table_id, fts)? {
+                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if keep(&row) {
+                        rows.push(row);
+                        scores.push(score);
+                    }
+                }
+                rows
+            }
+            (None, Some(constraint), _) => self
                 .spatial_candidates(snapshot, table_id, *constraint)?
                 .into_iter()
                 .filter(|row| {
@@ -483,10 +557,10 @@ impl SubscriptionManager {
                     keep(row)
                 })
                 .collect(),
-            (None, AccessPath::IndexScan(scan)) => {
+            (None, None, AccessPath::IndexScan(scan)) => {
                 index_scan_rows(plan, scan, viewer, snapshot, table_id, schema)?
             }
-            (None, AccessPath::FullScan) => snapshot
+            (_, _, AccessPath::FullScan) => snapshot
                 .scan(table_id)?
                 .filter(|row| {
                     QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -494,15 +568,30 @@ impl SubscriptionManager {
                 })
                 .cloned()
                 .collect(),
+            (Some(_), Some(_), _) => unreachable!("compile rejects MATCH + spatial"),
         };
 
         // ORDER BY / LIMIT apply to InitialData ONLY (SUB-013). QP-020: an
-        // index-served order skips the in-RAM sort — the scan already
-        // streamed rows in order (DESC via the reverse walk).
-        if let Some(order) = plan.order_by
+        // index-served order skips the in-RAM sort. FTS-041: `ORDER BY
+        // SCORE` sorts by BM25 (snapshot-only, like every ordering).
+        if let Some(descending) = plan.order_by_score {
+            QUERY_SORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let mut paired: Vec<(Row, f64)> = rows.drain(..).zip(scores.drain(..)).collect();
+            paired.sort_by(|a, b| {
+                let ord = a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal);
+                if descending { ord.reverse() } else { ord }
+            });
+            for (row, score) in paired {
+                rows.push(row);
+                scores.push(score);
+            }
+        } else if let Some(order) = plan.order_by
             && !plan.ordered_by_index
         {
             QUERY_SORTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // A column sort on a MATCH plan drops score pairing (scores are
+            // only surfaced with SCORE ordering / projection intact).
+            scores.clear();
             rows.sort_by(|a, b| {
                 let ord = a
                     .value(order.column)
@@ -514,20 +603,24 @@ impl SubscriptionManager {
         }
         if let Some(limit) = plan.limit {
             rows.truncate(limit as usize);
+            scores.truncate(limit as usize);
         }
 
         let inserts = encode_full_rows(&rows)?;
-        Ok(InitialData {
-            id: 0,
-            schema_version: 0,
-            tables: vec![TableUpdate {
-                table_id: table_id.as_u32(),
-                table_name: schema.name.to_owned(),
-                query_id: 0,
-                inserts,
-                deletes: RowList::empty(),
-            }],
-        })
+        Ok((
+            InitialData {
+                id: 0,
+                schema_version: 0,
+                tables: vec![TableUpdate {
+                    table_id: table_id.as_u32(),
+                    table_name: schema.name.to_owned(),
+                    query_id: 0,
+                    inserts,
+                    deletes: RowList::empty(),
+                }],
+            },
+            scores,
+        ))
     }
 
     // --- Commit evaluation (SUB-021) ----------------------------------------
@@ -547,7 +640,13 @@ impl SubscriptionManager {
             return Ok(None); // fast path: this plan's table did not change
         };
 
-        let keep = |row: &&Row| plan.matches(row) && visible(plan, row, viewer);
+        // FTS-042: live diffs test the boolean MATCH by re-analyzing the
+        // delta row — no re-ranking.
+        let keep = |row: &&Row| {
+            plan.matches(row)
+                && plan.fts.as_ref().is_none_or(|fts| fts.matches_row(row))
+                && visible(plan, row, viewer)
+        };
         let matched_inserts: Vec<&Row> = table_diff.inserts.iter().filter(keep).collect();
         // Deletes are matched by running the SAME predicate + RLS over the
         // deleted rows' pre-commit values (SUB-021) — no per-row
@@ -603,9 +702,56 @@ impl SubscriptionManager {
                 .chain(table.deletes.iter().map(|(_, old)| old));
             for row in rows {
                 self.select_by_value(table.table_id, row, &mut candidates);
+                self.select_by_fts_terms(table.table_id, row, &mut candidates);
             }
         }
         candidates
+    }
+
+    /// FTS-042 candidate tier: analyze the delta row's `#[fulltext]` columns
+    /// and select the MATCH plans registered under any of its terms (exact
+    /// term hits plus the few prefix registrations) — fan-out stays
+    /// O(P_matched + S_matched), never O(all MATCH plans).
+    fn select_by_fts_terms(&self, table_id: TableId, row: &Row, out: &mut HashSet<QueryHash>) {
+        let Some(analyzers) = self.fts_analyzers.get(&table_id) else {
+            return;
+        };
+        let prefixes = self.fts_prefixes.get(&table_id);
+        for (column, analyzer) in analyzers {
+            let text = match row.value(*column) {
+                Some(crate::store::RowValue::Str(s)) => s.clone(),
+                Some(crate::store::RowValue::Optional(Some(inner))) => match inner.as_ref() {
+                    crate::store::RowValue::Str(s) => s.clone(),
+                    _ => continue,
+                },
+                Some(crate::store::RowValue::List(values)) => {
+                    let mut parts = Vec::with_capacity(values.len());
+                    for value in values {
+                        if let crate::store::RowValue::Str(s) = value {
+                            parts.push(s.as_str());
+                        }
+                    }
+                    parts.join(" ")
+                }
+                _ => continue,
+            };
+            let mut seen: HashSet<String> = HashSet::new();
+            for (term, _) in analyzer.analyze(&text) {
+                if !seen.insert(term.clone()) {
+                    continue;
+                }
+                if let Some(plans) = self.fts_terms.get(&(table_id, term.clone())) {
+                    out.extend(plans.iter().copied());
+                }
+                if let Some(prefixes) = prefixes {
+                    for (prefix, hash) in prefixes {
+                        if term.starts_with(prefix.as_str()) {
+                            out.insert(*hash);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Add the value-indexed plans whose `(table, column, value)` matches a
@@ -651,6 +797,22 @@ impl SubscriptionManager {
                 .or_default()
                 .entry(column)
                 .or_insert(0) += 1;
+        } else if let Some(fts) = &plan.fts {
+            // FTS-042: register the MATCH plan under its query terms so a
+            // commit only evaluates plans whose terms appear in the delta.
+            let (terms, prefixes) = fts.pruning_terms();
+            for term in terms {
+                self.fts_terms
+                    .entry((table_id, term))
+                    .or_default()
+                    .insert(hash);
+            }
+            for prefix in prefixes {
+                self.fts_prefixes
+                    .entry(table_id)
+                    .or_default()
+                    .push((prefix, hash));
+            }
         } else {
             self.table_watchers
                 .entry(table_id)
@@ -680,6 +842,27 @@ impl SubscriptionManager {
                 }
                 if columns.is_empty() {
                     self.indexed_columns.remove(&table_id);
+                }
+            }
+        } else if let Some(fts) = &plan.fts {
+            let (terms, prefixes) = fts.pruning_terms();
+            for term in terms {
+                let key = (table_id, term);
+                if let Some(set) = self.fts_terms.get_mut(&key) {
+                    set.remove(&hash);
+                    if set.is_empty() {
+                        self.fts_terms.remove(&key);
+                    }
+                }
+            }
+            if !prefixes.is_empty()
+                && let Some(list) = self.fts_prefixes.get_mut(&table_id)
+            {
+                list.retain(|(prefix, plan_hash)| {
+                    !(*plan_hash == hash && prefixes.contains(prefix))
+                });
+                if list.is_empty() {
+                    self.fts_prefixes.remove(&table_id);
                 }
             }
         } else if let Some(set) = self.table_watchers.get_mut(&table_id) {

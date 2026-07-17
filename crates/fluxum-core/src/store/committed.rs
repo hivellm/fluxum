@@ -366,6 +366,41 @@ impl Snapshot {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
     }
 
+    /// Evaluate a `MATCH` predicate through the table's `#[fulltext]` index
+    /// (SPEC-019 FTS-030): boolean AND-of-items + BM25 scores, resolved from
+    /// the posting lists — never a table scan. Errors when no full-text
+    /// index covers the query's column, or with the FTS-022 readiness gate
+    /// while rebuilding.
+    pub fn fulltext_match(
+        &self,
+        table: TableId,
+        query: &crate::index::FtsQuery,
+    ) -> Result<Vec<(Row, f64)>> {
+        let state = self.state.table(table)?;
+        let index = state
+            .fulltext
+            .iter()
+            .find(|index| index.column() == query.column)
+            .ok_or_else(|| {
+                FluxumError::Storage(format!(
+                    "table `{}` has no #[fulltext] index over column ordinal {} (FTS-033)",
+                    state.schema.name, query.column
+                ))
+            })?;
+        let mut out = Vec::new();
+        for (pk, score) in index.search(query)? {
+            let row = state.rows.get(&pk).ok_or_else(|| {
+                FluxumError::Storage(
+                    "internal invariant violated: full-text posting references a \
+                     missing row"
+                        .into(),
+                )
+            })?;
+            out.push((row.clone(), score));
+        }
+        Ok(out)
+    }
+
     /// Rows of `table` inside `region` (bounds inclusive, SPX-020),
     /// resolved via the spatial index — never a table scan (SPX-023).
     /// Errors when the table declares no `#[spatial(...)]` index (SPX-022).

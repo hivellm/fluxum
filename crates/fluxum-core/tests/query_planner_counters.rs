@@ -46,9 +46,36 @@ static ITEM: TableSchema = TableSchema {
     visibility: VisibilityRule::PublicAll,
 };
 
+static DOC_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "id",
+        ty: FluxType::U64,
+    },
+    ColumnSchema {
+        name: "body",
+        ty: FluxType::Str,
+    },
+];
+static DOC: TableSchema = TableSchema {
+    name: "Doc",
+    columns: DOC_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Public,
+    partition_by: None,
+    unique: &[],
+    indexes: &[fluxum_core::schema::IndexSchema::FullText {
+        column: 1,
+        language: fluxum_core::schema::FullTextLanguage::Simple,
+        stop_words: false,
+        stemming: false,
+    }],
+    visibility: VisibilityRule::PublicAll,
+};
+
 #[test]
 fn pushdown_scans_the_bounded_range_and_top_n_never_sorts() {
-    let schema = Arc::new(Schema::from_tables([&ITEM]).unwrap());
+    let schema = Arc::new(Schema::from_tables([&ITEM, &DOC]).unwrap());
     let store = MemStore::new(&schema).unwrap();
     let item = store.table_id("Item").unwrap();
     // 10 categories × 100 prices = 1,000 rows.
@@ -139,5 +166,22 @@ fn pushdown_scans_the_bounded_range_and_top_n_never_sorts() {
         deep_page_scanned <= first_page_scanned + 1,
         "deep page cost ({deep_page_scanned}) ≈ page size, not O(N · page) \
          (first page: {first_page_scanned})"
+    );
+
+    // SPEC-019 FTS-030 acceptance 5: a MATCH is bounded by its posting
+    // lists, never the table — 1,000 docs, 3 contain the term.
+    let doc = store.table_id("Doc").unwrap();
+    let mut tx = store.begin();
+    for i in 0..1_000u64 {
+        let body = if i % 333 == 0 { "hidden treasure map" } else { "plain filler text" };
+        tx.insert(doc, vec![RowValue::U64(i + 1), RowValue::Str(body.into())])
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    let (rows, scanned, _) = run("SELECT * FROM Doc WHERE body MATCH 'treasure'");
+    assert_eq!(rows, 4, "ids 1, 334, 667, 1000");
+    assert_eq!(
+        scanned, 4,
+        "MATCH touched only the posting-list candidates, not 1,000 docs"
     );
 }

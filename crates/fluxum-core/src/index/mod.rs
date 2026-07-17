@@ -47,7 +47,9 @@ pub mod quadtree;
 pub mod rtree;
 
 pub use btree::BTreeIndex;
-pub use fulltext::{Analyzer, AnalyzerId, FullTextIndexState, Language};
+pub use fulltext::{
+    Analyzer, AnalyzerId, BM25_B, BM25_K1, FtsItem, FtsQuery, FullTextIndexState, Language,
+};
 pub use quadtree::{QuadTree, Rect};
 pub use rtree::{Aabb, RTree};
 

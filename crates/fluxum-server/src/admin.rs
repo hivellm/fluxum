@@ -244,12 +244,40 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
                     column
                 })
                 .collect();
-            json!({
+            let mut entry = json!({
                 "name": table.name,
                 "columns": columns,
                 "primary_key": table.primary_key,
                 "access": format!("{:?}", table.access),
-            })
+            });
+            // SPEC-019 FTS-050: expose each full-text index — column,
+            // analyzer id/config, BM25 params. Never corpus content.
+            let fulltext: Vec<Value> = table
+                .indexes
+                .iter()
+                .filter_map(|index| match index {
+                    fluxum_core::schema::IndexSchema::FullText {
+                        column,
+                        language,
+                        stop_words,
+                        stemming,
+                    } => Some(json!({
+                        "column": table.columns[usize::from(*column)].name,
+                        "language": format!("{language:?}").to_lowercase(),
+                        "stop_words": stop_words,
+                        "stemming": stemming,
+                        "bm25": {
+                            "k1": fluxum_core::index::BM25_K1,
+                            "b": fluxum_core::index::BM25_B,
+                        },
+                    })),
+                    _ => None,
+                })
+                .collect();
+            if !fulltext.is_empty() {
+                entry["fulltext"] = Value::Array(fulltext);
+            }
+            entry
         })
         .collect();
     let mut reducers: Vec<&str> = ctx.engine.registry().names().collect();
@@ -265,8 +293,10 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
             // SPEC-018 QP-031: the query surface SDK codegen documents —
             // the extended operator set plus keyset pagination (no OFFSET).
             "query": {
-                "operators": ["=", "IN", "BETWEEN", "<", ">", "<=", ">="],
+                "operators": ["=", "IN", "BETWEEN", "<", ">", "<=", ">=", "MATCH"],
                 "pagination": "keyset: ORDER BY <indexed col> [, <pk>] LIMIT n AFTER (value, pk)",
+                // SPEC-019 FTS-052: the full-text surface SDKs render.
+                "match": "col MATCH 'term \"a phrase\" prefix*' [ORDER BY SCORE DESC] [SELECT *, SCORE]",
             },
         }),
     )

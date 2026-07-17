@@ -18,7 +18,7 @@
 //! the pager is wired into the live path, page-ordered eviction) are plain
 //! range iteration — the same tiering story as the B-tree index.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::error::{FluxumError, Result};
 use crate::store::row::{PkBytes, Row, RowValue};
@@ -186,6 +186,199 @@ fn stem_english(word: &str) -> String {
     word.to_owned()
 }
 
+/// BM25 `k1` (term-frequency saturation), the standard default (FTS-040).
+pub const BM25_K1: f64 = 1.2;
+/// BM25 `b` (length normalization), the standard default (FTS-040).
+pub const BM25_B: f64 = 0.75;
+
+/// One analyzed `MATCH` item (SPEC-019 FTS-030/031/032).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FtsItem {
+    /// A plain term: the document must contain it.
+    Term(String),
+    /// A trailing-`*` prefix (typeahead): any indexed term extending it.
+    Prefix(String),
+    /// A quoted phrase: `(term, analyzed position)` pairs — the position
+    /// deltas encode stop-word gaps so adjacency matches index semantics.
+    Phrase(Vec<(String, u32)>),
+}
+
+/// A compiled `MATCH` predicate over one `#[fulltext]` column (FTS-030):
+/// AND-of-items, analyzer-normalized at compile time so index-time and
+/// query-time analysis can never disagree (FTS-010).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FtsQuery {
+    /// The matched column's ordinal.
+    pub column: u16,
+    /// The AND-ed items (non-empty; enforced by [`FtsQuery::parse`]).
+    pub items: Vec<FtsItem>,
+    /// The column's analyzer — used to re-analyze delta rows for the
+    /// FTS-042 boolean live match.
+    pub analyzer: Analyzer,
+}
+
+impl FtsQuery {
+    /// Parse and analyze a raw `MATCH` string: bare terms AND together, a
+    /// trailing `*` makes a prefix, a `"…"` group is a phrase. Unsupported
+    /// search constructs — fuzzy `~`, `OR`/`NOT` inside the match, `^`
+    /// field boosts, non-trailing wildcards — are rejected with a wire-ready
+    /// 400 (FTS-033).
+    pub fn parse(raw: &str, column: u16, analyzer: Analyzer) -> Result<Self> {
+        let unsupported = |detail: &str| {
+            FluxumError::query(
+                fluxum_protocol::codes::SQL_UNSUPPORTED,
+                format!("unsupported MATCH syntax: {detail} (FTS-033)"),
+            )
+        };
+        for (marker, name) in [
+            ('~', "fuzzy `~`"),
+            ('^', "field boost `^`"),
+            ('(', "grouping"),
+            (')', "grouping"),
+        ] {
+            if raw.contains(marker) {
+                return Err(unsupported(name));
+            }
+        }
+        let mut items = Vec::new();
+        let mut rest = raw.trim();
+        while !rest.is_empty() {
+            if let Some(after) = rest.strip_prefix('"') {
+                // Quoted phrase group.
+                let Some(end) = after.find('"') else {
+                    return Err(unsupported("unterminated phrase quote"));
+                };
+                let phrase = &after[..end];
+                if phrase.contains('*') {
+                    return Err(unsupported("wildcards inside a phrase"));
+                }
+                let mut terms = analyzer.analyze(phrase);
+                match terms.len() {
+                    0 => return Err(unsupported("empty phrase")),
+                    1 => items.push(FtsItem::Term(terms.swap_remove(0).0)),
+                    _ => items.push(FtsItem::Phrase(terms)),
+                }
+                rest = after[end + 1..].trim_start();
+                continue;
+            }
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let word = &rest[..end];
+            rest = rest[end..].trim_start();
+            if word.eq_ignore_ascii_case("OR") || word.eq_ignore_ascii_case("NOT") {
+                return Err(unsupported(
+                    "boolean OR/NOT inside MATCH (AND-of-terms only)",
+                ));
+            }
+            if let Some(prefix) = word.strip_suffix('*') {
+                if prefix.contains('*') {
+                    return Err(unsupported("only a single trailing `*` is supported"));
+                }
+                // Analyze the prefix WITHOUT stemming semantics changing it:
+                // the prefix matches raw indexed terms, so it is case-folded
+                // only (a stem could be shorter than what the user typed).
+                let folded = case_fold(prefix);
+                if folded.is_empty() {
+                    return Err(unsupported("empty prefix before `*`"));
+                }
+                items.push(FtsItem::Prefix(folded));
+                continue;
+            }
+            if word.contains('*') {
+                return Err(unsupported("only a trailing `*` wildcard is supported"));
+            }
+            for (term, _) in analyzer.analyze(word) {
+                items.push(FtsItem::Term(term));
+            }
+        }
+        if items.is_empty() {
+            return Err(unsupported(
+                "the query analyzed to no terms (stop-words only or empty)",
+            ));
+        }
+        Ok(Self {
+            column,
+            items,
+            analyzer,
+        })
+    }
+
+    /// FTS-042: boolean re-analysis of one delta row — every item present
+    /// (phrases positionally). No scoring; live diffs are never ranked.
+    pub fn matches_row(&self, row: &Row) -> bool {
+        let text = match row.values().get(usize::from(self.column)) {
+            Some(RowValue::Str(s)) => s.clone(),
+            Some(RowValue::Optional(Some(inner))) => match inner.as_ref() {
+                RowValue::Str(s) => s.clone(),
+                _ => return false,
+            },
+            Some(RowValue::List(values)) => {
+                let mut parts = Vec::with_capacity(values.len());
+                for value in values {
+                    match value {
+                        RowValue::Str(s) => parts.push(s.as_str()),
+                        _ => return false,
+                    }
+                }
+                parts.join(" ")
+            }
+            _ => return false,
+        };
+        self.matches_text(&text)
+    }
+
+    /// Whether `text` (analyzed with this query's analyzer) satisfies every
+    /// item — the same predicate [`FullTextIndexState::search`] evaluates
+    /// through the index.
+    pub fn matches_text(&self, text: &str) -> bool {
+        let mut positions: HashMap<&str, Vec<u32>> = HashMap::new();
+        let analyzed = self.analyzer.analyze(text);
+        for (term, pos) in &analyzed {
+            positions.entry(term.as_str()).or_default().push(*pos);
+        }
+        self.items.iter().all(|item| match item {
+            FtsItem::Term(term) => positions.contains_key(term.as_str()),
+            FtsItem::Prefix(prefix) => {
+                positions.keys().any(|term| term.starts_with(prefix.as_str()))
+            }
+            FtsItem::Phrase(terms) => {
+                let Some(((first, first_pos), rest)) = terms.split_first() else {
+                    return false;
+                };
+                let Some(anchors) = positions.get(first.as_str()) else {
+                    return false;
+                };
+                anchors.iter().any(|anchor| {
+                    rest.iter().all(|(term, pos)| {
+                        positions.get(term.as_str()).is_some_and(|list| {
+                            list.binary_search(&(anchor + (pos - first_pos))).is_ok()
+                        })
+                    })
+                })
+            }
+        })
+    }
+
+    /// The pruning terms this query registers in the term→plans index
+    /// (FTS-042): every plain term, a phrase's first term, and each prefix
+    /// (matched by prefix against delta terms).
+    pub fn pruning_terms(&self) -> (Vec<String>, Vec<String>) {
+        let mut terms = Vec::new();
+        let mut prefixes = Vec::new();
+        for item in &self.items {
+            match item {
+                FtsItem::Term(term) => terms.push(term.clone()),
+                FtsItem::Phrase(phrase) => {
+                    if let Some((first, _)) = phrase.first() {
+                        terms.push(first.clone());
+                    }
+                }
+                FtsItem::Prefix(prefix) => prefixes.push(prefix.clone()),
+            }
+        }
+        (terms, prefixes)
+    }
+}
+
 /// One document's entry in a term's posting list (FTS-020): the positions at
 /// which the term occurs, in ascending document order. The term frequency
 /// `tf` is `positions.len()`.
@@ -286,6 +479,11 @@ impl FullTextIndexState {
         self.analyzer.id()
     }
 
+    /// The indexed column's ordinal.
+    pub(crate) fn column(&self) -> u16 {
+        self.column
+    }
+
     /// Read the indexed column's text, concatenating `Vec<String>` elements
     /// with a token-breaking gap. A `NULL` (`Optional(None)`) document
     /// contributes no terms.
@@ -367,6 +565,134 @@ impl FullTextIndexState {
             self.total_len -= u64::from(len);
         }
         Ok(())
+    }
+
+    // --- MATCH evaluation (SPEC-019 FTS-030/031/032/040) --------------------
+
+    /// Evaluate a `MATCH` predicate: AND-of-items over the posting lists —
+    /// term intersection, trailing-`*` prefix union (FTS-031), positional
+    /// phrase adjacency (FTS-032) — scored with BM25 (FTS-040). Returns
+    /// `(pk, score)` for every matching document, unordered. Routed through
+    /// the index only; there is no full-scan fallback (FTS-030). Errors with
+    /// the FTS-022 readiness gate while rebuilding.
+    pub fn search(&self, query: &FtsQuery) -> Result<Vec<(PkBytes, f64)>> {
+        self.check_ready()?;
+        // Per item: matched docs with a synthetic term frequency, plus the
+        // item's document frequency for idf.
+        let mut per_item: Vec<HashMap<PkBytes, u32>> = Vec::with_capacity(query.items.len());
+        for item in &query.items {
+            let docs: HashMap<PkBytes, u32> = match item {
+                FtsItem::Term(term) => self
+                    .postings
+                    .get(term)
+                    .map(|docs| docs.iter().map(|(pk, p)| (pk.clone(), p.tf())).collect())
+                    .unwrap_or_default(),
+                // FTS-031: BTreeMap range scan over `[prefix, successor)`,
+                // union of the covered posting lists (one synthetic term).
+                FtsItem::Prefix(prefix) => {
+                    let mut union: HashMap<PkBytes, u32> = HashMap::new();
+                    for (_, docs) in self
+                        .postings
+                        .range::<String, _>((
+                            std::ops::Bound::Included(prefix.clone()),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .take_while(|(term, _)| term.starts_with(prefix.as_str()))
+                    {
+                        for (pk, posting) in docs {
+                            *union.entry(pk.clone()).or_default() += posting.tf();
+                        }
+                    }
+                    union
+                }
+                // FTS-032: adjacency in stored positions, honoring the query
+                // phrase's own analyzed position deltas (stop-word gaps).
+                FtsItem::Phrase(terms) => self.phrase_docs(terms),
+            };
+            if docs.is_empty() {
+                return Ok(Vec::new()); // AND semantics: one empty item = no match
+            }
+            per_item.push(docs);
+        }
+        if per_item.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Boolean AND: intersect, starting from the smallest item set.
+        per_item.sort_by_key(HashMap::len);
+        let Some((first, rest)) = per_item.split_first() else {
+            return Ok(Vec::new()); // unreachable: emptiness returned above
+        };
+        let matched: Vec<&PkBytes> = first
+            .keys()
+            .filter(|pk| rest.iter().all(|docs| docs.contains_key(*pk)))
+            .collect();
+
+        // FTS-040: BM25 with the maintained corpus statistics.
+        #[allow(clippy::cast_precision_loss)] // corpus sizes are far below 2^52
+        let n = self.total_docs() as f64;
+        let avgdl = self.avg_doc_len().max(1.0);
+        let idf: Vec<f64> = per_item
+            .iter()
+            .map(|docs| {
+                #[allow(clippy::cast_precision_loss)]
+                let df = docs.len() as f64;
+                (1.0 + (n - df + 0.5) / (df + 0.5)).ln()
+            })
+            .collect();
+        let mut out = Vec::with_capacity(matched.len());
+        for pk in matched {
+            let dl = f64::from(self.doc_len(pk).unwrap_or(0));
+            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl);
+            let mut score = 0.0;
+            for (docs, idf) in per_item.iter().zip(&idf) {
+                let tf = f64::from(docs.get(pk).copied().unwrap_or(0));
+                score += idf * (tf * (BM25_K1 + 1.0)) / (tf + norm);
+            }
+            out.push((pk.clone(), score));
+        }
+        Ok(out)
+    }
+
+    /// The documents containing `terms` adjacently and in order (FTS-032),
+    /// with the phrase's occurrence count as the synthetic tf. The terms
+    /// carry their analyzed positions so stop-word gaps in the phrase are
+    /// honored exactly as at index time.
+    fn phrase_docs(&self, terms: &[(String, u32)]) -> HashMap<PkBytes, u32> {
+        let Some(((first_term, first_pos), rest)) = terms.split_first() else {
+            return HashMap::new();
+        };
+        let Some(first_docs) = self.postings.get(first_term) else {
+            return HashMap::new();
+        };
+        let mut out = HashMap::new();
+        for (pk, first_posting) in first_docs {
+            // Every later term must appear at the position-delta offset from
+            // the anchor occurrence.
+            let mut count = 0u32;
+            for anchor in &first_posting.positions {
+                let mut all = true;
+                for (term, pos) in rest {
+                    let offset = pos - first_pos;
+                    let needed = anchor + offset;
+                    let present = self
+                        .postings
+                        .get(term)
+                        .and_then(|docs| docs.get(pk))
+                        .is_some_and(|p| p.positions.binary_search(&needed).is_ok());
+                    if !present {
+                        all = false;
+                        break;
+                    }
+                }
+                if all {
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                out.insert(pk.clone(), count);
+            }
+        }
+        out
     }
 
     // --- BM25 corpus statistics (FTS-020) ---------------------------------

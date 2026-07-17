@@ -134,6 +134,16 @@ pub struct CompiledPlan {
     /// keyset-pagination task; carried here so the extension stays additive
     /// (QP-050). Always `None` until that task lands.
     pub cursor: Option<Keyset>,
+    /// SPEC-019 FTS-030: the compiled `MATCH` predicate, if any. Routed
+    /// through the inverted index for the snapshot (never a full scan);
+    /// tested as a boolean re-analysis on `TxUpdate` delta rows (FTS-042).
+    pub fts: Option<crate::index::FtsQuery>,
+    /// FTS-041 `ORDER BY SCORE [DESC]`: sort the snapshot by BM25 score
+    /// (`Some(descending)`). Snapshot-only, like every ordering (SUB-013).
+    pub order_by_score: Option<bool>,
+    /// FTS-041 `SELECT *, SCORE`: surface the BM25 score as a synthetic
+    /// `_score` column on the JSON one-off read surface.
+    pub select_score: bool,
 }
 
 /// How the snapshot evaluator reads a plan's candidate rows (QP-001).
@@ -192,6 +202,8 @@ impl fmt::Debug for CompiledPlan {
             .field("access", &self.access)
             .field("has_residual", &self.residual.is_some())
             .field("ordered_by_index", &self.ordered_by_index)
+            .field("has_fts", &self.fts.is_some())
+            .field("order_by_score", &self.order_by_score)
             .finish()
     }
 }
@@ -224,7 +236,30 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
 
     let mut conditions = Vec::with_capacity(ast.conditions.len());
     let mut equalities = Vec::new();
+    let mut fts: Option<crate::index::FtsQuery> = None;
     for cond in &ast.conditions {
+        // SPEC-019 FTS-030/033: `MATCH` compiles to the index-routed
+        // predicate, not an ordinary condition.
+        if let CondAst::Match(column, raw) = cond {
+            if fts.is_some() {
+                return Err(unsupported(
+                    "at most one MATCH predicate per query (FTS-030)",
+                ));
+            }
+            let (ordinal, _) = resolve_column(table, column)?;
+            let analyzer = fulltext_analyzer(table, ordinal).ok_or_else(|| {
+                FluxumError::query(
+                    codes::SQL_UNSUPPORTED,
+                    format!(
+                        "MATCH on column `{column}` of table `{}`: no #[fulltext] index \
+                         is declared over it (FTS-033)",
+                        table.name
+                    ),
+                )
+            })?;
+            fts = Some(crate::index::FtsQuery::parse(raw, ordinal, analyzer)?);
+            continue;
+        }
         let compiled = compile_condition(table, cond)?;
         if let CompiledCond::Eq(ordinal, value) = &compiled {
             equalities.push((*ordinal, value.clone()));
@@ -236,25 +271,46 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         .spatial
         .map(|clause| compile_spatial(table, clause))
         .transpose()?;
+    if fts.is_some() && spatial.is_some() {
+        return Err(unsupported(
+            "MATCH cannot combine with a spatial clause in one query",
+        ));
+    }
 
-    let order_by = ast
-        .order_by
-        .as_ref()
-        .map(|(column, descending)| {
-            let (ordinal, _) = resolve_column(table, column)?;
-            Ok::<_, FluxumError>(OrderSpec {
-                column: ordinal,
-                descending: *descending,
-            })
-        })
-        .transpose()?;
+    // FTS-041: `ORDER BY SCORE [DESC]` sorts by BM25 — recognized when the
+    // word does not name a real column and a MATCH is present.
+    let mut order_by_score: Option<bool> = None;
+    let order_by = match ast.order_by.as_ref() {
+        None => None,
+        Some((column, descending)) => {
+            if table.columns.iter().all(|c| c.name != column.as_str())
+                && column.eq_ignore_ascii_case("SCORE")
+            {
+                if fts.is_none() {
+                    return Err(unsupported("ORDER BY SCORE requires a MATCH (FTS-041)"));
+                }
+                order_by_score = Some(*descending);
+                None
+            } else {
+                let (ordinal, _) = resolve_column(table, column)?;
+                Some(OrderSpec {
+                    column: ordinal,
+                    descending: *descending,
+                })
+            }
+        }
+    };
+    if ast.select_score && fts.is_none() {
+        return Err(unsupported("SELECT *, SCORE requires a MATCH (FTS-041)"));
+    }
 
     let normalized = normalize(&ast);
     let query_hash = QueryHash(crate::simd::global().hash64(normalized.as_bytes(), 0));
 
     // SPEC-018 QP-001: rule-based access-path selection at compile time.
-    // Spatial queries keep their dedicated index path (SUB-022) untouched.
-    let (access, consumed, ordered_by_index) = if spatial.is_some() {
+    // Spatial and MATCH queries keep their dedicated index routes (SUB-022 /
+    // FTS-030); their ordinary conditions apply as per-row filters.
+    let (access, consumed, ordered_by_index) = if spatial.is_some() || fts.is_some() {
         (AccessPath::FullScan, Vec::new(), false)
     } else {
         plan_access(table, &conditions, order_by.as_ref())
@@ -373,6 +429,30 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         residual_desc,
         ordered_by_index,
         cursor,
+        fts,
+        order_by_score,
+        select_score: ast.select_score,
+    })
+}
+
+/// The analyzer of the `#[fulltext]` index declared over `ordinal`, if any
+/// (FTS-033: `None` means MATCH is rejected).
+fn fulltext_analyzer(table: &TableSchema, ordinal: u16) -> Option<crate::index::Analyzer> {
+    table.indexes.iter().find_map(|index| match index {
+        IndexSchema::FullText {
+            column,
+            language,
+            stop_words,
+            stemming,
+        } if *column == ordinal => Some(crate::index::Analyzer {
+            language: match language {
+                crate::schema::FullTextLanguage::Simple => crate::index::Language::Simple,
+                crate::schema::FullTextLanguage::English => crate::index::Language::English,
+            },
+            stop_words: *stop_words,
+            stemming: *stemming,
+        }),
+        _ => None,
     })
 }
 
@@ -707,6 +787,11 @@ fn compile_condition(table: &TableSchema, cond: &CondAst) -> Result<CompiledCond
                 coerce(table, column, high, ty)?,
             ))
         }
+        // FTS-030: MATCH is compiled by `compile` itself (it needs the
+        // analyzer, not a value coercion) — reaching here is a caller bug.
+        CondAst::Match(column, _) => Err(FluxumError::Storage(format!(
+            "internal invariant violated: MATCH on `{column}` reached compile_condition"
+        ))),
         // SPEC-018 QP-030/032: comparison operators, same type discipline
         // as BETWEEN (schema-typed coercion; no order over Bool/Option/List).
         CondAst::Cmp(column, op, lit) => {
@@ -861,7 +946,12 @@ fn normalize(ast: &QueryAst) -> String {
     use std::fmt::Write;
 
     let mut out = String::with_capacity(64);
-    let _ = write!(out, "SELECT * FROM {}", ast.table);
+    let _ = write!(
+        out,
+        "SELECT *{} FROM {}",
+        if ast.select_score { ", SCORE" } else { "" },
+        ast.table
+    );
     for (index, cond) in ast.conditions.iter().enumerate() {
         out.push_str(if index == 0 { " WHERE " } else { " AND " });
         match cond {
@@ -883,6 +973,9 @@ fn normalize(ast: &QueryAst) -> String {
             }
             CondAst::Cmp(column, op, lit) => {
                 let _ = write!(out, "{column} {op} {lit}");
+            }
+            CondAst::Match(column, query) => {
+                let _ = write!(out, "{column} MATCH '{}'", query.replace('\'', "''"));
             }
         }
     }
@@ -1103,6 +1196,9 @@ mod tests {
             residual_desc: vec![],
             ordered_by_index: false,
             cursor: None,
+            fts: None,
+            order_by_score: None,
+            select_score: false,
         };
         let debug = format!("{plan:?}");
         assert!(debug.contains("has_filter"), "{debug}");
