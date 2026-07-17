@@ -202,7 +202,20 @@ fn read_at(file: &File, offset: u64, buf: &mut [u8]) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt as _;
-        file.read_exact_at(buf, offset)?;
+        // `read_exact_at`'s own EOF error is the generic std message
+        // ("failed to fill whole buffer"); map it to the same domain error
+        // the Windows branch raises so a short read reads identically on
+        // both platforms.
+        file.read_exact_at(buf, offset).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                FluxumError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "page file read past end",
+                ))
+            } else {
+                FluxumError::Io(e)
+            }
+        })?;
     }
     #[cfg(windows)]
     {

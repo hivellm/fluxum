@@ -294,6 +294,17 @@ impl CommitLog {
     }
 
     async fn send(&self, cmd: Cmd) -> Result<()> {
+        // A fatal write poisons the writer: the actor publishes `Failed` on
+        // the durable watch, then exits and drops the receiver. Between those
+        // two steps the bounded channel still has buffer, so a `send` could
+        // be accepted after the failure is already observable through
+        // `wait_durable`/`durable_tx_id` — a race that let a post-failure
+        // append return `Ok`. Gate on the published state first so every
+        // command surface reports the poison deterministically, rather than
+        // relying on the receiver drop having landed.
+        if matches!(&*self.durable.borrow(), DurableState::Failed(_)) {
+            return Err(self.writer_gone_error());
+        }
         let sender = self
             .sender
             .as_ref()
