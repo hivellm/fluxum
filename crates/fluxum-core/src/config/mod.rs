@@ -382,6 +382,25 @@ impl Default for SubscriptionsConfig {
     }
 }
 
+/// Reducer admission tuning (SPEC-004 §7).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ReducerConfig {
+    /// RED-052 global shard guard: total client reducer admissions per
+    /// second before excess calls answer `503 "shard overloaded"`.
+    /// `0` disables the guard.
+    pub shard_max_reducers_per_sec: u64,
+}
+
+impl Default for ReducerConfig {
+    fn default() -> Self {
+        Self {
+            shard_max_reducers_per_sec:
+                crate::reducer::RateLimiterOptions::DEFAULT_SHARD_MAX_REDUCERS_PER_SEC,
+        }
+    }
+}
+
 /// Observability thresholds (SPEC-012).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -455,6 +474,8 @@ pub struct Config {
     pub auth: AuthConfig,
     /// Subscription fan-out.
     pub subscriptions: SubscriptionsConfig,
+    /// Reducer admission tuning.
+    pub reducer: ReducerConfig,
     /// Observability thresholds.
     pub observability: ObservabilityConfig,
     /// Logging.
@@ -929,14 +950,11 @@ fn parse_env_scalar(raw: &str) -> Value {
 /// key that does not exist would silently never match, quietly making the
 /// key it was meant to free non-reloadable forever.
 /// `reloadable_keys_all_exist` pins that.
-///
-/// OPS-040 also names reducer rate limits as reloadable; `Config` has no
-/// rate-limit key yet (`RateLimiterOptions` is constructed by the assembly,
-/// not from config), so there is nothing to list here until it gains one.
 pub const RELOADABLE_KEYS: &[&str] = &[
     "logging.level",
     "logging.format",
     "observability.slow_reducer_threshold_us",
+    "reducer.shard_max_reducers_per_sec",
     "subscriptions.send_buffer_bytes",
 ];
 

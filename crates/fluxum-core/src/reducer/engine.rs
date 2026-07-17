@@ -200,6 +200,14 @@ impl ReducerEngine {
         self
     }
 
+    /// The shard's admission rate limiter (RED-050..RED-052). Config hot
+    /// reload publishes a new `reducer.shard_max_reducers_per_sec` through
+    /// this handle (OPS-040) — the limiter is internally synchronized, so
+    /// retuning it needs no `&mut` and never pauses admission.
+    pub fn rate_limiter(&self) -> &RateLimiter {
+        &self.rate_limiter
+    }
+
     /// The engine's reducer registry (dispatch and admission share it).
     pub fn registry(&self) -> &Arc<ReducerRegistry> {
         &self.registry

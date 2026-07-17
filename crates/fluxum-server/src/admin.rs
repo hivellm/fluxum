@@ -95,6 +95,7 @@ pub async fn dispatch(
         ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
         ("POST", ["plugins", name, "enable"]) => plugin_set_disabled(ctx, name, false),
         ("POST", ["drain"]) => drain(ctx),
+        ("POST", ["config", "reload"]) => config_reload(ctx),
         _ => AdminResponse::err(404, None, "not found"),
     }
 }
@@ -140,6 +141,7 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["plugins"]
             | ["plugins", _, "disable" | "enable"]
             | ["drain"]
+            | ["config", "reload"]
     )
 }
 
@@ -183,6 +185,15 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
         && let Some(map) = body.as_object_mut()
     {
         map.insert("config".into(), effective.clone());
+    }
+    // OPS-040: the reloadable values actually in force, with each one's
+    // source — this is how an operator confirms a reload landed (and, when
+    // a value looks unchanged, sees that `env` outranked the file).
+    // Re-rendered on publish, so this is a clone here too.
+    if let Some(reloadable) = ctx.reloadable_config()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert("reloadable".into(), reloadable);
     }
     AdminResponse { status: code, body }
 }
@@ -278,6 +289,33 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     AdminResponse {
         status: 200,
         body: Value::String(text), // the caller serves it as text/plain
+    }
+}
+
+// --- POST /config/reload (SPEC-025 OPS-040/041) ---------------------------------
+
+/// Re-read the config file + environment and hot-apply the reloadable keys
+/// (OPS-040) — the same operation SIGHUP triggers, for platforms and
+/// orchestrators where signalling the process is awkward.
+///
+/// A rejected reload (OPS-041: some frozen key changed) answers `400` with
+/// the offending keys named, and the running config is untouched — retrying
+/// after fixing the file is safe, and so is ignoring the failure.
+///
+/// Deliberately allowed while draining: a reload admits no new work and
+/// changes no state a drain is waiting on, and raising the log level to
+/// debug a slow drain is exactly when an operator needs it most.
+fn config_reload(ctx: &Arc<ShardContext>) -> AdminResponse {
+    match ctx.reload_config() {
+        Ok(changed) => AdminResponse::ok(
+            None,
+            json!({
+                "reloaded": true,
+                "changed": changed,
+                "reloadable": ctx.reloadable_config(),
+            }),
+        ),
+        Err(e) => AdminResponse::err(400, None, e),
     }
 }
 

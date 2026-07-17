@@ -83,6 +83,52 @@ impl ConnectionRegistry {
     }
 }
 
+/// Render the reloadable slice of `config` for `/health` (OPS-040): each
+/// key's current value plus where it came from, so an operator can see both
+/// *what* is in force and *why* — a value that looks unchanged after a
+/// reload is explained by its source (`env` beating the file, say).
+///
+/// A key absent from `sources` was never overridden, so it is a built-in
+/// default; the loader only records keys set above that.
+fn render_reloadable(config: &fluxum_core::config::Config) -> serde_json::Value {
+    use fluxum_core::config::{RELOADABLE_KEYS, ValueSource};
+    let rendered = serde_json::to_value(config).unwrap_or(serde_json::Value::Null);
+    let mut out = serde_json::Map::new();
+    for key in RELOADABLE_KEYS {
+        let mut cursor = &rendered;
+        for segment in key.split('.') {
+            cursor = match cursor.get(segment) {
+                Some(next) => next,
+                // Unreachable while `reloadable_keys_all_exist` passes; a
+                // missing key is reported rather than silently skipped.
+                None => &serde_json::Value::Null,
+            };
+        }
+        let source = config.sources.get(*key).copied().unwrap_or(ValueSource::Default);
+        out.insert(
+            (*key).to_owned(),
+            serde_json::json!({
+                "value": cursor.clone(),
+                "source": source,
+            }),
+        );
+    }
+    serde_json::Value::Object(out)
+}
+
+/// What a hot reload re-reads and republishes through (OPS-040).
+struct ConfigSource {
+    /// The YAML file the running config was loaded from, if any. A reload
+    /// re-reads *this* path; `None` means the process was configured from
+    /// env + defaults only, and a reload re-reads just those layers.
+    path: Option<std::path::PathBuf>,
+    /// The configuration currently in force — the baseline a reload diffs
+    /// against to decide what changed and what is frozen (OPS-041).
+    config: fluxum_core::config::Config,
+    /// The live logging subscriber, when this process installed one.
+    log: Option<crate::logging::LogReloadHandle>,
+}
+
 /// The shared per-shard state every connection session reads from (SPEC-006
 /// server assembly; the full multi-shard `ShardHost` is T5.4).
 pub struct ShardContext {
@@ -130,6 +176,22 @@ pub struct ShardContext {
     /// retries them against the restarted process (OPS-031) instead of
     /// losing them.
     draining: std::sync::atomic::AtomicBool,
+    /// SPEC-025 OPS-040: the currently published reloadable values and their
+    /// provenance, rendered for `/health`. Unlike `effective_config` this is
+    /// a lock, not a `OnceLock` — its whole purpose is to change. Read off
+    /// the `/health` path like `effective_config`, never inside the
+    /// lock-free [`Health`] snapshot itself.
+    reloadable: std::sync::RwLock<Option<serde_json::Value>>,
+    /// SPEC-025 OPS-040: the live `subscriptions.send_buffer_bytes`. A
+    /// [`SubscriberBuffer`](fluxum_core::subscription::SubscriberBuffer) is
+    /// per-connection and reads this when the connection is admitted, so a
+    /// reload applies to every connection opened after it.
+    send_buffer_bytes: AtomicU64,
+    /// SPEC-025 OPS-040: everything a reload needs — where the config came
+    /// from, what is currently running, and how to republish it. `None`
+    /// until the assembly calls [`ShardContext::install_config`]; a reload
+    /// without it is refused rather than guessing a path.
+    config_source: std::sync::Mutex<Option<ConfigSource>>,
     /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
     /// inputs, every derived value with its source, and the per-kernel SIMD
     /// selection. Serialized at install so `/health` stays a clone, not a
@@ -203,6 +265,13 @@ impl ShardContext {
             started: std::time::Instant::now(),
             effective_config: std::sync::OnceLock::new(),
             draining: std::sync::atomic::AtomicBool::new(false),
+            reloadable: std::sync::RwLock::new(None),
+            config_source: std::sync::Mutex::new(None),
+            send_buffer_bytes: AtomicU64::new(
+                fluxum_core::config::SubscriptionsConfig::default()
+                    .send_buffer_bytes
+                    .0,
+            ),
         })
     }
 
@@ -242,6 +311,120 @@ impl ShardContext {
     /// The rendered effective configuration, if the assembly installed one.
     pub fn effective_config(&self) -> Option<&serde_json::Value> {
         self.effective_config.get()
+    }
+
+    /// The live `subscriptions.send_buffer_bytes` (OPS-040). The transport
+    /// reads this when it admits a connection, so a reload sizes every
+    /// subsequent connection's [`SubscriberBuffer`] without touching the
+    /// buffers already in flight.
+    ///
+    /// [`SubscriberBuffer`]: fluxum_core::subscription::SubscriberBuffer
+    pub fn send_buffer_bytes(&self) -> u64 {
+        self.send_buffer_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The reloadable values currently in force, with each one's provenance
+    /// (OPS-040), or `None` before the first [`publish_reloadable`] call.
+    ///
+    /// [`publish_reloadable`]: ShardContext::publish_reloadable
+    pub fn reloadable_config(&self) -> Option<serde_json::Value> {
+        self.reloadable
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Install the running configuration (OPS-040): publishes every
+    /// reloadable value immediately, and records `path` + `log` so a later
+    /// [`reload_config`] can re-read the same layers. The assembly calls
+    /// this once, at boot, with the config it loaded.
+    ///
+    /// [`reload_config`]: ShardContext::reload_config
+    pub fn install_config(
+        &self,
+        path: Option<std::path::PathBuf>,
+        config: fluxum_core::config::Config,
+        log: Option<crate::logging::LogReloadHandle>,
+    ) {
+        self.publish_reloadable(&config, log.as_ref());
+        *self
+            .config_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(ConfigSource { path, config, log });
+    }
+
+    /// Re-read the config file + env and hot-apply it (OPS-040/041): the
+    /// operation behind both `POST /config/reload` and SIGHUP.
+    ///
+    /// All-or-nothing. If any non-reloadable key changed, this returns the
+    /// error naming every offending key and **nothing** is applied — the
+    /// running config stays exactly as it was (OPS-041). On success it
+    /// returns the reloadable keys that actually changed, which is empty for
+    /// a no-op reload (still a success).
+    ///
+    /// Reloads serialize on `config_source`, so two operators racing a
+    /// reload cannot interleave halves of two configs.
+    ///
+    /// # Errors
+    /// Returns a message if no config was installed, or the loader/validator
+    /// rejected the new file, or a frozen key changed.
+    pub fn reload_config(&self) -> std::result::Result<Vec<String>, String> {
+        let mut guard = self
+            .config_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(source) = guard.as_mut() else {
+            return Err("no configuration installed; this process cannot reload".to_owned());
+        };
+        // Errors escape before anything is published: `reload` borrows the
+        // running config and only yields a new one inside `Ok`.
+        let reload = source
+            .config
+            .reload(source.path.as_deref())
+            .map_err(|e| e.to_string())?;
+        self.publish_reloadable(&reload.config, source.log.as_ref());
+        source.config = reload.config;
+        Ok(reload.changed)
+    }
+
+    /// Publish every [`RELOADABLE_KEYS`] value in `config` to the live shard
+    /// (OPS-040), and re-render the `/health` view of them.
+    ///
+    /// This is the *same* call at boot and on reload, deliberately: a key
+    /// that is reloadable but only read at assembly time would apply on
+    /// reload and then silently revert on the next restart. Running one
+    /// publish path in both places makes "what a reload does" and "what boot
+    /// does" the same code, so they cannot drift.
+    ///
+    /// `log` is the handle from [`logging::init`]; pass `None` when no
+    /// subscriber was installed by this process (tests, embedded use) — the
+    /// remaining keys still publish.
+    ///
+    /// [`RELOADABLE_KEYS`]: fluxum_core::config::RELOADABLE_KEYS
+    pub fn publish_reloadable(
+        &self,
+        config: &fluxum_core::config::Config,
+        log: Option<&crate::logging::LogReloadHandle>,
+    ) {
+        if let Some(handle) = log
+            && let Err(e) = handle.apply(&config.logging)
+        {
+            // A dead subscriber must not abort the rest of the publish: the
+            // other knobs are independent and still worth applying.
+            tracing::warn!(error = %e, "logging reload failed; other keys still applied");
+        }
+        self.metrics()
+            .set_slow_reducer_threshold_us(config.observability.slow_reducer_threshold_us);
+        self.engine
+            .rate_limiter()
+            .set_shard_max_reducers_per_sec(config.reducer.shard_max_reducers_per_sec);
+        self.send_buffer_bytes
+            .store(config.subscriptions.send_buffer_bytes.0, Ordering::Relaxed);
+        *self
+            .reloadable
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(render_reloadable(config));
     }
 
     /// Install the validated plugin registry (SPEC-020 PLG-032): built by

@@ -676,7 +676,10 @@ auth:
       token: ${FLUXUM_INGEST_TOKEN}
 
 subscriptions:
-  send_buffer_bytes: 2097152        # 2 MB per client
+  send_buffer_bytes: 2097152        # 2 MiB per client
+
+reducer:
+  shard_max_reducers_per_sec: 200000  # RED-052 global shard guard; 0 disables
 
 observability:
   slow_reducer_threshold_us: 5000
@@ -685,6 +688,57 @@ logging:
   level: info
   format: json               # json | pretty
 ```
+
+### Hot reload (SPEC-025 OPS-040/041)
+
+A defined subset of keys can change on a **running** process — no restart,
+no dropped connections:
+
+| Reloadable key | Reaches |
+|----------------|---------|
+| `logging.level` | the live `tracing` filter |
+| `logging.format` | the live `tracing` layer |
+| `observability.slow_reducer_threshold_us` | the shard's metrics registry |
+| `reducer.shard_max_reducers_per_sec` | the RED-052 admission guard |
+| `subscriptions.send_buffer_bytes` | each connection admitted after the reload |
+
+Everything else — ports, storage paths, shard count, auth — is **frozen**
+until restart. The allowlist is opt-*in*: a key added to `Config` is frozen
+until someone classifies it, so the failure mode of forgetting is a rejected
+reload (loud, harmless) rather than a silently hot-swapped storage path.
+
+Trigger a reload with `POST /config/reload`. It re-reads the file and the
+environment through the same layered loader as boot, so precedence is
+unchanged — notably, a `RUST_LOG` or `FLUXUM_*` override still outranks the
+file, which is why `/health` reports each value's **source** alongside it.
+
+Reload is **all-or-nothing** (OPS-041). If any frozen key changed, the
+response is `400` naming *every* offender at once and nothing is applied —
+not even the reloadable keys in the same file. A rejection is not a latch:
+fix the file and reload again.
+
+```console
+$ curl -XPOST localhost:15800/config/reload
+{"success":true,"payload":{"reloaded":true,"changed":["logging.level"], ...}}
+
+$ curl -XPOST localhost:15800/config/reload   # after editing http_port
+{"success":false,"error":"reload rejected: these keys cannot change at
+ runtime: server.http_port. Restart to apply them. Reloadable keys: ..."}
+```
+
+`GET /health` reports the values in force under `reloadable`, each with its
+provenance:
+
+```json
+{ "reloadable": {
+    "logging.level": { "value": "debug", "source": "file" },
+    "reducer.shard_max_reducers_per_sec": { "value": 200000, "source": "default" }
+} }
+```
+
+Boot and reload run the *same* publish path, deliberately: a key that
+applied on reload but was only read at assembly time would silently revert
+on the next restart.
 
 ---
 
