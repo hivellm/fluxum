@@ -8,8 +8,16 @@
 //! the gate-G5 wire freeze). Until then this crate pins the `sdks/rust` layout slot from
 //! ROADMAP M0 and re-exports the shared wire layer so the quality gate covers the
 //! SDK-facing protocol surface from day one (DAG T0.1, NFR-09).
+//!
+//! [`ResumeTracker`] is the exception: the resume bookkeeping SPEC-021 CS-020/CS-022
+//! puts on the client is exactly what the gate-G5 wire freeze constrains, so it ships
+//! ahead of the connection as a transport-free unit. T6.2 wires it to a real socket —
+//! feed it each `InitialData`/`TxUpdate`, and ask it what to send on reconnect.
+
+pub mod resume;
 
 pub use fluxum_protocol as protocol;
+pub use resume::{Reconnect, ResumeTracker};
 
 #[cfg(test)]
 mod tests {
