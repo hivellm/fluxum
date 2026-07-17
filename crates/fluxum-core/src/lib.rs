@@ -55,6 +55,7 @@ pub mod auth;
 pub mod checkpoint;
 pub mod commitlog;
 pub mod config;
+pub mod crdt;
 pub mod crypto;
 pub mod error;
 pub mod hw;

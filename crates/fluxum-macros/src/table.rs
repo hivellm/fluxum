@@ -60,6 +60,9 @@ pub(crate) enum FluxTy {
     /// A `#[derive(FluxType)]` enum or nested struct used as a column
     /// (SPEC-023 DMX-030); the payload is the field's Rust type.
     Derived(Box<Type>),
+    /// `fluxum_core::crdt::CrdtText` — convergent collaborative text
+    /// (SPEC-023 DMX-060), stored as tagged bytes.
+    CrdtText,
 }
 
 impl FluxTy {
@@ -102,6 +105,7 @@ impl FluxTy {
             Self::Derived(ty) => {
                 quote!(<#ty as ::fluxum_core::schema::FluxTypeDef>::FLUX_TYPE)
             }
+            Self::CrdtText => quote!(#path::CrdtText),
         }
     }
 }
@@ -898,6 +902,16 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                     "column `{}` is a `#[derive(FluxType)]` enum/struct and cannot be a primary \
                      key, partition key, unique constraint, or index key — rich types support \
                      equality only (SPEC-023 DMX-031)",
+                    col.ident
+                ),
+            ));
+        }
+        if matches!(col.flux, FluxTy::CrdtText) {
+            return Err(syn::Error::new(
+                col.ident.span(),
+                format!(
+                    "column `{}` is a CrdtText document and cannot be a primary key, partition \
+                     key, unique constraint, or index key (SPEC-023 DMX-060)",
                     col.ident
                 ),
             ));
@@ -2317,6 +2331,7 @@ pub(crate) fn parse_flux_type(ty: &Type) -> syn::Result<FluxTy> {
         "Timestamp" => simple(FluxTy::Timestamp),
         "Decimal" => simple(FluxTy::Decimal),
         "BlobRef" => simple(FluxTy::Blob),
+        "CrdtText" => simple(FluxTy::CrdtText),
         "Vec" => {
             let inner = generic_inner(&segment.arguments).ok_or_else(unsupported)?;
             let inner = parse_flux_type(inner)?;
@@ -2392,6 +2407,8 @@ pub(crate) fn to_row_value(flux: &FluxTy, expr: TokenStream) -> TokenStream {
         FluxTy::Derived(_) => {
             quote!(::fluxum_core::schema::FluxTypeDef::to_row_value(#expr))
         }
+        // DMX-060: stored as the tagged state encoding.
+        FluxTy::CrdtText => quote!(#rv::Bytes(#expr.to_bytes())),
     }
 }
 
@@ -2484,6 +2501,19 @@ pub(crate) fn from_row_value(
                 match <#ty as ::fluxum_core::schema::FluxTypeDef>::from_row_value(#src) {
                     ::core::result::Result::Ok(__fx_v) => __fx_v,
                     ::core::result::Result::Err(_) => #mismatch,
+                }
+            }
+        }
+        FluxTy::CrdtText => {
+            quote! {
+                match #src {
+                    #rv::Bytes(__fx_bytes) => {
+                        match ::fluxum_core::crdt::CrdtText::from_bytes(__fx_bytes) {
+                            ::core::result::Result::Ok(__fx_doc) => __fx_doc,
+                            ::core::result::Result::Err(_) => #mismatch,
+                        }
+                    }
+                    _ => #mismatch,
                 }
             }
         }

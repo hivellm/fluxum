@@ -549,7 +549,15 @@ impl SubscriptionManager {
         }
 
         let schema = self.table_schema(table_id)?;
-        let inserts = encode_full_row_refs(&matched_inserts)?;
+        // SPEC-023 DMX-061: a CrdtText column of an in-place replacement
+        // fans out as the compact tagged op diff, never the whole document.
+        let inserts = match crdt_ordinals(schema) {
+            ords if ords.is_empty() => encode_full_row_refs(&matched_inserts)?,
+            ords => {
+                let rows = crdt_patch_rows(schema, &ords, &matched_inserts, table_diff)?;
+                encode_full_rows(&rows)?
+            }
+        };
         let deletes = encode_pk_rows(schema, &matched_deletes)?;
         Ok(Some(TableUpdate {
             table_id: table_id.as_u32(),
@@ -708,6 +716,64 @@ impl SubscriptionManager {
             SpatialConstraint::Radius { x, y, r } => snapshot.spatial_radius(table_id, x, y, r),
         }
     }
+}
+
+/// The ordinals of `schema`'s `CrdtText` columns (SPEC-023 DMX-060).
+fn crdt_ordinals(schema: &TableSchema) -> Vec<u16> {
+    schema
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| matches!(c.ty, crate::schema::FluxType::CrdtText))
+        .map(|(i, _)| u16::try_from(i).unwrap_or(u16::MAX))
+        .collect()
+}
+
+/// DMX-061: rewrite each matched insert that replaces a same-PK deleted row
+/// so its `CrdtText` columns carry the compact tagged op diff (the ops this
+/// commit added) instead of the whole document. Fresh inserts — and any
+/// value that fails to decode — keep the full tagged state; the tag byte
+/// tells the subscriber which decode applies.
+fn crdt_patch_rows(
+    schema: &TableSchema,
+    ordinals: &[u16],
+    inserts: &[&Row],
+    table_diff: &crate::store::TableDiff,
+) -> Result<Vec<Row>> {
+    use crate::crdt::{CrdtText, encode_ops};
+    let old_by_pk: HashMap<&[u8], &Row> = table_diff
+        .deletes
+        .iter()
+        .map(|(pk, old)| (pk.as_bytes(), old))
+        .collect();
+    let mut out = Vec::with_capacity(inserts.len());
+    for row in inserts {
+        let pk = encode_pk_of_row(schema, row.values())?;
+        let Some(old) = old_by_pk.get(pk.as_bytes()) else {
+            out.push((*row).clone()); // fresh insert: full state
+            continue;
+        };
+        let mut values = row.values().to_vec();
+        for &ordinal in ordinals {
+            let idx = usize::from(ordinal);
+            let (Some(crate::store::RowValue::Bytes(new_bytes)), Some(old_value)) =
+                (values.get(idx), old.values().get(idx))
+            else {
+                continue;
+            };
+            let crate::store::RowValue::Bytes(old_bytes) = old_value else {
+                continue;
+            };
+            if let (Ok(new_doc), Ok(old_doc)) =
+                (CrdtText::from_bytes(new_bytes), CrdtText::from_bytes(old_bytes))
+            {
+                let patch = new_doc.ops_since(&old_doc);
+                values[idx] = crate::store::RowValue::Bytes(encode_ops(&patch));
+            }
+        }
+        out.push(Row::new(values));
+    }
+    Ok(out)
 }
 
 /// Encode owned rows as a full-row FluxBIN `RowList` (RPC-041).

@@ -99,6 +99,8 @@ impl RowValue {
             | (Self::F64(_), FluxType::F64)
             | (Self::Str(_), FluxType::Str)
             | (Self::Bytes(_), FluxType::Bytes)
+            // DMX-060: a CrdtText value is its tagged state bytes.
+            | (Self::Bytes(_), FluxType::CrdtText)
             | (Self::Identity(_), FluxType::Identity)
             | (Self::ConnectionId(_), FluxType::ConnectionId)
             | (Self::EntityId(_), FluxType::EntityId)
@@ -462,6 +464,9 @@ fn decode_value(r: &mut FluxBinReader<'_>, ty: &FluxType) -> Result<RowValue> {
         FluxType::F64 => RowValue::F64(r.read_f64().map_err(map)?),
         FluxType::Str => RowValue::Str(r.read_str().map_err(map)?.to_owned()),
         FluxType::Bytes => RowValue::Bytes(r.read_bytes().map_err(map)?.to_vec()),
+        // DMX-060: a CrdtText column's stored value is its tagged state
+        // encoding, carried as ordinary length-prefixed bytes.
+        FluxType::CrdtText => RowValue::Bytes(r.read_bytes().map_err(map)?.to_vec()),
         FluxType::Identity => {
             RowValue::Identity(Identity::from_bytes(r.read_identity().map_err(map)?))
         }

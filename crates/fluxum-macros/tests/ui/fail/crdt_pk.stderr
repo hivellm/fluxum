@@ -1,0 +1,13 @@
+error: column `body` is a CrdtText document and cannot be a primary key, partition key, unique constraint, or index key (SPEC-023 DMX-060)
+  --> tests/ui/fail/crdt_pk.rs:10:9
+   |
+10 |     pub body: CrdtText,
+   |         ^^^^
+
+warning: unused import: `fluxum_core::crdt::CrdtText`
+ --> tests/ui/fail/crdt_pk.rs:4:5
+  |
+4 | use fluxum_core::crdt::CrdtText;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default

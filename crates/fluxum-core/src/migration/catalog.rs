@@ -75,6 +75,9 @@ pub enum StoredType {
         /// Fields in declaration order.
         fields: Vec<StoredColumn>,
     },
+    /// [`crate::crdt::CrdtText`] — convergent collaborative text
+    /// (SPEC-023 DMX-060), stored as tagged bytes.
+    CrdtText,
 }
 
 /// One variant of a stored [`StoredType::Enum`].
@@ -108,6 +111,7 @@ impl From<&FluxType> for StoredType {
             FluxType::Timestamp => Self::Timestamp,
             FluxType::Decimal => Self::Decimal,
             FluxType::Blob => Self::Blob,
+            FluxType::CrdtText => Self::CrdtText,
             FluxType::Option(inner) => Self::Option(Box::new(Self::from(*inner))),
             FluxType::List(inner) => Self::List(Box::new(Self::from(*inner))),
             FluxType::Enum(schema) => Self::Enum {

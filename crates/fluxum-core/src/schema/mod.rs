@@ -126,6 +126,11 @@ pub enum FluxType {
     /// A `#[derive(FluxType)]` nested struct (SPEC-023 DMX-030). FluxBIN:
     /// its field values in declaration order, with no tag.
     Struct(&'static StructSchema),
+    /// [`crate::crdt::CrdtText`] — a convergent collaborative text document
+    /// (SPEC-023 DMX-060). Stored/encoded as length-prefixed bytes: the
+    /// tagged state encoding at rest and in `InitialData`, the tagged patch
+    /// (op-diff) encoding in `TxUpdate`s (DMX-061). Never keyable.
+    CrdtText,
 }
 
 impl FluxType {
@@ -142,7 +147,12 @@ impl FluxType {
     pub const fn is_keyable(&self) -> bool {
         !matches!(
             self,
-            Self::Enum(_) | Self::Struct(_) | Self::List(_) | Self::Option(_) | Self::Bytes
+            Self::Enum(_)
+                | Self::Struct(_)
+                | Self::List(_)
+                | Self::Option(_)
+                | Self::Bytes
+                | Self::CrdtText
         )
     }
 }
