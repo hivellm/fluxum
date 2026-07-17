@@ -459,9 +459,76 @@ pub struct Config {
     pub observability: ObservabilityConfig,
     /// Logging.
     pub logging: LoggingConfig,
+    /// Field-level crypto keys for column transforms (SPEC-017 §5).
+    pub transforms: TransformsConfig,
     /// Provenance of every non-default key (`key.path` → source).
     #[serde(skip)]
     pub sources: BTreeMap<String, ValueSource>,
+}
+
+/// Named cryptographic keys for column transforms (SPEC-017 CT-035): the
+/// `#[encrypted(ecies, key = "…")]` / `#[signed(…)]` executors resolve their
+/// key by id against this set. Config-embedded key material is the baseline;
+/// `FLUXUM_*` env injection overrides individual fields like any other key.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TransformsConfig {
+    /// The declared keys, by id.
+    pub keys: Vec<TransformKey>,
+}
+
+/// The key scheme (CT-030/033).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KeyScheme {
+    /// X25519 recipient key for `#[encrypted(ecies)]`.
+    X25519,
+    /// Ed25519 signing key for `#[signed(ed25519)]`.
+    Ed25519,
+}
+
+/// One named transform key (CT-035). `secret` is the 32-byte key as 64 hex
+/// characters; `previous` holds retired secrets still accepted for reads
+/// during rotation (CT-036).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransformKey {
+    /// Stable key label referenced by `key = "…"` in the attribute.
+    pub id: String,
+    /// The key scheme.
+    pub scheme: KeyScheme,
+    /// The active 32-byte secret as 64 hex characters.
+    pub secret: String,
+    /// Retired secrets (hex) still accepted for reads (rotation, CT-036).
+    #[serde(default)]
+    pub previous: Vec<String>,
+}
+
+impl TransformsConfig {
+    /// Build the X25519 ECIES key set (CT-030/035), keyed by id. Malformed
+    /// key material or a duplicate id is a hard config error.
+    pub fn ecies_keys(
+        &self,
+    ) -> crate::error::Result<std::collections::HashMap<String, crate::transform::crypto::EciesKey>>
+    {
+        use crate::error::FluxumError;
+        use crate::transform::crypto::EciesKey;
+        let mut out = std::collections::HashMap::new();
+        for key in &self.keys {
+            if key.scheme != KeyScheme::X25519 {
+                continue; // ed25519 signing keys are resolved by the sign executor
+            }
+            if out.contains_key(&key.id) {
+                return Err(FluxumError::Config(format!(
+                    "duplicate transform key id `{}` (CT-035)",
+                    key.id
+                )));
+            }
+            let ecies = EciesKey::from_hex(&key.id, &key.secret, &key.previous)?;
+            out.insert(key.id.clone(), ecies);
+        }
+        Ok(out)
+    }
 }
 
 /// Environment lookup used by the loader; injected for testability.

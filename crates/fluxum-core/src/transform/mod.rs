@@ -11,6 +11,8 @@
 //! `#[signed]`) and read-path masking/grants run in phases 3–4; here they are
 //! declared, validated, and reflected in `/schema`, not yet applied.
 
+pub mod crypto;
+pub mod engine;
 pub mod normalize;
 
 pub use normalize::{datetime_utc, money_from_minor_units, money_from_str, normalize_string};

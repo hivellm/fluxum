@@ -397,6 +397,26 @@ pub(crate) fn encode_row(values: &[RowValue]) -> Result<Vec<u8>> {
 /// Decode a FluxBIN row encoded by [`encode_row`], driven by the table
 /// schema (FluxBIN is not self-describing). Verifies exact consumption —
 /// trailing bytes are a decode error, never silently ignored.
+/// FluxBIN-encode a single value to bytes — the plaintext serialization the
+/// `#[encrypted]` executor seals (SPEC-017 CT-030).
+pub fn encode_value_bytes(value: &RowValue) -> Result<Vec<u8>> {
+    let mut w = FluxBinWriter::new();
+    value.encode(&mut w)?;
+    Ok(w.into_bytes())
+}
+
+/// Decode a single value of type `ty` from bytes produced by
+/// [`encode_value_bytes`] (SPEC-017 CT-030 decrypt path). Rejects trailing
+/// bytes.
+pub fn decode_value_bytes(bytes: &[u8], ty: &FluxType) -> Result<RowValue> {
+    let mut r = FluxBinReader::new(bytes);
+    let value = decode_value(&mut r, ty)
+        .map_err(|e| FluxumError::Storage(format!("encrypted field failed FluxBIN decode: {e}")))?;
+    r.expect_eof()
+        .map_err(|e| FluxumError::Storage(format!("encrypted field trailing bytes: {e}")))?;
+    Ok(value)
+}
+
 pub(crate) fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
     let mut r = FluxBinReader::new(bytes);
     let mut values = Vec::with_capacity(schema.columns.len());

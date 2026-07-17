@@ -132,6 +132,9 @@ pub struct MemStore {
     /// columns are validated against it at write time and reference-counted
     /// in the commit merge; without one, `Blob` writes are rejected.
     blobs: std::sync::OnceLock<Arc<crate::commitlog::BlobStore>>,
+    /// The column-transform executor, once attached (SPEC-017 §5): encrypts
+    /// `#[encrypted]` columns on write so stored rows carry ciphertext.
+    transforms: std::sync::OnceLock<Arc<crate::transform::engine::TransformEngine>>,
 }
 
 impl MemStore {
@@ -197,6 +200,7 @@ impl MemStore {
         Ok(Self {
             catalog,
             blobs: std::sync::OnceLock::new(),
+            transforms: std::sync::OnceLock::new(),
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -244,6 +248,18 @@ impl MemStore {
         }
         blobs.rebuild_refcounts(references);
         let _ = self.blobs.set(blobs);
+    }
+
+    /// Attach the shard's column-transform executor (SPEC-017 §5). `#[encrypted]`
+    /// columns are sealed on write once this is set; idempotent (the first
+    /// attach wins).
+    pub fn attach_transform_engine(&self, engine: Arc<crate::transform::engine::TransformEngine>) {
+        let _ = self.transforms.set(engine);
+    }
+
+    /// The attached transform executor, if any.
+    pub fn transform_engine(&self) -> Option<&Arc<crate::transform::engine::TransformEngine>> {
+        self.transforms.get()
     }
 
     /// The attached blob store, if any.
@@ -477,6 +493,14 @@ impl Tx<'_> {
         self.state.tx_id
     }
 
+    /// The store's column-transform executor, if attached (SPEC-017 §5) —
+    /// the read boundary decrypts `#[encrypted]` columns through it.
+    pub(crate) fn transform_engine(
+        &self,
+    ) -> Option<Arc<crate::transform::engine::TransformEngine>> {
+        self.store.transforms.get().cloned()
+    }
+
     /// Insert a row (column values in declaration order).
     ///
     /// Enforces PK uniqueness (TXN-040) and every `#[unique]` constraint
@@ -531,6 +555,17 @@ impl Tx<'_> {
         }
         self.assign_auto_inc(table, schema, &mut values)?;
         let pk = encode_pk_of_row(schema, &values)?;
+
+        // SPEC-017 CT-011/030: seal `#[encrypted]` columns after validation and
+        // pk derivation (key columns are never encrypted, CT-013), before the
+        // row is stored — so the commit log, cold pages, checkpoints, and
+        // replication stream only ever see ciphertext. Non-encrypted tables
+        // pay nothing (the engine fast-skips).
+        if let Some(engine) = self.store.transforms.get()
+            && engine.touches(table)
+        {
+            engine.on_write_row(table, &mut values, pk.as_bytes())?;
+        }
 
         let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
         // Overlay occupancy (STG-007): a pending insert/reinsert holds the

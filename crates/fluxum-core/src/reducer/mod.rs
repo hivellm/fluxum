@@ -504,7 +504,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .insert(table_of::<T>(), row.into_values())?;
-        T::from_values(stored.values())
+        T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
 
     /// Insert or replace by primary key (the TXN-040 exception); `#[unique]`
@@ -515,7 +515,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .upsert(table_of::<T>(), row.into_values())?;
-        T::from_values(stored.values())
+        T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
 
     /// Delete the row with primary key `pk`. Returns whether a (committed
@@ -534,7 +534,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let rows = self.committed_rows::<T>()?;
         let mut deleted = 0u64;
         for row in rows {
-            let typed = T::from_values(row.values())?;
+            let typed = T::from_values(self.decrypt_row::<T>(row)?.values())?;
             if pred(&typed)
                 && self
                     .exclusive()?
@@ -554,13 +554,14 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let row = self
             .shared()?
             .query_pk(table_of::<T>(), &T::pk_values(&pk))?;
-        row.map(|r| T::from_values(r.values())).transpose()
+        row.map(|r| T::from_values(self.decrypt_row::<T>(r)?.values()))
+            .transpose()
     }
 
     /// Full scan of the committed snapshot, in encoded-PK byte order.
     /// Never sees this transaction's pending writes (TXN-050).
     pub fn scan<T: Table>(&self) -> Result<Vec<T>> {
-        decode_rows(&self.committed_rows::<T>()?)
+        self.decode_rows_plain::<T>(self.committed_rows::<T>()?)
     }
 
     /// Filtered scan of the committed snapshot (TXN-050 view).
@@ -579,7 +580,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
             let tx = self.shared()?;
             tx.scan_pending(table_of::<T>())?.cloned().collect()
         };
-        decode_rows(&rows)
+        self.decode_rows_plain::<T>(rows)
     }
 
     /// How many of this transaction's pending rows match `pred`.
@@ -603,7 +604,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
             let tx = self.shared()?;
             tx.scan_all(table_of::<T>())?.cloned().collect()
         };
-        decode_rows(&rows)
+        self.decode_rows_plain::<T>(rows)
     }
 
     /// Filtered combined view (see [`TxHandle::scan_all`]).
@@ -653,6 +654,32 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     fn committed_rows<T: Table>(&self) -> Result<Vec<Row>> {
         let tx = self.shared()?;
         Ok(tx.scan(table_of::<T>())?.cloned().collect())
+    }
+
+    /// Decrypt a stored row's `#[encrypted]` columns for the reducer
+    /// (SPEC-017 CT-031). Reducers run as server peers (AUTH-062), so they are
+    /// always authorized to see plaintext. A no-op when no transform engine is
+    /// attached or `T`'s table has no encrypted column.
+    fn decrypt_row<T: Table>(&self, row: Row) -> Result<Row> {
+        let engine = self.env.tx.borrow().transform_engine();
+        let Some(engine) = engine else {
+            return Ok(row);
+        };
+        let table = table_of::<T>();
+        if !engine.touches(table) {
+            return Ok(row);
+        }
+        let mut values = row.values().to_vec();
+        let pk = crate::store::row::encode_pk_of_row(T::SCHEMA, &values)?;
+        engine.on_read_row(table, &mut values, pk.as_bytes(), true)?;
+        Ok(Row::new(values))
+    }
+
+    /// [`Self::decrypt_row`] over many rows, then typed decode.
+    fn decode_rows_plain<T: Table>(&self, rows: Vec<Row>) -> Result<Vec<T>> {
+        rows.into_iter()
+            .map(|row| T::from_values(self.decrypt_row::<T>(row)?.values()))
+            .collect()
     }
 
     /// Shared access to the transaction. Cannot be contended in correct
