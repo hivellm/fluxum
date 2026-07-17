@@ -471,6 +471,28 @@ pub fn registered_foreign_keys() -> impl Iterator<Item = &'static ForeignKeyDef>
     inventory::iter::<ForeignKeyDef>()
 }
 
+/// A `#[fluxum::edge]` typed directed relation (SPEC-023 DMX-050),
+/// registered at link time. The edge table itself is an ordinary table with
+/// a `(from, to)` composite primary key and a `btree(from)` index — this
+/// descriptor names the relation's endpoints for introspection and
+/// assembly-time validation. Traversal is a point prefix scan, never a
+/// general JOIN (SPEC-023 §8).
+pub struct EdgeDef {
+    /// The edge table's struct name.
+    pub name: &'static str,
+    /// The `from` endpoint's table name (`""` = untyped endpoint).
+    pub from_table: &'static str,
+    /// The `to` endpoint's table name (`""` = untyped endpoint).
+    pub to_table: &'static str,
+}
+
+inventory::collect!(EdgeDef);
+
+/// Every registered edge relation in this binary (linker order).
+pub fn registered_edges() -> impl Iterator<Item = &'static EdgeDef> {
+    inventory::iter::<EdgeDef>()
+}
+
 /// How a durable table's rows expire (SPEC-023 DMX-020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlKind {

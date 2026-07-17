@@ -677,6 +677,33 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         Ok(rows)
     }
 
+    // --- Edge traversal (SPEC-023 DMX-050) -----------------------------------
+
+    /// The outgoing edges of one node: every committed `E` row whose `from`
+    /// column equals `from` — one B-tree prefix scan over the edge's
+    /// `btree(from)` neighbor index, O(log n + k). A point traversal, never
+    /// a JOIN (SPEC-023 §8); committed view (TXN-050).
+    pub fn traverse<E: Table>(&self, from: impl Into<crate::store::RowValue>) -> Result<Vec<E>> {
+        let table = table_of::<E>();
+        let schema = E::SCHEMA;
+        let Some(from_column) = schema.columns.first().filter(|c| c.name == "from") else {
+            return Err(FluxumError::Storage(format!(
+                "`{}` is not a #[fluxum::edge] table: traversal needs the `from` \
+                 neighbor index (DMX-050)",
+                schema.name
+            )));
+        };
+        let index = crate::index::IndexId::of(schema.name, &[from_column.name]);
+        let from = from.into();
+        let rows: Vec<Row> = {
+            let tx = self.shared()?;
+            tx.index_eq(table, index, std::slice::from_ref(&from))?
+                .cloned()
+                .collect()
+        };
+        self.decode_rows_plain::<E>(rows)
+    }
+
     // --- Reducer delegation (RED-005) ---------------------------------------
 
     /// Call another registered reducer **within the same transaction**: the

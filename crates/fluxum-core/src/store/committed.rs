@@ -415,6 +415,25 @@ impl Snapshot {
         Ok(out)
     }
 
+    /// SPEC-023 DMX-050: the outgoing edges of one node — every row of the
+    /// `#[fluxum::edge]` table whose `from` column equals `from`, resolved
+    /// by the edge's `btree(from)` neighbor index (O(log n + k), never a
+    /// table scan or JOIN).
+    pub fn edge_neighbors(&self, table: TableId, from: &RowValue) -> Result<Vec<Row>> {
+        let state = self.state.table(table)?;
+        let Some(from_column) = state.schema.columns.first().filter(|c| c.name == "from") else {
+            return Err(FluxumError::Storage(format!(
+                "`{}` is not a #[fluxum::edge] table (DMX-050)",
+                state.schema.name
+            )));
+        };
+        let index = IndexId::of(state.schema.name, &[from_column.name]);
+        Ok(state
+            .index_scan(index, std::slice::from_ref(from), Bound::Unbounded, Bound::Unbounded)?
+            .cloned()
+            .collect())
+    }
+
     /// Rows of `table` inside `region` (bounds inclusive, SPX-020),
     /// resolved via the spatial index — never a table scan (SPX-023).
     /// Errors when the table declares no `#[spatial(...)]` index (SPX-022).

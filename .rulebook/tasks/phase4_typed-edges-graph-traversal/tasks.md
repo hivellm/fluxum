@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Add a `#[fluxum::edge]` macro that declares a typed directed relation `(from, to, props)` and expands to a composite-PK-indexed edge table (DMX-050; crates/fluxum-macros)
-- [ ] 1.2 Represent the edge relation as a schema descriptor keyed by a `(from, to)` composite primary key (DMX-050; crates/fluxum-core/src/schema)
-- [ ] 1.3 Back neighbor lookup with a composite-PK B-tree `(from, ...)` prefix scan so traversal is O(log n + k) (DMX-050; crates/fluxum-core/src/index/btree.rs)
-- [ ] 1.4 Provide `traverse` helpers that walk a node's outgoing edges without invoking any general JOIN engine (point traversals only) (DMX-050; crates/fluxum-core/src/schema)
-- [ ] 1.5 Make edge sets subscribable like tables so a client can subscribe to the neighbors of a node (DMX-051; crates/fluxum-core/src/subscription)
-- [ ] 1.6 Deliver live edge diffs to neighbor subscribers as edges are added and removed (DMX-051; crates/fluxum-core/src/subscription)
-- [ ] 1.7 Verification: `Owns` edges from `Player` to `Item` compile; subscribing to a player's `Owns` neighbors returns that player's items and live diffs; traversal uses the composite-PK prefix scan (no full scan)
+- [x] 1.1 Add a `#[fluxum::edge]` macro that declares a typed directed relation `(from, to, props)` and expands to a composite-PK-indexed edge table (DMX-050; crates/fluxum-macros) — `#[fluxum::edge(from = Player, to = Item)]` on a struct with `from`/`to` fields + property columns delegates to the table expansion as `#[fluxum::table(public, primary_key(from, to))]` + an injected `#[index(btree(from))]` neighbor index; missing `from`/`to` fields are a compile error; the composite PK makes the relation a set (duplicate edge = PK conflict, pinned)
+- [x] 1.2 Represent the edge relation as a schema descriptor keyed by a `(from, to)` composite primary key (DMX-050; crates/fluxum-core/src/schema) — link-time `EdgeDef { name, from_table, to_table }` via `inventory` (endpoints optional/untyped when omitted); `Schema::from_tables` validates that named endpoints are in the assembled schema (descriptive DMX-050 error, pinned)
+- [x] 1.3 Back neighbor lookup with a composite-PK B-tree `(from, ...)` prefix scan so traversal is O(log n + k) (DMX-050) — the injected `btree(from)` index is the existing composite B-tree primitive; `SELECT * FROM Owns WHERE from = X` compiles to `AccessPath::IndexScan` over it (pinned structurally), so no new index machinery was needed
+- [x] 1.4 Provide `traverse` helpers that walk a node's outgoing edges without invoking any general JOIN engine (point traversals only) (DMX-050) — `TxHandle::traverse::<E>(from)` (reducer surface, typed rows, committed view) and `Snapshot::edge_neighbors(table, from)` (store surface), both one `index_eq` prefix scan; a non-edge table (no leading `from` column) errors descriptively
+- [x] 1.5 Make edge sets subscribable like tables so a client can subscribe to the neighbors of a node (DMX-051; crates/fluxum-core/src/subscription) — an edge table IS a table: `SELECT * FROM Owns WHERE from = X` subscribes through the existing path, initial data = current neighbors, and the plan lands in the equality value-pruning tier (only commits touching that `from` evaluate it)
+- [x] 1.6 Deliver live edge diffs to neighbor subscribers as edges are added and removed (DMX-051) — pinned: an edge add fans out to the node's subscriber, another node's edges never do, and an edge removal delivers a delete diff
+- [x] 1.7 Verification: `Owns` edges from `Player` to `Item` compile; subscribing to a player's `Owns` neighbors returns that player's items and live diffs; traversal uses the composite-PK prefix scan (no full scan) — crates/fluxum-macros/tests/typed_edges.rs (2 tests covering the full scenario incl. the IndexScan access-path proof)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation — `#[fluxum::edge]` proc-macro rustdoc (shape, non-goals boundary, traversal + subscription surfaces), `EdgeDef` docs, `traverse`/`edge_neighbors` docs with the DMX-050 point-traversal contract
+- [x] 2.2 Write tests covering the new behavior — crates/fluxum-macros/tests/typed_edges.rs (expansion shape: composite PK + neighbor index + EdgeDef + endpoint validation + set semantics; traversal both surfaces + IndexScan proof + subscription initial/add/other-node/removal diffs)
+- [x] 2.3 Run tests and confirm they pass — `cargo test --workspace` green (0 failures), `cargo clippy --workspace --all-targets` clean, coverage gate ≥90%

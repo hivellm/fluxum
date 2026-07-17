@@ -1660,6 +1660,72 @@ fn collect_idents(expr: &Expr) -> std::collections::HashSet<String> {
     out
 }
 
+/// Entry point for `#[fluxum::edge]` (SPEC-023 DMX-050): validate the
+/// `from`/`to` fields and endpoint arguments, then expand as the equivalent
+/// `#[fluxum::table(public, primary_key(from, to))]` with a `btree(from)`
+/// neighbor index, plus the link-time `EdgeDef`.
+pub fn expand_edge(args: TokenStream, input: TokenStream) -> TokenStream {
+    match try_expand_edge(args, input) {
+        Ok(tokens) => tokens,
+        Err(err) => err.to_compile_error(),
+    }
+}
+
+fn try_expand_edge(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream> {
+    use syn::parse::Parser;
+
+    let mut from_table = String::new();
+    let mut to_table = String::new();
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("from") {
+            let ident: Ident = meta.value()?.parse()?;
+            from_table = ident.to_string();
+            return Ok(());
+        }
+        if meta.path.is_ident("to") {
+            let ident: Ident = meta.value()?.parse()?;
+            to_table = ident.to_string();
+            return Ok(());
+        }
+        Err(meta.error("expected `from = <Table>` / `to = <Table>` (DMX-050)"))
+    });
+    parser.parse2(args.clone())?;
+
+    let item: syn::ItemStruct = syn::parse2(input)?;
+    let has = |name: &str| {
+        item.fields
+            .iter()
+            .any(|f| f.ident.as_ref().is_some_and(|i| i == name))
+    };
+    if !has("from") || !has("to") {
+        return Err(syn::Error::new(
+            item.ident.span(),
+            "#[fluxum::edge] structs declare `from` and `to` fields (the endpoint keys), \
+             plus any property columns (DMX-050)",
+        ));
+    }
+    let name = item.ident.to_string();
+
+    // Delegate to the table expansion with the edge shape imposed.
+    let table_args = quote!(public, primary_key(from, to));
+    let with_index: TokenStream = quote! {
+        #[index(btree(from))]
+        #item
+    };
+    let expanded = try_expand(table_args, with_index)?;
+    Ok(quote! {
+        #expanded
+
+        ::fluxum_core::schema::inventory::submit! {
+            ::fluxum_core::schema::EdgeDef {
+                name: #name,
+                from_table: #from_table,
+                to_table: #to_table,
+            }
+        }
+    })
+}
+
 /// `#[references(Parent(col))]` or
 /// `#[references(Parent(col), on_delete = restrict|cascade|set_null)]`
 /// (SPEC-022 RV-030/032). The referenced column must be the parent's

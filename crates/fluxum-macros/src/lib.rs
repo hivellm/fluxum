@@ -295,6 +295,21 @@ pub fn on_update(args: TokenStream, input: TokenStream) -> TokenStream {
     trigger::expand(trigger::Kind::Update, args.into(), input.into()).into()
 }
 
+/// Declares a typed directed edge relation (SPEC-023 DMX-050):
+/// `#[fluxum::edge(from = Player, to = Item)]` on a struct with `from` and
+/// `to` fields (plus any property columns) expands to an ordinary public
+/// table with a `(from, to)` composite primary key and a `btree(from)`
+/// index — so a node's neighbors are one B-tree prefix scan, O(log n + k),
+/// never a general JOIN (SPEC-023 §8). Edge sets subscribe like tables
+/// (`SELECT * FROM Owns WHERE from = X` — DMX-051 live neighbor diffs), and
+/// reducers traverse with `ctx.tx.traverse::<Owns>(from)`. The `from =` /
+/// `to =` arguments name the endpoint tables for introspection and
+/// assembly-time validation; omit them for untyped endpoints.
+#[proc_macro_attribute]
+pub fn edge(args: TokenStream, input: TokenStream) -> TokenStream {
+    table::expand_edge(args.into(), input.into()).into()
+}
+
 /// Declares a delete trigger (SPEC-022 RV-031):
 /// `#[fluxum::on_delete(Table)]` runs
 /// `fn(ctx: &ReducerContext, row: &Table) -> Result<(), String>` inside the

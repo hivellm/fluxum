@@ -113,6 +113,22 @@ impl Schema {
         crate::schema::validate_registered_ephemeral(&schema)?;
         // SPEC-023 DMX-020: row-TTL metadata must resolve too.
         crate::schema::validate_registered_ttl(&schema)?;
+        // SPEC-023 DMX-050: edge endpoints must resolve when the edge table
+        // is part of this schema.
+        for def in crate::schema::registered_edges() {
+            if schema.table(def.name).is_none() {
+                continue; // registry is process-global; schemas may be subsets
+            }
+            for endpoint in [def.from_table, def.to_table] {
+                if !endpoint.is_empty() && schema.table(endpoint).is_none() {
+                    return Err(FluxumError::Schema(format!(
+                        "edge `{}`: endpoint table `{endpoint}` is not in the assembled \
+                         schema (DMX-050)",
+                        def.name
+                    )));
+                }
+            }
+        }
         Ok(schema)
     }
 
