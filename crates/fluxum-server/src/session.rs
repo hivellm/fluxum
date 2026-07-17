@@ -135,6 +135,19 @@ impl Session {
             ));
         }
 
+        // SPEC-025 OPS-030: while draining, refuse *new* work with a
+        // retryable signal so the SDK retries it against the restarted
+        // process (OPS-031) rather than surfacing a failure. Work already
+        // admitted is untouched, and reads/unsubscribe/resume still serve —
+        // a drain must not break the clients it is politely shedding.
+        if self.ctx.is_draining() && admits_new_work(&message) {
+            return Routed::reply(error(
+                Some(request_id(&message)),
+                codes::CLUSTER_SHARD_UNAVAILABLE,
+                "shard draining for restart; retry",
+            ));
+        }
+
         match message {
             // A second Authenticate re-derives identity but keeps the
             // connection id (idempotent re-auth).
@@ -391,6 +404,23 @@ impl Session {
             }
         }
     }
+}
+
+/// Whether `message` asks the shard to take on **new** work — the class a
+/// drain sheds (SPEC-025 OPS-030).
+///
+/// `Unsubscribe` and `OneOffQuery` are deliberately absent: dropping a
+/// subscription costs nothing and a read touches no writer, so refusing
+/// them would only hurt the clients a drain is trying to let down gently.
+/// `Resume` likewise continues an *existing* subscription (SPEC-021
+/// CS-021) rather than starting one.
+fn admits_new_work(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::ReducerCall(_)
+            | ClientMessage::Subscribe(_)
+            | ClientMessage::SubscribeSingle(_)
+    )
 }
 
 /// The `id` a client message carries (echoed on its response, RPC-002).

@@ -93,6 +93,15 @@ pub async fn serve(
                 _ = accept_shutdown.notified() => break,
                 accepted = listener.accept() => {
                     match accepted {
+                        // SPEC-025 OPS-030: while draining, admit nobody new.
+                        // Closing immediately is the retryable signal on a raw
+                        // socket — the client reconnects and lands on the
+                        // restarted process (OPS-031). Connections already
+                        // established keep being serviced.
+                        Ok(_) if accept_ctx.is_draining() => {
+                            tracing::debug!(target: "fluxum::tcp",
+                                "refused a connection: draining");
+                        }
                         Ok((stream, _peer)) => {
                             let conn_ctx = Arc::clone(&accept_ctx);
                             let conn_shutdown = accept_shutdown.clone();

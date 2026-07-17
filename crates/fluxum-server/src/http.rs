@@ -192,6 +192,19 @@ async fn serve_connection(
             None => return Ok(()), // clean close
         };
         let keep_alive = match (request.method.as_str(), request.path.as_str()) {
+            // SPEC-025 OPS-030: while draining, refuse *new* `/rpc` work
+            // with a retryable 503 so the client reconnects to the restarted
+            // process (OPS-031).
+            //
+            // The refusal lives here, not in the accept loop: a drained shard
+            // must still answer `/health` (so a load balancer sees it leave
+            // rotation), `/metrics` (so the drain is observable) and `/drain`
+            // itself. Refusing at accept would blind exactly the tooling the
+            // drain depends on.
+            ("POST" | "GET", "/rpc") if state.ctx.is_draining() => {
+                write_simple(&mut stream, 503, "Service Unavailable").await?;
+                return Ok(());
+            }
             ("POST", "/rpc") => {
                 handle_post(&state, &mut stream, &request).await?;
                 true

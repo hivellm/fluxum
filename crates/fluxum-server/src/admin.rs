@@ -94,6 +94,7 @@ pub async fn dispatch(
         ("GET", ["plugins"]) => plugins(ctx),
         ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
         ("POST", ["plugins", name, "enable"]) => plugin_set_disabled(ctx, name, false),
+        ("POST", ["drain"]) => drain(ctx),
         _ => AdminResponse::err(404, None, "not found"),
     }
 }
@@ -138,6 +139,7 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["view", _]
             | ["plugins"]
             | ["plugins", _, "disable" | "enable"]
+            | ["drain"]
     )
 }
 
@@ -279,6 +281,33 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     }
 }
 
+// --- POST /drain (SPEC-025 OPS-030) ---------------------------------------------
+
+/// Put the shard into the drain state: stop admitting new work while
+/// in-flight transactions finish (`fluxum drain` / a deploy's pre-stop
+/// hook).
+///
+/// This *enters* drain and returns immediately, rather than blocking until
+/// the process exits: the caller is an operator or an orchestrator's
+/// pre-stop hook that wants a prompt ack, then polls `/health` (which now
+/// reports `shutting_down`) to watch the shard quiesce. The quiesce +
+/// checkpoint + exit sequence belongs to whoever owns the process — see
+/// [`crate::drain`].
+fn drain(ctx: &Arc<ShardContext>) -> AdminResponse {
+    ctx.begin_drain();
+    let health = ctx.health();
+    AdminResponse::ok(
+        None,
+        json!({
+            "draining": true,
+            "shard": health.shard_id,
+            "state": health.state.as_str(),
+            "queue_depth": health.queue_depth,
+            "last_tx_id": health.last_tx_id,
+        }),
+    )
+}
+
 // --- GET /schema (SPEC-011: tables + reducers + views) -------------------------
 
 async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
@@ -414,6 +443,17 @@ async fn reducer_call(ctx: &Arc<ShardContext>, name: &str, body: &[u8]) -> Admin
         Ok(pair) => pair,
         Err(e) => return AdminResponse::err(400, None, e),
     };
+    // SPEC-025 OPS-030: a reducer call is new work, and the admin surface
+    // reaches the engine directly rather than through the session router —
+    // so it needs the drain refusal of its own, or `POST /reducer/:name`
+    // would keep writing to a shard that is on its way out.
+    if ctx.is_draining() {
+        return AdminResponse::err(
+            503,
+            request_id.as_deref(),
+            "shard draining for restart; retry",
+        );
+    }
     // The payload is the reducer's argument array (RPC-051).
     let args = match &payload {
         Value::Null => Vec::new(),

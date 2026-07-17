@@ -398,6 +398,50 @@ async fn health_reports_status_and_is_fast() {
     server.shutdown();
 }
 
+// --- POST /drain (SPEC-025 OPS-030) ---------------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn drain_endpoint_puts_the_shard_into_drain() {
+    let server = start().await;
+
+    // Healthy before: 200 / ok.
+    let resp = request(server.local_addr, "GET", "/health", None).await;
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["status"], "ok");
+
+    // The operator (or a pre-stop hook) drains.
+    let resp = request(server.local_addr, "POST", "/drain", None).await;
+    assert_eq!(resp.status, 200);
+    let body = resp.json();
+    assert_eq!(body["success"], true);
+    assert_eq!(body["payload"]["draining"], true);
+    assert_eq!(body["payload"]["state"], "shutting_down");
+
+    // /health now reports the shard out of rotation (503), which is how a
+    // load balancer learns to stop sending it traffic.
+    let resp = request(server.local_addr, "GET", "/health", None).await;
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.json()["status"], "error");
+    assert_eq!(resp.json()["shards"][0]["state"], "shutting_down");
+
+    // A new reducer call is refused *retryably*, not dropped — the admin
+    // surface reaches the engine directly, so it carries its own refusal.
+    let resp = request(
+        server.local_addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":["hi"]}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 503, "retryable while draining");
+    assert_eq!(resp.json()["success"], false);
+
+    // Draining twice is harmless (a retried pre-stop hook).
+    let resp = request(server.local_addr, "POST", "/drain", None).await;
+    assert_eq!(resp.status, 200);
+    server.shutdown();
+}
+
 // --- /metrics: Prometheus text -------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
