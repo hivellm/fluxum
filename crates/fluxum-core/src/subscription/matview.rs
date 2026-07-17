@@ -127,7 +127,10 @@ impl MatViewEngine {
     /// The current view rows, encoded — the `InitialData` of a view
     /// subscription (RV-011).
     pub(crate) fn snapshot_rows(&self, name: &str) -> Result<Option<TableUpdate>> {
-        let states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some((index, view)) = self.views.iter().enumerate().find(|(_, v)| v.name == name)
         else {
             return Ok(None);
@@ -149,7 +152,10 @@ impl MatViewEngine {
     /// Apply one commit's delta rows (RV-010: only the delta, only affected
     /// groups/ranks) and render the changed view rows per view (RV-011).
     pub(crate) fn on_commit(&self, diff: &TxDiff) -> Result<Vec<(String, TableUpdate)>> {
-        let mut states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = Vec::new();
         for (view, state) in self.views.iter().zip(states.iter_mut()) {
             let Some(table_diff) = diff.tables.iter().find(|t| t.table_id == view.table) else {
@@ -219,7 +225,10 @@ impl MatViewEngine {
     /// validation seam.
     pub(crate) fn validate_against(&self, snapshot: &Snapshot) -> Result<()> {
         let fresh = Self::init_from_views(&self.views, snapshot)?;
-        let states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let states = self
+            .states
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for ((view, state), fresh_state) in self.views.iter().zip(states.iter()).zip(&fresh) {
             if !state.eq_state(fresh_state) {
                 return Err(FluxumError::Storage(format!(
@@ -298,7 +307,9 @@ fn resolve(def: &'static MaterializedViewDef, table: &'static TableSchema) -> Re
             }
         }
         (Some(_), Some(_)) => {
-            return Err(fail("declare an aggregate OR a top-N window, not both".into()));
+            return Err(fail(
+                "declare an aggregate OR a top-N window, not both".into(),
+            ));
         }
         (None, None) => return Err(fail("declare an aggregate or a top-N window".into())),
     };
@@ -384,10 +395,7 @@ fn render_all(view: &ResolvedView, state: &ViewState) -> Vec<Vec<RowValue>> {
             .groups
             .values()
             .map(|acc| {
-                let group = acc
-                    .group_value
-                    .clone()
-                    .unwrap_or(RowValue::Str("*".into()));
+                let group = acc.group_value.clone().unwrap_or(RowValue::Str("*".into()));
                 vec![group, aggregate_value(*agg, acc)]
             })
             .collect(),
@@ -421,7 +429,11 @@ fn aggregate_value(agg: MvAggregate, acc: &GroupAcc) -> RowValue {
         }
         MvAggregate::Avg(_) => {
             let total = acc.sum_float + acc.sum_int as f64;
-            RowValue::F64(if acc.count == 0 { 0.0 } else { total / acc.count as f64 })
+            RowValue::F64(if acc.count == 0 {
+                0.0
+            } else {
+                total / acc.count as f64
+            })
         }
         MvAggregate::Min(_) => acc
             .values

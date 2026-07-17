@@ -307,6 +307,17 @@ pub enum VisibilityRule {
     /// Registered filter function `fn(row: &T, viewer: &Identity) -> bool`
     /// referenced by name (DM-061).
     Custom(&'static str),
+    /// SPEC-022 RV-040: a row is visible to an identity iff a matching row
+    /// exists in the membership table — `key` names the column shared by
+    /// both tables, and the membership table's (first) `Identity` column
+    /// identifies the member. Evaluated for initial data AND diffs against
+    /// the subscription manager's membership index (RV-041: sub-linear).
+    MemberOf {
+        /// The membership table's struct name.
+        table: &'static str,
+        /// The join-key column name, present in both tables.
+        key: &'static str,
+    },
 }
 
 /// Cleanup metadata of one ephemeral table (SPEC-023 DMX-011), registered at

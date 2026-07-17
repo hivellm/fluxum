@@ -88,6 +88,24 @@ impl Subscriber {
     }
 }
 
+/// One membership table's live `(member identity, encoded key)` pairs
+/// (RV-041).
+type MemberSet = HashSet<([u8; 32], Vec<u8>)>;
+
+/// One resolved `member_of` visibility rule (SPEC-022 RV-040).
+struct MembershipSpec {
+    /// The protected table.
+    protected: TableId,
+    /// The membership table.
+    member_table: TableId,
+    /// The join-key column's ordinal in the protected table.
+    key_in_protected: u16,
+    /// The join-key column's ordinal in the membership table.
+    key_in_member: u16,
+    /// The membership table's member-identity column ordinal.
+    identity_in_member: u16,
+}
+
 /// The `search_args` value key: the FluxBIN encoding of one equality value
 /// ([`RowValue`] is not `Ord`/`Hash` because of floats, but its byte
 /// encoding is). Equality is exact, so any deterministic encoding indexes
@@ -182,6 +200,14 @@ pub struct SubscriptionManager {
     /// The materialized-view engine (SPEC-022 RV-010..013) — empty until
     /// [`SubscriptionManager::init_views`] resolves and rebuilds it.
     matviews: matview::MatViewEngine,
+    /// RV-040 `member_of` rules resolved against the schema, one per
+    /// protected table.
+    membership_specs: Vec<MembershipSpec>,
+    /// RV-041 membership index, parallel to `membership_specs`: the
+    /// `(member identity, encoded key)` pairs currently in each membership
+    /// table — an O(1) probe per row instead of a scan. Interior-mutable so
+    /// `on_commit(&self)` can maintain it.
+    members: std::sync::Mutex<Vec<MemberSet>>,
     /// View subscribers, per view name (RV-011).
     view_subs: HashMap<String, HashSet<u128>>,
     /// The views each connection subscribes to (disconnect cleanup).
@@ -233,6 +259,43 @@ impl SubscriptionManager {
                 }
             }
         }
+        // RV-040: resolve every `member_of` rule (validated at schema
+        // assembly, so the lookups here cannot fail on a legal schema).
+        let mut membership_specs = Vec::new();
+        for table in schema.tables() {
+            let crate::schema::VisibilityRule::MemberOf { table: member, key } = table.visibility
+            else {
+                continue;
+            };
+            let Some(member_schema) = schema.table(member) else {
+                continue;
+            };
+            let ordinal_of = |t: &'static crate::schema::TableSchema, name: &str| {
+                t.columns
+                    .iter()
+                    .position(|c| c.name == name)
+                    .map(|i| u16::try_from(i).unwrap_or(u16::MAX))
+            };
+            let identity = member_schema
+                .columns
+                .iter()
+                .position(|c| matches!(c.ty, crate::schema::FluxType::Identity))
+                .map(|i| u16::try_from(i).unwrap_or(u16::MAX));
+            if let (Some(key_in_protected), Some(key_in_member), Some(identity_in_member)) = (
+                ordinal_of(table, key),
+                ordinal_of(member_schema, key),
+                identity,
+            ) {
+                membership_specs.push(MembershipSpec {
+                    protected: TableId::of(table.name),
+                    member_table: TableId::of(member),
+                    key_in_protected,
+                    key_in_member,
+                    identity_in_member,
+                });
+            }
+        }
+        let member_sets = vec![HashSet::new(); membership_specs.len()];
         Self {
             schema,
             limits,
@@ -244,6 +307,8 @@ impl SubscriptionManager {
             fts_analyzers,
             plugins: None,
             matviews: matview::MatViewEngine::default(),
+            membership_specs,
+            members: std::sync::Mutex::new(member_sets),
             view_subs: HashMap::new(),
             conn_views: HashMap::new(),
             indexed_columns: HashMap::new(),
@@ -252,12 +317,71 @@ impl SubscriptionManager {
         }
     }
 
+    /// One membership entry of `spec` from a membership-table row.
+    fn membership_entry(spec: &MembershipSpec, row: &Row) -> Option<([u8; 32], Vec<u8>)> {
+        let identity = match row.value(spec.identity_in_member) {
+            Some(crate::store::RowValue::Identity(id)) => *id.as_bytes(),
+            _ => return None,
+        };
+        let key_value = row.value(spec.key_in_member)?;
+        let mut key = Vec::new();
+        crate::index::btree::encode_value(key_value, &mut key);
+        Some((identity, key))
+    }
+
+    /// RV-040/041: whether `row` of `plan`'s table is visible to `viewer` —
+    /// the `rls` closure (owner_only) AND the membership index (member_of).
+    /// `viewer = None` (public plan or server-peer bypass) sees everything.
+    fn row_visible(&self, plan: &CompiledPlan, row: &Row, viewer: Option<&Identity>) -> bool {
+        if !visible(plan, row, viewer) {
+            return false;
+        }
+        let Some(viewer) = viewer else {
+            return true;
+        };
+        let table_id = plan.table_ids[0];
+        let Some(index) = self
+            .membership_specs
+            .iter()
+            .position(|spec| spec.protected == table_id)
+        else {
+            return true;
+        };
+        let spec = &self.membership_specs[index];
+        let Some(key_value) = row.value(spec.key_in_protected) else {
+            return false;
+        };
+        let mut key = Vec::new();
+        crate::index::btree::encode_value(key_value, &mut key);
+        let members = self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        members[index].contains(&(*viewer.as_bytes(), key))
+    }
+
     /// Resolve the registered `#[fluxum::view(materialized)]` declarations
     /// and rebuild their state from `snapshot` (SPEC-022 RV-010/013 — the
     /// startup/recovery path). Call at assembly, before serving; without
     /// it, materialized views are inactive.
     pub fn init_views(&mut self, snapshot: &Snapshot) -> Result<()> {
         self.matviews = matview::MatViewEngine::init(&self.schema, snapshot)?;
+        // RV-041: rebuild the membership index from the membership tables
+        // (the same startup/recovery contract as view state).
+        let mut sets = Vec::with_capacity(self.membership_specs.len());
+        for spec in &self.membership_specs {
+            let mut set = HashSet::new();
+            for row in snapshot.scan(spec.member_table)? {
+                if let Some(entry) = Self::membership_entry(spec, row) {
+                    set.insert(entry);
+                }
+            }
+            sets.push(set);
+        }
+        *self
+            .members
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = sets;
         Ok(())
     }
 
@@ -422,7 +546,7 @@ impl SubscriptionManager {
         plan: &CompiledPlan,
         subscriber: Subscriber,
     ) -> (QueryHash, Option<Identity>) {
-        if plan.rls.is_none() {
+        if !plan.caller_scoped {
             return (plan.query_hash, None);
         }
         if subscriber.is_server_peer {
@@ -599,6 +723,31 @@ impl SubscriptionManager {
             });
         }
         deltas.sort_by_key(|d| d.query_hash);
+        // RV-040: apply this commit's membership-table changes AFTER the
+        // deltas were evaluated — a membership change flips visibility for
+        // LATER commits (joining mid-commit never retro-filters this one).
+        {
+            let mut members = self
+                .members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (spec, set) in self.membership_specs.iter().zip(members.iter_mut()) {
+                let Some(table_diff) = diff.tables.iter().find(|t| t.table_id == spec.member_table)
+                else {
+                    continue;
+                };
+                for (_, old) in &table_diff.deletes {
+                    if let Some(entry) = Self::membership_entry(spec, old) {
+                        set.remove(&entry);
+                    }
+                }
+                for row in &table_diff.inserts {
+                    if let Some(entry) = Self::membership_entry(spec, row) {
+                        set.insert(entry);
+                    }
+                }
+            }
+        }
         Ok(deltas)
     }
 
@@ -639,7 +788,7 @@ impl SubscriptionManager {
         // bounded B-tree scans (SPEC-018 QP-010); otherwise a full committed
         // scan. Every path applies RLS for this viewer (SUB-030) — `viewer`
         // is `None` for a public query or a server-peer bypass.
-        let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
+        let keep = |row: &Row| plan.matches(row) && self.row_visible(plan, row, viewer);
         // BM25 scores parallel to `rows`, present only for a MATCH plan
         // (FTS-040/041); dropped unless SCORE ordering/projection needs them.
         let mut scores: Vec<f64> = Vec::new();
@@ -664,7 +813,7 @@ impl SubscriptionManager {
                 })
                 .collect(),
             (None, None, AccessPath::IndexScan(scan)) => {
-                index_scan_rows(plan, scan, viewer, snapshot, table_id, schema)?
+                self.index_scan_rows(plan, scan, viewer, snapshot, table_id, schema)?
             }
             (_, _, AccessPath::FullScan) => snapshot
                 .scan(table_id)?
@@ -785,9 +934,9 @@ impl SubscriptionManager {
         if let Some(binding) =
             registry.readpath_binding(Capability::Retriever, schema.name, column_name)
             && let Some(PluginInstance::Retriever(retriever)) = &binding.instance
-            && let Ok(dense) = binding
-                .state
-                .guard(&binding.name, || retriever.retrieve(&query, RERANK_CANDIDATE_K, &ctx))
+            && let Ok(dense) = binding.state.guard(&binding.name, || {
+                retriever.retrieve(&query, RERANK_CANDIDATE_K, &ctx)
+            })
         {
             let mut by_pk: HashMap<Vec<u8>, Row> = HashMap::new();
             let mut lexical = Vec::with_capacity(paired.len());
@@ -806,12 +955,14 @@ impl SubscriptionManager {
             {
                 fusion_binding
                     .state
-                    .guard(&fusion_binding.name, || Ok(fusion.fuse(&lexical, &dense, &ctx)))
+                    .guard(&fusion_binding.name, || {
+                        Ok(fusion.fuse(&lexical, &dense, &ctx))
+                    })
                     .unwrap_or_else(|_| default_fusion.fuse(&lexical, &dense, &ctx))
             } else {
                 default_fusion.fuse(&lexical, &dense, &ctx)
             };
-            let keep = |row: &Row| plan.matches(row) && visible(plan, row, viewer);
+            let keep = |row: &Row| plan.matches(row) && self.row_visible(plan, row, viewer);
             let mut out = Vec::with_capacity(fused.len());
             for scored in fused {
                 if let Some(row) = by_pk.remove(scored.pk.as_bytes()) {
@@ -880,11 +1031,12 @@ impl SubscriptionManager {
         };
 
         // FTS-042: live diffs test the boolean MATCH by re-analyzing the
-        // delta row — no re-ranking.
+        // delta row — no re-ranking. RV-040: relational visibility applies
+        // to diffs exactly as to initial data.
         let keep = |row: &&Row| {
             plan.matches(row)
                 && plan.fts.as_ref().is_none_or(|fts| fts.matches_row(row))
-                && visible(plan, row, viewer)
+                && self.row_visible(plan, row, viewer)
         };
         let matched_inserts: Vec<&Row> = table_diff.inserts.iter().filter(keep).collect();
         // Deletes are matched by running the SAME predicate + RLS over the
@@ -1158,8 +1310,7 @@ impl SubscriptionManager {
 /// Rows touched by snapshot-read candidate selection (SPEC-018 acceptance
 /// 2/3: proves range pushdown reads O(bounded range), not O(table)).
 /// Process-global, relaxed — a observability counter, never control flow.
-pub static QUERY_ROWS_SCANNED: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+pub static QUERY_ROWS_SCANNED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// In-RAM sorts performed for `ORDER BY` (SPEC-018 QP-020: an index-served
 /// order must leave this untouched).
 pub static QUERY_SORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1169,96 +1320,102 @@ pub static QUERY_SORTS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 /// and, when the order is index-served with a `LIMIT`, an early stop after
 /// the first `n` authorized rows (top-N reads O(n + skipped), and RLS runs
 /// *before* counting toward the limit so a page is never short, QP-022).
-fn index_scan_rows(
-    plan: &CompiledPlan,
-    scan: &crate::sql::IndexScanPlan,
-    viewer: Option<&Identity>,
-    snapshot: &Snapshot,
-    table_id: TableId,
-    schema: &TableSchema,
-) -> Result<Vec<Row>> {
-    use std::sync::atomic::Ordering as AtomicOrdering;
-    // QP-040/041: the AFTER cursor's bound already seeks to the order
-    // value; what remains is skipping rows AT the cursor value up to (and
-    // including) the cursor's primary key — the `(value = c AND pk ≤ k)`
-    // residue of the keyset predicate (`pk ≥ k` for a DESC walk). The
-    // tiebreak compares ENCODED PK bytes, because that is the total order
-    // the index actually yields within one key — the cursor is unambiguous
-    // exactly because the walk and the comparison share one order.
-    let cursor_boundary: Option<crate::store::PkBytes> = plan
-        .cursor
-        .as_ref()
-        .map(|cursor| encode_pk_values(schema, std::slice::from_ref(&cursor.pk_value)))
-        .transpose()?;
-    let cursor_skip = |row: &Row| -> bool {
-        let (Some(cursor), Some(boundary), Some(order)) =
-            (&plan.cursor, &cursor_boundary, plan.order_by)
-        else {
-            return false;
-        };
-        let Some(value) = row.value(order.column) else {
-            return false;
-        };
-        if crate::sql::cmp_row_values(value, &cursor.order_value)
-            != Some(std::cmp::Ordering::Equal)
-        {
-            return false;
-        }
-        let Ok(row_pk) = encode_pk_of_row(schema, row.values()) else {
-            return false;
-        };
-        match row_pk.as_bytes().cmp(boundary.as_bytes()) {
-            std::cmp::Ordering::Equal => true,
-            std::cmp::Ordering::Less => !order.descending,
-            std::cmp::Ordering::Greater => order.descending,
-        }
-    };
-    let residual_keep = |row: &Row| {
-        QUERY_ROWS_SCANNED.fetch_add(1, AtomicOrdering::Relaxed);
-        !cursor_skip(row)
-            && plan.residual.as_ref().is_none_or(|f| f(row))
-            && visible(plan, row, viewer)
-    };
-    // QP-021: early stop only when the scan order IS the result order.
-    let early_stop = if plan.ordered_by_index {
-        plan.limit.map(|n| n as usize)
-    } else {
-        None
-    };
-    let descending = plan.order_by.is_some_and(|o| o.descending) && plan.ordered_by_index;
-    let mut rows: Vec<Row> = Vec::new();
-    'probes: for probe in &scan.probes {
-        let lower = bound_ref(&scan.lower);
-        let upper = bound_ref(&scan.upper);
-        let iter = snapshot.index_scan(table_id, scan.index_id, probe, lower, upper)?;
-        if descending {
-            // DESC is served by walking the bounded range in reverse: the
-            // range itself stays bounded, so the read cost is unchanged.
-            let range: Vec<&Row> = iter.collect();
-            for row in range.into_iter().rev() {
-                if residual_keep(row) {
-                    rows.push(row.clone());
-                    if early_stop.is_some_and(|n| rows.len() >= n) {
-                        break 'probes;
-                    }
-                }
+impl SubscriptionManager {
+    #[allow(clippy::too_many_arguments)]
+    fn index_scan_rows(
+        &self,
+        plan: &CompiledPlan,
+        scan: &crate::sql::IndexScanPlan,
+        viewer: Option<&Identity>,
+        snapshot: &Snapshot,
+        table_id: TableId,
+        schema: &TableSchema,
+    ) -> Result<Vec<Row>> {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+        // QP-040/041: the AFTER cursor's bound already seeks to the order
+        // value; what remains is skipping rows AT the cursor value up to (and
+        // including) the cursor's primary key — the `(value = c AND pk ≤ k)`
+        // residue of the keyset predicate (`pk ≥ k` for a DESC walk). The
+        // tiebreak compares ENCODED PK bytes, because that is the total order
+        // the index actually yields within one key — the cursor is unambiguous
+        // exactly because the walk and the comparison share one order.
+        let cursor_boundary: Option<crate::store::PkBytes> = plan
+            .cursor
+            .as_ref()
+            .map(|cursor| encode_pk_values(schema, std::slice::from_ref(&cursor.pk_value)))
+            .transpose()?;
+        let cursor_skip = |row: &Row| -> bool {
+            let (Some(cursor), Some(boundary), Some(order)) =
+                (&plan.cursor, &cursor_boundary, plan.order_by)
+            else {
+                return false;
+            };
+            let Some(value) = row.value(order.column) else {
+                return false;
+            };
+            if crate::sql::cmp_row_values(value, &cursor.order_value)
+                != Some(std::cmp::Ordering::Equal)
+            {
+                return false;
             }
+            let Ok(row_pk) = encode_pk_of_row(schema, row.values()) else {
+                return false;
+            };
+            match row_pk.as_bytes().cmp(boundary.as_bytes()) {
+                std::cmp::Ordering::Equal => true,
+                std::cmp::Ordering::Less => !order.descending,
+                std::cmp::Ordering::Greater => order.descending,
+            }
+        };
+        let residual_keep = |row: &Row| {
+            QUERY_ROWS_SCANNED.fetch_add(1, AtomicOrdering::Relaxed);
+            !cursor_skip(row)
+                && plan.residual.as_ref().is_none_or(|f| f(row))
+                && self.row_visible(plan, row, viewer)
+        };
+        // QP-021: early stop only when the scan order IS the result order.
+        let early_stop = if plan.ordered_by_index {
+            plan.limit.map(|n| n as usize)
         } else {
-            for row in iter {
-                if residual_keep(row) {
-                    rows.push(row.clone());
-                    if early_stop.is_some_and(|n| rows.len() >= n) {
-                        break 'probes;
+            None
+        };
+        let descending = plan.order_by.is_some_and(|o| o.descending) && plan.ordered_by_index;
+        let mut rows: Vec<Row> = Vec::new();
+        'probes: for probe in &scan.probes {
+            let lower = bound_ref(&scan.lower);
+            let upper = bound_ref(&scan.upper);
+            let iter = snapshot.index_scan(table_id, scan.index_id, probe, lower, upper)?;
+            if descending {
+                // DESC is served by walking the bounded range in reverse: the
+                // range itself stays bounded, so the read cost is unchanged.
+                let range: Vec<&Row> = iter.collect();
+                for row in range.into_iter().rev() {
+                    if residual_keep(row) {
+                        rows.push(row.clone());
+                        if early_stop.is_some_and(|n| rows.len() >= n) {
+                            break 'probes;
+                        }
+                    }
+                }
+            } else {
+                for row in iter {
+                    if residual_keep(row) {
+                        rows.push(row.clone());
+                        if early_stop.is_some_and(|n| rows.len() >= n) {
+                            break 'probes;
+                        }
                     }
                 }
             }
         }
+        Ok(rows)
     }
-    Ok(rows)
 }
 
 /// Borrow a `Bound<RowValue>` as the `Bound<&RowValue>` the scan API takes.
-fn bound_ref(bound: &std::ops::Bound<crate::store::RowValue>) -> std::ops::Bound<&crate::store::RowValue> {
+fn bound_ref(
+    bound: &std::ops::Bound<crate::store::RowValue>,
+) -> std::ops::Bound<&crate::store::RowValue> {
     match bound {
         std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
         std::ops::Bound::Included(v) => std::ops::Bound::Included(v),
@@ -1312,9 +1469,10 @@ fn crdt_patch_rows(
             let crate::store::RowValue::Bytes(old_bytes) = old_value else {
                 continue;
             };
-            if let (Ok(new_doc), Ok(old_doc)) =
-                (CrdtText::from_bytes(new_bytes), CrdtText::from_bytes(old_bytes))
-            {
+            if let (Ok(new_doc), Ok(old_doc)) = (
+                CrdtText::from_bytes(new_bytes),
+                CrdtText::from_bytes(old_bytes),
+            ) {
                 let patch = new_doc.ops_since(&old_doc);
                 values[idx] = crate::store::RowValue::Bytes(encode_ops(&patch));
             }

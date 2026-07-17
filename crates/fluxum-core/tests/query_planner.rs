@@ -156,7 +156,11 @@ fn marketplace_query_selects_the_composite_index_deterministically() {
     assert!(matches!(plan.access, AccessPath::IndexScan(_)));
     assert!(plan.residual.is_some(), "listed_at is residual");
     assert_eq!(plan.residual_desc.len(), 1);
-    assert!(plan.residual_desc[0].contains("listed_at"), "{:?}", plan.residual_desc);
+    assert!(
+        plan.residual_desc[0].contains("listed_at"),
+        "{:?}",
+        plan.residual_desc
+    );
 
     // No usable index → FullScan.
     let plan = compile(&schema, "SELECT * FROM Item WHERE listed_at = 3").unwrap();
@@ -206,11 +210,7 @@ fn in_expands_to_probes_under_the_cap_and_falls_back_above_it() {
 // --- QP-002: transparency over a generated corpus --------------------------------
 
 /// Decode InitialData insert rows to comparable byte vectors.
-fn result_rows(
-    manager: &SubscriptionManager,
-    store: &MemStore,
-    sql: &str,
-) -> Vec<Vec<u8>> {
+fn result_rows(manager: &SubscriptionManager, store: &MemStore, sql: &str) -> Vec<Vec<u8>> {
     let initial = manager
         .snapshot_result(admin(), sql, &store.snapshot())
         .unwrap();
@@ -240,7 +240,12 @@ fn index_scan_results_match_forced_full_scan_across_a_corpus() {
         " WHERE category = 'c7' AND price BETWEEN 90 AND 240 AND listed_at BETWEEN 0 AND 3",
         " WHERE category = 'missing'",
     ];
-    let orders = ["", " ORDER BY price ASC", " ORDER BY price DESC", " ORDER BY listed_at ASC"];
+    let orders = [
+        "",
+        " ORDER BY price ASC",
+        " ORDER BY price DESC",
+        " ORDER BY listed_at ASC",
+    ];
     let limits = ["", " LIMIT 7"];
 
     let mut corpus = 0;

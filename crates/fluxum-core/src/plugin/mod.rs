@@ -565,9 +565,8 @@ impl PluginRegistry {
 
     /// Validate and construct one manifest binding.
     fn bind(schema: &Schema, decl: &PluginDecl) -> Result<BoundPlugin> {
-        let fail = |detail: String| {
-            FluxumError::Config(format!("plugins: `{}`: {detail}", decl.name))
-        };
+        let fail =
+            |detail: String| FluxumError::Config(format!("plugins: `{}`: {detail}", decl.name));
         if decl.name.is_empty() {
             return Err(FluxumError::Config(
                 "plugins: plugin name must be non-empty (PLG-032)".into(),
@@ -813,9 +812,7 @@ fn adopt_builtins(schema: &Schema, config: &Config) -> Vec<BuiltinSeam> {
     let custom_visibility: Vec<String> = schema
         .tables()
         .filter_map(|table| match table.visibility {
-            crate::schema::VisibilityRule::Custom(name) => {
-                Some(format!("{} → {name}", table.name))
-            }
+            crate::schema::VisibilityRule::Custom(name) => Some(format!("{} → {name}", table.name)),
             _ => None,
         })
         .collect();

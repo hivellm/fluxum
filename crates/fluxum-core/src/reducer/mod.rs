@@ -83,8 +83,8 @@ use crate::types::{ConnectionId, Identity, Timestamp};
 pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
 pub use ratelimit::{RateLimiter, RateLimiterOptions};
 pub use view::{
-    MaterializedViewDef, MvAggregate, MvTopN, ReadOnlyTxHandle, ViewContext, ViewDef,
-    ViewRegistry, registered_materialized_views,
+    MaterializedViewDef, MvAggregate, MvTopN, ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry,
+    registered_materialized_views,
 };
 
 /// Maximum reducer-calls-reducer nesting depth (RED-005 guard).
@@ -166,8 +166,7 @@ pub fn registered_reducers() -> impl Iterator<Item = &'static ReducerDef> {
 /// The static handler shape the `#[fluxum::on_insert/on_update/on_delete]`
 /// macros emit (SPEC-022 RV-031): `(ctx, old row, new row)` — `old` is set
 /// for Update/Delete, `new` for Insert/Update; rows arrive decrypted.
-pub type TriggerFnPtr =
-    fn(&ReducerContext<'_, '_, '_>, Option<&Row>, Option<&Row>) -> Result<()>;
+pub type TriggerFnPtr = fn(&ReducerContext<'_, '_, '_>, Option<&Row>, Option<&Row>) -> Result<()>;
 
 /// One `#[fluxum::on_insert(Table)]` / `on_update` / `on_delete` hook in the
 /// link-time registry (SPEC-022 RV-031): dispatched by [`TxHandle`] inside

@@ -10,7 +10,7 @@ use std::sync::{Arc, OnceLock};
 use fluxum_core::config::{Config, PluginDecl, PluginHost, PluginScope};
 use fluxum_core::plugin::{
     FtQuery, Fusion, InProcPluginDef, PluginCtx, PluginError, PluginInstance, PluginRegistry,
-    ReciprocalRankFusion, Retriever, Scored, ScoreReranker,
+    ReciprocalRankFusion, Retriever, ScoreReranker, Scored,
 };
 use fluxum_core::schema::{
     ColumnSchema, FluxType, FullTextLanguage, IndexSchema, Schema, TableAccess, TableSchema,
@@ -175,7 +175,10 @@ fn registry(schema: &Schema, plugins: &[(&str, &str)]) -> Arc<PluginRegistry> {
     Arc::new(PluginRegistry::build(schema, &config).unwrap())
 }
 
-fn manager_with(schema: &Arc<Schema>, registry: Option<Arc<PluginRegistry>>) -> SubscriptionManager {
+fn manager_with(
+    schema: &Arc<Schema>,
+    registry: Option<Arc<PluginRegistry>>,
+) -> SubscriptionManager {
     let mut manager = SubscriptionManager::new(Arc::clone(schema), SubscriptionLimits::default());
     if let Some(registry) = registry {
         manager.set_plugins(registry);
@@ -212,7 +215,10 @@ fn reranker_order_is_authoritative_and_hooks_need_score_ranking() {
     let base = manager_with(&schema, None);
     assert_eq!(ids(&base, &store, RANKED), vec![3, 2, 1], "pure BM25 order");
 
-    let hooked = manager_with(&schema, Some(registry(&schema, &[("hx_reverse", "score_reranker")])));
+    let hooked = manager_with(
+        &schema,
+        Some(registry(&schema, &[("hx_reverse", "score_reranker")])),
+    );
     assert_eq!(
         ids(&hooked, &store, RANKED),
         vec![1, 2, 3],
@@ -259,13 +265,26 @@ fn stub_retriever_fuses_with_reference_rrf_and_fails_open() {
     // lexical match at all — the hybrid admission case).
     let pk = |id: u64| snapshot.encode_pk(item, &[RowValue::U64(id)]).unwrap();
     let dense = vec![
-        Scored { pk: pk(1), score: 0.99 },
-        Scored { pk: pk(4), score: 0.80 },
+        Scored {
+            pk: pk(1),
+            score: 0.99,
+        },
+        Scored {
+            pk: pk(4),
+            score: 0.80,
+        },
     ];
     DENSE.set(dense.clone()).unwrap();
 
-    let hooked = manager_with(&schema, Some(registry(&schema, &[("hx_stub_retriever", "retriever")])));
-    let got = ids(&hooked, &store, "SELECT * FROM Item WHERE description MATCH 'sword' ORDER BY SCORE DESC LIMIT 4");
+    let hooked = manager_with(
+        &schema,
+        Some(registry(&schema, &[("hx_stub_retriever", "retriever")])),
+    );
+    let got = ids(
+        &hooked,
+        &store,
+        "SELECT * FROM Item WHERE description MATCH 'sword' ORDER BY SCORE DESC LIMIT 4",
+    );
 
     // Reference RRF: lexical [3, 2, 1] fused with dense [1, 4].
     let lexical = [3u64, 2, 1];
@@ -294,11 +313,17 @@ fn stub_retriever_fuses_with_reference_rrf_and_fails_open() {
                 .unwrap()
         })
         .collect();
-    assert_eq!(got, reference_ids, "engine order == reference RRF (PLG-041)");
+    assert_eq!(
+        got, reference_ids,
+        "engine order == reference RRF (PLG-041)"
+    );
     assert!(got.contains(&4), "dense-only candidate admitted (hybrid)");
 
     // A failing retriever leaves the lexical result standing.
-    let failing = manager_with(&schema, Some(registry(&schema, &[("hx_fail_retriever", "retriever")])));
+    let failing = manager_with(
+        &schema,
+        Some(registry(&schema, &[("hx_fail_retriever", "retriever")])),
+    );
     assert_eq!(
         ids(&failing, &store, RANKED),
         vec![3, 2, 1],
@@ -313,7 +338,10 @@ fn hooks_never_touch_stored_state_or_diffs() {
     let schema = schema();
     let store_plain = MemStore::new(&schema).unwrap();
     let store_hooked = MemStore::new(&schema).unwrap();
-    let manager = manager_with(&schema, Some(registry(&schema, &[("hx_reverse", "score_reranker")])));
+    let manager = manager_with(
+        &schema,
+        Some(registry(&schema, &[("hx_reverse", "score_reranker")])),
+    );
     let _ = &manager; // the hooked manager exists while commits run
 
     let mut diffs_plain = Vec::new();
@@ -337,10 +365,18 @@ fn hooks_never_touch_stored_state_or_diffs() {
         diffs_plain, diffs_hooked,
         "TxDiffs bit-identical with a non-deterministic hook bound (PLG-022)"
     );
-    let rows =
-        |store: &MemStore| -> Vec<_> {
-            let item = store.table_id("Item").unwrap();
-            store.snapshot().scan(item).unwrap().cloned().collect::<Vec<_>>()
-        };
-    assert_eq!(rows(&store_plain), rows(&store_hooked), "stored rows identical");
+    let rows = |store: &MemStore| -> Vec<_> {
+        let item = store.table_id("Item").unwrap();
+        store
+            .snapshot()
+            .scan(item)
+            .unwrap()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        rows(&store_plain),
+        rows(&store_hooked),
+        "stored rows identical"
+    );
 }

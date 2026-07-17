@@ -804,7 +804,12 @@ impl Tx<'_> {
     /// deleted does not.
     fn parent_exists(&self, fk: &ResolvedFk, value: &RowValue) -> Result<bool> {
         let pk = encode_pk_values(fk.parent_schema, std::slice::from_ref(value))?;
-        match self.state.tables.get(&fk.parent).and_then(|ops| ops.get(&pk)) {
+        match self
+            .state
+            .tables
+            .get(&fk.parent)
+            .and_then(|ops| ops.get(&pk))
+        {
             Some(PendingOp::Insert(_) | PendingOp::Update(_)) => Ok(true),
             Some(PendingOp::Delete) => Ok(false),
             None => Ok(self.base.table(fk.parent)?.rows.contains_key(&pk)),
@@ -916,7 +921,10 @@ impl Tx<'_> {
         let children: Vec<Row> = self
             .scan_all(fk.child)?
             .filter(|row| {
-                fk_value_matches(row.values().get(usize::from(fk.child_ordinal)), parent_value)
+                fk_value_matches(
+                    row.values().get(usize::from(fk.child_ordinal)),
+                    parent_value,
+                )
             })
             .cloned()
             .collect();

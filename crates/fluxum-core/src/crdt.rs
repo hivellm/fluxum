@@ -50,9 +50,7 @@ pub const TAG_PATCH: u8 = 0x01;
 /// A character's (or delete op's) unique identity: a Lamport sequence plus
 /// the editing actor. Ordering is `(seq, actor)` — the total order every
 /// deterministic tie-break in this module derives from.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OpId {
     /// Lamport sequence: strictly greater than every op the actor had seen
     /// when generating this one (so a parent's seq < its children's).
@@ -205,7 +203,11 @@ impl CrdtText {
                 visible.len()
             )));
         }
-        let mut after = if pos == 0 { None } else { Some(visible[pos - 1]) };
+        let mut after = if pos == 0 {
+            None
+        } else {
+            Some(visible[pos - 1])
+        };
         let mut ops = Vec::with_capacity(text.chars().count());
         for (seq, ch) in (self.next_seq()..).zip(text.chars()) {
             let id = OpId { seq, actor };
@@ -354,9 +356,8 @@ impl CrdtText {
     /// Decode the tagged state encoding.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         match bytes.split_first() {
-            Some((&TAG_STATE, body)) => rmp_serde::from_slice(body).map_err(|e| {
-                FluxumError::Storage(format!("CrdtText state decode failed: {e}"))
-            }),
+            Some((&TAG_STATE, body)) => rmp_serde::from_slice(body)
+                .map_err(|e| FluxumError::Storage(format!("CrdtText state decode failed: {e}"))),
             Some((&TAG_PATCH, _)) => Err(FluxumError::Storage(
                 "expected CrdtText state bytes, found a patch — apply patches with \
                  apply_patch_bytes (DMX-061)"

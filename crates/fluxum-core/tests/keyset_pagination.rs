@@ -148,8 +148,7 @@ fn comparison_operators_compile_fold_and_filter_correctly() {
     assert!(err.to_string().contains("QP-032"), "{err}");
     let err = compile(&schema, "SELECT * FROM Item WHERE price != 3").unwrap_err();
     assert!(err.to_string().contains("!="), "{err}");
-    let err =
-        compile(&schema, "SELECT * FROM Item WHERE price = 1 OR price = 2").unwrap_err();
+    let err = compile(&schema, "SELECT * FROM Item WHERE price = 1 OR price = 2").unwrap_err();
     assert!(err.to_string().contains("OR"), "{err}");
 }
 
@@ -239,7 +238,10 @@ fn cursor_requires_index_served_order_and_offset_stays_rejected() {
         "SELECT * FROM Item ORDER BY price ASC LIMIT 5 OFFSET 100",
     )
     .unwrap_err();
-    assert!(err.to_string().contains("OFFSET") && err.to_string().contains("keyset"), "{err}");
+    assert!(
+        err.to_string().contains("OFFSET") && err.to_string().contains("keyset"),
+        "{err}"
+    );
 
     // QP-041: the explicit tiebreak must be the PK, same direction.
     compile(
@@ -275,7 +277,12 @@ fn cursor_pages_have_distinct_query_hashes_and_explain_shows_the_cursor() {
 
     let report = explain(&schema, &format!("{base} AFTER (250, 123)")).unwrap();
     assert_eq!(report["access"]["kind"], "index_scan");
-    assert!(report["cursor"]["order_value"].as_str().unwrap().contains("250"));
+    assert!(
+        report["cursor"]["order_value"]
+            .as_str()
+            .unwrap()
+            .contains("250")
+    );
     assert!(
         report["access"]["lower"].as_str().unwrap().contains("250"),
         "the cursor tightened the scan's lower bound: {report}"

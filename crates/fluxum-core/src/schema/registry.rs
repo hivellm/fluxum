@@ -71,6 +71,44 @@ impl Schema {
         // this schema (runtime backstop behind the macro's compile-time
         // rejections; covers hand-registered defs).
         crate::transform::validate_registered(&schema)?;
+        // SPEC-022 RV-040: every member_of visibility rule must resolve —
+        // the membership table is in this schema, the key column exists in
+        // BOTH tables with one type, and the membership table carries an
+        // Identity column identifying the member.
+        for table in schema.tables() {
+            let crate::schema::VisibilityRule::MemberOf { table: member, key } = table.visibility
+            else {
+                continue;
+            };
+            let fail = |detail: String| {
+                Err(FluxumError::Schema(format!(
+                    "table `{}` #[visibility(member_of({member}, {key}))]: {detail} (RV-040)",
+                    table.name
+                )))
+            };
+            let Some(member_schema) = schema.table(member) else {
+                return fail(format!("membership table `{member}` is not in the schema"));
+            };
+            let key_of = |t: &'static TableSchema| t.columns.iter().find(|c| c.name == key);
+            let (Some(own), Some(theirs)) = (key_of(table), key_of(member_schema)) else {
+                return fail(format!("key column `{key}` must exist in both tables"));
+            };
+            if own.ty != theirs.ty {
+                return fail(format!(
+                    "key column `{key}` type differs: {:?} vs {:?}",
+                    own.ty, theirs.ty
+                ));
+            }
+            if !member_schema
+                .columns
+                .iter()
+                .any(|c| matches!(c.ty, crate::schema::FluxType::Identity))
+            {
+                return fail(format!(
+                    "membership table `{member}` needs an Identity column (the member)"
+                ));
+            }
+        }
         // SPEC-023 DMX-011: ephemeral cleanup metadata must resolve too.
         crate::schema::validate_registered_ephemeral(&schema)?;
         // SPEC-023 DMX-020: row-TTL metadata must resolve too.

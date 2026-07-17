@@ -144,6 +144,11 @@ pub struct CompiledPlan {
     /// FTS-041 `SELECT *, SCORE`: surface the BM25 score as a synthetic
     /// `_score` column on the JSON one-off read surface.
     pub select_score: bool,
+    /// Whether results depend on WHO is asking (SUB-030/031, RV-040): true
+    /// for `owner_only` (an `rls` closure) and for `member_of` (evaluated
+    /// against the manager's membership index). Drives the per-viewer
+    /// effective-hash bucketing.
+    pub caller_scoped: bool,
 }
 
 /// How the snapshot evaluator reads a plan's candidate rows (QP-001).
@@ -349,6 +354,8 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
     // per-identity subscription bucket (the subscription manager folds the
     // identity into the dedup key and carries the viewer per bucket).
     let rls = compile_visibility(table);
+    let caller_scoped =
+        rls.is_some() || matches!(table.visibility, VisibilityRule::MemberOf { .. });
 
     // QP-041: an explicit ORDER BY tiebreak must be the primary key, same
     // direction — it is implicit otherwise, so the total order is fixed.
@@ -432,6 +439,7 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         fts,
         order_by_score,
         select_score: ast.select_score,
+        caller_scoped,
     })
 }
 
@@ -540,22 +548,20 @@ fn plan_access(
                         lower = tighter_lower(lower, Bound::Included(low.clone()));
                         upper = tighter_upper(upper, Bound::Included(high.clone()));
                     }
-                    CompiledCond::Cmp(ord, op, value) if *ord == range_col => {
-                        match op {
-                            CmpOp::Gt => {
-                                lower = tighter_lower(lower, Bound::Excluded(value.clone()));
-                            }
-                            CmpOp::Ge => {
-                                lower = tighter_lower(lower, Bound::Included(value.clone()));
-                            }
-                            CmpOp::Lt => {
-                                upper = tighter_upper(upper, Bound::Excluded(value.clone()));
-                            }
-                            CmpOp::Le => {
-                                upper = tighter_upper(upper, Bound::Included(value.clone()));
-                            }
+                    CompiledCond::Cmp(ord, op, value) if *ord == range_col => match op {
+                        CmpOp::Gt => {
+                            lower = tighter_lower(lower, Bound::Excluded(value.clone()));
                         }
-                    }
+                        CmpOp::Ge => {
+                            lower = tighter_lower(lower, Bound::Included(value.clone()));
+                        }
+                        CmpOp::Lt => {
+                            upper = tighter_upper(upper, Bound::Excluded(value.clone()));
+                        }
+                        CmpOp::Le => {
+                            upper = tighter_upper(upper, Bound::Included(value.clone()));
+                        }
+                    },
                     _ => continue,
                 }
                 consumed.push(i);
@@ -611,16 +617,19 @@ fn tighter_lower(a: Bound<RowValue>, b: Bound<RowValue>) -> Bound<RowValue> {
     match (&a, &b) {
         (Bound::Unbounded, _) => b,
         (_, Bound::Unbounded) => a,
-        (
-            Bound::Included(x) | Bound::Excluded(x),
-            Bound::Included(y) | Bound::Excluded(y),
-        ) => match cmp_values(x, y) {
-            Some(Ordering::Less) => b,
-            Some(Ordering::Greater) | None => a,
-            Some(Ordering::Equal) => {
-                if matches!(a, Bound::Excluded(_)) { a } else { b }
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp_values(x, y) {
+                Some(Ordering::Less) => b,
+                Some(Ordering::Greater) | None => a,
+                Some(Ordering::Equal) => {
+                    if matches!(a, Bound::Excluded(_)) {
+                        a
+                    } else {
+                        b
+                    }
+                }
             }
-        },
+        }
     }
 }
 
@@ -630,16 +639,19 @@ fn tighter_upper(a: Bound<RowValue>, b: Bound<RowValue>) -> Bound<RowValue> {
     match (&a, &b) {
         (Bound::Unbounded, _) => b,
         (_, Bound::Unbounded) => a,
-        (
-            Bound::Included(x) | Bound::Excluded(x),
-            Bound::Included(y) | Bound::Excluded(y),
-        ) => match cmp_values(x, y) {
-            Some(Ordering::Greater) => b,
-            Some(Ordering::Less) | None => a,
-            Some(Ordering::Equal) => {
-                if matches!(a, Bound::Excluded(_)) { a } else { b }
+        (Bound::Included(x) | Bound::Excluded(x), Bound::Included(y) | Bound::Excluded(y)) => {
+            match cmp_values(x, y) {
+                Some(Ordering::Greater) => b,
+                Some(Ordering::Less) | None => a,
+                Some(Ordering::Equal) => {
+                    if matches!(a, Bound::Excluded(_)) {
+                        a
+                    } else {
+                        b
+                    }
+                }
             }
-        },
+        }
     }
 }
 
@@ -706,7 +718,15 @@ fn compile_visibility(table: &TableSchema) -> Option<RlsFn> {
                 row.value(owner) == Some(&RowValue::Identity(*viewer))
             }))
         }
-        VisibilityRule::PublicAll | VisibilityRule::ShardLocal | VisibilityRule::Custom(_) => None,
+        // RV-040 `member_of` is evaluated by the subscription manager
+        // against its live membership index (the rule needs table state a
+        // pure row closure cannot see); `caller_scoped` still buckets the
+        // plan per viewer. `custom` (SUB-032 named predicates) stays a
+        // documented gap; `shard_local` needs the phase-5 shard context.
+        VisibilityRule::PublicAll
+        | VisibilityRule::ShardLocal
+        | VisibilityRule::Custom(_)
+        | VisibilityRule::MemberOf { .. } => None,
     }
 }
 
@@ -1199,6 +1219,7 @@ mod tests {
             fts: None,
             order_by_score: None,
             select_score: false,
+            caller_scoped: false,
         };
         let debug = format!("{plan:?}");
         assert!(debug.contains("has_filter"), "{debug}");

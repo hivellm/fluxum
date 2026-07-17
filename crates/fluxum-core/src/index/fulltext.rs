@@ -342,9 +342,9 @@ impl FtsQuery {
         }
         self.items.iter().all(|item| match item {
             FtsItem::Term(term) => positions.contains_key(term.as_str()),
-            FtsItem::Prefix(prefix) => {
-                positions.keys().any(|term| term.starts_with(prefix.as_str()))
-            }
+            FtsItem::Prefix(prefix) => positions
+                .keys()
+                .any(|term| term.starts_with(prefix.as_str())),
             FtsItem::Phrase(terms) => {
                 let Some(((first, first_pos), rest)) = terms.split_first() else {
                     return false;

@@ -158,9 +158,8 @@ fn pushdown_scans_the_bounded_range_and_top_n_never_sorts() {
     let (rows, first_page_scanned, sorts) =
         run("SELECT * FROM Item WHERE category = 'c7' ORDER BY price ASC LIMIT 10");
     assert_eq!((rows, sorts), (10, 0));
-    let (rows, deep_page_scanned, sorts) = run(
-        "SELECT * FROM Item WHERE category = 'c7' ORDER BY price ASC LIMIT 10 AFTER (69, 770)",
-    );
+    let (rows, deep_page_scanned, sorts) =
+        run("SELECT * FROM Item WHERE category = 'c7' ORDER BY price ASC LIMIT 10 AFTER (69, 770)");
     assert_eq!((rows, sorts), (10, 0));
     assert!(
         deep_page_scanned <= first_page_scanned + 1,
@@ -173,7 +172,11 @@ fn pushdown_scans_the_bounded_range_and_top_n_never_sorts() {
     let doc = store.table_id("Doc").unwrap();
     let mut tx = store.begin();
     for i in 0..1_000u64 {
-        let body = if i % 333 == 0 { "hidden treasure map" } else { "plain filler text" };
+        let body = if i % 333 == 0 {
+            "hidden treasure map"
+        } else {
+            "plain filler text"
+        };
         tx.insert(doc, vec![RowValue::U64(i + 1), RowValue::Str(body.into())])
             .unwrap();
     }

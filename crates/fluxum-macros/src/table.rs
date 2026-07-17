@@ -191,6 +191,8 @@ enum Visibility {
     PublicAll,
     ShardLocal,
     Custom(Ident),
+    /// `member_of(Table, key)` — relational visibility (SPEC-022 RV-040).
+    MemberOf { table: Ident, key: Ident },
 }
 
 // Domain index names (SPEC-001/SPEC-008); the shared "Tree" postfix is intrinsic.
@@ -1210,6 +1212,17 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             }
             quote!(::fluxum_core::schema::VisibilityRule::OwnerOnly { owner: #ord })
         }
+        Some(Visibility::MemberOf { table, key }) => {
+            // The key column must exist HERE; the membership end resolves
+            // at schema assembly, where the other table is in hand (RV-040).
+            ordinal_of(key, "`#[visibility(member_of(...))]` (RV-040)")?;
+            let table = table.to_string();
+            let key = key.to_string();
+            quote!(::fluxum_core::schema::VisibilityRule::MemberOf {
+                table: #table,
+                key: #key,
+            })
+        }
     };
 
     // -- computed columns (SPEC-022 RV-050) -------------------------------------
@@ -1911,11 +1924,24 @@ fn parse_visibility(attr: &Attribute) -> syn::Result<Visibility> {
         Ok(Visibility::OwnerOnly(meta.require_list()?.parse_args()?))
     } else if meta.path().is_ident("custom") {
         Ok(Visibility::Custom(meta.require_list()?.parse_args()?))
+    } else if meta.path().is_ident("member_of") {
+        // SPEC-022 RV-040: `member_of(Table, key)`.
+        let list = meta.require_list()?;
+        let (table, key) = list.parse_args_with(|input: syn::parse::ParseStream| {
+            let table: Ident = input.parse()?;
+            input.parse::<Token![,]>()?;
+            let key: Ident = input.parse()?;
+            if !input.is_empty() {
+                return Err(input.error("member_of takes exactly (Table, key) (RV-040)"));
+            }
+            Ok((table, key))
+        })?;
+        Ok(Visibility::MemberOf { table, key })
     } else {
         Err(syn::Error::new(
             meta.span(),
-            "expected `owner_only(col)`, `public_all`, `shard_local`, or `custom(filter_fn)` \
-             (DM-061)",
+            "expected `owner_only(col)`, `public_all`, `shard_local`, `custom(filter_fn)`, \
+             or `member_of(Table, key)` (DM-061)",
         ))
     }
 }

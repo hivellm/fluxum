@@ -127,7 +127,11 @@ fn patch_bytes_replay_a_delta_onto_the_older_state() {
     let mut replayed = old.clone();
     replayed.apply_patch_bytes(&patch).unwrap();
     assert_eq!(replayed, new, "old + patch = new");
-    assert!(replayed.text().starts_with("ello world"), "{}", replayed.text());
+    assert!(
+        replayed.text().starts_with("ello world"),
+        "{}",
+        replayed.text()
+    );
 
     // State/patch tags are mutually exclusive at every decode boundary.
     assert!(CrdtText::from_bytes(&patch).is_err());
@@ -143,7 +147,11 @@ fn state_roundtrip_and_actor_derivation() {
     assert_eq!(decoded.text(), "état 🚀");
 
     let actor = CrdtText::actor_of(&Identity::from_bytes([7; 32]));
-    assert_eq!(actor, u64::from_le_bytes([7; 8]), "stable, identity-derived");
+    assert_eq!(
+        actor,
+        u64::from_le_bytes([7; 8]),
+        "stable, identity-derived"
+    );
 }
 
 // --- DMX-061: subscription fan-out sends patches, not rewrites -------------------

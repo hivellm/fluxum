@@ -56,7 +56,11 @@ const CORPUS: &[(u64, &str, &str)] = &[
     (2, "weapon", "the common sword"),
     (3, "weapon", "sword sword sword collectors edition"),
     (4, "armor", "a rare shield"),
-    (5, "misc", "sword rare but listed backwards as rare items go"),
+    (
+        5,
+        "misc",
+        "sword rare but listed backwards as rare items go",
+    ),
     (6, "misc", "running shoes for swordfighters"),
 ];
 
@@ -85,9 +89,7 @@ fn admin() -> Subscriber {
 
 /// Matching ids of `sql`, unordered.
 fn ids(manager: &SubscriptionManager, store: &MemStore, sql: &str) -> Vec<u64> {
-    let result = manager
-        .query_json(admin(), sql, &store.snapshot())
-        .unwrap();
+    let result = manager.query_json(admin(), sql, &store.snapshot()).unwrap();
     let mut ids: Vec<u64> = result["rows"]
         .as_array()
         .unwrap()
@@ -100,19 +102,12 @@ fn ids(manager: &SubscriptionManager, store: &MemStore, sql: &str) -> Vec<u64> {
 
 /// Ordered `(id, _score)` rows of a `SELECT *, SCORE` query.
 fn scored(manager: &SubscriptionManager, store: &MemStore, sql: &str) -> Vec<(u64, f64)> {
-    let result = manager
-        .query_json(admin(), sql, &store.snapshot())
-        .unwrap();
+    let result = manager.query_json(admin(), sql, &store.snapshot()).unwrap();
     result["rows"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| {
-            (
-                row["id"].as_u64().unwrap(),
-                row["_score"].as_f64().unwrap(),
-            )
-        })
+        .map(|row| (row["id"].as_u64().unwrap(), row["_score"].as_f64().unwrap()))
         .collect()
 }
 
@@ -126,23 +121,39 @@ fn boolean_prefix_and_phrase_return_exact_reference_sets() {
 
     // AND-of-terms: both must occur (any order, any distance).
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH 'rare sword'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH 'rare sword'"
+        ),
         vec![1, 5],
         "docs containing BOTH terms"
     );
     // Single term.
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH 'sword'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH 'sword'"
+        ),
         vec![1, 2, 3, 5]
     );
     // Trailing-* prefix (typeahead) reaches `swordfighters` too (FTS-031).
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH 'swo*'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH 'swo*'"
+        ),
         vec![1, 2, 3, 5, 6]
     );
     // Phrase: adjacent and in order — doc 5 has the words reversed (FTS-032).
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH '\"rare sword\"'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH '\"rare sword\"'"
+        ),
         vec![1]
     );
     // Mixed phrase + term.
@@ -156,11 +167,19 @@ fn boolean_prefix_and_phrase_return_exact_reference_sets() {
     );
     // English stemming: query variants fold to the index's stems (FTS-010).
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH 'kings'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH 'kings'"
+        ),
         vec![1]
     );
     assert_eq!(
-        ids(&manager, &store, "SELECT * FROM Item WHERE description MATCH 'running'"),
+        ids(
+            &manager,
+            &store,
+            "SELECT * FROM Item WHERE description MATCH 'running'"
+        ),
         vec![6]
     );
 
@@ -184,11 +203,17 @@ fn unsupported_match_constructs_are_rejected() {
     let err = compile(&schema, "SELECT * FROM Item WHERE category MATCH 'x'").unwrap_err();
     assert!(err.to_string().contains("FTS-033"), "{err}");
     for (sql, what) in [
-        ("SELECT * FROM Item WHERE description MATCH 'sword~'", "fuzzy"),
+        (
+            "SELECT * FROM Item WHERE description MATCH 'sword~'",
+            "fuzzy",
+        ),
         ("SELECT * FROM Item WHERE description MATCH 'a OR b'", "OR"),
         ("SELECT * FROM Item WHERE description MATCH 'NOT a'", "NOT"),
         ("SELECT * FROM Item WHERE description MATCH 'a^2'", "boost"),
-        ("SELECT * FROM Item WHERE description MATCH '*infix'", "wildcard"),
+        (
+            "SELECT * FROM Item WHERE description MATCH '*infix'",
+            "wildcard",
+        ),
         ("SELECT * FROM Item WHERE description MATCH ''", "empty"),
     ] {
         let err = compile(&schema, sql).unwrap_err();
@@ -286,11 +311,24 @@ fn live_diffs_are_boolean_and_term_pruned() {
 
     let sub = |manager: &mut SubscriptionManager, conn: u128, sql: &str| {
         manager
-            .subscribe(conn, Subscriber::client(Identity::from_bytes([1; 32])), sql, &store.snapshot())
+            .subscribe(
+                conn,
+                Subscriber::client(Identity::from_bytes([1; 32])),
+                sql,
+                &store.snapshot(),
+            )
             .unwrap();
     };
-    sub(&mut manager, 1, "SELECT * FROM Item WHERE description MATCH 'dragon'");
-    sub(&mut manager, 2, "SELECT * FROM Item WHERE description MATCH 'phoenix'");
+    sub(
+        &mut manager,
+        1,
+        "SELECT * FROM Item WHERE description MATCH 'dragon'",
+    );
+    sub(
+        &mut manager,
+        2,
+        "SELECT * FROM Item WHERE description MATCH 'phoenix'",
+    );
     sub(
         &mut manager,
         3,
@@ -312,12 +350,16 @@ fn live_diffs_are_boolean_and_term_pruned() {
     };
 
     // A dragon row reaches ONLY the dragon plan (term pruning + boolean).
-    let deltas = manager.on_commit(&commit_doc(100, "a dragon appears")).unwrap();
+    let deltas = manager
+        .on_commit(&commit_doc(100, "a dragon appears"))
+        .unwrap();
     assert_eq!(deltas.len(), 1);
     assert_eq!(deltas[0].subscribers, vec![1]);
 
     // A row with neither term reaches no plan.
-    let deltas = manager.on_commit(&commit_doc(101, "nothing to see")).unwrap();
+    let deltas = manager
+        .on_commit(&commit_doc(101, "nothing to see"))
+        .unwrap();
     assert!(deltas.is_empty(), "no term hit → no evaluation");
 
     // The phrase plan is pruned in by its first term but boolean-verified:

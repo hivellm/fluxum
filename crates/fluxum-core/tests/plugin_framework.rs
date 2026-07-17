@@ -9,7 +9,7 @@ use std::sync::Arc;
 use fluxum_core::config::{Config, PluginDecl, PluginHost, PluginScope, TransformKey};
 use fluxum_core::plugin::{
     Capability, FtQuery, Fusion, InProcPluginDef, Placement, PluginCtx, PluginError,
-    PluginInstance, PluginRegistry, PluginState, ReciprocalRankFusion, Scored, ScoreReranker,
+    PluginInstance, PluginRegistry, PluginState, ReciprocalRankFusion, ScoreReranker, Scored,
 };
 use fluxum_core::schema::{
     ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule,
@@ -197,11 +197,17 @@ fn capability_set_is_closed_with_fixed_placement() {
 fn build_rejects_illegal_bindings_with_descriptive_errors() {
     // Unknown capability (closed set, PLG-003).
     let err = build_err(vec![in_proc("x", "mind_reader")]);
-    assert!(err.contains("unknown capability") && err.contains("PLG-003"), "{err}");
+    assert!(
+        err.contains("unknown capability") && err.contains("PLG-003"),
+        "{err}"
+    );
 
     // Sidecar on a WritePath capability (PLG-021).
     let err = build_err(vec![sidecar("x", "column_transform")]);
-    assert!(err.contains("WritePath") && err.contains("PLG-021"), "{err}");
+    assert!(
+        err.contains("WritePath") && err.contains("PLG-021"),
+        "{err}"
+    );
 
     // In-proc plugin not compiled into the binary (PLG-030).
     let err = build_err(vec![in_proc("absent_plugin", "score_reranker")]);
@@ -209,7 +215,10 @@ fn build_rejects_illegal_bindings_with_descriptive_errors() {
 
     // Declared capability disagrees with the compiled instance.
     let err = build_err(vec![in_proc("reverse_reranker", "retriever")]);
-    assert!(err.contains("implements") && err.contains("score_reranker"), "{err}");
+    assert!(
+        err.contains("implements") && err.contains("score_reranker"),
+        "{err}"
+    );
 
     // applies_to targets must exist.
     let mut bad_table = sidecar("x", "score_reranker");
@@ -261,7 +270,9 @@ fn a_legal_set_builds_and_reports() {
     assert!(names.contains(&"reverse_reranker") && names.contains(&"vec_hybrid"));
     // Adopted seams (PLG-002): the configured auth provider is always there.
     assert!(
-        report.iter().any(|p| p.capability == "auth" && p.host == "builtin"),
+        report
+            .iter()
+            .any(|p| p.capability == "auth" && p.host == "builtin"),
         "auth seam adopted: {names:?}"
     );
 }
@@ -287,7 +298,10 @@ fn report_lists_key_ids_but_never_secrets() {
     let json = serde_json::to_string(&report).unwrap();
     assert!(key_seam.name.contains("config"));
     assert!(json.contains("orders_key"), "key ids are listed");
-    assert!(!json.contains(&secret_hex), "key material never leaks (PLG-060)");
+    assert!(
+        !json.contains(&secret_hex),
+        "key material never leaks (PLG-060)"
+    );
 }
 
 #[test]
@@ -301,7 +315,10 @@ fn hot_disable_flips_health_without_rebuild() {
     assert_eq!(plugin.health, "disabled");
     registry.set_disabled("r", false);
     let report = registry.report();
-    assert_eq!(report.iter().find(|p| p.name == "r").unwrap().health, "active");
+    assert_eq!(
+        report.iter().find(|p| p.name == "r").unwrap().health,
+        "active"
+    );
 }
 
 // --- PLG-030: in-process panic isolation ----------------------------------------
@@ -325,7 +342,10 @@ fn panicking_plugin_is_disabled_and_metered_not_fatal() {
             reranker.rerank(&query(), candidates.clone(), &ctx())
         })
         .expect_err("the panic surfaces as a PluginError, never unwinds");
-    assert!(err.0.contains("panicked") && err.0.contains("model exploded"), "{err}");
+    assert!(
+        err.0.contains("panicked") && err.0.contains("model exploded"),
+        "{err}"
+    );
     assert_eq!(plugin.state.panics(), 1, "fluxum_plugin_panics_total");
     assert!(plugin.state.is_disabled(), "auto-disabled (PLG-030)");
 
@@ -367,7 +387,10 @@ fn healthy_in_proc_plugin_runs_under_guard() {
         })
         .unwrap();
     assert_eq!(
-        reordered.iter().map(|s| s.pk.as_bytes()[0]).collect::<Vec<_>>(),
+        reordered
+            .iter()
+            .map(|s| s.pk.as_bytes()[0])
+            .collect::<Vec<_>>(),
         vec![2, 1],
         "plugin output honored on the read path"
     );
