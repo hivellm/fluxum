@@ -85,7 +85,7 @@ pub mod tx;
 pub(crate) mod unique;
 
 pub use committed::{CommittedState, Snapshot, TableState};
-pub use memstore::{MemStore, StoreOptions, Tx};
+pub use memstore::{AsOfPoint, MemStore, StoreOptions, Tx};
 pub use row::{PkBytes, Row, RowValue};
 pub use tx::{TableDiff, TriggerEvent, TriggerKind, TxDiff, TxState, UndoRecord};
 

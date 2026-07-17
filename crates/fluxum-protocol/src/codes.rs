@@ -87,6 +87,8 @@ pub const SQL_UNSUPPORTED: u16 = 3003;
 pub const SQL_TYPE_MISMATCH: u16 = 3004;
 /// 3010 — spatial predicate on a table without a spatial index (SPX-022).
 pub const SQL_NO_SPATIAL_INDEX: u16 = 3010;
+/// 3020 — `AS OF` point older than the retained temporal window (RV-021).
+pub const SQL_AS_OF_OUT_OF_WINDOW: u16 = 3020;
 /// 3100 — `#[unique]` constraint violation (TXN-041).
 pub const SQL_UNIQUE_VIOLATION: u16 = 3100;
 /// 3101 — `#[check(expr)]` constraint violation (SPEC-022 RV-030).

@@ -149,6 +149,10 @@ pub struct CompiledPlan {
     /// against the manager's membership index). Drives the per-viewer
     /// effective-hash bucketing.
     pub caller_scoped: bool,
+    /// SPEC-022 RV-021: the `AS OF` point this plan reads at, if any. The
+    /// caller resolves it to a snapshot via `MemStore::snapshot_as_of`
+    /// before evaluating; RLS and masking apply exactly as live (RV-022).
+    pub as_of: Option<crate::store::AsOfPoint>,
 }
 
 /// How the snapshot evaluator reads a plan's candidate rows (QP-001).
@@ -445,7 +449,32 @@ pub fn compile(schema: &Schema, sql: &str) -> Result<CompiledPlan> {
         order_by_score,
         select_score: ast.select_score,
         caller_scoped,
+        as_of: ast.as_of.map(|(is_timestamp, value)| {
+            if is_timestamp {
+                crate::store::AsOfPoint::Timestamp(value)
+            } else {
+                #[allow(clippy::cast_sign_loss)] // parser rejects negatives
+                crate::store::AsOfPoint::Tx(value as u64)
+            }
+        }),
     })
+}
+
+/// The `AS OF` point of `sql`, if any (RV-021) — the transport resolves it
+/// to a historical snapshot (`MemStore::snapshot_as_of`) before handing the
+/// query to the subscription manager. Parse-only; schema resolution and the
+/// full compile happen downstream as usual.
+pub fn as_of_point(sql: &str) -> Result<Option<crate::store::AsOfPoint>> {
+    let tokens = lexer::tokenize(sql)?;
+    let ast = parse::Parser::new(&tokens).parse_query()?;
+    Ok(ast.as_of.map(|(is_timestamp, value)| {
+        if is_timestamp {
+            crate::store::AsOfPoint::Timestamp(value)
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            crate::store::AsOfPoint::Tx(value as u64)
+        }
+    }))
 }
 
 /// The analyzer of the `#[fulltext]` index declared over `ordinal`, if any
@@ -1035,6 +1064,13 @@ fn normalize(ast: &QueryAst) -> String {
     if let Some((order_value, pk_value)) = &ast.after {
         let _ = write!(out, " AFTER ({order_value}, {pk_value})");
     }
+    if let Some((is_timestamp, value)) = &ast.as_of {
+        let _ = write!(
+            out,
+            " AS OF {} {value}",
+            if *is_timestamp { "TIMESTAMP" } else { "TX" }
+        );
+    }
     out
 }
 
@@ -1225,6 +1261,7 @@ mod tests {
             order_by_score: None,
             select_score: false,
             caller_scoped: false,
+            as_of: None,
         };
         let debug = format!("{plan:?}");
         assert!(debug.contains("has_filter"), "{debug}");

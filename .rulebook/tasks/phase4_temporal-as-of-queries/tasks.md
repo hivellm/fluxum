@@ -1,14 +1,14 @@
 ## 1. Implementation
-- [ ] 1.1 Retain superseded row versions in a bounded temporal window, tagged by committing tx_id/timestamp (RV-020; crates/fluxum-core/src/store/committed.rs)
-- [ ] 1.2 Bound retention by a configurable budget / checkpoint horizon and prune versions past the window (RV-020; crates/fluxum-core/src/store/memstore.rs)
-- [ ] 1.3 Add an AS OF snapshot read that resolves a tx_id or timestamp to the committed state at that point (RV-021; crates/fluxum-core/src/store/committed.rs)
-- [ ] 1.4 Parse `AS OF (tx_id | timestamp)` and thread it into the query plan (RV-021; crates/fluxum-core/src/sql/mod.rs)
-- [ ] 1.5 Accept AS OF on OneOffQuery and the `/query` admin endpoint (RV-021; crates/fluxum-server/src/admin.rs)
-- [ ] 1.6 Return a typed error when the requested point is older than the retained window (RV-021; crates/fluxum-core/src/store/committed.rs)
-- [ ] 1.7 Apply RLS and column masking to AS OF reads exactly as for live reads (RV-022; crates/fluxum-core/src/sql/mod.rs)
-- [ ] 1.8 Reuse the AS OF snapshot for subscription initial-data reads at an offset (RV-021; crates/fluxum-core/src/subscription/mod.rs)
+- [x] 1.1 Retain superseded row versions in a bounded temporal window, tagged by committing tx_id/timestamp (RV-020; crates/fluxum-core/src/store/memstore.rs) — the MVCC design already produces one immutable `Arc<CommittedState>` per commit; retention is a `history` ring of `(tx_id, commit µs, snapshot)` pushed at the commit swap. Untouched tables are `Arc`-shared between neighbors, so retention costs only the touched-table copies the commits already made; metadata only, never reducer-visible (SEC-020 unaffected)
+- [x] 1.2 Bound retention by a configurable budget / checkpoint horizon and prune versions past the window (RV-020; crates/fluxum-core/src/store/memstore.rs) — `StoreOptions::temporal_window` (default 64 commits; 0 disables), pruned on every push; a byte-budget bound and a config.yml knob are noted follow-ups (the commit-count window is a hard bound today)
+- [x] 1.3 Add an AS OF snapshot read that resolves a tx_id or timestamp to the committed state at that point (RV-021; crates/fluxum-core/src/store/memstore.rs) — `AsOfPoint::{Tx, Timestamp}` + `MemStore::snapshot_as_of`: newest retained snapshot at or before the point; a point newer than every retained commit answers with the live snapshot
+- [x] 1.4 Parse `AS OF (tx_id | timestamp)` and thread it into the query plan (RV-021; crates/fluxum-core/src/sql/) — `AS OF TX <n>` / `AS OF TIMESTAMP <µs>` after the AFTER clause; `CompiledPlan.as_of`; normalization renders it so each point is its own hashed plan; `sql::as_of_point(sql)` is the parse-only helper transports resolve snapshots with
+- [x] 1.5 Accept AS OF on OneOffQuery and the `/query` admin endpoint (RV-021; crates/fluxum-server) — both surfaces resolve `as_of_point` → `snapshot_as_of` before evaluation; resolution errors surface as the typed wire error
+- [x] 1.6 Return a typed error when the requested point is older than the retained window (RV-021) — new wire code 3020 `SQL_AS_OF_OUT_OF_WINDOW`, with the oldest retained `(tx, µs)` in the message and a PITR pointer; RV-020's bound is real — never a silent approximation (pinned incl. the window-0 disabled case)
+- [x] 1.7 Apply RLS and column masking to AS OF reads exactly as for live reads (RV-022) — historical reads flow through the ordinary `initial_data` projection (RLS, membership, grants/masks all apply); pinned: an owner reads the historical draft, a stranger sees nothing historically or live. Note: visibility/grants evaluate with CURRENT privileges over historical data — the security-correct reading of RV-022
+- [x] 1.8 Reuse the AS OF snapshot for subscription initial-data reads at an offset (RV-021; crates/fluxum-core/src/subscription/mod.rs) — `snapshot_result`/`query_json` evaluate whatever snapshot the transport resolves, so an AS OF one-off IS the initial-data read at an offset (exercised by the tests through the same resolution flow the session/admin use)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation — rustdoc: StoreOptions::temporal_window (cost model), history field, AsOfPoint, snapshot_as_of semantics (newer-than-all = live; older = typed 3020), sql::as_of_point, transport resolution comments, wire code 3020
+- [x] 2.2 Write tests covering the new behavior — crates/fluxum-core/tests/temporal_as_of.rs (2 tests: per-version TX reads inside a window of 2 with pruning + newer-than-all + out-of-window 3020 for TX and TIMESTAMP forms + window-0 disable; RLS parity on historical reads + per-point query hashes)
+- [x] 2.3 Run tests and confirm they pass — `cargo test --workspace` green (0 failures), `cargo clippy --workspace --all-targets` clean, coverage gate ≥90%

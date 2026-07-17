@@ -260,10 +260,19 @@ impl Session {
     }
 
     /// RPC-025: a one-off read (SUB-025) — the current filtered result,
-    /// without registering a subscription.
+    /// without registering a subscription. SPEC-022 RV-021: an `AS OF`
+    /// clause resolves a historical snapshot from the temporal window;
+    /// RLS and masking apply exactly as live (RV-022).
     async fn one_off_query(&self, id: u32, sql: String) -> Routed {
         let (_, subscriber, _) = self.authed();
-        let snapshot = self.ctx.store().snapshot();
+        let snapshot = match fluxum_core::sql::as_of_point(&sql) {
+            Ok(Some(point)) => match self.ctx.store().snapshot_as_of(point) {
+                Ok(snapshot) => snapshot,
+                Err(e) => return Routed::reply(from_error(Some(id), &e)),
+            },
+            Ok(None) => self.ctx.store().snapshot(),
+            Err(e) => return Routed::reply(from_error(Some(id), &e)),
+        };
         let manager = self.ctx.subscriptions.lock().await;
         match manager.snapshot_result(subscriber, &sql, &snapshot) {
             Ok(mut initial) => {

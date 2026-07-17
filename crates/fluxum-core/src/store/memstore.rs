@@ -41,6 +41,12 @@ pub struct StoreOptions {
     /// be finite and > 0. Rows outside the bounds are still indexed
     /// correctly (overflow bucket) — the bounds only size the tree.
     pub spatial_bounds: Rect,
+    /// SPEC-022 RV-020: how many recent commits' snapshots stay reachable
+    /// for `AS OF` reads (default 64; `0` disables temporal reads). Each
+    /// retained snapshot structurally shares untouched tables with its
+    /// neighbors, so the cost is bounded by the touched-table copies the
+    /// commits already made.
+    pub temporal_window: usize,
 }
 
 impl Default for StoreOptions {
@@ -51,6 +57,7 @@ impl Default for StoreOptions {
             // ±2^20 covers typical projected-coordinate workloads; out-of-
             // bounds rows stay correct via the overflow bucket (SPX-004).
             spatial_bounds: Rect::new(-1_048_576.0, -1_048_576.0, 2_097_152.0, 2_097_152.0),
+            temporal_window: 64,
         }
     }
 }
@@ -153,6 +160,21 @@ pub struct MemStore {
     /// Incoming foreign keys per parent table (RV-032): the referential
     /// action each parent delete applies to its child rows.
     fks_in: HashMap<TableId, Vec<ResolvedFk>>,
+    /// SPEC-022 RV-020: the bounded temporal window — the last
+    /// `options.temporal_window` commits' snapshots, ascending by `tx_id`,
+    /// each tagged `(tx_id, commit timestamp µs)`. `AS OF` reads resolve
+    /// here ([`MemStore::snapshot_as_of`]).
+    history: Mutex<std::collections::VecDeque<(u64, i64, Arc<CommittedState>)>>,
+}
+
+/// The point an `AS OF` read resolves to (SPEC-022 RV-021).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsOfPoint {
+    /// The committed state right after transaction `tx_id`.
+    Tx(u64),
+    /// The committed state at `µs` since the Unix epoch (the newest commit
+    /// at or before it).
+    Timestamp(i64),
 }
 
 /// A `#[references]` declaration resolved against the assembled catalog
@@ -248,6 +270,7 @@ impl MemStore {
             not_null,
             fks_out,
             fks_in,
+            history: Mutex::new(std::collections::VecDeque::new()),
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -506,6 +529,62 @@ impl MemStore {
                 "unknown table id {table}: not in the assembled schema"
             ))
         })
+    }
+
+    /// SPEC-022 RV-021: the committed state at an earlier point — the
+    /// newest retained snapshot at or before `point`. `AS OF` a point newer
+    /// than every retained commit answers with the LIVE snapshot (the state
+    /// there is the current one); a point older than the retained window is
+    /// a typed 3020 (RV-020's bound is real, never silently approximated).
+    pub fn snapshot_as_of(&self, point: AsOfPoint) -> Result<Snapshot> {
+        let history = self
+            .history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let (Some(oldest), Some(newest)) = (history.front(), history.back()) else {
+            return Err(FluxumError::query(
+                codes::SQL_AS_OF_OUT_OF_WINDOW,
+                "AS OF: no commits are retained yet (RV-020/021)",
+            ));
+        };
+        let newer_than_all = match point {
+            AsOfPoint::Tx(tx) => tx >= newest.0,
+            AsOfPoint::Timestamp(us) => us >= newest.1,
+        };
+        if newer_than_all {
+            return Ok(self.snapshot());
+        }
+        let older_than_window = match point {
+            AsOfPoint::Tx(tx) => tx < oldest.0,
+            AsOfPoint::Timestamp(us) => us < oldest.1,
+        };
+        if older_than_window {
+            return Err(FluxumError::query(
+                codes::SQL_AS_OF_OUT_OF_WINDOW,
+                format!(
+                    "AS OF {point:?} is older than the retained temporal window \
+                     (oldest: tx {} at {} µs) — raise StoreOptions::temporal_window or \
+                     use PITR for long horizons (RV-020/021)",
+                    oldest.0, oldest.1
+                ),
+            ));
+        }
+        // Newest retained snapshot at or before the point.
+        let state = history
+            .iter()
+            .rev()
+            .find(|(tx, us, _)| match point {
+                AsOfPoint::Tx(want) => *tx <= want,
+                AsOfPoint::Timestamp(want) => *us <= want,
+            })
+            .map(|(_, _, state)| Arc::clone(state))
+            .ok_or_else(|| {
+                FluxumError::query(
+                    codes::SQL_AS_OF_OUT_OF_WINDOW,
+                    "AS OF point precedes every retained commit (RV-021)",
+                )
+            })?;
+        Ok(Snapshot { state })
     }
 
     /// Whether `table` is an ephemeral (memory-only) table (SPEC-023 DMX-010):
@@ -1345,9 +1424,28 @@ impl Tx<'_> {
         // 3. Consume the tx id and swap the snapshot — atomic for readers.
         let tx_id = self.state.tx_id;
         self.writer.next_tx_id = tx_id.saturating_add(1);
-        self.store
-            .committed
-            .store(Arc::new(CommittedState { tables }));
+        let published = Arc::new(CommittedState { tables });
+        self.store.committed.store(Arc::clone(&published));
+
+        // SPEC-022 RV-020: retain this commit's snapshot in the bounded
+        // temporal window. Untouched tables are `Arc`-shared with the
+        // neighbors, so retention costs only the copies the commit already
+        // made. Metadata only — never reducer-visible (SEC-020 unaffected).
+        if self.store.options.temporal_window > 0 {
+            let mut history = self
+                .store
+                .history
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            history.push_back((
+                tx_id,
+                crate::types::Timestamp::now().as_micros(),
+                published,
+            ));
+            while history.len() > self.store.options.temporal_window {
+                history.pop_front();
+            }
+        }
 
         // 4. Blob refcounts (DMX-040): row references drive GC. Applied
         //    under the writer lock, increments before decrements so an

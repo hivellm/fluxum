@@ -98,6 +98,9 @@ pub(crate) struct QueryAst {
     pub after: Option<(Lit, Lit)>,
     /// `SELECT *, SCORE` — opt-in `_score` projection (FTS-041).
     pub select_score: bool,
+    /// `AS OF TX <n>` / `AS OF TIMESTAMP <µs>` (SPEC-022 RV-021):
+    /// `(is_timestamp, value)`.
+    pub as_of: Option<(bool, i64)>,
 }
 
 /// SUB-012 constructs plus common SQL that is outside the subset, each with
@@ -256,6 +259,34 @@ impl<'t> Parser<'t> {
             ));
         }
 
+        // SPEC-022 RV-021: `AS OF TX <n> | AS OF TIMESTAMP <µs>` — a
+        // point-in-time read of the retained temporal window.
+        let mut as_of = None;
+        if self.peek_keyword("AS") {
+            self.pos += 1;
+            self.expect_keyword("OF")?;
+            let is_timestamp = if self.peek_keyword("TX") {
+                self.pos += 1;
+                false
+            } else if self.peek_keyword("TIMESTAMP") {
+                self.pos += 1;
+                true
+            } else {
+                return Err(unsupported(
+                    "AS OF takes `TX <tx_id>` or `TIMESTAMP <µs since epoch>` (RV-021)",
+                ));
+            };
+            match self.next() {
+                Some(Token::Int(value)) if *value >= 0 => as_of = Some((is_timestamp, *value)),
+                other => {
+                    return Err(unsupported(format!(
+                        "AS OF takes a non-negative integer, got {}",
+                        display_token(other)
+                    )));
+                }
+            }
+        }
+
         if let Some(extra) = self.tokens.get(self.pos) {
             // A rejected construct after the parsed prefix (e.g. `... GROUP
             // BY c`, `... JOIN t`) gets its named SUB-012 diagnostic.
@@ -277,6 +308,7 @@ impl<'t> Parser<'t> {
             limit,
             after,
             select_score,
+            as_of,
         })
     }
 

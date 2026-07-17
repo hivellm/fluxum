@@ -423,7 +423,17 @@ async fn query(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
         }
     };
     let subscriber = Subscriber::server_peer(ctx.admin_identity); // admin bypasses RLS
-    let snapshot = ctx.store().snapshot();
+    // SPEC-022 RV-021: `AS OF` resolves a historical snapshot.
+    let snapshot = match fluxum_core::sql::as_of_point(&sql) {
+        Ok(Some(point)) => match ctx.store().snapshot_as_of(point) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                return AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string());
+            }
+        },
+        Ok(None) => ctx.store().snapshot(),
+        Err(e) => return AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string()),
+    };
     let manager = ctx.subscriptions.lock().await;
     match manager.query_json(subscriber, &sql, &snapshot) {
         Ok(result) => AdminResponse::ok(request_id.as_deref(), result),
