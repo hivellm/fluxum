@@ -270,11 +270,7 @@ impl ShardCoord {
     /// SHD-040: scan a commit's inserts for partitioned rows whose key no
     /// longer resolves to the shard that committed them. One entry per
     /// distinct entity key.
-    fn detect_moves(
-        &self,
-        origin: ShardId,
-        diff: &TxDiff,
-    ) -> Result<Vec<EntityMove>> {
+    fn detect_moves(&self, origin: ShardId, diff: &TxDiff) -> Result<Vec<EntityMove>> {
         let mut moves: Vec<EntityMove> = Vec::new();
         let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
         for (table, key_ordinals) in self.router.partitioned_tables() {

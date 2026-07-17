@@ -22,6 +22,7 @@
 
 pub mod admin;
 pub mod http;
+pub mod logging;
 pub mod session;
 pub mod shard;
 pub mod tcp;
@@ -121,6 +122,15 @@ pub struct ShardContext {
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
+    /// Process start instant, for the `/health` `uptime_s` field (OBS-060).
+    started: std::time::Instant,
+    /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
+    /// inputs, every derived value with its source, and the per-kernel SIMD
+    /// selection. Serialized at install so `/health` stays a clone, not a
+    /// serialization, on the < 50 ms path (OBS-061).
+    ///
+    /// [`EffectiveConfig`]: fluxum_core::hw::EffectiveConfig
+    effective_config: std::sync::OnceLock<serde_json::Value>,
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -132,6 +142,10 @@ pub struct Health {
     pub shard_id: u32,
     /// Last committed transaction id (`0` before the first commit).
     pub last_tx_id: u64,
+    /// Lifecycle state (OBS-050): drives the `/health` `status`.
+    pub state: fluxum_core::metrics::ShardState,
+    /// Pending `ReducerCall`s in the single-writer queue (OBS-012).
+    pub queue_depth: u64,
 }
 
 impl ShardContext {
@@ -180,7 +194,25 @@ impl ShardContext {
             ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
+            started: std::time::Instant::now(),
+            effective_config: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Install the boot-time effective configuration (HWA-013): the assembly
+    /// calls this after `hw::derive(&probe, &config)` so `GET /health`
+    /// exposes the probe inputs, each derived value with its provenance, and
+    /// the resolved per-kernel SIMD selection (HWA-033). A second call is
+    /// ignored; without it `/health` simply omits the `config` key.
+    pub fn set_effective_config(&self, effective: &fluxum_core::hw::EffectiveConfig) {
+        if let Ok(value) = serde_json::to_value(effective) {
+            let _ = self.effective_config.set(value);
+        }
+    }
+
+    /// The rendered effective configuration, if the assembly installed one.
+    pub fn effective_config(&self) -> Option<&serde_json::Value> {
+        self.effective_config.get()
     }
 
     /// Install the validated plugin registry (SPEC-020 PLG-032): built by
@@ -286,12 +318,27 @@ impl ShardContext {
         });
     }
 
-    /// A lock-free health snapshot (RPC-053): reads only atomics.
+    /// A lock-free health snapshot (RPC-053 / OBS-060/061): reads only
+    /// atomics and the pipeline's channel gauge — never a storage lock.
     pub fn health(&self) -> Health {
         Health {
             shard_id: self.shard_id,
             last_tx_id: self.last_tx_id.load(Ordering::Relaxed),
+            state: self.metrics().shard_state(),
+            queue_depth: self.engine.pipeline().queue_depth(),
         }
+    }
+
+    /// The shard's `fluxum_*` metrics registry (SPEC-012 T5.6), owned by the
+    /// reducer engine and shared with the transport for fan-out/connection
+    /// counters and the `/metrics` export.
+    pub fn metrics(&self) -> &Arc<fluxum_core::metrics::Metrics> {
+        self.engine.metrics()
+    }
+
+    /// Seconds since this shard context was created (`/health` uptime).
+    pub fn uptime_s(&self) -> u64 {
+        self.started.elapsed().as_secs()
     }
 
     /// The shard's committed store (lock-free snapshots for InitialData /
@@ -367,6 +414,12 @@ pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
                 // SPEC-007 SHD-051: tag the originating shard so a client
                 // subscribed on several shards can attribute per-shard order.
                 tx_update.shard_id = ctx.shard_id;
+                // OBS-021: rows delivered per TxUpdate (insert + delete).
+                let rows: u64 = tx_update
+                    .tables
+                    .iter()
+                    .map(|t| u64::try_from(t.inserts.len() + t.deletes.len()).unwrap_or(u64::MAX))
+                    .sum();
                 let body = match ServerMessage::TxUpdate(tx_update).encode() {
                     Ok(body) => body,
                     Err(_) => continue,
@@ -377,11 +430,14 @@ pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
                 let frame: OutFrame = Arc::new(framed);
                 for (conn_id, handle) in ctx.connections.handles_for(&delta.subscribers).await {
                     match handle.sink.try_send(Arc::clone(&frame)) {
-                        Ok(()) => {}
+                        // OBS-021: one TxUpdate delivered.
+                        Ok(()) => ctx.metrics().note_fanout(rows),
                         // SUB-042 Full tier: never block — drop the consumer.
                         Err(mpsc::error::TrySendError::Full(_)) => {
                             tracing::warn!(target: "fluxum::fanout", connection = conn_id,
                                 "subscriber dropped: send buffer full");
+                            ctx.metrics()
+                                .note_drop(fluxum_core::metrics::DropReason::BufferFull);
                             handle.shutdown.notify_waiters();
                             ctx.connections.remove(conn_id).await;
                         }

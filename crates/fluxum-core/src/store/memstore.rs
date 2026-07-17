@@ -298,6 +298,12 @@ impl MemStore {
         self.catalog.get(&table).copied()
     }
 
+    /// Every registered table's schema (order unspecified) — the SPEC-012
+    /// `/metrics` exporter walks this for per-table row gauges (OBS-030).
+    pub fn table_schemas(&self) -> impl Iterator<Item = &'static TableSchema> + '_ {
+        self.catalog.values().copied()
+    }
+
     /// Attach the shard's blob store (SPEC-023 DMX-040) and rebuild its
     /// refcounts from the **current** committed snapshot — call after
     /// recovery, before serving writes. `Blob` column writes are rejected

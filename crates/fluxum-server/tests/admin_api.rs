@@ -382,9 +382,15 @@ async fn health_reports_status_and_is_fast() {
     let elapsed = start_t.elapsed();
     assert_eq!(resp.status, 200);
     let json = resp.json();
+    // OBS-060 payload shape: status + a per-shard array carrying
+    // id/state/tx_id/queue_depth.
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["shards"], 1);
-    assert_eq!(json["shard"]["id"], SHARD);
+    let shards = json["shards"].as_array().unwrap();
+    assert_eq!(shards.len(), 1);
+    assert_eq!(shards[0]["id"], SHARD.to_string());
+    assert_eq!(shards[0]["state"], "ready");
+    assert_eq!(shards[0]["queue_depth"], 0);
+    assert!(json["uptime_s"].is_number());
     assert!(
         elapsed < Duration::from_millis(50),
         "health took {elapsed:?}"

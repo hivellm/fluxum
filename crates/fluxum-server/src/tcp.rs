@@ -184,6 +184,7 @@ async fn drive_connection(
 
     // Cleanup: deregister and stop the writer.
     if let Some(conn_id) = session.connection_id() {
+        ctx.metrics().note_disconnect(); // OBS-040
         ctx.connections.remove(conn_id).await;
         ctx.subscriptions.lock().await.disconnect(conn_id);
         // RED-012: run the `on_disconnect` hooks and publish their diff to the

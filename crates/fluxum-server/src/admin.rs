@@ -18,6 +18,7 @@
 //! unversioned. Admin calls run under the server admin identity (RLS bypass,
 //! AUTH-062) — this surface is for trusted operators.
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -84,7 +85,7 @@ pub async fn dispatch(
 ) -> AdminResponse {
     match (method, split_path(path).as_slice()) {
         ("GET", ["health"]) => health(ctx),
-        ("GET", ["metrics"]) => metrics(ctx),
+        ("GET", ["metrics"]) => metrics(ctx).await,
         ("GET", ["schema"]) => schema(ctx).await,
         ("POST", ["reducer", name]) => reducer_call(ctx, name, body).await,
         ("POST", ["query"]) => query(ctx, body).await,
@@ -152,37 +153,85 @@ fn split_path(path: &str) -> Vec<&str> {
 // --- GET /health (RPC-053: lock-free, < 50 ms) ---------------------------------
 
 fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
-    let health = ctx.health(); // atomics only — no storage lock
-    // Envelope-free per the spec's `/health` shape, plus the per-shard detail.
-    AdminResponse {
-        status: 200,
-        body: json!({
-            "status": "ok",
-            "shards": 1,
-            "shard": {
-                "id": health.shard_id,
-                "state": "ready",
-                "last_tx_id": health.last_tx_id,
+    use fluxum_core::metrics::ShardState;
+    let health = ctx.health(); // atomics + channel gauge — no storage lock
+    // OBS-060: status + HTTP code derive from the shard's lifecycle state.
+    let (status, code) = match health.state {
+        ShardState::Ready => ("ok", 200),
+        ShardState::Recovering => ("degraded", 503),
+        ShardState::Starting | ShardState::ShuttingDown => ("error", 503),
+    };
+    let mut body = json!({
+        "status": status,
+        "shards": [
+            {
+                "id": health.shard_id.to_string(),
+                "state": health.state.as_str(),
+                "tx_id": health.last_tx_id,
+                "queue_depth": health.queue_depth,
             }
-        }),
+        ],
+        "connections": ctx.metrics().connections_active(),
+        "uptime_s": ctx.uptime_s(),
+    });
+    // HWA-013: the effective configuration — probe inputs, derived values
+    // with their sources, and the per-kernel SIMD selection. Pre-rendered at
+    // install, so this stays a clone on the < 50 ms path (OBS-061).
+    if let Some(effective) = ctx.effective_config()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert("config".into(), effective.clone());
     }
+    AdminResponse { status: code, body }
 }
 
 // --- GET /metrics (Prometheus text; T5.6 expands the metric set) ----------------
 
-fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
+async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     let health = ctx.health();
-    let text = format!(
-        "# HELP fluxum_shard_last_tx_id Last committed transaction id per shard.\n\
-         # TYPE fluxum_shard_last_tx_id gauge\n\
-         fluxum_shard_last_tx_id{{shard=\"{shard}\"}} {tx}\n\
-         # HELP fluxum_up Whether the shard is serving.\n\
-         # TYPE fluxum_up gauge\n\
-         fluxum_up{{shard=\"{shard}\"}} 1\n",
-        shard = health.shard_id,
-        tx = health.last_tx_id,
-    );
-    let mut text = text;
+    // OBS-012: publish the live queue depth before rendering the gauge.
+    ctx.metrics().set_queue_depth(health.queue_depth);
+    // OBS-020: refresh the active-subscription gauge from the manager.
+    {
+        let active = ctx.subscriptions.lock().await.plan_count();
+        ctx.metrics()
+            .set_subscriptions_active(i64::try_from(active).unwrap_or(i64::MAX));
+    }
+    // OBS-010..OBS-050: the shard's own counter block.
+    let mut text = ctx.metrics().prometheus(health.last_tx_id);
+    // OBS-030/031: per-table row counts + an estimated MemStore footprint.
+    // Lock-free snapshot; the byte figure is a schema-width estimate (the
+    // spec's `memstore_bytes` is explicitly an estimate, not exact bytes).
+    {
+        let shard = health.shard_id;
+        let snapshot = ctx.store().snapshot();
+        let mut rows_block = String::from(
+            "# HELP fluxum_table_rows Committed rows per table.\n\
+             # TYPE fluxum_table_rows gauge\n",
+        );
+        let mut estimated_bytes: u64 = 0;
+        for table in ctx.store().table_schemas() {
+            let table_id = fluxum_core::store::TableId::of(table.name);
+            let rows = snapshot.row_count(table_id).unwrap_or(0);
+            let rows_u64 = u64::try_from(rows).unwrap_or(u64::MAX);
+            let _ = writeln!(
+                rows_block,
+                "fluxum_table_rows{{shard=\"{shard}\",table=\"{}\"}} {rows_u64}",
+                table.name,
+            );
+            // ~24 bytes per column (tag + inline scalar / small heap) — a
+            // coarse gauge for RAM-pressure alerting (OBS-031).
+            let width = u64::try_from(table.columns.len()).unwrap_or(0) * 24;
+            estimated_bytes = estimated_bytes.saturating_add(rows_u64.saturating_mul(width));
+        }
+        text.push_str(&rows_block);
+        let _ = writeln!(
+            text,
+            "# HELP fluxum_memstore_bytes Estimated in-memory CommittedState size.\n\
+             # TYPE fluxum_memstore_bytes gauge\n\
+             fluxum_memstore_bytes{{shard=\"{shard}\"}} {estimated_bytes}",
+        );
+    }
     // SPEC-017 CT-014/034: transform read-error and signature-verify meters.
     if let Some(engine) = ctx.store().transform_engine() {
         text.push_str(&format!(

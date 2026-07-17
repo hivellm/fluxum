@@ -170,6 +170,15 @@ impl TxPipeline {
         }
     }
 
+    /// Pending jobs in the single-writer queue (OBS-012): the bounded
+    /// channel's capacity minus its remaining slots. A sustained high value
+    /// means the shard is overloaded.
+    pub fn queue_depth(&self) -> u64 {
+        let capacity = self.sender.max_capacity();
+        let available = self.sender.capacity();
+        u64::try_from(capacity.saturating_sub(available)).unwrap_or(0)
+    }
+
     /// Submit a reducer job and await its outcome — `submit` plus the
     /// response wait. Backpressure semantics are unchanged: a full queue
     /// errors immediately with `503 "shard busy"` (TXN-011).

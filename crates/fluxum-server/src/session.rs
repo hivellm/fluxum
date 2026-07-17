@@ -155,12 +155,22 @@ impl Session {
     fn authenticate(&mut self, id: u32, token: &[u8]) -> Routed {
         let outcome = match self.ctx.authenticator.authenticate(token) {
             Ok(outcome) => outcome,
-            Err(e) => return Routed::reply(from_error(Some(id), &e)),
+            Err(e) => {
+                // OBS-040: a rejected authentication.
+                self.ctx.metrics().note_auth(false);
+                return Routed::reply(from_error(Some(id), &e));
+            }
         };
+        // OBS-040: a successful authentication; a first auth is a new
+        // connection (re-auth on an existing session keeps its id).
+        self.ctx.metrics().note_auth(true);
         // Keep the connection id across a re-auth; allocate on first auth.
         let connection_id = match &self.state {
             SessionState::Authenticated { caller, .. } => caller.connection_id.as_u128(),
-            SessionState::Unauthenticated => self.ctx.allocate_connection_id(),
+            SessionState::Unauthenticated => {
+                self.ctx.metrics().note_connect();
+                self.ctx.allocate_connection_id()
+            }
         };
         let caller = ReducerCaller {
             identity: outcome.identity,

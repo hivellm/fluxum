@@ -26,8 +26,10 @@
 //!   real connection).
 
 use std::sync::Arc;
+use std::time::Instant;
 
-use crate::error::Result;
+use crate::error::{FluxumError, Result};
+use crate::metrics::{Metrics, ReducerOutcome};
 use crate::txn::{CommitReceipt, TxPipeline};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
@@ -151,6 +153,7 @@ pub struct ReducerEngine {
     shard_id: u32,
     server_identity: Identity,
     rate_limiter: RateLimiter,
+    metrics: Arc<Metrics>,
 }
 
 impl ReducerEngine {
@@ -176,7 +179,15 @@ impl ReducerEngine {
             shard_id,
             server_identity,
             rate_limiter: RateLimiter::new(RateLimiterOptions::default(), [server_identity]),
+            metrics: Metrics::new(shard_id),
         }
+    }
+
+    /// The shard's `fluxum_*` metrics registry (SPEC-012 T5.6). The server
+    /// transport records fan-out/connection counters against the same `Arc`
+    /// and the admin `/metrics` endpoint renders it.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
     }
 
     /// Replace the admission rate limiter (RED-050..RED-052) — the server
@@ -338,16 +349,115 @@ impl ReducerEngine {
         name: &str,
         args: Vec<FluxValue>,
     ) -> Result<CommitReceipt> {
-        let max_rate = self.registry.admission(name)?;
-        self.rate_limiter.check(&caller.identity, name, max_rate)?;
-        self.registry.check_args(name, &args)?;
+        let start = Instant::now();
+        let identity = caller.identity;
+        // Admission + admission-time rejections carry no transaction; each
+        // records its OBS-010 outcome before returning (RED-006/RED-001).
+        let max_rate = match self.registry.admission(name) {
+            Ok(rate) => rate,
+            Err(error) => return self.reject(name, ReducerOutcome::Err, start, error),
+        };
+        if let Err(error) = self.rate_limiter.check(&identity, name, max_rate) {
+            return self.reject(name, ReducerOutcome::RateLimited, start, error);
+        }
+        if let Err(error) = self.registry.check_args(name, &args) {
+            return self.reject(name, ReducerOutcome::Err, start, error);
+        }
+
         let registry = Arc::clone(&self.registry);
-        let name = name.to_owned();
-        self.pipeline
+        let dispatch_name = name.to_owned();
+        let result = self
+            .pipeline
             .call(Box::new(move |tx| {
-                registry.dispatch(caller, &name, &args, tx)
+                registry.dispatch(caller, &dispatch_name, &args, tx)
             }))
-            .await
+            .await;
+
+        let duration_us = duration_us(start);
+        match result {
+            Ok(receipt) => {
+                // OBS-010/013: committed.
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::Ok, duration_us);
+                self.metrics.note_commit();
+                self.warn_if_slow(name, duration_us);
+                Ok(receipt)
+            }
+            Err(error) if is_queue_full(&error) => {
+                // TXN-011: the writer queue was full; the reducer never ran.
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::QueueFull, duration_us);
+                Err(error)
+            }
+            Err(error) => {
+                // OBS-010/013: the reducer returned Err or panicked → rollback.
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::Err, duration_us);
+                self.metrics.note_rollback();
+                self.log_failure(name, &identity, &error, duration_us);
+                self.warn_if_slow(name, duration_us);
+                Err(error)
+            }
+        }
+    }
+
+    /// Record an admission-time rejection outcome and return its error.
+    fn reject(
+        &self,
+        name: &str,
+        outcome: ReducerOutcome,
+        start: Instant,
+        error: FluxumError,
+    ) -> Result<CommitReceipt> {
+        let duration_us = duration_us(start);
+        self.metrics.record_reducer(name, outcome, duration_us);
+        if outcome == ReducerOutcome::RateLimited {
+            // OBS-070: queue-full / rate-limit is a WARN-worthy admission event.
+            tracing::warn!(
+                shard = self.shard_id,
+                reducer = name,
+                "reducer rejected by rate limiter"
+            );
+        }
+        Err(error)
+    }
+
+    /// OBS-071: log a reducer failure — a panic is an `ERROR` with a
+    /// backtrace (SPEC-004 isolation boundary), a business `Err` a `DEBUG`.
+    fn log_failure(&self, name: &str, identity: &Identity, error: &FluxumError, duration_us: u64) {
+        if matches!(error, FluxumError::ReducerPanic(_)) {
+            tracing::error!(
+                shard = self.shard_id,
+                reducer = name,
+                identity = %identity,
+                duration_us,
+                backtrace = %std::backtrace::Backtrace::capture(),
+                err = %error,
+                "reducer panicked (transaction rolled back)"
+            );
+        } else {
+            tracing::debug!(
+                shard = self.shard_id,
+                reducer = name,
+                identity = %identity,
+                duration_us,
+                err = %error,
+                "reducer returned Err"
+            );
+        }
+    }
+
+    /// OBS-072: WARN when a reducer exceeds the configured threshold.
+    fn warn_if_slow(&self, name: &str, duration_us: u64) {
+        if self.metrics.is_slow(duration_us) {
+            tracing::warn!(
+                event = "slow_reducer",
+                shard = self.shard_id,
+                reducer = name,
+                duration_us,
+                "reducer exceeded the slow-reducer threshold"
+            );
+        }
     }
 
     /// Run `defs` in one transaction under the server identity (RED-025:
@@ -381,4 +491,15 @@ impl ReducerEngine {
             }))
             .await
     }
+}
+
+/// Elapsed microseconds since `start`, saturating (OBS-011).
+fn duration_us(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+}
+
+/// Whether `error` is the TXN-011 full-queue rejection (the reducer never
+/// executed — outcome `queue_full`, not a rollback).
+fn is_queue_full(error: &FluxumError) -> bool {
+    error.to_wire().code == fluxum_protocol::codes::CLUSTER_SHARD_UNAVAILABLE
 }

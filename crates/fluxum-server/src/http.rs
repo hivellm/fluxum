@@ -479,6 +479,7 @@ async fn handle_get(
     // Terminate the chunked body and evict the session.
     let _ = write_last_chunk(&mut stream).await;
     let evicted = state.sessions.lock().await.remove(&token);
+    state.ctx.metrics().note_disconnect(); // OBS-040
     state.ctx.connections.remove(connection_id).await;
     state
         .ctx
