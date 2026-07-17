@@ -135,6 +135,10 @@ pub struct MemStore {
     /// The column-transform executor, once attached (SPEC-017 §5): encrypts
     /// `#[encrypted]` columns on write so stored rows carry ciphertext.
     transforms: std::sync::OnceLock<Arc<crate::transform::engine::TransformEngine>>,
+    /// `#[computed]` columns per table (SPEC-022 RV-050): `(ordinal, compute)`
+    /// derivations applied on write, resolved from the link-time registry at
+    /// construction (pure fns; no runtime attach).
+    computed: HashMap<TableId, Vec<(u16, crate::schema::ComputeFn)>>,
 }
 
 impl MemStore {
@@ -197,10 +201,12 @@ impl MemStore {
                 counters.insert(id, AutoIncCounter::new());
             }
         }
+        let computed = build_computed(&catalog);
         Ok(Self {
             catalog,
             blobs: std::sync::OnceLock::new(),
             transforms: std::sync::OnceLock::new(),
+            computed,
             committed: ArcSwap::from_pointee(CommittedState { tables }),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
@@ -527,6 +533,19 @@ impl Tx<'_> {
     /// for an occupied primary key.
     fn write(&mut self, table: TableId, mut values: Vec<RowValue>, replace: bool) -> Result<Row> {
         let schema = self.store.schema_of(table)?;
+        // RV-050: derive every `#[computed]` column from the other columns,
+        // overwriting whatever the reducer set (the column is read-only). Runs
+        // before validation so the derived value is what gets type-checked,
+        // stored, indexed, and fanned out — and before encryption, so a
+        // derivation over a plaintext sibling sees the plaintext.
+        if let Some(cols) = self.store.computed.get(&table) {
+            for (ordinal, compute) in cols {
+                let derived = compute(&values)?;
+                if let Some(slot) = values.get_mut(usize::from(*ordinal)) {
+                    *slot = derived;
+                }
+            }
+        }
         // DMX-040: a `Blob` value must reference a stored object — validated
         // here (write time) so the commit merge's incref can never miss.
         for &ordinal in &blob_ordinals(schema) {
@@ -1160,6 +1179,25 @@ fn build_spatial_index(
         });
     }
     Ok(spatial)
+}
+
+/// Resolve the `#[computed]` derivations for every table in `catalog` from the
+/// link-time registry (SPEC-022 RV-050), keyed by [`TableId`].
+fn build_computed(
+    catalog: &HashMap<TableId, &'static TableSchema>,
+) -> HashMap<TableId, Vec<(u16, crate::schema::ComputeFn)>> {
+    let mut out: HashMap<TableId, Vec<(u16, crate::schema::ComputeFn)>> = HashMap::new();
+    for def in crate::schema::registered_computed() {
+        let id = TableId::of(def.table);
+        if catalog.contains_key(&id) {
+            out.entry(id).or_default().push((def.ordinal, def.compute));
+        }
+    }
+    // Apply in ordinal order so a computed column may reference an earlier one.
+    for cols in out.values_mut() {
+        cols.sort_by_key(|(ord, _)| *ord);
+    }
+    out
 }
 
 /// The empty full-text indexes of `table`, one per `#[fulltext(...)]`

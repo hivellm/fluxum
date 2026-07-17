@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Parse `#[computed(expr)]` on a column in the table macro, capturing the expression and its sibling-column references (RV-050; crates/fluxum-macros/src/table.rs)
-- [ ] 1.2 Add a computed flag + stored expression to ColumnSchema (RV-050; crates/fluxum-core/src/schema/mod.rs)
-- [ ] 1.3 Evaluate the computed expression from sibling column values on write, before merge (RV-050; crates/fluxum-core/src/txn/mod.rs)
-- [ ] 1.4 Make the computed column read-only to reducers so a reducer cannot set its value (RV-050; crates/fluxum-macros/src/table.rs)
-- [ ] 1.5 Store, replicate, and fan out the computed value to subscribers like any stored column (RV-050; crates/fluxum-core/src/txn/mod.rs)
-- [ ] 1.6 Allow a computed column to be indexed (RV-051; crates/fluxum-core/src/index/mod.rs)
-- [ ] 1.7 Allow computed columns in WHERE/ORDER BY like any column (RV-051; crates/fluxum-core/src/sql/mod.rs)
+- [x] 1.1 Parse `#[computed(expr)]` on a column in the table macro, capturing the expression and its sibling-column references (RV-050; crates/fluxum-macros/src/table.rs) — `attr.parse_args::<Expr>()`; `collect_idents` walks the token stream (recursing into groups) so idents inside macro calls are found; each sibling reference binds to its native type via `from_row_value`
+- [x] 1.2 Add a computed flag + stored expression to ColumnSchema (RV-050; crates/fluxum-core/src/schema/mod.rs) — as with transforms/TTL, kept off `ColumnSchema` in a side registry: link-time `ComputedDef { table, column, ordinal, compute: ComputeFn }` via `inventory`, with `registered_computed()` / `computed_def()` / `is_computed()` lookups
+- [x] 1.3 Evaluate the computed expression from sibling column values on write, before merge (RV-050; landed in crates/fluxum-core/src/store/memstore.rs `Tx::write`, the actual write path) — derivations run before validation and before encryption, in ordinal order so a computed column may reference an earlier one
+- [x] 1.4 Make the computed column read-only to reducers so a reducer cannot set its value (RV-050) — the store unconditionally overwrites the column's slot with the derived value on every insert/update; macro rejects `#[computed]` combined with `#[primary_key]`/`#[auto_inc]`/`#[default]`/`#[owner]`/transforms, and self-reference
+- [x] 1.5 Store, replicate, and fan out the computed value to subscribers like any stored column (RV-050) — derivation happens before the row is validated/stored, so the committed row (and thus commitlog, replication, and subscription fan-out) carries the derived value; no downstream special-casing
+- [x] 1.6 Allow a computed column to be indexed (RV-051; crates/fluxum-core/src/index/mod.rs) — no index changes needed: the derived value is a stored column value; pinned by `#[index(btree(total))]` + `verify_index_integrity` rebuild check
+- [x] 1.7 Allow computed columns in WHERE/ORDER BY like any column (RV-051; crates/fluxum-core/src/sql/mod.rs) — no compiler changes needed: `sql::compile` resolves any schema column; pinned by a test compiling `WHERE total BETWEEN … ORDER BY total DESC` and evaluating the plan over stored rows
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation — rustdoc: `#[computed(expr)]` row in the macro attribute table (fluxum-macros/src/lib.rs), `ComputedDef`/`ComputeFn`/`is_computed` docs (schema/mod.rs), write-path comment in `Tx::write`, `collect_idents` caveat (idents inside string literals are not detected — reference columns as real idents)
+- [x] 2.2 Write tests covering the new behavior — crates/fluxum-macros/tests/computed_columns.rs (derive-on-write + read-only + computed-over-computed + string derivation; index integrity; SQL WHERE/ORDER BY); trybuild: ui/pass/computed_column.rs, ui/fail/computed_pk.rs
+- [x] 2.3 Run tests and confirm they pass — `cargo test --workspace` green (0 failures), `cargo clippy --workspace --all-targets` clean

@@ -1,0 +1,5 @@
+error: a `#[computed]` column cannot be a primary key or `#[auto_inc]` (RV-050)
+ --> tests/ui/fail/computed_pk.rs:8:5
+  |
+8 |     #[computed(a + 1)]
+  |     ^^^^^^^^^^^^^^^^^^

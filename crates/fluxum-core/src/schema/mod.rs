@@ -327,6 +327,45 @@ pub fn ephemeral_def(table: &str) -> Option<&'static EphemeralDef> {
     registered_ephemeral().find(|def| def.table == table)
 }
 
+/// A `#[computed(expr)]` generated column (SPEC-022 RV-050), registered at
+/// link time by `#[fluxum::table]`. The derivation is a macro-compiled
+/// function over the row's other column values, applied on write — kept off
+/// [`ColumnSchema`] in a side registry (like the transforms/TTL metadata) so
+/// the additive metadata costs no change at column construction sites.
+pub struct ComputedDef {
+    /// The `#[fluxum::table]` struct name.
+    pub table: &'static str,
+    /// The computed column's name.
+    pub column: &'static str,
+    /// The computed column's ordinal.
+    pub ordinal: u16,
+    /// Derive the column's value from the (already-populated) other columns
+    /// of `values`. Errors surface as a write-time transaction failure.
+    pub compute: ComputeFn,
+}
+
+/// A macro-compiled `#[computed]` derivation: row values in, derived value
+/// out (SPEC-022 RV-050).
+pub type ComputeFn = fn(&[crate::store::RowValue]) -> Result<crate::store::RowValue>;
+
+inventory::collect!(ComputedDef);
+
+/// Every registered computed-column def in this binary (linker order).
+pub fn registered_computed() -> impl Iterator<Item = &'static ComputedDef> {
+    inventory::iter::<ComputedDef>()
+}
+
+/// The computed-column def of `(table, column)`, if registered.
+pub fn computed_def(table: &str, column: &str) -> Option<&'static ComputedDef> {
+    registered_computed().find(|def| def.table == table && def.column == column)
+}
+
+/// Whether `(table, column)` is a `#[computed]` column (RV-050) — reducers
+/// cannot set its value; the store derives it on write.
+pub fn is_computed(table: &str, column: &str) -> bool {
+    computed_def(table, column).is_some()
+}
+
 /// How a durable table's rows expire (SPEC-023 DMX-020).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TtlKind {

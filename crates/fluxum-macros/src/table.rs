@@ -126,6 +126,9 @@ struct Column {
     /// Span of an `#[owner]` attribute (ephemeral `ConnectionId` binding,
     /// SPEC-023 DMX-011), if present.
     owner: Option<Span>,
+    /// The `#[computed(expr)]` generation expression, if present (SPEC-022
+    /// RV-050): a Rust expression over sibling columns, evaluated on write.
+    computed: Option<(Expr, Span)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -427,6 +430,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         let mut primary_key = None;
         let mut auto_inc = None;
         let mut default = None;
+        let mut computed = None;
         let mut rename_from = None;
         let mut transforms: Vec<TransformDecl> = Vec::new();
         let mut owner = None;
@@ -453,6 +457,11 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
                     return Err(syn::Error::new(attr.span(), "duplicate `#[default]`"));
                 }
                 default = Some(parse_default(&attr)?);
+            } else if attr.path().is_ident("computed") {
+                if computed.is_some() {
+                    return Err(syn::Error::new(attr.span(), "duplicate `#[computed]`"));
+                }
+                computed = Some((attr.parse_args::<Expr>()?, attr.span()));
             } else if attr.path().is_ident("rename") {
                 if rename_from.is_some() {
                     return Err(syn::Error::new(attr.span(), "duplicate `#[rename]`"));
@@ -508,6 +517,7 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
             rename_from,
             transforms,
             owner,
+            computed,
         });
     }
     if columns.is_empty() {
@@ -1127,9 +1137,90 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
         }
     };
 
-    // -- codegen ------------------------------------------------------------------
+    // -- computed columns (SPEC-022 RV-050) -------------------------------------
+    // Each `#[computed(expr)]` compiles to a link-time `ComputedDef` whose
+    // `compute` fn binds the referenced sibling columns to their native types,
+    // evaluates the Rust expression, and wraps the result. The store applies it
+    // on write, overwriting whatever the reducer set (the column is read-only).
     let struct_ident = &item.ident;
     let name_str = struct_ident.to_string();
+    let mut computed_submits: Vec<TokenStream> = Vec::new();
+    {
+        let by_name: std::collections::HashMap<String, (u16, &FluxTy)> = columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                (
+                    c.ident.to_string(),
+                    (u16::try_from(i).unwrap_or(u16::MAX), &c.flux),
+                )
+            })
+            .collect();
+        for (i, column) in columns.iter().enumerate() {
+            let Some((expr, span)) = &column.computed else {
+                continue;
+            };
+            let span = *span;
+            if column.primary_key.is_some() || column.auto_inc.is_some() {
+                return Err(syn::Error::new(
+                    span,
+                    "a `#[computed]` column cannot be a primary key or `#[auto_inc]` (RV-050)",
+                ));
+            }
+            if column.default.is_some() {
+                return Err(syn::Error::new(
+                    span,
+                    "a `#[computed]` column cannot also declare `#[default]` — its value is \
+                     always derived (RV-050)",
+                ));
+            }
+            if column.owner.is_some() || !column.transforms.is_empty() {
+                return Err(syn::Error::new(
+                    span,
+                    "a `#[computed]` column cannot combine with `#[owner]` or a transform \
+                     attribute (RV-050)",
+                ));
+            }
+            let ord = u16::try_from(i).unwrap_or(u16::MAX);
+            let self_name = column.ident.to_string();
+            let mut bindings: Vec<TokenStream> = Vec::new();
+            for name in collect_idents(expr) {
+                if name == self_name {
+                    return Err(syn::Error::new(
+                        span,
+                        format!("`#[computed]` column `{self_name}` cannot reference itself"),
+                    ));
+                }
+                if let Some((sib_ord, sib_flux)) = by_name.get(&name) {
+                    let ident = format_ident!("{}", name);
+                    let idx = usize::from(*sib_ord);
+                    let extract =
+                        from_row_value(sib_flux, quote!((&__fx_values[#idx])), &name_str, &name);
+                    bindings.push(quote!(let #ident = #extract;));
+                }
+            }
+            let wrap = to_row_value(&column.flux, quote!(__fx_result));
+            let fn_ident = format_ident!("__fx_compute_{}_{}", struct_ident, column.ident);
+            computed_submits.push(quote! {
+                #[allow(unused_variables, non_snake_case)]
+                fn #fn_ident(
+                    __fx_values: &[::fluxum_core::store::RowValue],
+                ) -> ::fluxum_core::error::Result<::fluxum_core::store::RowValue> {
+                    #(#bindings)*
+                    let __fx_result = { #expr };
+                    ::core::result::Result::Ok(#wrap)
+                }
+                ::fluxum_core::schema::inventory::submit! {
+                    ::fluxum_core::schema::ComputedDef {
+                        table: #name_str,
+                        column: #self_name,
+                        ordinal: #ord,
+                        compute: #fn_ident,
+                    }
+                }
+            });
+        }
+    }
 
     let column_tokens = columns.iter().map(|c| {
         let name = c.ident.to_string();
@@ -1318,6 +1409,8 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 
             #ttl_submit
 
+            #(#computed_submits)*
+
             #migration_meta
         };
     })
@@ -1326,6 +1419,31 @@ fn try_expand(args: TokenStream, input: TokenStream) -> syn::Result<TokenStream>
 // ---------------------------------------------------------------------------
 // Attribute parsers
 // ---------------------------------------------------------------------------
+
+/// Collect every identifier token in a `#[computed]` expression, so each one
+/// that names a sibling column can be bound to its native value (SPEC-022
+/// RV-050). Scans the raw token stream (recursing into groups) so identifiers
+/// inside macro calls like `format!(…)` are found too — only tokens matching a
+/// sibling column name are bound, and the generated fn allows unused bindings
+/// for a method/type name that happens to match a column. Idents *inside a
+/// string literal* (`format!("{id}")` inline capture) are not tokens and are
+/// not detected — reference columns as real idents.
+fn collect_idents(expr: &Expr) -> std::collections::HashSet<String> {
+    fn walk(ts: proc_macro2::TokenStream, out: &mut std::collections::HashSet<String>) {
+        for tt in ts {
+            match tt {
+                proc_macro2::TokenTree::Ident(id) => {
+                    out.insert(id.to_string());
+                }
+                proc_macro2::TokenTree::Group(g) => walk(g.stream(), out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = std::collections::HashSet::new();
+    walk(expr.to_token_stream(), &mut out);
+    out
+}
 
 /// `#[default(expr)]` (SPEC-010 MIG-020): the backfill value used when the
 /// column is auto-applied onto existing rows.

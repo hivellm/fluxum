@@ -42,6 +42,7 @@ mod table;
 /// | `#[auto_inc]` | Server-assigned monotonic id; `u64` `#[primary_key]` only (DM-004) |
 /// | `#[owner]` | Ephemeral-table `ConnectionId` binding: the owner's rows are deleted on disconnect (SPEC-023 DMX-011) |
 /// | `#[default(value)]` | Backfill value: the schema diff auto-adds the column to existing rows (SPEC-010 MIG-021) |
+/// | `#[computed(expr)]` | Generated column: `expr` (a Rust expression over sibling columns) derives the value on write; read-only to reducers, stored/indexed/replicated like any column (SPEC-022 RV-050). Reference columns as real idents, not inline `{col}` format captures |
 /// | `#[rename(from = "old")]` | Column was renamed from `old`: the schema diff renames it in place (SPEC-010 MIG-021) |
 /// | `#[normalize(money\|datetime\|string, …)]` | Deterministic value canonicalization (SPEC-017 CT-021..023) |
 /// | `#[encrypted(ecies, key = "NAME")]` | Declared at-rest field encryption; executes with the phase-3 crypto task (SPEC-017 CT-030) |
