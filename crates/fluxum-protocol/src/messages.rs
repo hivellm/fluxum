@@ -153,6 +153,19 @@ pub struct ReducerCall {
     pub version: Option<u32>,
     /// Positional arguments (after `ReducerContext`).
     pub args: Vec<crate::value::FluxValue>,
+    // --- Additive tail (RPC-011): append only, never reorder above ---------
+    /// An optional client-assigned key making submission exactly-once
+    /// (SPEC-021 CS-030): if the shard has already applied this key for the
+    /// same `(caller identity, reducer)`, it returns the original
+    /// `ReducerResult` and does **not** re-run the reducer body. A client
+    /// replaying a queued call after a lost ack MUST reuse the same key
+    /// (CS-032), so the retry cannot double-apply.
+    ///
+    /// The dedup window is bounded and durable — a key old enough to have
+    /// been pruned is executed again, so a key is a safety net for prompt
+    /// retries, not an indefinite guarantee.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// RPC-022 — register a batch of subscription queries.

@@ -318,6 +318,7 @@ async fn authenticate_issues_a_session_and_reducer_call_commits() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("hello".into())],
+        idempotency_key: None,
     });
     let resp = post(
         server.local_addr,
@@ -347,6 +348,7 @@ async fn reducer_call_without_a_session_is_401() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("x".into())],
+        idempotency_key: None,
     });
     // No session header, and the message is not Authenticate → the session
     // core answers 401 in the response body.
@@ -369,6 +371,7 @@ async fn a_stale_session_post_is_404() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("x".into())],
+        idempotency_key: None,
     });
     let resp = post(
         server.local_addr,
@@ -426,6 +429,7 @@ async fn get_stream_pushes_txupdate_on_commit() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("live".into())],
+        idempotency_key: None,
     });
     let resp = post(addr, Some(&writer), CONTENT_TYPE, &[frame(&call)]).await;
     assert!(matches!(
@@ -503,12 +507,14 @@ async fn http_and_tcp_route_byte_identical_frames() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("a".into())],
+        idempotency_key: None,
     }));
     let c2 = frame(&ClientMessage::ReducerCall(ReducerCall {
         id: 101,
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("b".into())],
+        idempotency_key: None,
     }));
     let resp = post(addr, Some(&session), CONTENT_TYPE, &[c1, c2]).await;
     let ids: Vec<u32> = resp
@@ -716,6 +722,7 @@ async fn idle_session_gets_408_on_the_stream_and_a_stale_post_after() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("x".into())],
+        idempotency_key: None,
     });
     let resp = post(addr, Some(&session), CONTENT_TYPE, &[frame(&call)]).await;
     assert_eq!(resp.status, 404, "session evicted after idle expiry");
@@ -956,6 +963,7 @@ async fn failing_lifecycle_hooks_do_not_break_the_http_transport() {
         reducer: "send_chat".into(),
         version: None,
         args: vec![FluxValue::Str("still works".into())],
+        idempotency_key: None,
     });
     let resp = post(addr, Some(&session), CONTENT_TYPE, &[frame(&call)]).await;
     assert_eq!(resp.status, 200);

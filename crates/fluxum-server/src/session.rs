@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use fluxum_core::FluxumError;
-use fluxum_core::reducer::{FluxValue, ReducerCaller};
+use fluxum_core::reducer::{CallOutcome, FluxValue, ReducerCaller};
 use fluxum_core::subscription::{Resumed, Subscriber};
 use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_protocol::{
@@ -140,7 +140,8 @@ impl Session {
             // connection id (idempotent re-auth).
             ClientMessage::Authenticate(auth) => self.authenticate(auth.id, &auth.token),
             ClientMessage::ReducerCall(call) => {
-                self.reducer_call(call.id, call.reducer, call.args).await
+                self.reducer_call(call.id, call.reducer, call.args, call.idempotency_key)
+                    .await
             }
             ClientMessage::Subscribe(sub) => self.subscribe(sub.id, sub.queries).await,
             ClientMessage::SubscribeSingle(sub) => self.subscribe(sub.id, vec![sub.query]).await,
@@ -200,16 +201,36 @@ impl Session {
     /// (RED-060) is a `ReducerResult { Err }`, not an `Error` frame; an
     /// admission/query error maps to its wire code; a successful commit is
     /// published to the fan-out.
-    async fn reducer_call(&self, id: u32, reducer: String, args: Vec<FluxValue>) -> Routed {
+    async fn reducer_call(
+        &self,
+        id: u32,
+        reducer: String,
+        args: Vec<FluxValue>,
+        idempotency_key: Option<String>,
+    ) -> Routed {
         let (caller, _, _) = self.authed();
-        match self.ctx.engine.call(caller, &reducer, args).await {
-            Ok(receipt) => Routed {
+        let outcome = self
+            .ctx
+            .engine
+            .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
+            .await;
+        match outcome {
+            Ok(CallOutcome::Committed(receipt)) => Routed {
                 responses: vec![ServerMessage::ReducerResult(ReducerResult {
                     id,
                     outcome: Ok(()),
                 })],
                 commit: Some(receipt.diff),
             },
+            // SPEC-021 CS-030: the key already applied — answer the original
+            // result (a committed call's is `Ok`) and publish no diff; the
+            // original commit already fanned out.
+            Ok(CallOutcome::Deduplicated) => {
+                Routed::reply(ServerMessage::ReducerResult(ReducerResult {
+                    id,
+                    outcome: Ok(()),
+                }))
+            }
             // RED-060/SPEC-028: a body's own Err is 5001; a panic is 5002 —
             // both travel as the ReducerResult outcome, not an Error frame.
             Err(FluxumError::Reducer(message)) => {

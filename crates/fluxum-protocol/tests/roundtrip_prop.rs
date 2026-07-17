@@ -102,14 +102,17 @@ fn client_message() -> impl Strategy<Value = ClientMessage> {
             any::<u32>(),
             ".{0,16}",
             prop::option::of(any::<u32>()),
-            prop::collection::vec(flux_value(), 0..4)
+            prop::collection::vec(flux_value(), 0..4),
+            prop::option::of(".{0,24}".prop_map(String::from))
         )
-            .prop_map(|(id, reducer, version, args)| {
+            .prop_map(|(id, reducer, version, args, idempotency_key)| {
                 ClientMessage::ReducerCall(ReducerCall {
                     id,
                     reducer,
                     version,
                     args,
+                    // SPEC-021 CS-030 addition roundtrips too.
+                    idempotency_key,
                 })
             }),
         (

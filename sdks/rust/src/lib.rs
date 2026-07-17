@@ -14,9 +14,11 @@
 //! ahead of the connection as a transport-free unit. T6.2 wires it to a real socket —
 //! feed it each `InitialData`/`TxUpdate`, and ask it what to send on reconnect.
 
+pub mod idempotency;
 pub mod resume;
 
 pub use fluxum_protocol as protocol;
+pub use idempotency::{OfflineQueue, QueuedCall};
 pub use resume::{Reconnect, ResumeTracker};
 
 #[cfg(test)]

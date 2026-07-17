@@ -60,6 +60,7 @@
 
 pub mod args;
 pub mod engine;
+pub mod idempotency;
 pub mod ratelimit;
 pub mod stdlib;
 pub mod view;
@@ -80,7 +81,10 @@ use crate::schema::Table;
 use crate::store::{Row, TableId, TriggerKind, Tx};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
-pub use engine::{LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport};
+pub use engine::{
+    CallOutcome, LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport,
+};
+pub use idempotency::{IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE_NAME, IdempotencyOptions};
 pub use ratelimit::{RateLimiter, RateLimiterOptions};
 pub use view::{
     MaterializedViewDef, MvAggregate, MvTopN, ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry,

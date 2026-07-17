@@ -30,6 +30,7 @@ use std::time::Instant;
 
 use crate::error::{FluxumError, Result};
 use crate::metrics::{Metrics, ReducerOutcome};
+use crate::reducer::idempotency;
 use crate::txn::{CommitReceipt, TxPipeline};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
@@ -401,14 +402,126 @@ impl ReducerEngine {
         }
     }
 
+    /// [`ReducerEngine::call`] with SPEC-021 CS-030 exactly-once
+    /// submission: if `key` has already been applied for this
+    /// `(caller identity, reducer)`, the body does not run and the answer is
+    /// [`CallOutcome::Deduplicated`].
+    ///
+    /// `None` is an ordinary call. Passing a key on a shard whose schema has
+    /// no `__idempotency__` table is an error rather than a silent
+    /// downgrade: a client that asked for exactly-once must not be given
+    /// at-least-once quietly.
+    ///
+    /// # Atomicity
+    ///
+    /// The check and the record both happen **inside the reducer's own
+    /// transaction**, on the shard's single writer — so two concurrent calls
+    /// bearing the same key cannot both miss the check, and the record
+    /// commits with the effects it guards or rolls back with them (CS-031).
+    /// A reducer that returns `Err` or panics therefore records nothing and
+    /// its retry re-executes, which is safe: it applied nothing.
+    pub async fn call_idempotent(
+        &self,
+        caller: ReducerCaller,
+        name: &str,
+        args: Vec<FluxValue>,
+        key: Option<&str>,
+    ) -> Result<CallOutcome> {
+        let Some(key) = key else {
+            return self
+                .call(caller, name, args)
+                .await
+                .map(CallOutcome::Committed);
+        };
+        let table = self
+            .pipeline
+            .store()
+            .table_id(idempotency::IDEMPOTENCY_TABLE_NAME)
+            .ok_or_else(|| {
+                FluxumError::Reducer(format!(
+                    "idempotency_key requires the `{}` table in the schema (SPEC-021 CS-030)",
+                    idempotency::IDEMPOTENCY_TABLE_NAME
+                ))
+            })?;
+
+        let start = Instant::now();
+        let identity = caller.identity;
+        let max_rate = match self.registry.admission(name) {
+            Ok(rate) => rate,
+            Err(error) => return self.reject(name, ReducerOutcome::Err, start, error),
+        };
+        if let Err(error) = self.rate_limiter.check(&identity, name, max_rate) {
+            return self.reject(name, ReducerOutcome::RateLimited, start, error);
+        }
+        if let Err(error) = self.registry.check_args(name, &args) {
+            return self.reject(name, ReducerOutcome::Err, start, error);
+        }
+
+        // A replay aborts the transaction rather than committing an empty
+        // one, so a deduplicated call consumes no tx id (TXN-030). The flag
+        // — not the error text — is what distinguishes it.
+        let hit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = Arc::clone(&self.registry);
+        let dispatch_name = name.to_owned();
+        let key_owned = key.to_owned();
+        let flag = Arc::clone(&hit);
+        let result = self
+            .pipeline
+            .call(Box::new(move |tx| {
+                if idempotency::already_applied(tx, table, &identity, &dispatch_name, &key_owned)? {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return Err(FluxumError::Reducer("idempotency replay".into()));
+                }
+                registry.dispatch(caller, &dispatch_name, &args, tx)?;
+                idempotency::record(tx, table, &identity, &dispatch_name, &key_owned)
+            }))
+            .await;
+
+        let duration_us = duration_us(start);
+        if hit.load(std::sync::atomic::Ordering::SeqCst) {
+            // CS-030: not a failure — the original call already applied.
+            tracing::debug!(
+                shard = self.shard_id,
+                reducer = name,
+                identity = %identity,
+                "idempotency key replayed; reducer body skipped"
+            );
+            return Ok(CallOutcome::Deduplicated);
+        }
+        match result {
+            Ok(receipt) => {
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::Ok, duration_us);
+                self.metrics.note_commit();
+                self.warn_if_slow(name, duration_us);
+                Ok(CallOutcome::Committed(receipt))
+            }
+            Err(error) if is_queue_full(&error) => {
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::QueueFull, duration_us);
+                Err(error)
+            }
+            Err(error) => {
+                self.metrics
+                    .record_reducer(name, ReducerOutcome::Err, duration_us);
+                self.metrics.note_rollback();
+                self.log_failure(name, &identity, &error, duration_us);
+                self.warn_if_slow(name, duration_us);
+                Err(error)
+            }
+        }
+    }
+
     /// Record an admission-time rejection outcome and return its error.
-    fn reject(
+    /// Generic in the success type — it only ever returns `Err`, so both the
+    /// `CommitReceipt` and `CallOutcome` paths share it.
+    fn reject<T>(
         &self,
         name: &str,
         outcome: ReducerOutcome,
         start: Instant,
         error: FluxumError,
-    ) -> Result<CommitReceipt> {
+    ) -> Result<T> {
         let duration_us = duration_us(start);
         self.metrics.record_reducer(name, outcome, duration_us);
         if outcome == ReducerOutcome::RateLimited {
@@ -491,6 +604,19 @@ impl ReducerEngine {
             }))
             .await
     }
+}
+
+/// The result of an idempotent call (SPEC-021 CS-030).
+#[derive(Debug)]
+pub enum CallOutcome {
+    /// The reducer ran and its transaction committed.
+    Committed(CommitReceipt),
+    /// The `idempotency_key` had already been applied for this
+    /// `(identity, reducer)`: the body did **not** run and nothing was
+    /// committed. The caller answers the original result — for a committed
+    /// call that is `Ok` — and publishes no new diff (the original commit
+    /// already fanned out).
+    Deduplicated,
 }
 
 /// Elapsed microseconds since `start`, saturating (OBS-011).

@@ -178,6 +178,7 @@ async fn every_pre_auth_message_type_is_401_with_its_id_echoed() {
                 reducer: "send_chat".into(),
                 version: None,
                 args: vec![],
+                idempotency_key: None,
             }),
         ),
         (
@@ -287,6 +288,7 @@ async fn an_unknown_reducer_maps_to_an_error_frame() {
             reducer: "no_such_reducer".into(),
             version: None,
             args: vec![],
+            idempotency_key: None,
         }))
         .await;
     match routed.responses.first() {

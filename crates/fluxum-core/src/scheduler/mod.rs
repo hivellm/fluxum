@@ -231,6 +231,13 @@ pub struct SchedulerOptions {
     /// (at-least-once without a hot loop). Recurring entries use
     /// `max(period, retry_backoff)`. Default 1 s.
     pub retry_backoff: Duration,
+    /// Bounds on the SPEC-021 CS-031 idempotency dedup window, which this
+    /// worker prunes (the spec assigns the pruning to the schedule worker).
+    pub idempotency: crate::reducer::IdempotencyOptions,
+    /// How often to prune that window. Much coarser than `poll_interval`:
+    /// the window is bounded by age and count, so scanning it on every 5 ms
+    /// tick would be pure waste. Default 30 s.
+    pub idempotency_prune_interval: Duration,
 }
 
 impl Default for SchedulerOptions {
@@ -238,6 +245,8 @@ impl Default for SchedulerOptions {
         Self {
             poll_interval: Duration::from_millis(5),
             retry_backoff: Duration::from_secs(1),
+            idempotency: crate::reducer::IdempotencyOptions::default(),
+            idempotency_prune_interval: Duration::from_secs(30),
         }
     }
 }
@@ -503,6 +512,7 @@ async fn schedule_worker(
 ) {
     // id → earliest next delivery attempt, for failed firings only.
     let mut backoff: HashMap<u64, Instant> = HashMap::new();
+    let mut next_prune = Instant::now() + options.idempotency_prune_interval;
     loop {
         tokio::select! {
             _ = shutdown.changed() => break,
@@ -513,6 +523,68 @@ async fn schedule_worker(
         for entry in due {
             fire_entry(&fire, &options, entry, &mut backoff).await;
         }
+        // SPEC-021 CS-031: keep the dedup window inside its bounds. On its
+        // own coarse cadence — the window is bounded by age and count, so
+        // rescanning it every poll would be waste.
+        if Instant::now() >= next_prune {
+            prune_idempotency(&fire, &options, now_us).await;
+            next_prune = Instant::now() + options.idempotency_prune_interval;
+        }
+    }
+}
+
+/// Delete dedup records outside the CS-031 window bounds, in one
+/// transaction. A shard without the `__idempotency__` table (the feature is
+/// opt-in) is a no-op.
+async fn prune_idempotency(fire: &FireContext, options: &SchedulerOptions, now_us: i64) {
+    use crate::reducer::idempotency;
+
+    let store = fire.pipeline.store();
+    let Some(table) = store.table_id(idempotency::IDEMPOTENCY_TABLE_NAME) else {
+        return;
+    };
+    // Read the committed window, decide outside the writer, then delete.
+    let doomed = {
+        let snapshot = store.snapshot();
+        let Ok(rows) = snapshot.scan(table) else {
+            return;
+        };
+        let records: Vec<(Vec<RowValue>, i64)> = rows
+            .filter_map(|row| {
+                let values = row.values();
+                let created_us = match values.get(3) {
+                    Some(RowValue::I64(us)) => *us,
+                    _ => return None,
+                };
+                Some((values[..3].to_vec(), created_us))
+            })
+            .collect();
+        idempotency::prunable(records, now_us, &options.idempotency)
+    };
+    if doomed.is_empty() {
+        return;
+    }
+    let count = doomed.len();
+    let result = fire
+        .pipeline
+        .call(Box::new(move |tx| {
+            for pk in doomed {
+                tx.delete(table, &pk)?;
+            }
+            Ok(())
+        }))
+        .await;
+    match result {
+        Ok(_) => tracing::debug!(
+            target: "fluxum::scheduler",
+            pruned = count,
+            "pruned idempotency records outside the window"
+        ),
+        Err(e) => tracing::warn!(
+            target: "fluxum::scheduler",
+            error = %e,
+            "idempotency prune failed; retrying next interval"
+        ),
     }
 }
 

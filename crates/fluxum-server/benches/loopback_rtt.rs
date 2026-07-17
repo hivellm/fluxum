@@ -110,6 +110,7 @@ impl Bench {
             reducer: "noop".into(),
             version: None,
             args: vec![],
+            idempotency_key: None,
         });
         let framed = self.codec.encode(&call.encode().unwrap()).unwrap();
         self.stream.write_all(&framed).await.unwrap();

@@ -262,6 +262,7 @@ async fn pre_auth_messages_are_401_and_keep_the_connection_open() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("hi".into())],
+            idempotency_key: None,
         }))
         .await;
     match client.recv().await.unwrap() {
@@ -290,6 +291,7 @@ async fn reducer_call_commits_and_returns_reducerresult() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("hello".into())],
+            idempotency_key: None,
         }))
         .await;
     match client.recv().await.unwrap() {
@@ -306,6 +308,7 @@ async fn reducer_call_commits_and_returns_reducerresult() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str(String::new())],
+            idempotency_key: None,
         }))
         .await;
     match client.recv().await.unwrap() {
@@ -336,6 +339,7 @@ async fn pipelined_calls_are_answered_with_matching_ids() {
                 reducer: "send_chat".into(),
                 version: None,
                 args: vec![FluxValue::Str(format!("m{id}"))],
+                idempotency_key: None,
             }))
             .await;
     }
@@ -383,6 +387,7 @@ async fn subscribe_returns_initialdata_then_pushes_txupdate_on_commit() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("live".into())],
+            idempotency_key: None,
         }))
         .await;
     assert!(matches!(
@@ -410,6 +415,7 @@ async fn subscribe_returns_initialdata_then_pushes_txupdate_on_commit() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("after".into())],
+            idempotency_key: None,
         }))
         .await;
     assert!(matches!(
@@ -436,6 +442,7 @@ async fn one_off_query_returns_current_state_without_subscribing() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("one".into())],
+            idempotency_key: None,
         }))
         .await;
     client.recv().await.unwrap();
@@ -532,6 +539,7 @@ async fn reconnect_resubscribe_gets_fresh_initialdata_reflecting_missed_commits(
                 reducer: "send_chat".into(),
                 version: None,
                 args: vec![FluxValue::Str(text.into())],
+                idempotency_key: None,
             }))
             .await;
         writer.recv().await.unwrap();
@@ -752,6 +760,7 @@ async fn failing_lifecycle_hooks_do_not_break_the_tcp_transport() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("survives".into())],
+            idempotency_key: None,
         }))
         .await;
     assert!(matches!(
@@ -827,6 +836,7 @@ async fn idle_timeout_disabled_reads_without_expiry_and_survives_a_reset() {
             reducer: "send_chat".into(),
             version: None,
             args: vec![FluxValue::Str("after the gap".into())],
+            idempotency_key: None,
         }))
         .await;
     assert!(matches!(
