@@ -272,6 +272,27 @@ pub struct Ballot {
   `KeyProvider` trait (analogous to `AuthProvider`) so signing/decryption keys can live in an
   external KMS/HSM rather than `config.yml`.
 
+### Implementation status (phase 3 — crypto complete; SDK sibling pending)
+- **Executors** ([transform/crypto.rs](../../crates/fluxum-core/src/transform/crypto.rs),
+  [transform/engine.rs](../../crates/fluxum-core/src/transform/engine.rs)): `#[encrypted(ecies)]`
+  (ECIES over X25519 + HKDF-SHA-256 + XChaCha20-Poly1305, CT-030/031/032/036) and
+  `#[signed(ed25519, by = server)]` (CT-033/034) execute. The `TransformEngine` compiles the
+  link-time registry against the config keyring; `on_write_row` encrypts then signs and
+  `on_read_row` verifies+strips then decrypts, both wired into the store write path and the reducer
+  `TxHandle` read boundary. AEAD/signature context binds `(table, column, primary_key)`.
+- **Config** ([config `transforms.keys`](../../crates/fluxum-core/src/config/mod.rs)): the
+  implemented shape is a **list** — `keys: [{ id, scheme: x25519|ed25519, secret: <hex>, previous:
+  [<hex>] }]` (rather than the illustrative map above). `#[encrypted(key = "…")]` resolves by id;
+  `#[signed(by = server)]` uses the Ed25519 key with id `server`. `TransformEngine::build` aborts
+  startup on a missing/scheme-mismatched key (CT-035); `previous` keys give rotation (CT-036).
+- **Metrics**: `TransformEngine::verify_failures()` (CT-034) and `read_errors()` (CT-014) counters
+  are maintained; exporting them as named Prometheus series rides the server metrics wiring.
+- **Deferred**: the reducer-facing `<field>_verified` projection sibling (CT-034) rides the phase-4
+  SDK codegen (§7 note); `#[signed(by = <Identity column>)]` per-identity keys are CT-037 [P2] via a
+  future `KeyProvider`. `#[masked]`/`#[column_grant]` read-authorization resolution is phase-4 (§6).
+  Client-facing reads keep ciphertext until those grants land; server-peer reducers are authorized
+  today (CT-031).
+
 ## 6. Field-level security
 
 - **CT-040** [P0] `VisibilityRule` (row-level, [SPEC-001 §8](SPEC-001-data-model.md)) is unchanged.

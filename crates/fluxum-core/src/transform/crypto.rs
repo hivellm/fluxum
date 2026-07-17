@@ -33,12 +33,77 @@
 
 use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use hkdf::Hkdf;
 use sha2::Sha256;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 use zeroize::Zeroize;
 
 use crate::error::{FluxumError, Result};
+
+/// Ed25519 signature width.
+pub const SIGNATURE_LEN: usize = 64;
+
+/// A named Ed25519 signing key for `#[signed(ed25519, by = server)]`
+/// (SPEC-017 CT-033/035). Holds the server's signing key; the verifying
+/// (public) key is derived. Signing-key bytes are zeroized on drop.
+pub struct SignKey {
+    id: String,
+    signing: SigningKey,
+}
+
+impl SignKey {
+    /// Build from a label and the 32-byte Ed25519 secret.
+    pub fn new(id: impl Into<String>, secret: [u8; 32]) -> Self {
+        Self {
+            id: id.into(),
+            signing: SigningKey::from_bytes(&secret),
+        }
+    }
+
+    /// Parse from a label and 64 hex characters.
+    pub fn from_hex(id: impl Into<String>, hex: &str) -> Result<Self> {
+        Ok(Self::new(id, parse_secret(hex)?))
+    }
+
+    /// The key's label.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Sign `msg` (CT-033). Returns the 64-byte signature.
+    pub fn sign(&self, msg: &[u8]) -> [u8; SIGNATURE_LEN] {
+        self.signing.sign(msg).to_bytes()
+    }
+
+    /// Verify `signature` over `msg` against this key's public key (CT-034).
+    pub fn verify(&self, msg: &[u8], signature: &[u8; SIGNATURE_LEN]) -> bool {
+        let vk: VerifyingKey = self.signing.verifying_key();
+        ed25519_dalek::Signature::try_from(&signature[..])
+            .map(|sig| vk.verify(msg, &sig).is_ok())
+            .unwrap_or(false)
+    }
+}
+
+impl std::fmt::Debug for SignKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignKey").field("id", &self.id).finish()
+    }
+}
+
+/// Verify a signature against an arbitrary Ed25519 public key — the
+/// `#[signed(by = <Identity column>)]` path, where the [`crate::types::Identity`]
+/// is itself the signer's public key (SPEC-009). Returns `false` on any
+/// malformed input rather than erroring (CT-034 never drops the row).
+pub fn ed25519_verify_with(public: &[u8; 32], msg: &[u8], signature: &[u8]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(public) else {
+        return false;
+    };
+    let Ok(sig) = ed25519_dalek::Signature::try_from(signature) else {
+        return false;
+    };
+    vk.verify(msg, &sig).is_ok()
+}
 
 /// Envelope format version.
 const ENVELOPE_VERSION: u8 = 1;
@@ -310,5 +375,48 @@ mod tests {
             !format!("{k:?}").contains("ab"),
             "Debug never leaks material"
         );
+    }
+
+    #[test]
+    fn ed25519_sign_verify_round_trips_and_rejects_tampering() {
+        let key = SignKey::new("server", [3u8; 32]);
+        let msg = b"table:Vote|col:choice|pk:1|field";
+        let sig = key.sign(msg);
+        assert!(key.verify(msg, &sig), "a valid signature verifies");
+        // A tampered message fails.
+        assert!(!key.verify(b"different message", &sig));
+        // A tampered signature fails.
+        let mut bad = sig;
+        bad[0] ^= 0x01;
+        assert!(!key.verify(msg, &bad));
+        // Debug never leaks the signing key.
+        assert!(!format!("{key:?}").contains("signing"));
+    }
+
+    #[test]
+    fn ed25519_verify_with_public_key_binds_the_signer() {
+        // The `by = <Identity column>` path: verify against the signer's
+        // public key (an Identity IS an Ed25519 public key, SPEC-009).
+        let signer = SignKey::new("alice", [7u8; 32]);
+        let public = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        let msg = b"signed field";
+        let sig = signer.sign(msg);
+        assert!(super::ed25519_verify_with(&public, msg, &sig));
+        // A different public key rejects.
+        let other = ed25519_dalek::SigningKey::from_bytes(&[8u8; 32])
+            .verifying_key()
+            .to_bytes();
+        assert!(!super::ed25519_verify_with(&other, msg, &sig));
+        // Malformed signature length rejects without panicking.
+        assert!(!super::ed25519_verify_with(&public, msg, &[0u8; 10]));
+    }
+
+    #[test]
+    fn ed25519_hex_keys_parse() {
+        let k = SignKey::from_hex("server", &"ab".repeat(32)).unwrap();
+        assert_eq!(k.id(), "server");
+        assert!(SignKey::from_hex("server", "abcd").is_err());
     }
 }

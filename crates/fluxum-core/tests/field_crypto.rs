@@ -94,6 +94,16 @@ fn engine(keys: HashMap<String, EciesKey>) -> TransformEngine {
     )
 }
 
+fn sign_engine() -> TransformEngine {
+    use fluxum_core::transform::crypto::SignKey;
+    TransformEngine::for_test(
+        TableId::of("Vote"),
+        vec![(1, &FluxType::Str, None, true)],
+        HashMap::new(),
+        Some(SignKey::new("server", [5u8; 32])),
+    )
+}
+
 fn caller() -> ReducerCaller {
     ReducerCaller {
         identity: Identity::from_token("tester"),
@@ -152,6 +162,53 @@ fn encrypted_column_stores_ciphertext_and_reads_back_plaintext() {
         );
         let all = ctx.tx.scan::<Vote>()?;
         assert_eq!(all[0].choice, secret, "scan decrypts too");
+        Ok(())
+    })
+    .unwrap();
+    tx.commit().unwrap();
+}
+
+/// CT-033/034: a `#[signed(by = server)]` column round-trips through the store
+/// — the field stays clear text with an appended signature at rest, and an
+/// authorized reducer read verifies + strips it back to the plaintext.
+#[test]
+fn signed_column_round_trips_through_the_store() {
+    let store = store_with_engine(sign_engine());
+    let registry = ReducerRegistry::new();
+
+    let mut tx = store.begin();
+    with_context(&registry, caller(), &mut tx, |ctx| {
+        let stored = ctx.tx.insert(Vote {
+            id: 1,
+            choice: "public-choice".to_owned(),
+        })?;
+        assert_eq!(stored.choice, "public-choice", "reducer sees plaintext");
+        Ok(())
+    })
+    .unwrap();
+    tx.commit().unwrap();
+
+    // At rest: clear-text field bytes plus a signature (integrity, not secrecy).
+    let table = store.table_id("Vote").unwrap();
+    match store
+        .snapshot()
+        .scan(table)
+        .unwrap()
+        .next()
+        .unwrap()
+        .value(1)
+    {
+        Some(RowValue::Bytes(b)) => assert!(
+            b.windows(13).any(|w| w == b"public-choice"),
+            "signed field stays clear text (CT-033)"
+        ),
+        other => panic!("{other:?}"),
+    }
+
+    // Authorized read verifies + strips the signature.
+    let mut tx = store.begin();
+    with_context(&registry, caller(), &mut tx, |ctx| {
+        assert_eq!(ctx.tx.query_pk::<Vote>(1)?.unwrap().choice, "public-choice");
         Ok(())
     })
     .unwrap();

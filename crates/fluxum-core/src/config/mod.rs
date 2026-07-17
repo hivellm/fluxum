@@ -529,6 +529,31 @@ impl TransformsConfig {
         }
         Ok(out)
     }
+
+    /// Build the Ed25519 signing key set (CT-033/035), keyed by id. A
+    /// `#[signed(ed25519, by = server)]` column signs with the key whose id is
+    /// `server`. Malformed material or a duplicate id is a hard error.
+    pub fn ed25519_keys(
+        &self,
+    ) -> crate::error::Result<std::collections::HashMap<String, crate::transform::crypto::SignKey>>
+    {
+        use crate::error::FluxumError;
+        use crate::transform::crypto::SignKey;
+        let mut out = std::collections::HashMap::new();
+        for key in &self.keys {
+            if key.scheme != KeyScheme::Ed25519 {
+                continue;
+            }
+            if out.contains_key(&key.id) {
+                return Err(FluxumError::Config(format!(
+                    "duplicate transform key id `{}` (CT-035)",
+                    key.id
+                )));
+            }
+            out.insert(key.id.clone(), SignKey::from_hex(&key.id, &key.secret)?);
+        }
+        Ok(out)
+    }
 }
 
 /// Environment lookup used by the loader; injected for testability.
