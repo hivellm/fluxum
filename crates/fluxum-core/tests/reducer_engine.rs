@@ -360,6 +360,19 @@ async fn admission_rejects_unknown_names_and_bad_args_without_a_transaction() {
         .await
         .unwrap();
     let baseline_tx = receipt.tx_id;
+    // `logged_records` replays the log *from disk*, and the log appends
+    // asynchronously — a commit that has returned is not yet durable. Without
+    // this wait the baseline can be taken before this commit lands, and its
+    // late arrival then gets misread below as a rejected call having reached
+    // the log. (Observed as an intermittent failure of the assertion at the
+    // end of this test.)
+    shard
+        .engine
+        .pipeline()
+        .log()
+        .wait_durable(baseline_tx)
+        .await
+        .unwrap();
     let baseline_records = logged_records(dir.path());
 
     // Unknown reducer: wire-ready 404, no transaction, no log entry.
