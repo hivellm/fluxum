@@ -252,10 +252,12 @@ pub struct InitialData {
     pub id: u32,
     /// Server's current schema version (RPC-043).
     pub schema_version: u32,
+    /// One entry per query.
+    pub tables: Vec<TableUpdate>,
+    // --- Additive tail (RPC-011): append only, never reorder above ---------
     /// The monotonic per-shard offset this snapshot reflects (SPEC-021
     /// CS-020): the client retains it per subscription and replays from it
-    /// with [`Resume`]. `#[serde(default)]` keeps pre-field frames decoding
-    /// (CS-023: additive).
+    /// with [`Resume`].
     #[serde(default)]
     pub tx_offset: u64,
     /// Set when this snapshot answers a [`Resume`] whose `from_offset`
@@ -264,8 +266,6 @@ pub struct InitialData {
     /// than merging it.
     #[serde(default)]
     pub cache_reset: bool,
-    /// One entry per query.
-    pub tables: Vec<TableUpdate>,
 }
 
 /// RPC-032 — per-table row diff carried by `InitialData` and `TxUpdate`.
@@ -301,22 +301,27 @@ pub struct TxUpdate {
     pub caller: [u8; 32],
     /// Reducer execution time in microseconds.
     pub duration_us: u32,
+    /// Row diffs, one entry per affected subscribed table.
+    pub tables: Vec<TableUpdate>,
+    // --- Additive tail (RPC-011) ------------------------------------------
+    //
+    // The envelope is *positional*: a payload is a MessagePack array in
+    // declaration order. A new field is therefore only backward compatible
+    // at the TAIL, where `#[serde(default)]` fills it in for a frame that
+    // predates it — inserting one mid-struct shifts every later field and
+    // makes older frames undecodable. Append here; never reorder above.
     /// The originating shard (SPEC-007 SHD-051): a client subscribed on
     /// several shards receives separate `TxUpdate`s, each tagged so
-    /// per-shard ordering is attributable. `0` for single-shard
-    /// deployments; `#[serde(default)]` keeps pre-field frames decoding.
+    /// per-shard ordering is attributable. `0` for single-shard deployments.
     #[serde(default)]
     pub shard_id: u32,
     /// The monotonic per-shard resume cursor for this commit (SPEC-021
     /// CS-020). It currently mirrors [`TxUpdate::tx_id`], but it is the
     /// documented cursor clients retain and echo in [`Resume::from_offset`]
     /// — the offset space is free to diverge from tx ids later without
-    /// breaking resumption. `#[serde(default)]` keeps pre-field frames
-    /// decoding (CS-023: additive).
+    /// breaking resumption.
     #[serde(default)]
     pub tx_offset: u64,
-    /// Row diffs, one entry per affected subscribed table.
-    pub tables: Vec<TableUpdate>,
 }
 
 /// RPC-035 — metadata-stripped commit broadcast for connections that opted
