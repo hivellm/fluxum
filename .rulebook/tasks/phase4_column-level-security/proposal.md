@@ -11,6 +11,7 @@ Implement SPEC-017 §6: resolve a per-column authorized decision from #[column_g
 - Related specs: SPEC-005 (subscription fan-out, RLS composition), SPEC-009 (AUTH-062 server-peer, AUTH-070 roles), SPEC-010 (schema migration, __schema_meta__), SPEC-011 (schema JSON / SDK codegen), SPEC-013 (PostgreSQL parity harness)
 - New PRD requirements: FR-91 (field-level security — masking/authorization half)
 - Affected code: crates/fluxum-core/src/subscription/mod.rs (read-path masking + diff safety), one-off query + HTTP /query path, crates/fluxum-server (/schema JSON), migration/__schema_meta__
-- Depends on: phase1_column-transforms-type-surface (grant/mask schema), phase3_field-level-crypto (on_read hook + authorized flag), T4.x subscription manager + RLS
+- Depends on: phase1_column-transforms-type-surface (grant/mask schema), phase3_field-level-crypto (on_read hook + authorized flag + engine verify counters), T4.x subscription manager + RLS
+- Also absorbs the read-projection follow-ups split out of phase3_field-level-crypto: the `<field>_verified` sibling for `#[signed]` columns (CT-034), Prometheus export of the phase-3 transform counters (CT-014/034), and `#[signed(by = <Identity column>)]` per-identity keys (CT-037 [P2]). The phase-3 task delivered the crypto executors (ECIES + Ed25519 by=server), the write/read hooks, and server-peer-default authorization.
 - Breaking change: NO (additive; columns without a grant default to public)
 - User benefit: Postgres-equivalent column privileges + dynamic masking — raw values only to permitted callers, across every read path

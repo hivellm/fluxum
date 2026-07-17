@@ -1,0 +1,19 @@
+## 1. Implementation
+- [x] 1.1 Keyring: `config.transforms.keys` (id, scheme x25519/ed25519, secret hex, previous[]); `ecies_keys()`/`ed25519_keys()`; `TransformEngine::build` aborts startup when an `#[encrypted]`/`#[signed]` attribute names a missing/scheme-mismatched key (CT-035) (crates/fluxum-core/src/config/mod.rs, transform/engine.rs)
+- [x] 1.2 ECIES over X25519: ephemeral key agreement + HKDF-SHA-256 + XChaCha20-Poly1305 AEAD; self-describing envelope version‖scheme‖ephemeral_pubkey‖nonce‖ciphertext‖tag stored as Bytes (CT-030; crates/fluxum-core/src/transform/crypto.rs)
+- [x] 1.3 AEAD associated data binds ciphertext to (table_id, ordinal, primary_key); envelope header authenticated; relocation/tamper fails decryption (CT-032; crates/fluxum-core/src/transform/{crypto.rs,engine.rs})
+- [x] 1.4 Ed25519 sign on write over (table, column, pk, field_bytes); store field_bytes‖signature for `by = server` (CT-033; crates/fluxum-core/src/transform/{crypto.rs,engine.rs}). `by = <Identity column>` (per-identity keys, CT-037 [P2]) is split to phase4_column-level-security and rejected at build with a descriptive error
+- [x] 1.5 Read-side verify + strip on the read boundary; a failed verify increments `verify_failures` and never drops the row (CT-034; crates/fluxum-core/src/transform/engine.rs). The reducer-facing `<field>_verified` projection sibling is split to phase4_column-level-security (read-projection layer)
+- [x] 1.6 `TransformEngine::on_write_row` wired into the tx write path after validation + pk derivation, before storage — stored rows carry ciphertext, so the commit log / cold pages / checkpoints never see plaintext (CT-011, CT-014; crates/fluxum-core/src/store/memstore.rs, transform/engine.rs)
+- [x] 1.7 `on_read_row` wired at the reducer TxHandle boundary (insert/upsert/query_pk/scan family/delete_where), gated by an authorized flag; reducers run as server peers (AUTH-062) → authorized; client-facing reads keep ciphertext until phase4_column-level-security resolves column grants (CT-012, CT-031; crates/fluxum-core/src/reducer/mod.rs)
+- [x] 1.8 Key rotation: `ecies_open` tries the active secret then each `previous` secret; a value sealed under a retired key still decrypts while new writes seal under the active key (CT-036; crates/fluxum-core/src/transform/crypto.rs)
+- [x] 1.9 Read-path counters maintained on the engine: `verify_failures()` (CT-034) and `read_errors()` (CT-014). Exporting them as named Prometheus series is split to phase4_column-level-security (server metrics wiring)
+- [x] 1.10 Verification: persisted-row scan proves no plaintext at rest for an encrypted column; authorized reducer read returns exact plaintext; tampered ciphertext + cross-pk relocation rejected; rotation reads legacy + writes new; signed field round-trips (clear text + signature at rest, verified read); tampered signature bumps the metric without dropping the row; build aborts on a missing key (crates/fluxum-core/tests/field_crypto.rs, crates/fluxum-macros/tests/field_crypto_build.rs, ECIES/Ed25519 unit tests)
+
+## Scope note
+This task delivers the **crypto executors** (ECIES `#[encrypted]` + Ed25519 `#[signed(by=server)]`), the write/read hooks, and server-peer-default authorization — all P0 crypto (CT-030..036). The **read-authorization half** (`#[column_grant]`/`#[masked]` resolution, the `<field>_verified` projection sibling, Prometheus metric export, and `by=<Identity>` per-identity keys) is the read-projection layer and lives in **phase4_column-level-security** (its tasks 1.8–1.10), which depends on the phase-4 subscription/projection layer.
+
+## 2. Tail (docs + tests — check or waive with tailWaiver)
+- [x] 2.1 Update or create documentation covering the implementation
+- [x] 2.2 Write tests covering the new behavior
+- [x] 2.3 Run tests and confirm they pass
