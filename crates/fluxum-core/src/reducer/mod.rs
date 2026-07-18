@@ -167,6 +167,50 @@ pub fn registered_reducers() -> impl Iterator<Item = &'static ReducerDef> {
     inventory::iter::<ReducerDef>()
 }
 
+/// One declared reducer parameter, as the module's source spells it
+/// (SPEC-011 SDK-001): the name a generated client uses for the argument and
+/// the Rust type string a generator maps to its own type system.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParamDef {
+    /// The parameter's declared name.
+    pub name: &'static str,
+    /// Its declared Rust type, verbatim (`u64`, `String`, …).
+    pub ty: &'static str,
+}
+
+/// A reducer's call signature, for `/schema` and every SDK generator that
+/// consumes it (SPEC-011, FR-81).
+///
+/// Deliberately a *separate* link-time registry rather than fields on
+/// [`ReducerDef`]: the signature is metadata only the `#[fluxum::reducer]`
+/// macro can know, while `ReducerDef` is also written by hand (tests,
+/// embedders) where a signature would be noise. Keeping them apart means a
+/// hand-written def stays valid and simply reports no parameters, and adding
+/// signature metadata never breaks an existing definition — which is exactly
+/// the additive-only contract the module API freeze commits to.
+#[derive(Debug, Clone, Copy)]
+pub struct ReducerSignature {
+    /// The reducer this describes (joins to [`ReducerDef::name`]).
+    pub reducer: &'static str,
+    /// Declared parameters after the context, in call order.
+    pub params: &'static [ParamDef],
+    /// The declared return type, verbatim.
+    pub returns: &'static str,
+}
+
+inventory::collect!(ReducerSignature);
+
+/// Iterate every reducer signature registered in this binary.
+pub fn registered_signatures() -> impl Iterator<Item = &'static ReducerSignature> {
+    inventory::iter::<ReducerSignature>()
+}
+
+/// The signature of `reducer`, if the macro registered one (a hand-written
+/// [`ReducerDef`] has none).
+pub fn signature_of(reducer: &str) -> Option<&'static ReducerSignature> {
+    registered_signatures().find(|sig| sig.reducer == reducer)
+}
+
 /// The static handler shape the `#[fluxum::on_insert/on_update/on_delete]`
 /// macros emit (SPEC-022 RV-031): `(ctx, old row, new row)` — `old` is set
 /// for Update/Delete, `new` for Insert/Update; rows arrive decrypted.
@@ -327,6 +371,14 @@ impl ReducerRegistry {
     /// Registered reducer names (unordered).
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.handlers.keys().map(String::as_str)
+    }
+
+    /// The declared `(client_callable, max_rate_per_sec)` of `name` — the
+    /// admission facts `/schema` publishes for SDK codegen (SDK-001).
+    pub fn declaration(&self, name: &str) -> Option<(bool, u32)> {
+        self.handlers
+            .get(name)
+            .map(|r| (r.client_callable, r.max_rate_per_sec))
     }
 
     /// Client-path name admission (RED-006/RED-025): unknown names are a

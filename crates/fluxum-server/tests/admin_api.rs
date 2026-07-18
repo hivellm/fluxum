@@ -495,8 +495,14 @@ async fn schema_lists_tables_reducers_and_views() {
     let payload = &json["payload"];
     assert_eq!(payload["tables"][0]["name"], "Chat");
     assert_eq!(payload["tables"][0]["columns"][0]["name"], "id");
-    assert_eq!(payload["reducers"], serde_json::json!(["send_chat"]));
+    // T6.1: reducers are descriptors, not bare names — a generator needs the
+    // call signature, not just something to call.
+    assert_eq!(payload["reducers"][0]["name"], "send_chat");
+    assert!(payload["reducers"][0]["params"].is_array());
     assert_eq!(payload["views"], serde_json::json!(["chat_count"]));
+    // The document declares both its module version and its own shape version.
+    assert!(payload["schema_version"].is_u64());
+    assert_eq!(payload["document_version"], 1);
     server.shutdown();
 }
 

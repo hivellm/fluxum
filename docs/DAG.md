@@ -284,6 +284,25 @@ Implications:
 
 ## 5. Change control
 
+### 5.1 Module API freeze (T6.1) — **in force**
+
+`T6.1` has landed: the `/schema` document is final at `schema_version: 1` and the `#[fluxum::*]`
+module surface is **frozen**. From here every change to either must be **additive**:
+
+- **Allowed** — a new key in the schema document; a new optional field on an existing object; a new
+  `#[fluxum::*]` attribute or a new optional argument to an existing one; a new table/reducer/index
+  kind that appears as a new entry rather than reshaping an existing one.
+- **Breaking** — renaming or removing a key, changing a value's type or meaning, reordering a list
+  whose order is contractual, or making an existing macro argument required. Any of these must bump
+  `admin::SCHEMA_DOCUMENT_VERSION` and is a coordinated change across every SDK generator.
+
+The gate is mechanical, not a convention: `crates/fluxum-server/tests/schema_golden.rs` renders a
+fixture module through `GET /schema`, canonicalizes it exactly as `fluxum schema export` does, and
+compares it **byte for byte** against the committed `crates/fluxum-server/tests/golden/schema.json`.
+Any diff fails the build and names the first differing line. Updating that golden is the deliberate
+act that says "this change was intended" — and if it was not additive, the version bump must ride
+with it.
+
 - Adding/removing a task or edge requires updating this file **and** the affected spec in the same PR.
 - A gate may not be weakened without a PRD change (the gates are PRD §12 acceptance criteria
   decomposed by phase).

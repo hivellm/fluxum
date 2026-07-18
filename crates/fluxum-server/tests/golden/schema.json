@@ -1,0 +1,195 @@
+{
+  "document_version": 1,
+  "procedures": [],
+  "query": {
+    "match": "col MATCH 'term \"a phrase\" prefix*' [ORDER BY SCORE DESC] [SELECT *, SCORE]",
+    "operators": [
+      "=",
+      "IN",
+      "BETWEEN",
+      "<",
+      ">",
+      "<=",
+      ">=",
+      "MATCH"
+    ],
+    "pagination": "keyset: ORDER BY <indexed col> [, <pk>] LIMIT n AFTER (value, pk)"
+  },
+  "reducers": [
+    {
+      "client_callable": true,
+      "max_rate_per_sec": 5,
+      "name": "complete_task",
+      "params": [
+        {
+          "name": "task_id",
+          "type": "u64"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    },
+    {
+      "client_callable": true,
+      "max_rate_per_sec": 0,
+      "name": "send_chat",
+      "params": [
+        {
+          "name": "channel",
+          "type": "u32"
+        },
+        {
+          "name": "body",
+          "type": "String"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    }
+  ],
+  "schema_version": 1,
+  "tables": [
+    {
+      "access": "Public",
+      "auto_inc": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "U64"
+        },
+        {
+          "name": "channel",
+          "type": "U32"
+        },
+        {
+          "name": "body",
+          "type": "Str"
+        },
+        {
+          "name": "sent_at",
+          "type": "Timestamp"
+        }
+      ],
+      "fulltext": [
+        {
+          "bm25": {
+            "b": 0.75,
+            "k1": 1.2
+          },
+          "column": "body",
+          "language": "simple",
+          "stemming": false,
+          "stop_words": false
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "channel",
+            "sent_at"
+          ],
+          "kind": "btree"
+        },
+        {
+          "columns": [
+            "body"
+          ],
+          "kind": "fulltext",
+          "language": "simple",
+          "stemming": false,
+          "stop_words": false
+        }
+      ],
+      "name": "ChatMessage",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
+    },
+    {
+      "access": "Public",
+      "auto_inc": null,
+      "columns": [
+        {
+          "name": "grid_x",
+          "type": "I32"
+        },
+        {
+          "name": "grid_y",
+          "type": "I32"
+        },
+        {
+          "name": "x",
+          "type": "F32"
+        },
+        {
+          "name": "y",
+          "type": "F32"
+        },
+        {
+          "name": "reading",
+          "type": "F64"
+        }
+      ],
+      "indexes": [
+        {
+          "columns": [
+            "x",
+            "y"
+          ],
+          "kind": "quadtree"
+        }
+      ],
+      "name": "Sensor",
+      "partition_by": null,
+      "primary_key": [
+        0,
+        1
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
+    },
+    {
+      "access": "Public",
+      "auto_inc": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "U64"
+        },
+        {
+          "name": "owner",
+          "type": "Identity"
+        },
+        {
+          "name": "slug",
+          "type": "Str"
+        },
+        {
+          "name": "done",
+          "type": "Bool"
+        }
+      ],
+      "indexes": [],
+      "name": "Task",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [
+        [
+          "slug"
+        ]
+      ],
+      "visibility": {
+        "column": "owner",
+        "kind": "owner_only"
+      }
+    }
+  ],
+  "views": []
+}

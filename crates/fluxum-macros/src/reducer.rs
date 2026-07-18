@@ -387,6 +387,17 @@ fn try_expand_reducer(args: TokenStream, input: TokenStream) -> syn::Result<Toke
         }
     });
     let param_idents: Vec<&syn::Ident> = params.iter().map(|(ident, _)| ident).collect();
+    let signature_params = params.iter().map(|(ident, ty)| {
+        let param_name = ident.to_string();
+        let ty_str = quote!(#ty).to_string();
+        quote! {
+            ::fluxum_core::reducer::ParamDef { name: #param_name, ty: #ty_str }
+        }
+    });
+    let returns_str = match &item.sig.output {
+        ReturnType::Type(_, ty) => quote!(#ty).to_string(),
+        ReturnType::Default => String::new(),
+    };
 
     Ok(quote! {
         #item
@@ -421,6 +432,17 @@ fn try_expand_reducer(args: TokenStream, input: TokenStream) -> syn::Result<Toke
                     check_args: __fluxum_check_args,
                     client_callable: true,
                     max_rate_per_sec: #max_rate,
+                }
+            }
+
+            // SPEC-011 SDK-001: publish the call signature for `/schema` and
+            // every SDK generator. Types are the source spelling, which is
+            // what a generator maps into its own type system.
+            ::fluxum_core::schema::inventory::submit! {
+                ::fluxum_core::reducer::ReducerSignature {
+                    reducer: #name_str,
+                    params: &[#(#signature_params),*],
+                    returns: #returns_str,
                 }
             }
         };

@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft — `/schema` JSON freezes at T6.1 |
+| **Status** | `/schema` JSON **frozen at T6.1** (`document_version: 1`) — changes must be additive |
 | **Phase / tasks** | Phase 6 · T6.1–T6.4 + Phase 7 · T7.4–T7.6 ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-81, FR-82, FR-83, FR-84, FR-85, FR-86, FR-87, FR-88 |
 | **Requirement prefix** | `SDK-` |
@@ -56,55 +56,77 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
 
   ```json
   {
-    "schema_version": 3,
+    "schema_version": 1,
+    "document_version": 1,
     "tables": [
       {
-        "id": 2847362341,
         "name": "Task",
-        "public": true,
-        "global": false,
-        "partition_by": null,
+        "access": "Public",
         "columns": [
-          { "name": "id",    "type": "U64",      "pk": true, "auto_inc": true },
-          { "name": "owner", "type": "Identity", "pk": false },
-          { "name": "title", "type": "Str",      "pk": false },
-          { "name": "done",  "type": "Bool",     "pk": false }
+          { "name": "id",    "type": "U64" },
+          { "name": "owner", "type": "Identity" },
+          { "name": "slug",  "type": "Str" },
+          { "name": "done",  "type": "Bool" }
         ],
+        "primary_key": [0],
+        "auto_inc": "id",
+        "unique": [["slug"]],
+        "partition_by": null,
         "indexes": [
-          { "type": "btree", "columns": ["owner"] }
+          { "kind": "btree",    "columns": ["owner"] },
+          { "kind": "quadtree", "columns": ["x", "y"] },
+          { "kind": "fulltext", "columns": ["body"],
+            "language": "simple", "stop_words": false, "stemming": false }
         ],
-        "spatial_index": null,
-        "visibility": { "rule": "owner_only", "owner_field": "owner" }
+        "visibility": { "kind": "owner_only", "column": "owner" }
       }
     ],
     "reducers": [
       {
         "name": "send_chat",
-        "version": 2,
         "params": [
-          { "name": "channel", "type": "U32" },
-          { "name": "text",    "type": "Str" }
+          { "name": "channel", "type": "u32" },
+          { "name": "body",    "type": "String" }
         ],
-        "return_type": "Result[Unit, Str]"
+        "return_type": "Result < (), String >",
+        "client_callable": true,
+        "max_rate_per_sec": 0
       }
     ],
-    "views": [ ... ],
-    "procedures": [ ... ]
+    "views": [],
+    "procedures": [],
+    "query": { "operators": ["=", "IN", "…"], "pagination": "keyset: …", "match": "…" }
   }
   ```
 
-  Column and parameter `type` values are FluxValue wire-type names as defined in SPEC-006
-  (`Bool`, `I8`–`I64`, `U8`–`U64`, `F32`/`F64`, `Str`, `Buffer`, `Identity`, `EntityId`,
-  `Timestamp`, `Option[T]`, `List[T]`). Composite primary keys appear as multiple columns with
-  `"pk": true`, in declaration order. Tables declared `#[fluxum::table(partition_by(field))]`
-  report the partition column in `partition_by` (SPEC-007); non-partitioned tables report `null`.
-  Entries under `views` and `procedures` carry the same signature shape as reducers
-  (`name`, `params`, `return_type`).
+  Notes on the frozen shape:
+
+  - `primary_key` is a list of **column ordinals** in declaration order (composite keys list
+    several); `auto_inc`, `partition_by` and the `unique` groups name **columns**, so a generator
+    never has to resolve an ordinal for them.
+  - Column `type` values are the schema's `FluxType` names (`Bool`, `I8`–`I64`, `U8`–`U64`,
+    `F32`/`F64`, `Str`, `Bytes`, `Identity`, `ConnectionId`, `EntityId`, `Timestamp`, …).
+    Reducer parameter `type` values are the **Rust source spelling** (`u32`, `String`), which is
+    what a generator maps into its own type system.
+  - `indexes` carries every access path in one list — `btree`, `quadtree`, `rtree`, `fulltext` —
+    discriminated by `kind`, rather than a separate `spatial_index` key.
+  - `visibility` is a tagged object: `public_all`, `shard_local`, `owner_only` (+`column`),
+    `custom` (+`predicate`), or `member_of` (+`table`, `key`).
+  - `views` and `procedures` are always present; `procedures` stays empty until
+    `#[fluxum::procedure]` lands, so a generator can rely on the key existing rather than
+    branching on its absence.
+  - Reducers are sorted by name and object keys are sorted, so two exports of the same schema are
+    byte-identical — the property the T6.1 freeze gate depends on.
 
 - **SDK-002** [P0] The schema document SHALL include `schema_version: U32` — the current version
   from the schema registry (SPEC-001, SPEC-010). Generated SDK code SHALL embed the
   `schema_version` of the document it was generated from; runtime verification against
   `InitialData.schema_version` is specified in SDK-043.
+
+  The document additionally carries `document_version: U32` — the version of the **document's own
+  shape**, frozen at `1` by T6.1. The two move independently: `schema_version` tracks the
+  application's migrations, `document_version` only changes if this format changes
+  non-additively.
 
 ## 3. `fluxum generate` CLI
 
@@ -172,9 +194,12 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   fluxum schema export --server http://localhost:15800 --out ./schema.json
   ```
 
-  The exported file SHALL be byte-identical to the body served by `GET /schema`, so it can be
-  committed to a repository, diffed in review, and used as the golden file for the T6.1 schema
-  freeze test.
+  The exported file SHALL be the `GET /schema` document verbatim, so it can be committed to a
+  repository, diffed in review, and used as the golden file for the T6.1 schema freeze test.
+  Concretely the exporter unwraps the RPC-052 admin envelope and re-serializes the payload with
+  sorted keys — a canonicalization, not a transformation: no key is added, dropped or renamed, and
+  two exports of one schema are the same bytes. `--out` is optional; without it the document goes
+  to stdout.
 
 ## 4. Generated types (per table)
 

@@ -18,6 +18,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+fluxum-macros.workspace = true
+fluxum-cli = { path = "../fluxum-cli" }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "io-util", "sync", "time"] }
 

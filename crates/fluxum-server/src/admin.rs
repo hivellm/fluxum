@@ -498,6 +498,77 @@ fn drain(ctx: &Arc<ShardContext>) -> AdminResponse {
 
 // --- GET /schema (SPEC-011: tables + reducers + views) -------------------------
 
+/// The `/schema` document's **shape** version (SPEC-011 FR-81), reported as
+/// `document_version`.
+///
+/// `1` is the **module API freeze** (DAG T6.1): from here the `#[fluxum::*]`
+/// surface and this document may only change *additively* — new keys, new
+/// optional fields — so a generator built against v1 keeps working. A change
+/// that removes or repurposes a key is a breaking change and must bump this.
+///
+/// Distinct from the document's `schema_version`, which is the *module's*
+/// declared schema version (MIG-001) and moves when the application migrates
+/// (SDK-002).
+pub const SCHEMA_DOCUMENT_VERSION: u32 = 1;
+
+/// A table's row-visibility rule as `/schema` JSON (SUB-030..032). The shape
+/// is a tagged object rather than a bare string so a rule that carries a
+/// column or predicate name stays machine-readable.
+fn visibility_json(table: &fluxum_core::schema::TableSchema) -> Value {
+    use fluxum_core::schema::VisibilityRule;
+    match table.visibility {
+        VisibilityRule::PublicAll => json!({ "kind": "public_all" }),
+        VisibilityRule::OwnerOnly { owner } => json!({
+            "kind": "owner_only",
+            "column": table.columns[usize::from(owner)].name,
+        }),
+        VisibilityRule::ShardLocal => json!({ "kind": "shard_local" }),
+        VisibilityRule::Custom(name) => json!({ "kind": "custom", "predicate": name }),
+        VisibilityRule::MemberOf { table, key } => json!({
+            "kind": "member_of",
+            "table": table,
+            "key": key,
+        }),
+    }
+}
+
+/// A table's indexes as `/schema` JSON: the access paths a generator can
+/// document and the query planner can serve (SPEC-008/018/019).
+fn index_json(table: &fluxum_core::schema::TableSchema) -> Value {
+    use fluxum_core::schema::IndexSchema;
+    let column = |ordinal: &u16| table.columns[usize::from(*ordinal)].name;
+    Value::Array(
+        table
+            .indexes
+            .iter()
+            .map(|index| match index {
+                IndexSchema::BTree { columns } => json!({
+                    "kind": "btree",
+                    "columns": columns.iter().map(column).collect::<Vec<_>>(),
+                }),
+                IndexSchema::Spatial { kind, columns } => json!({
+                    // `quadtree` | `rtree` (SPEC-008) — the spatial flavour a
+                    // generator documents, not a bare "spatial".
+                    "kind": format!("{kind:?}").to_lowercase(),
+                    "columns": columns.iter().map(column).collect::<Vec<_>>(),
+                }),
+                IndexSchema::FullText {
+                    column: col,
+                    language,
+                    stop_words,
+                    stemming,
+                } => json!({
+                    "kind": "fulltext",
+                    "columns": [column(col)],
+                    "language": format!("{language:?}").to_lowercase(),
+                    "stop_words": stop_words,
+                    "stemming": stemming,
+                }),
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
 async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
     let manager = ctx.subscriptions.lock().await;
     let tables: Vec<Value> = manager
@@ -525,6 +596,31 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
                 "columns": columns,
                 "primary_key": table.primary_key,
                 "access": format!("{:?}", table.access),
+                // SPEC-001: the rest of the table contract a generator needs
+                // to emit typed accessors — the auto-inc column (by name, so
+                // a generator never has to resolve an ordinal), the unique
+                // constraints, the row-visibility rule, and the partition key.
+                "auto_inc": table
+                    .auto_inc
+                    .map(|ordinal| Value::String(table.columns[usize::from(ordinal)].name.to_owned()))
+                    .unwrap_or(Value::Null),
+                "unique": table
+                    .unique
+                    .iter()
+                    .map(|cols| {
+                        Value::Array(
+                            cols.iter()
+                                .map(|c| Value::String(table.columns[usize::from(*c)].name.to_owned()))
+                                .collect(),
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+                "visibility": visibility_json(table),
+                "partition_by": table
+                    .partition_by
+                    .map(|ordinal| Value::String(table.columns[usize::from(ordinal)].name.to_owned()))
+                    .unwrap_or(Value::Null),
+                "indexes": index_json(table),
             });
             // SPEC-019 FTS-050: expose each full-text index — column,
             // analyzer id/config, BM25 params. Never corpus content.
@@ -556,16 +652,56 @@ async fn schema(ctx: &Arc<ShardContext>) -> AdminResponse {
             entry
         })
         .collect();
-    let mut reducers: Vec<&str> = ctx.engine.registry().names().collect();
-    reducers.sort_unstable();
+    // Reducers as full descriptors (SDK-001): name, declared params and
+    // return type, whether a client may call it, and its admission rate.
+    // Sorted by name so the document is byte-stable across builds — linker
+    // order is not, and the freeze gate compares bytes.
+    let mut reducer_names: Vec<&str> = ctx.engine.registry().names().collect();
+    reducer_names.sort_unstable();
+    let reducers: Vec<Value> = reducer_names
+        .iter()
+        .map(|name| {
+            let declaration = ctx.engine.registry().declaration(name);
+            let signature = fluxum_core::reducer::signature_of(name);
+            json!({
+                "name": name,
+                // A hand-written ReducerDef registers no signature; it
+                // reports no params rather than being absent from the list.
+                "params": signature
+                    .map(|s| {
+                        s.params
+                            .iter()
+                            .map(|p| json!({ "name": p.name, "type": p.ty }))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                "return_type": signature.map_or("", |s| s.returns),
+                "client_callable": declaration.is_none_or(|(callable, _)| callable),
+                "max_rate_per_sec": declaration.map_or(0, |(_, rate)| rate),
+            })
+        })
+        .collect();
     let mut views: Vec<&str> = ctx.views.names().collect();
     views.sort_unstable();
     AdminResponse::ok(
         None,
         json!({
+            // SPEC-011 SDK-002: the *module's* declared schema version
+            // (MIG-001) — what a generated SDK embeds and checks against
+            // `InitialData.schema_version` at runtime (SDK-043). It moves
+            // when the application's schema migrates.
+            "schema_version": fluxum_core::migration::declared_schema_version().unwrap_or(1),
+            // The version of this *document's shape*, distinct from the
+            // module's. Frozen at 1 by T6.1: the format may only change
+            // additively, and a breaking change bumps this.
+            "document_version": SCHEMA_DOCUMENT_VERSION,
             "tables": tables,
             "reducers": reducers,
             "views": views,
+            // `#[fluxum::procedure]` is not implemented yet; the key is
+            // present and empty so a generator can rely on its existence
+            // rather than branching on absence once it lands.
+            "procedures": Value::Array(Vec::new()),
             // SPEC-018 QP-031: the query surface SDK codegen documents —
             // the extended operator set plus keyset pagination (no OFFSET).
             "query": {

@@ -1,8 +1,6 @@
-//! `fluxum` command-line binary (T0.1 skeleton).
+//! `fluxum` command-line binary.
 
 fn main() {
-    println!(
-        "fluxum {} — bootstrap skeleton, subcommands land per docs/DAG.md",
-        env!("CARGO_PKG_VERSION")
-    );
+    let code = fluxum_cli::run(std::env::args().skip(1));
+    std::process::exit(code);
 }
