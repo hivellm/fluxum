@@ -32,12 +32,12 @@
       freeze holds)
 
 ## 2. Tail (docs + tests)
-- [x] 2.1 Documentation — SPEC-006 RPC-001 now states that framing is the family standard and
+- [x] 2.1 Update or create documentation covering the implementation — SPEC-006 RPC-001 now states that framing is the family standard and
       SHALL be delegated where the family layer exposes it, records why the Rust side cannot yet,
       and points at the parity test and hivellm/thunder#6; SPEC-011 SDK-077 amended (see 1.4);
       new `sdks/typescript/README.md` with a "why the wire layer is not ours" section and an
       ownership table; `frame.rs` module docs explain the asymmetry with the TS SDK
-- [x] 2.2 Tests — `sdks/typescript/tests/protocol.test.ts` (8 tests: envelope round-trip,
+- [x] 2.2 Write tests covering the new behavior — `sdks/typescript/tests/protocol.test.ts` (8 tests: envelope round-trip,
       keep-alive consumption, partial frame, oversized-prefix cap, non-envelope rejection,
       Fixed/Offsets RowList slicing, inconsistent RowList) and
       `crates/fluxum-protocol/tests/thunder_parity.rs` (4 tests: byte-for-byte framing parity,
