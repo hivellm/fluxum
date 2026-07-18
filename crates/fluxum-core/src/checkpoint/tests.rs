@@ -574,6 +574,8 @@ mod recovery_guards {
                 deletes: vec![],
             }],
             auto_inc: vec![],
+            caller: Vec::new(),
+            reducer_name: String::new(),
         })
         .await
         .unwrap();

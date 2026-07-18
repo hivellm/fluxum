@@ -90,6 +90,8 @@ fn rec(tx_id: u64) -> TxRecord {
             deletes: vec![ByteBuf::from(tx_id.to_le_bytes().to_vec())],
         }],
         auto_inc: vec![],
+        caller: Vec::new(),
+        reducer_name: String::new(),
     }
 }
 

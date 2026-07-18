@@ -56,11 +56,13 @@ mod format;
 
 pub(crate) mod segment;
 
+pub mod audit;
 pub mod blob;
 pub mod record;
 pub mod replay;
 pub mod writer;
 
+pub use audit::{AuditEntry, AuditQuery, DEFAULT_AUDIT_LIMIT, audit};
 pub use blob::{BlobHash, BlobStore};
 pub use record::{LogValue, TableMutation, TxRecord};
 pub use replay::{Corruption, ReplayReport, replay};

@@ -10,6 +10,7 @@
 //! | POST | `/reducer/:name` | call a reducer (JSON args → JSON result) |
 //! | POST | `/query`         | one-off read-only SQL → JSON rows |
 //! | GET  | `/view/:name`    | call a `#[fluxum::view]` → JSON |
+//! | POST | `/audit`         | who changed a table/row and when (SPEC-025 OPS-020; server-peer only) |
 //! | GET  | `/plugins`       | active plugins + adopted seams (SPEC-020 PLG-060; never secrets) |
 //! | POST | `/plugins/:name/disable` | hot circuit-break without restart (PLG-061); `/enable` reverts |
 //!
@@ -90,6 +91,7 @@ pub async fn dispatch(
         ("POST", ["reducer", name]) => reducer_call(ctx, name, body).await,
         ("POST", ["query"]) => query(ctx, body).await,
         ("POST", ["query", "explain"]) => query_explain(ctx, body).await,
+        ("POST", ["audit"]) => audit(ctx, body).await,
         ("GET", ["view", name]) => view(ctx, name).await,
         ("GET", ["plugins"]) => plugins(ctx),
         ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
@@ -136,6 +138,7 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["schema"]
             | ["query"]
             | ["query", "explain"]
+            | ["audit"]
             | ["reducer", _]
             | ["view", _]
             | ["plugins"]
@@ -639,6 +642,188 @@ async fn query_explain(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
         Ok(report) => AdminResponse::ok(request_id.as_deref(), report),
         Err(e) => AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string()),
     }
+}
+
+// --- POST /audit (SPEC-025 OPS-020/021) ----------------------------------------
+
+/// Trace who changed a table/row and when, from the commit log (OPS-020).
+///
+/// Access control (OPS-021): the request must carry a `token` that
+/// authenticates to a **server peer** (AUTH-062); a plain client identity is
+/// refused `403`. The result is metadata only — `tx_id`, `timestamp`,
+/// `caller`, `reducer_name`, `inserted`, `deleted` — never column values, so
+/// a masked or field-encrypted column cannot leak plaintext through it.
+///
+/// Body: `{ token, table, pk?: [pk-col values], tx_from?, tx_to?, time_from?,
+/// time_to?, limit? }`.
+async fn audit(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
+    use fluxum_core::commitlog::AuditQuery;
+
+    let (request_id, payload) = match parse_request(body) {
+        Ok(pair) => pair,
+        Err(e) => return AdminResponse::err(400, None, e),
+    };
+    let rid = request_id.as_deref();
+
+    // OPS-021: server-peer credential required.
+    let Some(token) = payload.get("token").and_then(Value::as_str) else {
+        return AdminResponse::err(401, rid, "payload.token (server-peer credential) required");
+    };
+    match ctx.authenticator.authenticate(token.as_bytes()) {
+        Ok(outcome) if outcome.server_peer.is_some() => {}
+        Ok(_) => {
+            return AdminResponse::err(
+                403,
+                rid,
+                "audit is restricted to server-peer identities (OPS-021)",
+            );
+        }
+        Err(_) => return AdminResponse::err(403, rid, "invalid audit credential"),
+    }
+
+    let Some(table_name) = payload.get("table").and_then(Value::as_str) else {
+        return AdminResponse::err(400, rid, "payload.table (string) required");
+    };
+    let Some(table_id) = ctx.store().table_id(table_name) else {
+        return AdminResponse::err(404, rid, format!("unknown table `{table_name}`"));
+    };
+    let Some(schema) = ctx.store().table_schema(table_id) else {
+        return AdminResponse::err(404, rid, format!("unknown table `{table_name}`"));
+    };
+
+    // Optional row key: PK column values in declaration order, encoded to the
+    // table's stable key currency for matching.
+    let pk = match payload.get("pk") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(values)) => match encode_pk_values(ctx, table_id, schema, values) {
+            Ok(pk) => Some(pk),
+            Err(e) => return AdminResponse::err(400, rid, e),
+        },
+        Some(_) => {
+            return AdminResponse::err(400, rid, "payload.pk must be an array of key values");
+        }
+    };
+
+    let query = AuditQuery {
+        table: table_id,
+        pk,
+        tx_from: payload.get("tx_from").and_then(Value::as_u64),
+        tx_to: payload.get("tx_to").and_then(Value::as_u64),
+        time_from: payload.get("time_from").and_then(Value::as_i64),
+        time_to: payload.get("time_to").and_then(Value::as_i64),
+        limit: payload
+            .get("limit")
+            .and_then(Value::as_u64)
+            .and_then(|n| usize::try_from(n).ok())
+            .unwrap_or(0),
+    };
+
+    match ctx.engine.pipeline().log().audit(schema, &query) {
+        Ok(entries) => {
+            let rows: Vec<Value> = entries
+                .iter()
+                .map(|e| {
+                    json!({
+                        "tx_id": e.tx_id,
+                        "timestamp": e.timestamp,
+                        "caller": e.caller.to_string(),
+                        "reducer_name": e.reducer_name,
+                        "inserted": e.inserted,
+                        "deleted": e.deleted,
+                    })
+                })
+                .collect();
+            AdminResponse::ok(rid, json!({ "count": rows.len(), "entries": rows }))
+        }
+        Err(e) => AdminResponse::err(status_of(&e), rid, e.to_string()),
+    }
+}
+
+/// Coerce a JSON array of primary-key values (declaration order) into the
+/// table's encoded key. Errors on arity mismatch or an unsupported PK column
+/// type.
+fn encode_pk_values(
+    ctx: &Arc<ShardContext>,
+    table_id: fluxum_core::store::TableId,
+    schema: &fluxum_core::schema::TableSchema,
+    values: &[Value],
+) -> Result<fluxum_core::store::PkBytes, String> {
+    use fluxum_core::schema::FluxType;
+    use fluxum_core::store::RowValue;
+
+    if values.len() != schema.primary_key.len() {
+        return Err(format!(
+            "pk has {} value(s) but table `{}` has a {}-column primary key",
+            values.len(),
+            schema.name,
+            schema.primary_key.len()
+        ));
+    }
+    let mut pk_values = Vec::with_capacity(values.len());
+    for (ordinal, value) in schema.primary_key.iter().zip(values) {
+        let column = &schema.columns[usize::from(*ordinal)];
+        let bad = || {
+            format!(
+                "pk value for column `{}` is not a valid {:?}",
+                column.name, column.ty
+            )
+        };
+        let rv = match column.ty {
+            FluxType::Bool => RowValue::Bool(value.as_bool().ok_or_else(bad)?),
+            FluxType::I8 => RowValue::I8(
+                int(value)
+                    .and_then(|n| i8::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::I16 => RowValue::I16(
+                int(value)
+                    .and_then(|n| i16::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::I32 => RowValue::I32(
+                int(value)
+                    .and_then(|n| i32::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::I64 => RowValue::I64(int(value).ok_or_else(bad)?),
+            FluxType::U8 => RowValue::U8(
+                uint(value)
+                    .and_then(|n| u8::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::U16 => RowValue::U16(
+                uint(value)
+                    .and_then(|n| u16::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::U32 => RowValue::U32(
+                uint(value)
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(bad)?,
+            ),
+            FluxType::U64 => RowValue::U64(uint(value).ok_or_else(bad)?),
+            FluxType::Str => RowValue::Str(value.as_str().ok_or_else(bad)?.to_owned()),
+            other => {
+                return Err(format!(
+                    "audit row-key matching does not support a `{other:?}` primary-key column; \
+                     filter by tx/time range instead"
+                ));
+            }
+        };
+        pk_values.push(rv);
+    }
+    ctx.store()
+        .snapshot()
+        .encode_pk(table_id, &pk_values)
+        .map_err(|e| e.to_string())
+}
+
+fn int(v: &Value) -> Option<i64> {
+    v.as_i64()
+}
+
+fn uint(v: &Value) -> Option<u64> {
+    v.as_u64()
 }
 
 // --- GET /view/:name -----------------------------------------------------------

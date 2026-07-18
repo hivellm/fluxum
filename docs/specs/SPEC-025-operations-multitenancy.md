@@ -45,6 +45,36 @@ Given an order row changed three times
 When an operator runs the audit query for that row
 Then it lists the three reducer calls with caller and timestamp in commit order.
 
+#### Interface & implementation
+
+Each commit-log record carries its `caller` and `reducer_name` (tail-additive
+fields on `TxRecord`, threaded from the reducer engine through the pipeline as
+`CommitMeta`), so the trail needs no separate audit store. Lifecycle and
+scheduled commits are untagged (zero identity, empty reducer name).
+
+```
+POST /audit
+{ "token": "<server-peer token>", "table": "Order",
+  "pk": [1],                       // optional row key, PK columns in order
+  "tx_from": 10, "tx_to": 99,      // optional windows
+  "time_from": 0, "time_to": 0,    // micros since epoch
+  "limit": 1000 }
+→ { "count": N,
+    "entries": [ { "tx_id", "timestamp", "caller", "reducer_name",
+                   "inserted", "deleted" } ] }   // commit order
+```
+
+The read prunes at **segment granularity**: a segment file's name encodes its
+`first_tx_id` and segments are listed sorted, so a `tx_id` window selects a
+contiguous slice and the rest are never opened. Local retained/archived
+segments are covered; object-store archives arrive with the phase-7 backup
+task.
+
+Access control (OPS-021) requires a token authenticating to a registered
+**server peer** (AUTH-062) — a plain client identity is refused `403`. The
+result is **metadata only**: no column values are ever returned, so a masked
+or field-encrypted column cannot leak plaintext through an audit result.
+
 ## 4. Graceful drain & rolling restart (`OPS-03x`)
 
 ### Requirement: Zero-downtime restart

@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::error::{FluxumError, Result};
 use crate::store::TxDiff;
-use crate::types::Timestamp;
+use crate::types::{Identity, Timestamp};
 
 use super::CommitLogOptions;
 use super::format::encode_entry;
@@ -144,6 +144,17 @@ impl CommitLog {
         self.shard_id
     }
 
+    /// Run an audit query over this log's durable segments (SPEC-025 OPS-020).
+    /// Reads only flushed records; a just-committed transaction appears once
+    /// it is durable ([`CommitLog::wait_durable`]).
+    pub fn audit(
+        &self,
+        schema: &crate::schema::TableSchema,
+        query: &super::audit::AuditQuery,
+    ) -> Result<Vec<super::audit::AuditEntry>> {
+        super::audit::audit(&self.dir, self.shard_id, schema, query)
+    }
+
     /// The current fencing epoch entries are stamped with.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
@@ -176,10 +187,35 @@ impl CommitLog {
     }
 
     /// Convenience: build a [`TxRecord`] from the T2.1 commit output and
-    /// append it.
+    /// append it. The commit is tagged anonymously (zero identity, no reducer
+    /// name) — for an audited commit use [`CommitLog::append_diff_as`].
     pub async fn append_diff(&self, diff: &TxDiff, timestamp: Timestamp) -> Result<u64> {
-        self.append(TxRecord::from_diff(diff, self.shard_id, timestamp))
-            .await
+        self.append_diff_as(
+            diff,
+            timestamp,
+            Identity::from_bytes([0u8; 32]),
+            String::new(),
+        )
+        .await
+    }
+
+    /// Append a commit tagged with the identity and reducer that produced it
+    /// (SPEC-025 OPS-020 audit trail).
+    pub async fn append_diff_as(
+        &self,
+        diff: &TxDiff,
+        timestamp: Timestamp,
+        caller: Identity,
+        reducer: impl AsRef<str>,
+    ) -> Result<u64> {
+        self.append(TxRecord::from_diff(
+            diff,
+            self.shard_id,
+            timestamp,
+            caller,
+            reducer.as_ref(),
+        ))
+        .await
     }
 
     /// Raise the fencing epoch (SPEC-014 leader lineage). Pending appends

@@ -375,11 +375,18 @@ impl ReducerEngine {
 
         let registry = Arc::clone(&self.registry);
         let dispatch_name = name.to_owned();
+        // OPS-020: tag the commit with its caller + reducer for the audit
+        // trail.
+        let meta = crate::txn::CommitMeta {
+            caller: identity,
+            reducer_name: name.to_owned(),
+        };
         let result = self
             .pipeline
-            .call(Box::new(move |tx| {
-                registry.dispatch(caller, &dispatch_name, &args, tx)
-            }))
+            .call_with(
+                meta,
+                Box::new(move |tx| registry.dispatch(caller, &dispatch_name, &args, tx)),
+            )
             .await;
 
         let duration_us = duration_us(start);
@@ -473,16 +480,29 @@ impl ReducerEngine {
         let dispatch_name = name.to_owned();
         let key_owned = key.to_owned();
         let flag = Arc::clone(&hit);
+        let meta = crate::txn::CommitMeta {
+            caller: identity,
+            reducer_name: name.to_owned(),
+        };
         let result = self
             .pipeline
-            .call(Box::new(move |tx| {
-                if idempotency::already_applied(tx, table, &identity, &dispatch_name, &key_owned)? {
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return Err(FluxumError::Reducer("idempotency replay".into()));
-                }
-                registry.dispatch(caller, &dispatch_name, &args, tx)?;
-                idempotency::record(tx, table, &identity, &dispatch_name, &key_owned)
-            }))
+            .call_with(
+                meta,
+                Box::new(move |tx| {
+                    if idempotency::already_applied(
+                        tx,
+                        table,
+                        &identity,
+                        &dispatch_name,
+                        &key_owned,
+                    )? {
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        return Err(FluxumError::Reducer("idempotency replay".into()));
+                    }
+                    registry.dispatch(caller, &dispatch_name, &args, tx)?;
+                    idempotency::record(tx, table, &identity, &dispatch_name, &key_owned)
+                }),
+            )
             .await;
 
         let duration_us = duration_us(start);

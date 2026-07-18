@@ -38,11 +38,31 @@ pub struct TxRecord {
     /// this commit (STG-040 batched allocation — the durable write that
     /// makes counters resume without reuse after recovery).
     pub auto_inc: Vec<(u32, u64)>,
+    /// The identity that committed this transaction, as raw 32 bytes — the
+    /// audit trail's `caller` (SPEC-025 OPS-020). A **tail-additive** field:
+    /// `#[serde(default)]` decodes a record written before it existed (whose
+    /// positional array is one element shorter) as the zero identity, so the
+    /// on-disk/replication format stays backward-compatible. Scheduled and
+    /// lifecycle commits carry the shard's own server identity.
+    #[serde(default, with = "serde_bytes")]
+    pub caller: Vec<u8>,
+    /// The reducer whose call produced this commit — the audit trail's
+    /// `reducer_name` (OPS-020). Tail-additive like `caller`; empty for an
+    /// older record or a non-reducer commit.
+    #[serde(default)]
+    pub reducer_name: String,
 }
 
 impl TxRecord {
-    /// Build a record from the T2.1 commit output ([`TxDiff`]).
-    pub fn from_diff(diff: &TxDiff, shard_id: u32, timestamp: Timestamp) -> Self {
+    /// Build a record from the T2.1 commit output ([`TxDiff`]), tagged with
+    /// the committing `caller` and `reducer` for the audit trail (OPS-020).
+    pub fn from_diff(
+        diff: &TxDiff,
+        shard_id: u32,
+        timestamp: Timestamp,
+        caller: Identity,
+        reducer: &str,
+    ) -> Self {
         Self {
             tx_id: diff.tx_id,
             timestamp: timestamp.as_micros(),
@@ -65,7 +85,18 @@ impl TxRecord {
                 .iter()
                 .map(|(table, hw)| (table.as_u32(), *hw))
                 .collect(),
+            caller: caller.as_bytes().to_vec(),
+            reducer_name: reducer.to_owned(),
         }
+    }
+
+    /// The committing identity, reconstructed from the stored bytes. A record
+    /// written before the field existed (or a malformed one) yields the zero
+    /// identity.
+    pub fn caller_identity(&self) -> Identity {
+        <[u8; 32]>::try_from(self.caller.as_slice())
+            .map(Identity::from_bytes)
+            .unwrap_or_else(|_| Identity::from_bytes([0u8; 32]))
     }
 
     /// MessagePack-encode this record (the STG-011 entry body).
@@ -373,6 +404,8 @@ mod tests {
                 deletes: vec![ByteBuf::from(vec![1, 2, 3])],
             }],
             auto_inc: vec![(0xDEAD_BEEF, 4096)],
+            caller: vec![7u8; 32],
+            reducer_name: "set_thing".into(),
         };
         let bytes = record.encode().unwrap();
         let back = TxRecord::decode(&bytes).unwrap();

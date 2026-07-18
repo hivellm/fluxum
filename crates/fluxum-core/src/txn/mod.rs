@@ -97,9 +97,32 @@ pub struct CommitReceipt {
     pub diff: TxDiff,
 }
 
+/// Audit provenance for a commit (SPEC-025 OPS-020): who called, and which
+/// reducer. Carried through the pipeline to the commit-log record so the
+/// audit trail can answer "who changed this row, and when".
+#[derive(Debug, Clone)]
+pub struct CommitMeta {
+    /// The identity the reducer ran under.
+    pub caller: crate::types::Identity,
+    /// The reducer's name.
+    pub reducer_name: String,
+}
+
+impl CommitMeta {
+    /// Untagged provenance (zero identity, no name) — for internal or test
+    /// commits whose caller/reducer are not meaningful to an audit.
+    pub fn anonymous() -> Self {
+        Self {
+            caller: crate::types::Identity::from_bytes([0u8; 32]),
+            reducer_name: String::new(),
+        }
+    }
+}
+
 /// One queued reducer call.
 struct Job {
     reducer: ReducerFn,
+    meta: CommitMeta,
     respond: oneshot::Sender<Result<CommitReceipt>>,
 }
 
@@ -157,8 +180,22 @@ impl TxPipeline {
     /// storage error. On success, the returned receiver resolves to the
     /// job's commit receipt or rollback error once the writer reaches it.
     pub fn submit(&self, reducer: ReducerFn) -> Result<oneshot::Receiver<Result<CommitReceipt>>> {
+        self.submit_with(CommitMeta::anonymous(), reducer)
+    }
+
+    /// [`TxPipeline::submit`] tagging the commit with its audit provenance
+    /// (SPEC-025 OPS-020) — the reducer engine passes the real caller/name.
+    pub fn submit_with(
+        &self,
+        meta: CommitMeta,
+        reducer: ReducerFn,
+    ) -> Result<oneshot::Receiver<Result<CommitReceipt>>> {
         let (respond, receipt) = oneshot::channel();
-        match self.sender.try_send(Job { reducer, respond }) {
+        match self.sender.try_send(Job {
+            reducer,
+            meta,
+            respond,
+        }) {
             Ok(()) => Ok(receipt),
             Err(mpsc::error::TrySendError::Full(_)) => Err(FluxumError::query(
                 codes::CLUSTER_SHARD_UNAVAILABLE,
@@ -183,7 +220,13 @@ impl TxPipeline {
     /// response wait. Backpressure semantics are unchanged: a full queue
     /// errors immediately with `503 "shard busy"` (TXN-011).
     pub async fn call(&self, reducer: ReducerFn) -> Result<CommitReceipt> {
-        let receipt = self.submit(reducer)?;
+        self.call_with(CommitMeta::anonymous(), reducer).await
+    }
+
+    /// [`TxPipeline::call`] tagging the commit with its audit provenance
+    /// (SPEC-025 OPS-020).
+    pub async fn call_with(&self, meta: CommitMeta, reducer: ReducerFn) -> Result<CommitReceipt> {
+        let receipt = self.submit_with(meta, reducer)?;
         receipt.await.map_err(|_| {
             FluxumError::Storage("transaction pipeline worker dropped the call".into())
         })?
@@ -217,7 +260,7 @@ impl TxPipelineWorker {
     /// queued and returns.
     pub async fn run(mut self) {
         while let Some(job) = self.receiver.recv().await {
-            let result = self.process(job.reducer).await;
+            let result = self.process(job.reducer, &job.meta).await;
             // A caller that gave up on its receipt does not affect the
             // committed state; drop the response.
             let _ = job.respond.send(result);
@@ -228,7 +271,7 @@ impl TxPipelineWorker {
     /// append. Validation already happened eagerly inside the `Tx` write
     /// methods (TXN-040/041/042), so a returned diff is valid by
     /// construction.
-    async fn process(&self, reducer: ReducerFn) -> Result<CommitReceipt> {
+    async fn process(&self, reducer: ReducerFn, meta: &CommitMeta) -> Result<CommitReceipt> {
         let timestamp = Timestamp::now();
         let diff = execute(&self.store, reducer)?;
         let tx_id = diff.tx_id;
@@ -270,9 +313,13 @@ impl TxPipelineWorker {
                     .filter(|(table, _)| !self.store.is_ephemeral(*table))
                     .collect(),
             };
-            self.log.append_diff(&durable, timestamp).await?;
+            self.log
+                .append_diff_as(&durable, timestamp, meta.caller, &meta.reducer_name)
+                .await?;
         } else {
-            self.log.append_diff(&diff, timestamp).await?;
+            self.log
+                .append_diff_as(&diff, timestamp, meta.caller, &meta.reducer_name)
+                .await?;
         }
         Ok(CommitReceipt { tx_id, diff })
     }

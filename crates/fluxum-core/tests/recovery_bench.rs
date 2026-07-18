@@ -72,6 +72,8 @@ fn bench_record(tx_id: u64, payload: &str) -> TxRecord {
             deletes: vec![ByteBuf::from(delete_id.to_le_bytes().to_vec())],
         }],
         auto_inc: vec![],
+        caller: Vec::new(),
+        reducer_name: String::new(),
     }
 }
 
