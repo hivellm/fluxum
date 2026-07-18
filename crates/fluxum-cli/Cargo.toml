@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# Internal to the workspace: never goes to crates.io. Only `fluxum-sdk` is
+# published (SPEC-011 SDK-071), so no consumer ever resolves this from the
+# registry and it cannot drag a second crate into a release.
+publish = false
 
 [[bin]]
 name = "fluxum"
