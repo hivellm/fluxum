@@ -20,6 +20,8 @@
 //! runtime dependencies — a full HTTP stack would be a large dependency for
 //! one request.
 
+pub mod generate;
+
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -133,12 +135,20 @@ fluxum — Fluxum command-line tool
 
 USAGE:
     fluxum schema export --server <host:port> [--out <file>]
+    fluxum generate --lang <lang> --schema <url_or_file> --out <dir>
 
 COMMANDS:
     schema export    Fetch GET /schema from a running server and write the
                      module contract (SPEC-011). Prints to stdout without
                      --out. The output is canonical, so committing it gives
                      a byte-for-byte API-freeze gate.
+
+    generate         Emit typed client bindings from a schema. --schema takes
+                     a running server (host:port) or a saved schema.json;
+                     both produce identical bytes, so bindings can be
+                     committed and diffed in review.
+
+                     --lang    typescript | ts
 ";
 
 /// Run the CLI over `args` (without the program name). Returns the process
@@ -170,6 +180,35 @@ where
                 }
                 Err(e) => {
                     eprintln!("schema export failed: {e}");
+                    1
+                }
+            }
+        }
+        ["generate", rest @ ..] => {
+            let (Some(lang), Some(schema), Some(out)) = (
+                flag(rest, "--lang"),
+                flag(rest, "--schema"),
+                flag(rest, "--out"),
+            ) else {
+                eprintln!("generate: --lang, --schema and --out are all required\n\n{USAGE}");
+                return 2;
+            };
+            let Some(lang) = generate::Lang::parse(&lang) else {
+                eprintln!("generate: unknown --lang `{lang}` (supported: typescript)");
+                return 2;
+            };
+            match generate::load_schema(&schema)
+                .and_then(|doc| generate::generate(lang, &doc))
+                .and_then(|files| generate::write_files(std::path::Path::new(&out), &files))
+            {
+                Ok(written) => {
+                    for path in written {
+                        println!("{}", path.display());
+                    }
+                    0
+                }
+                Err(e) => {
+                    eprintln!("generate failed: {e}");
                     1
                 }
             }
