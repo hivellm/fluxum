@@ -117,6 +117,7 @@ async fn auth_frame(stream: &mut TcpStream, token: &[u8], id: u32) {
         token: token.to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     })
     .encode()
     .unwrap();

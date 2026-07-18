@@ -375,6 +375,22 @@ impl Metrics {
     /// Render the `fluxum_*` block this shard owns (OBS-010..OBS-050) in
     /// Prometheus text exposition format. `last_tx_id` is the shard's last
     /// committed transaction (the admin transport already holds it).
+    /// [`Metrics::prometheus`] with a `namespace` label added to every series
+    /// — per-namespace attribution for a multi-tenant process (SPEC-025
+    /// OPS-051).
+    ///
+    /// Implemented by relabelling the standard exposition rather than
+    /// duplicating it: every series here starts its label set with
+    /// `{shard="N"`, so inserting the namespace right after it is exact for
+    /// both the bare `{shard="N"}` and the multi-label
+    /// `{shard="N", reason="…"}` forms, and the two renderings can never
+    /// drift apart as series are added.
+    pub fn prometheus_in_namespace(&self, namespace: &str, last_tx_id: u64) -> String {
+        let bare = format!("{{shard=\"{}\"", self.shard_id);
+        let labelled = format!("{{shard=\"{}\", namespace=\"{namespace}\"", self.shard_id);
+        self.prometheus(last_tx_id).replace(&bare, &labelled)
+    }
+
     pub fn prometheus(&self, last_tx_id: u64) -> String {
         let shard = self.shard_id;
         let mut out = String::with_capacity(2048);

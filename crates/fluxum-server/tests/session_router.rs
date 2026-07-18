@@ -128,6 +128,7 @@ fn auth_msg(id: u32, token: &[u8]) -> ClientMessage {
         token: token.to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     })
 }
 

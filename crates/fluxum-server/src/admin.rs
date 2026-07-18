@@ -213,8 +213,24 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
         ctx.metrics()
             .set_subscriptions_active(i64::try_from(active).unwrap_or(i64::MAX));
     }
-    // OBS-010..OBS-050: the shard's own counter block.
+    // OBS-010..OBS-050: the shard's own counter block (the default database).
     let mut text = ctx.metrics().prometheus(health.last_tx_id);
+    // SPEC-025 OPS-051: the same series per named namespace, each carrying a
+    // `namespace` label so a tenant's load is attributable. Only the series
+    // lines are appended — the HELP/TYPE headers were already emitted above,
+    // and repeating them for the same metric name is invalid exposition.
+    for ns in ctx.namespaces() {
+        let block = ns
+            .metrics()
+            .prometheus_in_namespace(ns.name(), ns.last_tx_id());
+        for line in block
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            text.push_str(line);
+            text.push('\n');
+        }
+    }
     // OBS-030/031: per-table row counts + an estimated MemStore footprint.
     // Lock-free snapshot; the byte figure is a schema-width estimate (the
     // spec's `memstore_bytes` is explicitly an estimate, not exact bytes).

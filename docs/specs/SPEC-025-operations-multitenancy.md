@@ -116,6 +116,38 @@ Given namespaces `acme` and `globex`
 When a client authenticates into `acme`
 Then it sees only `acme` tables and cannot subscribe to or mutate `globex`.
 
+#### Interface & implementation
+
+A `Namespace` owns a complete database — its own store + commit log behind a
+`ReducerEngine`, its own schema, subscription set, and commit fan-out — and is
+registered on the `ShardContext`:
+
+```rust
+ctx.register_namespace(Namespace::new("acme", engine, subscriptions, 256))?;
+```
+
+A connection names its database in the `Authenticate` message
+(`namespace: Option<String>`, a tail-additive field — omitting it selects the
+default database, which is exactly today's single-database behaviour, so
+OPS-050 is not a breaking change). The binding is fixed for the connection's
+lifetime: a re-`Authenticate` naming a different database is refused rather
+than silently switching the data under live subscriptions, and an unknown
+namespace fails the handshake (`AUTH_FAILED`) so a client never lands in the
+wrong database.
+
+**Isolation is structural, not a check.** The session routes every read,
+write, subscription and commit through its bound namespace's engine and
+subscription manager; no code path takes a namespace name at query time, so a
+cross-namespace transaction or subscription is unrepresentable. Each namespace
+runs its own fan-out loop over its own commit broadcast, so a tenant's commit
+is only ever evaluated against that tenant's subscriptions.
+
+**Attribution (OPS-051).** Each namespace carries its own metrics registry, so
+`/metrics` emits its `fluxum_*` series with a `namespace` label alongside the
+default database's (which keeps its original, unlabelled label set for
+backward compatibility). Storage and backups are per-namespace by
+construction: each is opened over its own store directory and commit log.
+
 ## 7. Per-tenant quotas (`OPS-06x`)
 
 ### Requirement: Resource isolation

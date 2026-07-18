@@ -226,6 +226,7 @@ impl Client {
             token: token.to_vec(),
             compression: None,
             tx_updates: None,
+            namespace: None,
         }))
         .await;
         self.recv().await.unwrap()

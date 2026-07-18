@@ -164,6 +164,7 @@ async fn setup() -> (Bench, std::net::SocketAddr) {
         token: b"bench".to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     });
     let framed = client.codec.encode(&auth.encode().unwrap()).unwrap();
     client.stream.write_all(&framed).await.unwrap();

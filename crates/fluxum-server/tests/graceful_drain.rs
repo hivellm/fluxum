@@ -165,6 +165,7 @@ async fn authed_session(ctx: &Arc<ShardContext>) -> Session {
             token: b"client".to_vec(),
             compression: None,
             tx_updates: None,
+            namespace: None,
         }))
         .await;
     session

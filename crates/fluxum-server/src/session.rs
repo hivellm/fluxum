@@ -69,14 +69,24 @@ pub enum SessionState {
 pub struct Session {
     ctx: Arc<ShardContext>,
     state: SessionState,
+    /// The database this connection is bound to (SPEC-025 OPS-050), chosen
+    /// on `Authenticate` and fixed for the connection's lifetime. `None` is
+    /// the default database — the context's own engine/subscriptions — which
+    /// is what every client that names no namespace gets.
+    ///
+    /// Every read and write below routes through this binding, so a session
+    /// simply has no way to name another database's tables: cross-namespace
+    /// access is unrepresentable rather than merely rejected.
+    namespace: Option<Arc<crate::namespace::Namespace>>,
 }
 
 impl Session {
-    /// A fresh unauthenticated session.
+    /// A fresh unauthenticated session on the default database.
     pub fn new(ctx: Arc<ShardContext>) -> Self {
         Self {
             ctx,
             state: SessionState::Unauthenticated,
+            namespace: None,
         }
     }
 
@@ -84,7 +94,69 @@ impl Session {
     /// HTTP transport rebuilds one per request from its `Fluxum-Session`
     /// entry (SPEC-006 §3; the router core is transport-independent).
     pub fn with_state(ctx: Arc<ShardContext>, state: SessionState) -> Self {
-        Self { ctx, state }
+        Self {
+            ctx,
+            state,
+            namespace: None,
+        }
+    }
+
+    /// [`Session::with_state`] rebound to a namespace — the HTTP transport
+    /// persists the binding alongside the router state, since it rebuilds a
+    /// session per request.
+    pub fn with_state_in(
+        ctx: Arc<ShardContext>,
+        state: SessionState,
+        namespace: Option<Arc<crate::namespace::Namespace>>,
+    ) -> Self {
+        Self {
+            ctx,
+            state,
+            namespace,
+        }
+    }
+
+    /// The namespace this session is bound to (`None` = the default
+    /// database), so the transport can persist/resume the binding and
+    /// publish commits to the right fan-out.
+    pub fn namespace(&self) -> Option<&Arc<crate::namespace::Namespace>> {
+        self.namespace.as_ref()
+    }
+
+    /// This session's reducer engine: its namespace's, or the default
+    /// database's.
+    pub fn engine(&self) -> &fluxum_core::reducer::ReducerEngine {
+        match &self.namespace {
+            Some(ns) => ns.engine(),
+            None => &self.ctx.engine,
+        }
+    }
+
+    /// This session's subscription registry (namespace-scoped).
+    pub fn subscriptions(
+        &self,
+    ) -> &tokio::sync::Mutex<fluxum_core::subscription::SubscriptionManager> {
+        match &self.namespace {
+            Some(ns) => ns.subscriptions(),
+            None => &self.ctx.subscriptions,
+        }
+    }
+
+    /// This session's store — the lock-free read surface of its database.
+    pub fn store(&self) -> &Arc<fluxum_core::store::MemStore> {
+        match &self.namespace {
+            Some(ns) => ns.store(),
+            None => self.ctx.store(),
+        }
+    }
+
+    /// Publish a committed diff to *this session's* namespace fan-out, so a
+    /// tenant's commit never reaches another tenant's subscribers.
+    pub fn publish_commit(&self, diff: fluxum_core::store::TxDiff) {
+        match &self.namespace {
+            Some(ns) => ns.publish_commit(diff),
+            None => self.ctx.publish_commit(diff),
+        }
     }
 
     /// The current session state (to persist across HTTP requests).
@@ -126,7 +198,7 @@ impl Session {
         // other message is a 401 with the connection kept open.
         if !self.is_authenticated() {
             if let ClientMessage::Authenticate(auth) = &message {
-                return self.authenticate(auth.id, &auth.token);
+                return self.authenticate(auth.id, &auth.token, auth.namespace.as_deref());
             }
             return Routed::reply(error(
                 Some(request_id(&message)),
@@ -151,7 +223,9 @@ impl Session {
         match message {
             // A second Authenticate re-derives identity but keeps the
             // connection id (idempotent re-auth).
-            ClientMessage::Authenticate(auth) => self.authenticate(auth.id, &auth.token),
+            ClientMessage::Authenticate(auth) => {
+                self.authenticate(auth.id, &auth.token, auth.namespace.as_deref())
+            }
             ClientMessage::ReducerCall(call) => {
                 self.reducer_call(call.id, call.reducer, call.args, call.idempotency_key)
                     .await
@@ -170,7 +244,32 @@ impl Session {
     /// AUTH-020/021: validate the token, derive the identity, allocate a
     /// `ConnectionId`, and reply `AuthResult`. A failure is a `401` with the
     /// connection kept open.
-    fn authenticate(&mut self, id: u32, token: &[u8]) -> Routed {
+    fn authenticate(&mut self, id: u32, token: &[u8], namespace: Option<&str>) -> Routed {
+        // OPS-050: resolve the requested database first — an unknown name
+        // must not authenticate into *anything*. The binding is fixed for
+        // the connection's lifetime, so a re-`Authenticate` naming a
+        // different database is refused rather than silently switching the
+        // connection's data underneath its live subscriptions.
+        let requested = match self.ctx.resolve_namespace(namespace) {
+            Ok(ns) => ns,
+            Err(e) => {
+                self.ctx.metrics().note_auth(false);
+                return Routed::reply(from_error(Some(id), &e));
+            }
+        };
+        if self.is_authenticated() {
+            let current = self.namespace.as_ref().map(|ns| ns.name());
+            let wanted = requested.as_ref().map(|ns| ns.name());
+            if current != wanted {
+                return Routed::reply(error(
+                    Some(id),
+                    codes::AUTH_FAILED,
+                    "a connection is bound to its database for its lifetime; \
+                     reconnect to use another namespace (OPS-050)",
+                ));
+            }
+        }
+
         let outcome = match self.ctx.authenticator.authenticate(token) {
             Ok(outcome) => outcome,
             Err(e) => {
@@ -179,6 +278,7 @@ impl Session {
                 return Routed::reply(from_error(Some(id), &e));
             }
         };
+        self.namespace = requested;
         // OBS-040: a successful authentication; a first auth is a new
         // connection (re-auth on an existing session keeps its id).
         self.ctx.metrics().note_auth(true);
@@ -223,8 +323,7 @@ impl Session {
     ) -> Routed {
         let (caller, _, _) = self.authed();
         let outcome = self
-            .ctx
-            .engine
+            .engine()
             .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
             .await;
         match outcome {
@@ -285,8 +384,8 @@ impl Session {
     /// 404 telling the client to `Subscribe` afresh.
     async fn resume(&self, id: u32, query_id: u32, from_offset: u64) -> Routed {
         let (_, _, connection) = self.authed();
-        let snapshot = self.ctx.store().snapshot();
-        let manager = self.ctx.subscriptions.lock().await;
+        let snapshot = self.store().snapshot();
+        let manager = self.subscriptions().lock().await;
         match manager.resume(connection, query_id, from_offset, &snapshot) {
             Ok(Some(Resumed::Deltas(deltas))) => Routed {
                 responses: deltas
@@ -322,8 +421,8 @@ impl Session {
 
     async fn subscribe(&self, id: u32, queries: Vec<String>) -> Routed {
         let (_, subscriber, connection) = self.authed();
-        let snapshot = self.ctx.store().snapshot();
-        let mut manager = self.ctx.subscriptions.lock().await;
+        let snapshot = self.store().snapshot();
+        let mut manager = self.subscriptions().lock().await;
         let mut responses = Vec::with_capacity(queries.len());
         for sql in queries {
             match manager.subscribe(connection, subscriber.clone(), &sql, &snapshot) {
@@ -346,7 +445,7 @@ impl Session {
     /// RPC-024: drop each `query_id`. No response (delivery simply stops).
     async fn unsubscribe(&self, query_ids: Vec<u32>) -> Routed {
         let (_, _, connection) = self.authed();
-        let mut manager = self.ctx.subscriptions.lock().await;
+        let mut manager = self.subscriptions().lock().await;
         for query_id in query_ids {
             manager.unsubscribe(connection, query_id);
         }
@@ -360,14 +459,14 @@ impl Session {
     async fn one_off_query(&self, id: u32, sql: String) -> Routed {
         let (_, subscriber, _) = self.authed();
         let snapshot = match fluxum_core::sql::as_of_point(&sql) {
-            Ok(Some(point)) => match self.ctx.store().snapshot_as_of(point) {
+            Ok(Some(point)) => match self.store().snapshot_as_of(point) {
                 Ok(snapshot) => snapshot,
                 Err(e) => return Routed::reply(from_error(Some(id), &e)),
             },
-            Ok(None) => self.ctx.store().snapshot(),
+            Ok(None) => self.store().snapshot(),
             Err(e) => return Routed::reply(from_error(Some(id), &e)),
         };
-        let manager = self.ctx.subscriptions.lock().await;
+        let manager = self.subscriptions().lock().await;
         match manager.snapshot_result(subscriber, &sql, &snapshot) {
             Ok(mut initial) => {
                 initial.id = id;

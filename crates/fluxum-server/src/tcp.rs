@@ -265,12 +265,12 @@ async fn drive_connection(
     if let Some(conn_id) = session.connection_id() {
         ctx.metrics().note_disconnect(); // OBS-040
         ctx.connections.remove(conn_id).await;
-        ctx.subscriptions.lock().await.disconnect(conn_id);
+        session.subscriptions().lock().await.disconnect(conn_id);
         // RED-012: run the `on_disconnect` hooks and publish their diff to the
         // remaining subscribers (a presence cleanup must reach them).
         if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
-            match ctx.engine.client_disconnected(identity, cid).await {
-                Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
+            match session.engine().client_disconnected(identity, cid).await {
+                Ok(Some(receipt)) => session.publish_commit(receipt.diff),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
@@ -340,8 +340,8 @@ async fn route_frame(
         // RED-011: run the `on_connect` hooks and publish their diff to the
         // shard fan-out (a presence insert must reach subscribers).
         if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
-            match ctx.engine.client_connected(identity, cid).await {
-                Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
+            match session.engine().client_connected(identity, cid).await {
+                Ok(Some(receipt)) => session.publish_commit(receipt.diff),
                 Ok(None) => {}
                 Err(e) => {
                     tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
@@ -360,7 +360,7 @@ async fn route_frame(
     }
     // Publish a committed reducer diff to the shard fan-out (SUB-021).
     if let Some(diff) = routed.commit {
-        ctx.publish_commit(diff);
+        session.publish_commit(diff);
     }
     true
 }

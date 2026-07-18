@@ -151,6 +151,7 @@ impl Client {
                 token: b"subscriber".to_vec(),
                 compression: None,
                 tx_updates: None,
+                namespace: None,
             }))
             .await;
         assert!(matches!(

@@ -92,6 +92,10 @@ struct HttpSession {
     shutdown: Arc<Notify>,
     out_rx: Option<mpsc::Receiver<OutFrame>>,
     last_active: Instant,
+    /// The database this session bound to on `Authenticate` (SPEC-025
+    /// OPS-050); `None` = the default. Persisted here because this transport
+    /// rebuilds a `Session` per request, and the binding must survive that.
+    namespace: Option<Arc<crate::namespace::Namespace>>,
 }
 
 /// Why a GET stream ended — it decides the session's fate (SPEC-021
@@ -373,30 +377,43 @@ async fn handle_post(
         .iter()
         .any(|m| matches!(m, fluxum_protocol::ClientMessage::Authenticate(_)));
 
-    // Load or create the session's router state.
-    let (mut router_state, connection_id, new_session) = if let Some(token) = &session_token {
-        let mut sessions = state.sessions.lock().await;
-        match sessions.get_mut(token) {
-            Some(sess) => {
-                sess.last_active = Instant::now();
-                (sess.state.clone(), sess.connection_id, false)
+    // Load or create the session's router state — including its OPS-050
+    // namespace binding, which must survive this transport rebuilding a
+    // `Session` per request.
+    let (mut router_state, connection_id, new_session, mut namespace) =
+        if let Some(token) = &session_token {
+            let mut sessions = state.sessions.lock().await;
+            match sessions.get_mut(token) {
+                Some(sess) => {
+                    sess.last_active = Instant::now();
+                    (
+                        sess.state.clone(),
+                        sess.connection_id,
+                        false,
+                        sess.namespace.clone(),
+                    )
+                }
+                None => {
+                    drop(sessions);
+                    // Stale/expired session token (RPC-060).
+                    return write_simple(stream, 404, "Not Found").await;
+                }
             }
-            None => {
-                drop(sessions);
-                // Stale/expired session token (RPC-060).
-                return write_simple(stream, 404, "Not Found").await;
-            }
-        }
-    } else {
-        (SessionState::Unauthenticated, 0, true)
-    };
+        } else {
+            (SessionState::Unauthenticated, 0, true, None)
+        };
     let was_authed = matches!(router_state, SessionState::Authenticated { .. });
 
-    // Route every frame through the transport-independent session core.
+    // Route every frame through the transport-independent session core, in
+    // the session's database.
     let mut responses: Vec<ServerMessage> = Vec::new();
     let mut commits = Vec::new();
     {
-        let mut session = Session::with_state(Arc::clone(&state.ctx), router_state.clone());
+        let mut session = Session::with_state_in(
+            Arc::clone(&state.ctx),
+            router_state.clone(),
+            namespace.clone(),
+        );
         for message in messages {
             let routed = session.handle(message).await;
             responses.extend(routed.responses);
@@ -404,6 +421,8 @@ async fn handle_post(
                 commits.push(diff);
             }
         }
+        // An `Authenticate` in this batch may have bound the namespace.
+        namespace = session.namespace().cloned();
         router_state = session.into_state();
     }
 
@@ -445,15 +464,18 @@ async fn handle_post(
                 shutdown,
                 out_rx: Some(out_rx),
                 last_active: Instant::now(),
+                namespace: namespace.clone(),
             },
         );
         issued_token = Some(token);
-        // RED-011: run the `on_connect` hooks for the fresh session; their diff
-        // is published with the rest of this request's commits below.
+        // RED-011: run the `on_connect` hooks for the fresh session, in its
+        // own database; their diff is published with this request's commits.
         if let SessionState::Authenticated { caller, .. } = &router_state {
-            match state
-                .ctx
-                .engine
+            let engine = match &namespace {
+                Some(ns) => ns.engine(),
+                None => &state.ctx.engine,
+            };
+            match engine
                 .client_connected(caller.identity, caller.connection_id)
                 .await
             {
@@ -468,13 +490,18 @@ async fn handle_post(
         // Persist any state change (e.g. a re-auth) back to the store.
         if let Some(sess) = state.sessions.lock().await.get_mut(token) {
             sess.state = router_state.clone();
+            sess.namespace = namespace.clone();
         }
     }
     let _ = connection_id;
 
-    // Publish committed diffs to the fan-out (SUB-021).
+    // Publish committed diffs to this session's namespace fan-out (SUB-021),
+    // never to another tenant's.
     for diff in commits {
-        state.ctx.publish_commit(diff);
+        match &namespace {
+            Some(ns) => ns.publish_commit(diff),
+            None => state.ctx.publish_commit(diff),
+        }
     }
 
     // Encode the response frames into the body.
@@ -590,22 +617,32 @@ async fn evict_session(state: &Arc<HttpState>, token: &str, connection_id: u128)
     }
     state.ctx.metrics().note_disconnect(); // OBS-040
     state.ctx.connections.remove(connection_id).await;
-    state
-        .ctx
-        .subscriptions
-        .lock()
-        .await
-        .disconnect(connection_id);
+    // Deregister from the session's own database (OPS-050).
+    let namespace = evicted.as_ref().and_then(|s| s.namespace.clone());
+    match &namespace {
+        Some(ns) => ns.subscriptions().lock().await.disconnect(connection_id),
+        None => state
+            .ctx
+            .subscriptions
+            .lock()
+            .await
+            .disconnect(connection_id),
+    }
     if let Some(session) = evicted
         && let SessionState::Authenticated { caller, .. } = &session.state
     {
-        match state
-            .ctx
-            .engine
+        let engine = match &namespace {
+            Some(ns) => ns.engine(),
+            None => &state.ctx.engine,
+        };
+        match engine
             .client_disconnected(caller.identity, caller.connection_id)
             .await
         {
-            Ok(Some(receipt)) => state.ctx.publish_commit(receipt.diff),
+            Ok(Some(receipt)) => match &namespace {
+                Some(ns) => ns.publish_commit(receipt.diff),
+                None => state.ctx.publish_commit(receipt.diff),
+            },
             Ok(None) => {}
             Err(e) => {
                 tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");

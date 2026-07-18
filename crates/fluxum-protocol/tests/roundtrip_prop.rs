@@ -96,6 +96,7 @@ fn client_message() -> impl Strategy<Value = ClientMessage> {
                     token,
                     compression,
                     tx_updates,
+                    namespace: None,
                 })
             }),
         (

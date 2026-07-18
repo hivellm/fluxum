@@ -278,6 +278,7 @@ async fn authenticate(addr: std::net::SocketAddr, token: &[u8]) -> String {
         token: token.to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     });
     let resp = post(addr, None, CONTENT_TYPE, &[frame(&auth)]).await;
     assert_eq!(resp.status, 200);
@@ -300,6 +301,7 @@ async fn wrong_content_type_is_415() {
         token: b"alice".to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     });
     let resp = post(server.local_addr, None, "application/json", &[frame(&auth)]).await;
     assert_eq!(resp.status, 415, "non-fluxum content type rejected");
@@ -560,6 +562,7 @@ async fn post_body_skips_keepalives_and_a_trailing_partial_frame() {
         token: b"alice".to_vec(),
         compression: None,
         tx_updates: None,
+        namespace: None,
     }));
     // keep-alive frame + real frame + a dangling 2-byte partial header.
     let keepalive = FrameCodec::keepalive().to_vec();

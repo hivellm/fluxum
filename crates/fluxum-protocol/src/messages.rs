@@ -140,6 +140,16 @@ pub struct Authenticate {
     pub compression: Option<String>,
     /// `"full"` | `"light"` (RPC-035); `None` means `"full"`.
     pub tx_updates: Option<String>,
+    /// The database namespace to bind this connection to (SPEC-025 OPS-050);
+    /// `None` selects the server's default database — which is exactly the
+    /// single-database behaviour every existing client already gets.
+    ///
+    /// A **tail-additive** field: compact MessagePack encodes a struct as a
+    /// positional array, so appending here with `#[serde(default)]` keeps
+    /// frames written by older clients decodable. The binding lasts for the
+    /// connection's lifetime — a re-`Authenticate` may not switch namespace.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// RPC-021 — execute a named reducer atomically.

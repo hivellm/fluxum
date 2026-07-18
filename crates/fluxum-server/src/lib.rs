@@ -24,6 +24,7 @@ pub mod admin;
 pub mod connguard;
 pub mod http;
 pub mod logging;
+pub mod namespace;
 pub mod session;
 pub mod shard;
 pub mod tcp;
@@ -178,6 +179,11 @@ pub struct ShardContext {
     /// [`ShardContext::set_conn_guard`]; a default permissive guard is
     /// materialized on first use if none is installed.
     conn_guard: std::sync::OnceLock<Arc<crate::connguard::ConnGuard>>,
+    /// Additional named databases hosted by this process (SPEC-025 OPS-050).
+    /// This context's own engine/subscriptions are the *default* namespace;
+    /// entries here are wholly independent databases a connection binds to
+    /// by name on `Authenticate`. Empty in a single-database deployment.
+    namespaces: std::sync::RwLock<HashMap<String, Arc<crate::namespace::Namespace>>>,
     /// Process start instant, for the `/health` `uptime_s` field (OBS-060).
     started: std::time::Instant,
     /// SPEC-025 OPS-030: the shard is draining for a rolling restart. New
@@ -273,6 +279,7 @@ impl ShardContext {
             blob_store: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
+            namespaces: std::sync::RwLock::new(HashMap::new()),
             started: std::time::Instant::now(),
             effective_config: std::sync::OnceLock::new(),
             draining: std::sync::atomic::AtomicBool::new(false),
@@ -472,6 +479,77 @@ impl ShardContext {
         })
     }
 
+    /// Register an additional named database (SPEC-025 OPS-050). The
+    /// namespace owns its storage, schema, subscriptions and fan-out
+    /// outright; nothing is shared with the default database or any sibling.
+    /// Registering the reserved default name, or a duplicate, is an error —
+    /// a name must resolve to exactly one database.
+    pub fn register_namespace(
+        &self,
+        ns: Arc<crate::namespace::Namespace>,
+    ) -> fluxum_core::Result<()> {
+        use crate::namespace::DEFAULT_NAMESPACE;
+        if ns.name() == DEFAULT_NAMESPACE {
+            return Err(fluxum_core::FluxumError::config(format!(
+                "namespace `{DEFAULT_NAMESPACE}` is the implicit default database and cannot be \
+                 registered (OPS-050)"
+            )));
+        }
+        if ns.name().is_empty() {
+            return Err(fluxum_core::FluxumError::config(
+                "namespace name must be non-empty (OPS-050)",
+            ));
+        }
+        let mut map = self.namespaces.write().unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(ns.name()) {
+            return Err(fluxum_core::FluxumError::config(format!(
+                "duplicate namespace `{}` (OPS-050)",
+                ns.name()
+            )));
+        }
+        map.insert(ns.name().to_owned(), ns);
+        Ok(())
+    }
+
+    /// Resolve a namespace by name. `None`/the default name means "the
+    /// default database" — this context's own engine and subscriptions —
+    /// and yields `Ok(None)`. An unknown name is a typed error, so a
+    /// connection can never silently land in the wrong database (OPS-050).
+    pub fn resolve_namespace(
+        &self,
+        name: Option<&str>,
+    ) -> fluxum_core::Result<Option<Arc<crate::namespace::Namespace>>> {
+        use crate::namespace::DEFAULT_NAMESPACE;
+        let Some(name) = name.filter(|n| *n != DEFAULT_NAMESPACE) else {
+            return Ok(None);
+        };
+        self.namespaces
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| {
+                // Refused at bind time: the client named a database it may
+                // not have, so it never authenticates into anything.
+                fluxum_core::FluxumError::query(
+                    fluxum_protocol::codes::AUTH_FAILED,
+                    format!("unknown database namespace `{name}`"),
+                )
+            })
+    }
+
+    /// Every registered named namespace (the default is not included — it is
+    /// this context itself).
+    pub fn namespaces(&self) -> Vec<Arc<crate::namespace::Namespace>> {
+        self.namespaces
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
     /// Install the shard's blob store (SPEC-023 DMX-040): attaches it to the
     /// store (write validation + commit refcounts, rebuilding counts from
     /// the current snapshot) and enables the `/blob` HTTP endpoints. Call
@@ -622,10 +700,29 @@ impl ShardContext {
 /// transport without its own — two fan-out tasks over one broadcast would
 /// double-deliver to a subscriber registered in the shared registry.
 pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
+    // The default database's fan-out, plus one per registered namespace —
+    // each over its own commit broadcast and subscription set, so a tenant's
+    // commit is only ever evaluated against that tenant's subscriptions
+    // (SPEC-025 OPS-050).
+    for ns in ctx.namespaces() {
+        spawn_fanout_for(Arc::clone(&ctx), Some(ns), shutdown.clone());
+    }
+    spawn_fanout_for(ctx, None, shutdown);
+}
+
+/// One fan-out loop over `namespace` (`None` = the default database).
+pub(crate) fn spawn_fanout_for(
+    ctx: Arc<ShardContext>,
+    namespace: Option<Arc<crate::namespace::Namespace>>,
+    shutdown: Arc<Notify>,
+) {
     use fluxum_protocol::{FrameCodec, ServerMessage};
 
     tokio::spawn(async move {
-        let mut commits = ctx.subscribe_commits();
+        let mut commits = match &namespace {
+            Some(ns) => ns.subscribe_commits(),
+            None => ctx.subscribe_commits(),
+        };
         let codec = FrameCodec::default();
         loop {
             let diff = tokio::select! {
@@ -639,9 +736,13 @@ pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
                 },
             };
 
-            // Evaluate once (SUB-041: mutex held only across evaluation).
+            // Evaluate once (SUB-041: mutex held only across evaluation),
+            // against this namespace's subscriptions only.
             let deltas = {
-                let manager = ctx.subscriptions.lock().await;
+                let manager = match &namespace {
+                    Some(ns) => ns.subscriptions().lock().await,
+                    None => ctx.subscriptions.lock().await,
+                };
                 match manager.on_commit(&diff) {
                     Ok(deltas) => deltas,
                     Err(e) => {
