@@ -15,11 +15,19 @@
 //! feed it each `InitialData`/`TxUpdate`, and ask it what to send on reconnect.
 
 pub mod idempotency;
+pub mod protocol;
 pub mod resume;
 
-pub use fluxum_protocol as protocol;
 pub use idempotency::{OfflineQueue, QueuedCall};
 pub use resume::{Reconnect, ResumeTracker};
+
+// The vendored protocol files are byte-for-byte copies of the server-side
+// crate, where these modules sit at the crate root and refer to each other as
+// `crate::codes`, `crate::value`, and so on. Re-exporting them here makes
+// those paths resolve inside this crate too, which is what lets the copies
+// stay literal — a sync that had to rewrite paths could not be checked by
+// comparing bytes.
+pub(crate) use protocol::{codes, rowlist, tagged, value};
 
 #[cfg(test)]
 mod tests {

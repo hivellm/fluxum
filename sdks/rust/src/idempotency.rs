@@ -12,7 +12,7 @@
 //! (both after the G5 wire freeze); the piece the freeze constrains — that
 //! a replayed call reuses its key — ships here, tested.
 
-use fluxum_protocol::{ClientMessage, ReducerCall};
+use crate::protocol::{ClientMessage, ReducerCall};
 
 /// A call queued for submission, carrying the stable key it will keep for
 /// every retry (CS-032).
@@ -21,7 +21,7 @@ pub struct QueuedCall {
     /// The reducer to run.
     pub reducer: String,
     /// Its positional arguments.
-    pub args: Vec<fluxum_protocol::FluxValue>,
+    pub args: Vec<crate::protocol::FluxValue>,
     /// The key minted when this call was enqueued. Stable across every
     /// resend: that stability *is* the exactly-once guarantee.
     pub idempotency_key: String,
@@ -72,7 +72,7 @@ impl OfflineQueue {
     pub fn enqueue(
         &mut self,
         reducer: impl Into<String>,
-        args: Vec<fluxum_protocol::FluxValue>,
+        args: Vec<crate::protocol::FluxValue>,
     ) -> String {
         let key = format!("{}:{}", self.client_id, self.next_seq);
         self.next_seq += 1;

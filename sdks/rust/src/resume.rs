@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 
-use fluxum_protocol::{ClientMessage, InitialData, Resume, TxUpdate};
+use crate::protocol::{ClientMessage, InitialData, Resume, TxUpdate};
 
 /// What a client should send for a subscription when a connection comes
 /// back (SPEC-021 CS-021).
@@ -109,7 +109,7 @@ impl ResumeTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluxum_protocol::{RowList, TableUpdate};
+    use crate::protocol::{RowList, TableUpdate};
 
     fn table(query_id: u32) -> TableUpdate {
         TableUpdate {

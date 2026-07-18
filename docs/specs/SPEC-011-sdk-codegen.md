@@ -40,7 +40,7 @@ Python, Go, and C# ship with 0.2.0 ("competitive launch", G7). C++ is P2 and uns
 | JavaScript/TypeScript | **P0** | T6.2 | FR-82 | Reference target; **browser-native** (binary FluxRPC over Streamable HTTP, SDK-080..084); powers the MVP demo app (T6.5) |
 | Python | P1 | T7.4 | FR-83 | asyncio-first |
 | Go | P1 | T7.5 | FR-85 | context-aware, idiomatic errors |
-| Rust | P1 | T6.4 | FR-84 | `fluxum-sdk` crate; shares `fluxum-protocol` (§7) |
+| Rust | P1 | T6.4 | FR-84 | `fluxum-sdk` crate; mirrors `fluxum-protocol` (§7) |
 | C# | P1 | T7.6 | FR-86 | async/await, NuGet |
 | C++ | P2 | — | FR-87 | Typed structs + reducer helpers only (SDK-063) |
 
@@ -435,10 +435,17 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   authenticates (SPEC-009), calls reducers, manages subscriptions
   (`Subscribe`/`SubscribeSingle`/`Unsubscribe`/`OneOffQuery`), and maintains the local cache
   with the same diff-application, update-coalescing, refcounting, bounded-queue,
-  reconnection, and schema-version-check semantics as SDK-040–SDK-047. It SHALL reuse `fluxum-protocol` for FluxValue, the FluxBIN codec, message
-  types, and the `Identity`/`ConnectionId`/`EntityId`/`Timestamp` newtypes — no duplicated wire
-  code. Trusted backend services (privileged server peers) use this same SDK with a
-  server-to-server identity (SPEC-009).
+  reconnection, and schema-version-check semantics as SDK-040–SDK-047. It SHALL use FluxValue,
+  the FluxBIN codec, message types, and the `Identity`/`ConnectionId`/`EntityId`/`Timestamp`
+  newtypes **mirrored verbatim** from `fluxum-protocol` into `sdks/rust/src/protocol/`, never a
+  reimplementation: `fluxum-sdk` is the only crate this project publishes (SDK-071), and a
+  published crate cannot depend on an unpublished one, so a shared crate would force an internal
+  server crate onto crates.io and couple every SDK release to it. The mirror SHALL be asserted
+  byte-for-byte by a test in the quality gate, so the server and the client cannot come to speak
+  different protocols. Trusted backend services (privileged server peers) use this same SDK with
+  a server-to-server identity (SPEC-009).
+  *(amended: the original text mandated depending on `fluxum-protocol` directly, which is
+  incompatible with publishing exactly one crate.)*
 
 - **SDK-051** [P1] `fluxum generate --lang rust` SHALL emit bindings that layer on `fluxum-sdk`:
   table structs with FluxBIN decode impls (SDK-020, SDK-041), typed reducer wrappers (SDK-030),
@@ -596,7 +603,9 @@ to the database**; there is no JSON fallback and no intermediate gateway.
    packaged runtime is ≤ 50 KB min+gzip (SDK-083); `fluxum://` in a browser fails fast with the
    actionable error (SDK-082).
 3. **Rust SDK (T6.4):** `fluxum-sdk` plus `--lang rust` bindings pass the client conformance
-   subset (SPEC-013); a symbol/type audit confirms all wire types come from `fluxum-protocol`.
+   subset (SPEC-013); a symbol/type audit confirms all wire types come from the `fluxum-protocol`
+   mirror in `sdks/rust/src/protocol/`, which the gate holds byte-identical to the source
+   (SDK-050).
 4. **Python SDK (T7.4):** `--lang python` bindings plus the asyncio runtime pass the shared
    conformance corpus in Python CI; public API is fully type-hinted (`py.typed`) and
    connection/subscription lifecycle works via async context managers (SDK-061).

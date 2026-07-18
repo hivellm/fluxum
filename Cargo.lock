@@ -537,7 +537,11 @@ dependencies = [
 name = "fluxum-sdk"
 version = "0.1.0"
 dependencies = [
- "fluxum-protocol",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "thiserror",
+ "thunder-rpc",
 ]
 
 [[package]]

@@ -6,8 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# Deliberately depends on nothing internal: `src/protocol/` is vendored from
+# `crates/fluxum-protocol` (see that module's docs) so this crate publishes on
+# its own, without releasing an internal server crate to crates.io alongside it.
 [dependencies]
-fluxum-protocol.workspace = true
+rmp-serde.workspace = true
+serde.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
+thunder-rpc.workspace = true
 
 [lints]
 workspace = true
