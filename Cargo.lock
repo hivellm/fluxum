@@ -1522,9 +1522,9 @@ dependencies = [
 
 [[package]]
 name = "thunder-rpc"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "30d850577d018a7c724f9151ead0083ef4e62d63f9df4a954220dea2d292d914"
+checksum = "85a5bb11422b6bc8bfa17d0c2b1399a3b5781d565ce6e341558ba324a7e917ad"
 dependencies = [
  "rmp-serde",
  "serde",

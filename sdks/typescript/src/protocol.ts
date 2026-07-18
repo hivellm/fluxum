@@ -12,11 +12,11 @@
 // (`[tag, payload]`), the RowList batches, and FluxBIN rows (see
 // `fluxbin.ts`) are schema-driven and have no Thunder equivalent.
 //
-// Note the one place the two protocols differ in the framing layer itself:
-// Fluxum uses a zero-length frame as a keep-alive (RPC-001/RPC-006) which
-// receivers ignore, whereas Thunder treats a zero-length body as a decode
-// error. `FluxumFrameReader` below handles that case before delegating, so
-// keep-alives never reach Thunder's decoder.
+// The zero-length keep-alive (RPC-001/RPC-006) used to be Fluxum's private
+// extension to the family framing. It is now WIRE-024, defined in SPEC-001 —
+// Thunder's raw frame path returns such a frame as an empty body rather than
+// rejecting it, so `FluxumFrameReader` only has to *skip* keep-alives, not
+// parse them out of the byte stream itself.
 
 import { FrameReader, DEFAULT_MAX_FRAME_BYTES as THUNDER_MAX_FRAME } from '@hivehub/thunder';
 import { decode as decodeMsg, encode as encodeMsg } from '@msgpack/msgpack';
@@ -58,20 +58,15 @@ export function encodeFrame(body: Uint8Array): Uint8Array {
 }
 
 /**
- * A frame reader over Thunder's, adding Fluxum's keep-alive semantics.
+ * Thunder's frame reader with Fluxum's cap and keep-alive handling.
  *
- * Thunder's `FrameReader` rejects a zero-length body; Fluxum's transports
- * send exactly that as a liveness tick. Rather than fork the reader, this
- * consumes a keep-alive itself and hands everything else to Thunder — so the
- * cap enforcement, partial-buffer handling and byte layout all stay in one
- * family-owned implementation.
+ * Everything about the framing — the length prefix, the cap check, the
+ * partial-buffer state machine — is Thunder's. This adds the two things that
+ * are Fluxum's: the 16 MB cap (RPC-061) instead of Thunder's 64 MiB default,
+ * and skipping keep-alive frames so callers only ever see real messages.
  */
 export class FluxumFrameReader {
   readonly #inner: FrameReader;
-  // Explicitly `ArrayBufferLike`: chunks arrive from the transport and may be
-  // backed by any buffer, so the field must not narrow to `ArrayBuffer` from
-  // the empty-array initializer.
-  #pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 
   constructor(options: { maxFrameBytes?: number } = {}) {
     this.#inner = new FrameReader({
@@ -81,19 +76,7 @@ export class FluxumFrameReader {
 
   /** Append bytes received from the transport. */
   push(chunk: Uint8Array): void {
-    if (this.#pending.length === 0) {
-      this.#pending = chunk;
-    } else {
-      const merged = new Uint8Array(this.#pending.length + chunk.length);
-      merged.set(this.#pending, 0);
-      merged.set(chunk, this.#pending.length);
-      this.#pending = merged;
-    }
-    this.#drainKeepAlives();
-    if (this.#pending.length > 0) {
-      this.#inner.push(this.#pending);
-      this.#pending = new Uint8Array(0);
-    }
+    this.#inner.push(chunk);
   }
 
   /**
@@ -101,19 +84,13 @@ export class FluxumFrameReader {
    * Keep-alives are consumed silently and never surface.
    */
   nextBody(): Uint8Array | null {
-    return this.#inner.nextBody();
-  }
-
-  /** Strip any leading zero-length frames before Thunder sees them. */
-  #drainKeepAlives(): void {
-    while (this.#pending.length >= FRAME_HEADER_LEN) {
-      const view = new DataView(
-        this.#pending.buffer,
-        this.#pending.byteOffset,
-        this.#pending.byteLength,
-      );
-      if (view.getUint32(0, true) !== 0) return;
-      this.#pending = this.#pending.subarray(FRAME_HEADER_LEN);
+    // A keep-alive arrives as an empty body (WIRE-024). Loop rather than
+    // return: a stream that has been idle sends several in a row, and the
+    // real message may sit behind them in the same buffer.
+    for (;;) {
+      const body = this.#inner.nextBody();
+      if (body === null) return null;
+      if (body.length > 0) return body;
     }
   }
 }

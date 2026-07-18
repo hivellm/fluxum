@@ -1,20 +1,21 @@
 //! Byte-for-byte parity with the HiveLLM family wire layer (SPEC-001).
 //!
 //! Fluxum's framing *is* Thunder's framing — `u32 LE length prefix +
-//! MessagePack body` (SPEC-006 RPC-001). The TypeScript SDK proves that by
-//! delegating to `@hivehub/thunder`'s `FrameReader`; the Rust side cannot yet,
-//! because `thunder::wire` only decodes a frame by deserializing the body into
-//! its own `Request`/`Response` and offers no borrowed-body variant
-//! (hivellm/thunder#6). Fluxum's bodies are its own `[tag, payload]` catalog
-//! decoded from borrowed slices, so `FrameCodec` stays hand-written for now.
+//! MessagePack body` (SPEC-006 RPC-001). Since Thunder 0.2.0 shipped
+//! `decode_frame_raw` (hivellm/thunder#6), `FrameCodec::decode` delegates
+//! outright, so decoding cannot diverge: there is only one implementation.
 //!
-//! "For now" is the risk this file removes: as long as these assertions hold,
-//! the two implementations cannot drift, and the day Thunder grows
-//! `decode_frame_raw` the switch is a deletion rather than a re-derivation.
+//! What remains worth asserting is the seam. Encoding is still four lines in
+//! `frame.rs`, because Thunder's `encode_frame` serializes a *value* while
+//! Fluxum already holds encoded body bytes — so those four lines are checked
+//! byte-for-byte against Thunder's encoder here. And the round trip is
+//! checked end to end: Fluxum must read what Thunder writes, including
+//! back-to-back frames in one buffer, where a prefix or slicing disagreement
+//! would desynchronize a whole connection rather than fail one message.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use fluxum_protocol::{FRAME_HEADER_LEN, Frame, FrameCodec};
+use fluxum_protocol::{DEFAULT_MAX_FRAME_BYTES, FRAME_HEADER_LEN, Frame, FrameCodec, FrameError};
 use thunder::wire::{Request, Value, encode_frame};
 
 /// Thunder frames a body; Fluxum frames the same body. The bytes must match.
@@ -34,7 +35,7 @@ fn fluxum_framing_reproduces_thunder_framing_byte_for_byte() {
         Request {
             id: u32::MAX,
             command: "SUBSCRIBE".to_owned(),
-            args: vec![Value::Bytes(vec![0, 1, 2, 255]), Value::Int(-1)],
+            args: vec![Value::Bytes(vec![0, 1, 2, 255].into()), Value::Int(-1)],
         },
     ];
 
@@ -100,12 +101,11 @@ fn fluxum_decodes_a_stream_of_thunder_frames() {
     assert_eq!(second, Frame::Body(&b[FRAME_HEADER_LEN..]));
 }
 
-/// The one *intended* divergence, pinned so it stays intentional: Fluxum reads
-/// a zero-length frame as a keep-alive (RPC-001/006), Thunder's typed decode
-/// rejects it. Both SDKs work around this today; hivellm/thunder#6 asks the
-/// family standard to define it instead.
+/// The keep-alive, which used to be Fluxum's private extension and is now
+/// WIRE-024. Thunder's raw decode hands a zero-length frame back as an empty
+/// body; naming it [`Frame::KeepAlive`] is all Fluxum still does.
 #[test]
-fn zero_length_frame_is_a_keepalive_here_and_an_error_in_thunder() {
+fn zero_length_frame_is_the_family_keepalive() {
     let keepalive = FrameCodec::keepalive();
     assert_eq!(keepalive, [0; FRAME_HEADER_LEN]);
 
@@ -113,8 +113,35 @@ fn zero_length_frame_is_a_keepalive_here_and_an_error_in_thunder() {
     assert_eq!(frame, Frame::KeepAlive);
     assert_eq!(consumed, FRAME_HEADER_LEN);
 
+    // The same bytes, straight from Thunder: a valid frame with no body.
+    let (body, total) = thunder::wire::decode_frame_raw(&keepalive, 16 * 1024 * 1024)
+        .unwrap()
+        .unwrap();
+    assert!(body.is_empty());
+    assert_eq!(total, FRAME_HEADER_LEN);
+}
+
+/// Fluxum's 16 MB cap (RPC-061) overrides Thunder's 64 MiB default, and the
+/// rejection still fires from the 4-byte prefix alone — the property that
+/// keeps a hostile prefix from allocating anything.
+#[test]
+fn fluxum_cap_overrides_the_thunder_default_and_fires_on_the_prefix() {
+    let codec = FrameCodec::default();
+    let over = DEFAULT_MAX_FRAME_BYTES + 1;
+    let prefix_only = over.to_le_bytes();
+
+    let err = codec.decode(&prefix_only).unwrap_err();
+    assert_eq!(
+        err,
+        FrameError::TooLarge {
+            len: u64::from(over),
+            max: DEFAULT_MAX_FRAME_BYTES,
+        }
+    );
+
+    // Thunder's own default would have accepted this length.
     assert!(
-        thunder::wire::decode_frame::<Request>(&keepalive).is_err(),
-        "if Thunder starts accepting zero-length frames, drop Fluxum's workaround"
+        (over as usize) < thunder::wire::DEFAULT_MAX_FRAME_BYTES,
+        "the test is only meaningful while Fluxum's cap is the stricter one"
     );
 }

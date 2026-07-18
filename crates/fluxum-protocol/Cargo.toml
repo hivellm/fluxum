@@ -11,10 +11,10 @@ rmp-serde.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true
+thunder-rpc.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
-thunder-rpc.workspace = true
 
 [lints]
 workspace = true

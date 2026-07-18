@@ -25,9 +25,10 @@ test('a message round-trips through the tagged envelope', () => {
 });
 
 test('keep-alive frames are consumed, not surfaced or thrown on', () => {
-  // The divergence that matters: Thunder treats a zero-length body as a
-  // decode error; Fluxum sends it as a liveness tick on the GET stream. If
-  // this regresses, an idle HTTP subscription tears itself down.
+  // A keep-alive is a zero-length frame (WIRE-024 / RPC-001/006) that Fluxum
+  // sends as a liveness tick on the GET stream. Thunder surfaces it as an
+  // empty body; it must never reach a caller as a message. If this regresses,
+  // an idle HTTP subscription tears itself down.
   const reader = new FluxumFrameReader();
   reader.push(KEEPALIVE_FRAME);
   assert.equal(reader.nextBody(), null, 'a lone keep-alive yields nothing');
@@ -38,6 +39,27 @@ test('keep-alive frames are consumed, not surfaced or thrown on', () => {
   const body = reader.nextBody();
   assert.ok(body, 'the real frame still arrives after keep-alives');
   assert.equal(decodeMessage(body).tag, 'Error');
+});
+
+test('a long idle burst of keep-alives does not hide the next message', () => {
+  // The case a `return` instead of a loop would break: a stream idle for a
+  // while emits several ticks back to back, and the real message lands in the
+  // same buffer behind them. One `nextBody()` call must still surface it.
+  const reader = new FluxumFrameReader();
+  const burst = new Uint8Array(KEEPALIVE_FRAME.length * 5);
+  for (let i = 0; i < 5; i += 1) {
+    burst.set(KEEPALIVE_FRAME, i * KEEPALIVE_FRAME.length);
+  }
+  const message = encodeMessage('Ping', []);
+  const chunk = new Uint8Array(burst.length + message.length);
+  chunk.set(burst, 0);
+  chunk.set(message, burst.length);
+
+  reader.push(chunk);
+  const body = reader.nextBody();
+  assert.ok(body, 'the message behind five keep-alives still surfaces');
+  assert.equal(decodeMessage(body).tag, 'Ping');
+  assert.equal(reader.nextBody(), null, 'and nothing is left over');
 });
 
 test('a partial frame asks for more bytes instead of throwing', () => {

@@ -40,13 +40,14 @@ MessagePack codec as the stated exception.
 | RowList slicing | Fluxum — `sliceRowList` |
 | FluxBIN row decoding | Fluxum — `fluxbin.ts` |
 
-### The one place we still wrap Thunder
+### What `FluxumFrameReader` still adds
 
-`FluxumFrameReader` consumes zero-length frames before delegating. Fluxum uses a zero-length
-frame as a keep-alive tick (SPEC-006 RPC-001/006) — the HTTP push stream emits them on idle —
-while Thunder currently treats a zero-length body as a decode error. Fluxum also passes its own
-16 MB cap (RPC-061) rather than taking Thunder's 64 MiB default.
+Two things, both genuinely Fluxum's: it passes the 16 MB cap (RPC-061) instead of Thunder's
+64 MiB default, and it skips keep-alive frames so callers only ever see real messages.
 
-The keep-alive divergence is filed upstream as [hivellm/thunder#6](https://github.com/hivellm/thunder/issues/6),
-asking the family standard to *define* the zero-length frame rather than leaving each product to
-work around it. When it does, this wrapper goes away.
+A keep-alive is a zero-length frame (SPEC-006 RPC-001/006) — the HTTP push stream emits them on
+idle. That used to be a Fluxum extension the wrapper had to parse out of the byte stream itself;
+it is now WIRE-024 in the family spec, and Thunder's reader hands one back as an empty body. The
+wrapper is a `length > 0` check over Thunder's reader, nothing more. That change came from
+[hivellm/thunder#6](https://github.com/hivellm/thunder/issues/6), filed while adopting Thunder
+here and shipped in 0.2.0.

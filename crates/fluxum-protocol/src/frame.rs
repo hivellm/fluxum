@@ -17,22 +17,21 @@
 //! buffer and reports how many bytes it consumed, so the same code drives
 //! TCP and Streamable HTTP.
 //!
-//! # Why this is hand-written and the TypeScript SDK's is not
+//! # What is Fluxum's here, and what is not
 //!
-//! The framing above is the family standard (SPEC-001, `thunder`), so the
-//! rule is to delegate to `thunder::wire` rather than keep a private copy.
-//! The TypeScript SDK does exactly that, via Thunder's `FrameReader`. Rust
-//! cannot yet: `thunder::wire` decodes a frame only by deserializing the
-//! body into its own `Request`/`Response`, and exposes no borrowed-body
-//! variant — which is precisely what the sans-IO API above needs, because
-//! Fluxum's bodies are its own `[tag, payload]` catalog decoded from
-//! borrowed slices. Asked upstream in hivellm/thunder#6; when it lands,
-//! this module becomes a thin wrapper (keeping the 16 MB cap and [`Frame`])
-//! rather than an implementation.
+//! The framing above is the family standard (SPEC-001), not a Fluxum format,
+//! so this module does not implement it — [`thunder::wire::decode_frame_raw`]
+//! does. The prefix read, the `max_frame_bytes` check and the body slicing
+//! all live there, and this module supplies only what is genuinely Fluxum's:
+//! the 16 MB cap (RPC-061, against Thunder's 64 MiB default), the [`Frame`]
+//! enum that names the keep-alive, and the error mapping onto Fluxum's wire
+//! error codes.
 //!
-//! Until then `tests/thunder_parity.rs` asserts these bytes against
-//! `thunder::wire::encode_frame`, so the duplication cannot become a
-//! divergence.
+//! Encoding stays four lines here because Thunder's `encode_frame` serializes
+//! a value into a frame, while Fluxum already holds encoded body bytes and
+//! needs only the prefix — going through Thunder would MessagePack-wrap a
+//! body that is already MessagePack. `tests/thunder_parity.rs` asserts those
+//! four lines against `thunder::wire::encode_frame` byte for byte.
 
 use crate::codes;
 
@@ -125,25 +124,31 @@ impl FrameCodec {
     ///   fires from the 4-byte header alone (RPC-061), respond with a 413
     ///   `Error` and close.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Option<(Frame<'a>, usize)>, FrameError> {
-        let Some(header) = buf.first_chunk::<FRAME_HEADER_LEN>() else {
+        let decoded = thunder::wire::decode_frame_raw(buf, self.max_frame_bytes as usize).map_err(
+            |err| match err {
+                thunder::wire::DecodeError::FrameTooLarge { body, .. } => FrameError::TooLarge {
+                    len: body as u64,
+                    max: self.max_frame_bytes,
+                },
+                // `decode_frame_raw` reports the framing only: a body it
+                // cannot slice is too large, full stop. Body-shaped failures
+                // (`Rmp`, `KeepAlive`) belong to the typed path, which Fluxum
+                // does not use — its bodies are its own `[tag, payload]`
+                // catalog, decoded by the caller from the borrowed slice.
+                other => unreachable!("raw frame decode cannot fail with {other:?}"),
+            },
+        )?;
+
+        let Some((body, total)) = decoded else {
             return Ok(None);
         };
-        let len = u32::from_le_bytes(*header);
-        if len > self.max_frame_bytes {
-            return Err(FrameError::TooLarge {
-                len: u64::from(len),
-                max: self.max_frame_bytes,
-            });
+        // WIRE-024 / RPC-001: an empty body is the keep-alive tick, not a
+        // message. Thunder hands it back as an empty slice; naming it is
+        // Fluxum's part.
+        if body.is_empty() {
+            return Ok(Some((Frame::KeepAlive, total)));
         }
-        if len == 0 {
-            return Ok(Some((Frame::KeepAlive, FRAME_HEADER_LEN)));
-        }
-        let len = len as usize;
-        if buf.len() - FRAME_HEADER_LEN < len {
-            return Ok(None);
-        }
-        let total = FRAME_HEADER_LEN + len;
-        Ok(Some((Frame::Body(&buf[FRAME_HEADER_LEN..total]), total)))
+        Ok(Some((Frame::Body(body), total)))
     }
 }
 

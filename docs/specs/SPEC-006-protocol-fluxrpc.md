@@ -73,14 +73,13 @@ hot path.
   Fluxum dialect. Fluxum owns only what sits *above* the frame boundary: the `[tag, payload]`
   envelope catalog (§3), RowList slicing, and FluxBIN (§6).
 
-  Current state: the TypeScript SDK delegates to `@hivehub/thunder`'s `FrameReader`. The Rust
-  `fluxum-protocol` still carries its own codec because `thunder::wire` decodes a frame only by
-  deserializing the body into its own message types and has no borrowed-body variant, which
-  Fluxum's zero-copy sans-IO decoding requires (tracked upstream as hivellm/thunder#6). That
-  codec is pinned byte-for-byte against Thunder's encoder by
-  `crates/fluxum-protocol/tests/thunder_parity.rs`, so the two cannot drift while the gap lasts.
-  The zero-length keep-alive is the one place Fluxum currently extends the family layer — the
-  same issue asks for it to be defined in SPEC-001 instead.
+  Current state: both SDKs delegate. The TypeScript SDK uses `@hivehub/thunder`'s `FrameReader`;
+  `fluxum-protocol` uses `thunder::wire::decode_frame_raw`, which Thunder 0.2.0 added for exactly
+  this (hivellm/thunder#6). Fluxum supplies only the 16 MB cap and the keep-alive naming; the
+  zero-length frame is no longer a Fluxum extension but WIRE-024 in SPEC-001. Encoding is still a
+  four-line prefix write on the Fluxum side, because Thunder's encoder serializes a value while
+  Fluxum already holds encoded body bytes — those four lines are pinned byte-for-byte against
+  Thunder's encoder by `crates/fluxum-protocol/tests/thunder_parity.rs`.
 
 - **RPC-002** [P0] **Multiplexing.** Every message SHALL carry an `id: u32` field chosen by the
   sender. Server responses SHALL echo the `id` of the corresponding request. Multiple in-flight

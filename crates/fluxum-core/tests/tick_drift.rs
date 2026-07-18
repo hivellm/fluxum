@@ -107,11 +107,15 @@ async fn run_600_phase() -> std::result::Result<u64, ()> {
     let dir = tempfile::tempdir().unwrap();
     let handle = start_tick(dir.path(), &TICK_60HZ).await;
     tokio::time::sleep(Duration::from_secs(10)).await;
+    // Stop before sampling. Reading the two counters off a live scheduler
+    // races it: a tick firing between the `COUNT` load and the `executions`
+    // load makes the stats look one ahead of the firings, and the comparison
+    // below fails on a scheduler that did nothing wrong.
+    let stats = Arc::clone(handle.tick_stats("counting_tick").unwrap());
+    handle.stop().await;
     let counted = COUNT.load(Ordering::SeqCst);
-    let stats = handle.tick_stats("counting_tick").unwrap();
     let warnings = stats.warnings.load(Ordering::SeqCst);
     let executions = stats.executions.load(Ordering::SeqCst);
-    handle.stop().await;
     assert_eq!(executions, counted, "stats mirror the firings");
     assert!(
         !OVERLAPPED.load(Ordering::SeqCst),

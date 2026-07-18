@@ -42,11 +42,10 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 tempfile = "3"
 thiserror = "2"
 # HiveLLM shared binary RPC (wire v1, frozen). Registry name `thunder-rpc`, lib
-# name `thunder` — call sites say `use thunder::`. Fluxum uses it as a
-# dev-dependency only: `thunder::wire` cannot yet decode a frame into a borrowed
-# body (hivellm/thunder#6), so `fluxum-protocol` keeps its own sans-IO codec and
-# pins byte-for-byte equality against Thunder's encoder in a test.
-thunder-rpc = { version = "0.1.1", default-features = false }
+# name `thunder` — call sites say `use thunder::`. `fluxum-protocol` delegates
+# the framing to `thunder::wire` (SPEC-006 RPC-001); default features off
+# because Fluxum needs only the sans-IO wire codec, not the client or server.
+thunder-rpc = { version = "0.2.0", default-features = false }
 tokio = { version = "1", default-features = false }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
