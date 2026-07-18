@@ -474,8 +474,14 @@ to the database**; there is no JSON fallback and no intermediate gateway.
 - **SDK-081** [P0] **Plain-JavaScript consumable.** The package SHALL ship compiled JavaScript
   (ESM and CJS) with `.d.ts` type declarations: TypeScript is a development convenience, never a
   requirement — vanilla-JS applications consume the same package with full runtime behavior.
-  The runtime SHALL have zero runtime dependencies and be importable via npm **and** directly in
-  a browser via `<script type="module">` / ESM CDN without a build step.
+  The runtime SHALL depend on no third-party packages, with one exception: the HiveLLM-family
+  wire layer (`@hivehub/thunder`, SPEC-001) and the MessagePack codec it is specified against.
+  Fluxum SHALL NOT re-implement the family framing standard; anything above the frame boundary
+  (the `[tag, payload]` envelope catalog, RowList slicing, FluxBIN) stays Fluxum-owned and
+  dependency-free. The runtime SHALL be importable via npm **and** directly in a browser via
+  `<script type="module">` / ESM CDN without a build step.
+  *(amended by phase6_thunder-wire-adoption: adopting the family wire layer beats a private copy
+  of it; the footprint cost is bounded by SDK-083, which is measured in CI.)*
 
 - **SDK-082** [P0] **Dual environment, one package.** The same package SHALL run in Node.js
   (FluxRPC TCP via `fluxum://host:15801`, or Streamable HTTP) and in browsers (Streamable HTTP

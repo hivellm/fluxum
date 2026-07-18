@@ -68,7 +68,10 @@ export function encodeFrame(body: Uint8Array): Uint8Array {
  */
 export class FluxumFrameReader {
   readonly #inner: FrameReader;
-  #pending = new Uint8Array(0);
+  // Explicitly `ArrayBufferLike`: chunks arrive from the transport and may be
+  // backed by any buffer, so the field must not narrow to `ArrayBuffer` from
+  // the empty-array initializer.
+  #pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
 
   constructor(options: { maxFrameBytes?: number } = {}) {
     this.#inner = new FrameReader({

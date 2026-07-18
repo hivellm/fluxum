@@ -66,6 +66,22 @@ hot path.
   - A frame with `length = 0` (no body) is a **keep-alive frame**: receivers SHALL ignore it. It
     is used by the Streamable HTTP push stream (RPC-006) and MAY be used on TCP.
 
+  This framing is the HiveLLM family wire standard (SPEC-001, `thunder`), not a Fluxum invention.
+  Implementations SHALL delegate the length prefix, the `max_frame_bytes` check (RPC-061) and the
+  body slicing to the family wire layer wherever it exposes them, rather than re-implementing
+  them; the bytes above are frozen and any divergence is a bug in the implementation, not a
+  Fluxum dialect. Fluxum owns only what sits *above* the frame boundary: the `[tag, payload]`
+  envelope catalog (§3), RowList slicing, and FluxBIN (§6).
+
+  Current state: the TypeScript SDK delegates to `@hivehub/thunder`'s `FrameReader`. The Rust
+  `fluxum-protocol` still carries its own codec because `thunder::wire` decodes a frame only by
+  deserializing the body into its own message types and has no borrowed-body variant, which
+  Fluxum's zero-copy sans-IO decoding requires (tracked upstream as hivellm/thunder#6). That
+  codec is pinned byte-for-byte against Thunder's encoder by
+  `crates/fluxum-protocol/tests/thunder_parity.rs`, so the two cannot drift while the gap lasts.
+  The zero-length keep-alive is the one place Fluxum currently extends the family layer — the
+  same issue asks for it to be defined in SPEC-001 instead.
+
 - **RPC-002** [P0] **Multiplexing.** Every message SHALL carry an `id: u32` field chosen by the
   sender. Server responses SHALL echo the `id` of the corresponding request. Multiple in-flight
   requests on a single connection SHALL be supported; responses MAY arrive out of order. (This is

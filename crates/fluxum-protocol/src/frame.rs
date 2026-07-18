@@ -16,6 +16,23 @@
 //! The codec is sans-IO: [`FrameCodec::decode`] reads from a caller-owned
 //! buffer and reports how many bytes it consumed, so the same code drives
 //! TCP and Streamable HTTP.
+//!
+//! # Why this is hand-written and the TypeScript SDK's is not
+//!
+//! The framing above is the family standard (SPEC-001, `thunder`), so the
+//! rule is to delegate to `thunder::wire` rather than keep a private copy.
+//! The TypeScript SDK does exactly that, via Thunder's `FrameReader`. Rust
+//! cannot yet: `thunder::wire` decodes a frame only by deserializing the
+//! body into its own `Request`/`Response`, and exposes no borrowed-body
+//! variant — which is precisely what the sans-IO API above needs, because
+//! Fluxum's bodies are its own `[tag, payload]` catalog decoded from
+//! borrowed slices. Asked upstream in hivellm/thunder#6; when it lands,
+//! this module becomes a thin wrapper (keeping the 16 MB cap and [`Frame`])
+//! rather than an implementation.
+//!
+//! Until then `tests/thunder_parity.rs` asserts these bytes against
+//! `thunder::wire::encode_frame`, so the duplication cannot become a
+//! divergence.
 
 use crate::codes;
 

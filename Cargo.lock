@@ -530,6 +530,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "thiserror",
+ "thunder-rpc",
 ]
 
 [[package]]
@@ -1517,6 +1518,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1ad99c4c6d32803332c548b1af0540b357b3f5fc0be8f6c6bfe8b2e6ae784070"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "thunder-rpc"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "30d850577d018a7c724f9151ead0083ef4e62d63f9df4a954220dea2d292d914"
+dependencies = [
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "thiserror",
 ]
 
 [[package]]
