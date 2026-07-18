@@ -219,7 +219,8 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     // `namespace` label so a tenant's load is attributable. Only the series
     // lines are appended — the HELP/TYPE headers were already emitted above,
     // and repeating them for the same metric name is invalid exposition.
-    for ns in ctx.namespaces() {
+    let tenants = ctx.namespaces();
+    for ns in &tenants {
         let block = ns
             .metrics()
             .prometheus_in_namespace(ns.name(), ns.last_tx_id());
@@ -229,6 +230,82 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
         {
             text.push_str(line);
             text.push('\n');
+        }
+    }
+    // SPEC-025 OPS-061: per-tenant quota usage and ceilings, so an operator
+    // sees headroom and can alert *before* a tenant starts being refused. An
+    // unset ceiling reports 0 ("no limit") next to usage, which is always
+    // meaningful.
+    if !tenants.is_empty() {
+        text.push_str(
+            "# HELP fluxum_tenant_memory_bytes Estimated in-memory footprint per tenant.\n\
+             # TYPE fluxum_tenant_memory_bytes gauge\n",
+        );
+        for ns in &tenants {
+            let _ = writeln!(
+                text,
+                "fluxum_tenant_memory_bytes{{namespace=\"{}\"}} {}",
+                ns.name(),
+                ns.memory_bytes()
+            );
+        }
+        text.push_str(
+            "# HELP fluxum_tenant_storage_bytes Durable commit-log bytes per tenant.\n\
+             # TYPE fluxum_tenant_storage_bytes gauge\n",
+        );
+        for ns in &tenants {
+            let _ = writeln!(
+                text,
+                "fluxum_tenant_storage_bytes{{namespace=\"{}\"}} {}",
+                ns.name(),
+                ns.storage_bytes()
+            );
+        }
+        text.push_str(
+            "# HELP fluxum_tenant_subscriptions_active Live subscription plans per tenant.\n\
+             # TYPE fluxum_tenant_subscriptions_active gauge\n",
+        );
+        for ns in &tenants {
+            let live = ns.subscriptions().lock().await.plan_count();
+            let _ = writeln!(
+                text,
+                "fluxum_tenant_subscriptions_active{{namespace=\"{}\"}} {live}",
+                ns.name(),
+            );
+        }
+        text.push_str(
+            "# HELP fluxum_tenant_quota_bytes Configured ceiling per tenant (0 = unlimited).\n\
+             # TYPE fluxum_tenant_quota_bytes gauge\n",
+        );
+        for ns in &tenants {
+            let q = *ns.quotas().quotas();
+            let _ = writeln!(
+                text,
+                "fluxum_tenant_quota_bytes{{namespace=\"{}\", quota=\"memory\"}} {}",
+                ns.name(),
+                q.max_memory_bytes.unwrap_or(0),
+            );
+            let _ = writeln!(
+                text,
+                "fluxum_tenant_quota_bytes{{namespace=\"{}\", quota=\"storage\"}} {}",
+                ns.name(),
+                q.max_storage_bytes.unwrap_or(0),
+            );
+        }
+        text.push_str(
+            "# HELP fluxum_tenant_quota_exceeded_total Times a tenant hit a quota (OPS-060).\n\
+             # TYPE fluxum_tenant_quota_exceeded_total counter\n",
+        );
+        for ns in &tenants {
+            for quota in crate::quota::Quota::ALL {
+                let _ = writeln!(
+                    text,
+                    "fluxum_tenant_quota_exceeded_total{{namespace=\"{}\", quota=\"{}\"}} {}",
+                    ns.name(),
+                    quota.as_str(),
+                    ns.quotas().exceeded(quota),
+                );
+            }
         }
     }
     // OBS-030/031: per-table row counts + an estimated MemStore footprint.

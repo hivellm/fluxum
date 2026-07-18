@@ -161,6 +161,48 @@ Given tenant A hits its reducer-rate quota
 When A keeps calling reducers
 Then A receives 429s while tenant B's latency is unaffected.
 
+#### Interface & implementation
+
+Quotas attach to a namespace (the per-tenant unit, OPS-050) and every ceiling
+is optional — a namespace with none behaves exactly as an unquotaed one:
+
+```rust
+ctx.register_namespace(Namespace::with_quotas(
+    "acme", engine, subscriptions, 256,
+    TenantQuotas {
+        max_reducer_calls_per_sec: Some(500.0),  // aggregate, with equal burst
+        max_subscriptions:         Some(1_000),
+        max_memory_bytes:          Some(512 << 20),
+        max_storage_bytes:         Some(4 << 30),
+    },
+)?);
+```
+
+Where each bites:
+
+| Quota | Checked | On breach |
+|---|---|---|
+| Reducer rate | admission, above the per-`(Identity, reducer)` limiter (RED-050) | retryable `REDUCER_RATE_LIMITED` (429) |
+| Subscriptions | before registering, against the tenant's live plan count | typed error |
+| Memory | before admitting a write, on the estimated in-memory footprint | typed exhaustion error |
+| Storage | before admitting a write, on durable commit-log bytes (sampled, ~1 s cache) | typed exhaustion error |
+
+The rate ceiling is retryable because the tenant is merely going too fast; the
+exhaustion ceilings are not, since retrying a write against a full quota just
+fails again until the operator raises it or the tenant frees space. Refusing at
+*admission* is what protects the neighbours: a refused call costs no
+transaction, and no eviction is ever forced on another tenant's frames because
+each namespace owns its own store. The subscription count is read from the
+tenant's own manager rather than tracked alongside it, so the ceiling cannot
+drift as connections come and go.
+
+Usage and ceilings are exposed per tenant (OPS-061):
+`fluxum_tenant_memory_bytes`, `fluxum_tenant_storage_bytes`,
+`fluxum_tenant_subscriptions_active`, `fluxum_tenant_quota_bytes{quota}` (0 =
+unlimited) and `fluxum_tenant_quota_exceeded_total{quota}`, all labelled by
+`namespace` and emitted for every quota label even at zero, so an alert never
+goes stale for lack of a series.
+
 ## 8. Non-goals
 
 - Full multi-tenant SaaS billing/control plane (delegated to HiveHub.Cloud, family pattern).

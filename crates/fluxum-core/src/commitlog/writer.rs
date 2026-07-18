@@ -144,6 +144,19 @@ impl CommitLog {
         self.shard_id
     }
 
+    /// Total on-disk bytes of this log's segments — the durable footprint a
+    /// per-tenant storage quota is measured against (SPEC-025 OPS-060). A
+    /// segment that vanishes mid-scan (compaction) simply contributes zero.
+    pub fn disk_bytes(&self) -> Result<u64> {
+        let mut total = 0u64;
+        for seg in list_segments(&self.dir, self.shard_id)? {
+            if let Ok(meta) = std::fs::metadata(&seg.path) {
+                total = total.saturating_add(meta.len());
+            }
+        }
+        Ok(total)
+    }
+
     /// Run an audit query over this log's durable segments (SPEC-025 OPS-020).
     /// Reads only flushed records; a just-committed transaction appears once
     /// it is durable ([`CommitLog::wait_durable`]).

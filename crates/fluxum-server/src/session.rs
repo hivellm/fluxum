@@ -322,6 +322,22 @@ impl Session {
         idempotency_key: Option<String>,
     ) -> Routed {
         let (caller, _, _) = self.authed();
+        // SPEC-025 OPS-060: the tenant's own ceilings, above the
+        // per-(Identity, reducer) limiter. Checked at admission, so a
+        // refused call costs no transaction and never touches another
+        // tenant's admission or latency.
+        if let Some(ns) = &self.namespace {
+            if let Err(e) = ns.quotas().admit_reducer_call(ns.name()) {
+                return Routed::reply(from_error(Some(id), &e));
+            }
+            if let Err(e) = ns.quotas().admit_write(
+                ns.name(),
+                || ns.memory_bytes(),
+                || ns.engine().pipeline().log().disk_bytes().ok(),
+            ) {
+                return Routed::reply(from_error(Some(id), &e));
+            }
+        }
         let outcome = self
             .engine()
             .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
@@ -425,6 +441,17 @@ impl Session {
         let mut manager = self.subscriptions().lock().await;
         let mut responses = Vec::with_capacity(queries.len());
         for sql in queries {
+            // SPEC-025 OPS-060: the tenant's subscription ceiling, read from
+            // its own manager each time so the count cannot drift as
+            // connections come and go — and re-checked per query, so a batch
+            // cannot vault over the ceiling in one request.
+            if let Some(ns) = &self.namespace {
+                let live = u64::try_from(manager.plan_count()).unwrap_or(u64::MAX);
+                if let Err(e) = ns.quotas().admit_subscription(ns.name(), live) {
+                    responses.push(from_error(Some(id), &e));
+                    break;
+                }
+            }
             match manager.subscribe(connection, subscriber.clone(), &sql, &snapshot) {
                 Ok(mut subscribed) => {
                     subscribed.initial.id = id;

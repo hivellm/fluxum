@@ -25,6 +25,7 @@ pub mod connguard;
 pub mod http;
 pub mod logging;
 pub mod namespace;
+pub mod quota;
 pub mod session;
 pub mod shard;
 pub mod tcp;
