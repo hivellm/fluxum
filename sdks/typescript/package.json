@@ -1,0 +1,27 @@
+{
+  "name": "@hivehub/fluxum",
+  "version": "0.1.0",
+  "description": "Fluxum realtime database client — typed bindings over the HiveLLM binary wire (Thunder)",
+  "type": "module",
+  "license": "Apache-2.0",
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hivellm/fluxum.git",
+    "directory": "sdks/typescript"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@hivehub/thunder": "^0.1.1",
+    "@msgpack/msgpack": "^3.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "typescript": "^5"
+  }
+}

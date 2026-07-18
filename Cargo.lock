@@ -455,6 +455,10 @@ version = "0.1.0"
 [[package]]
 name = "fluxum-cli"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tempfile",
+]
 
 [[package]]
 name = "fluxum-core"
@@ -540,7 +544,9 @@ name = "fluxum-server"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "fluxum-cli",
  "fluxum-core",
+ "fluxum-macros",
  "fluxum-protocol",
  "rmp-serde",
  "serde_json",
