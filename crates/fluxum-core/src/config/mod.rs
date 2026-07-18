@@ -63,6 +63,8 @@ pub struct ServerConfig {
     /// Max inbound frame body size (RPC-061); frames above it are rejected
     /// with `413` and the connection is closed.
     pub max_frame_bytes: ByteSize,
+    /// Pre-auth connection-abuse limits (SPEC-026 SEC-030/031).
+    pub connection_limits: ConnectionLimitsConfig,
 }
 
 impl Default for ServerConfig {
@@ -73,6 +75,59 @@ impl Default for ServerConfig {
             tcp_port: 15801,
             idle_timeout_secs: 60,
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
+            connection_limits: ConnectionLimitsConfig::default(),
+        }
+    }
+}
+
+/// Pre-auth connection-abuse protection (SPEC-026 §4, SEC-030/031): the
+/// caps the transports enforce on the *unauthenticated* surface, keyed by
+/// peer IP, independent of the post-auth per-`(Identity, reducer)` reducer
+/// limiter (SPEC-004).
+///
+/// Every limit defaults **permissively** — high enough that a normal
+/// deployment and its well-behaved clients never notice, low enough that a
+/// flood, brute-force, or slowloris is contained. A `0` disables the
+/// individual limit (opt-out), so an operator can turn any one off without
+/// disabling the rest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConnectionLimitsConfig {
+    /// Max concurrent connections from one peer IP (SEC-030). `0` = no cap.
+    pub max_conns_per_ip: u32,
+    /// Sustained connection-accept rate per peer IP, connections/sec, with a
+    /// matching burst (SEC-030). `0` = no rate limit.
+    pub accept_rate_per_sec: f64,
+    /// Time budget, seconds, for a connection to complete its first
+    /// successful `Authenticate` (SEC-031, slowloris): a connection that has
+    /// not authenticated within it is dropped. `0` = no handshake deadline
+    /// (the ordinary idle timeout still applies).
+    pub handshake_timeout_secs: u64,
+    /// Max size, bytes, of a single *pre-auth* frame (SEC-031): a larger
+    /// handshake frame is dropped before it is parsed. `0` = fall back to
+    /// the ordinary `max_frame_bytes`.
+    pub handshake_max_bytes: ByteSize,
+    /// Consecutive failed `Authenticate` attempts from a peer IP before its
+    /// further connection attempts are throttled with exponential backoff
+    /// (SEC-031). `0` = no failed-auth throttle.
+    pub failed_auth_threshold: u32,
+    /// Base backoff after the threshold is crossed, milliseconds; doubles
+    /// per subsequent failure up to `failed_auth_backoff_max_ms`.
+    pub failed_auth_backoff_base_ms: u64,
+    /// Ceiling for the exponential failed-auth backoff, milliseconds.
+    pub failed_auth_backoff_max_ms: u64,
+}
+
+impl Default for ConnectionLimitsConfig {
+    fn default() -> Self {
+        Self {
+            max_conns_per_ip: 1024,
+            accept_rate_per_sec: 512.0,
+            handshake_timeout_secs: 10,
+            handshake_max_bytes: ByteSize(64 << 10),
+            failed_auth_threshold: 10,
+            failed_auth_backoff_base_ms: 100,
+            failed_auth_backoff_max_ms: 30_000,
         }
     }
 }

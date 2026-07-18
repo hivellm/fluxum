@@ -161,12 +161,25 @@ pub async fn serve(
             tokio::select! {
                 _ = accept_shutdown.notified() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, _peer)) = accepted else { continue };
-                    let conn_state = Arc::clone(&state);
-                    let conn_shutdown = accept_shutdown.clone();
-                    tokio::spawn(async move {
-                        let _ = serve_connection(conn_state, stream, conn_shutdown).await;
-                    });
+                    let Ok((stream, peer)) = accepted else { continue };
+                    // SEC-030/031: gate the pre-auth surface per peer IP, the
+                    // same guard the TCP transport uses (shared via ctx).
+                    let ip = peer.ip();
+                    match state.ctx.conn_guard().try_accept(ip) {
+                        Ok(permit) => {
+                            let conn_state = Arc::clone(&state);
+                            let conn_shutdown = accept_shutdown.clone();
+                            tokio::spawn(async move {
+                                let _ = serve_connection(conn_state, stream, ip, permit, conn_shutdown).await;
+                            });
+                        }
+                        Err(reason) => {
+                            state.ctx.metrics().note_conn_rejected(reason);
+                            tracing::debug!(target: "fluxum::http", %ip, reason = reason.as_str(),
+                                "refused a connection: pre-auth abuse limit");
+                            drop(stream);
+                        }
+                    }
                 }
             }
         }
@@ -183,8 +196,13 @@ pub async fn serve(
 async fn serve_connection(
     state: Arc<HttpState>,
     mut stream: TcpStream,
+    ip: std::net::IpAddr,
+    permit: crate::connguard::ConnPermit,
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
+    // Holds the peer's SEC-030 concurrent-connection slot for the connection's
+    // whole life (a GET stream can be long-lived); released on drop.
+    let _permit = permit;
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
         let request = match read_request(&mut stream, &mut buf).await? {
@@ -206,7 +224,7 @@ async fn serve_connection(
                 return Ok(());
             }
             ("POST", "/rpc") => {
-                handle_post(&state, &mut stream, &request).await?;
+                handle_post(&state, &mut stream, ip, &request).await?;
                 true
             }
             ("GET", "/rpc") => {
@@ -319,11 +337,27 @@ async fn handle_admin(
 async fn handle_post(
     state: &Arc<HttpState>,
     stream: &mut TcpStream,
+    ip: std::net::IpAddr,
     request: &Request,
 ) -> io::Result<()> {
     if !request.header_eq("content-type", CONTENT_TYPE) {
         return write_simple(stream, 415, "Unsupported Media Type").await;
     }
+    let session_token = request.header("fluxum-session");
+
+    // SEC-031: a request without a session token is a pre-auth handshake; cap
+    // its body so an oversized handshake is refused before it is parsed.
+    if session_token.is_none()
+        && let Some(cap) = state.ctx.conn_guard().limits().handshake_max_bytes
+        && request.body.len() > cap as usize
+    {
+        state
+            .ctx
+            .metrics()
+            .note_conn_rejected(fluxum_core::metrics::ConnRejectReason::HandshakeBudget);
+        return write_simple(stream, 413, "Payload Too Large").await;
+    }
+
     let codec = FrameCodec::new(state.options.max_frame_bytes);
     let messages = match decode_frames(&codec, &request.body) {
         Ok(messages) => messages,
@@ -332,8 +366,12 @@ async fn handle_post(
             return write_simple(stream, http_status(code), "").await;
         }
     };
-
-    let session_token = request.header("fluxum-session");
+    // SEC-031: does this request carry an `Authenticate`? Combined with the
+    // pre-routing auth state (below), its outcome drives the brute-force
+    // throttle.
+    let carries_authenticate = messages
+        .iter()
+        .any(|m| matches!(m, fluxum_protocol::ClientMessage::Authenticate(_)));
 
     // Load or create the session's router state.
     let (mut router_state, connection_id, new_session) = if let Some(token) = &session_token {
@@ -352,6 +390,7 @@ async fn handle_post(
     } else {
         (SessionState::Unauthenticated, 0, true)
     };
+    let was_authed = matches!(router_state, SessionState::Authenticated { .. });
 
     // Route every frame through the transport-independent session core.
     let mut responses: Vec<ServerMessage> = Vec::new();
@@ -366,6 +405,17 @@ async fn handle_post(
             }
         }
         router_state = session.into_state();
+    }
+
+    // SEC-031: record a pre-auth `Authenticate` outcome so the guard can
+    // throttle a brute-force reconnecting per guess. A success clears the
+    // peer's streak; a failure advances it toward backoff.
+    if !was_authed && carries_authenticate {
+        if matches!(router_state, SessionState::Authenticated { .. }) {
+            state.ctx.conn_guard().note_auth_success(ip);
+        } else {
+            state.ctx.conn_guard().note_auth_failure(ip);
+        }
     }
 
     // On a fresh session that just authenticated, register it + its outbound

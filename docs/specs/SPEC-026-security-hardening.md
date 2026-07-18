@@ -84,6 +84,28 @@ Given an address sending many bad tokens
 When it exceeds the failed-auth threshold
 Then further connection attempts from it are delayed/refused and counted, without affecting other clients.
 
+#### Configuration & implementation
+
+Both transports share one per-IP guard (`fluxum_server::connguard::ConnGuard`,
+held on the `ShardContext`), gating at the accept path before a session
+exists; the handshake time/size budget lives in the TCP read loop and the HTTP
+pre-auth POST path. Every limit defaults permissively and is opt-out at `0`:
+
+```yaml
+server:
+  connection_limits:
+    max_conns_per_ip: 1024           # SEC-030 concurrent cap (0 = uncapped)
+    accept_rate_per_sec: 512         # SEC-030 accept rate/sec + burst (0 = off)
+    handshake_timeout_secs: 10       # SEC-031 slowloris budget (0 = off)
+    handshake_max_bytes: 65536       # SEC-031 pre-auth frame cap (0 = max_frame_bytes)
+    failed_auth_threshold: 10        # SEC-031 backoff after N bad tokens (0 = off)
+    failed_auth_backoff_base_ms: 100 # doubles per failure past the threshold, capped
+    failed_auth_backoff_max_ms: 30000
+```
+
+Rejections increment `fluxum_conn_rejected_total{shard, reason}` with
+`reason ∈ {conn_cap, accept_rate, failed_auth, handshake_budget}` (SEC-032).
+
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).

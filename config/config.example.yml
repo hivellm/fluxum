@@ -16,6 +16,16 @@ server:
   tcp_host: "127.0.0.1"      # bind address for both listeners
   http_port: 15800           # HTTP: admin API + /rpc (FluxRPC over Streamable HTTP)
   tcp_port: 15801            # FluxRPC binary TCP
+  # Pre-auth connection-abuse protection (SPEC-026 SEC-030/031). Every knob
+  # defaults permissively; a value of 0 disables that one limit.
+  connection_limits:
+    max_conns_per_ip: 1024           # concurrent connections per peer IP (0 = uncapped)
+    accept_rate_per_sec: 512         # connection accept rate/sec per IP, equal burst (0 = off)
+    handshake_timeout_secs: 10       # budget to finish Authenticate; blunts slowloris (0 = off)
+    handshake_max_bytes: 65536       # max pre-auth frame size (0 = fall back to max_frame_bytes)
+    failed_auth_threshold: 10        # consecutive bad Authenticate before backoff (0 = off)
+    failed_auth_backoff_base_ms: 100 # base backoff, doubles per failure past the threshold
+    failed_auth_backoff_max_ms: 30000
 
 runtime:
   worker_threads: auto       # auto = effective cores (min 1)

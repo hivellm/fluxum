@@ -21,6 +21,7 @@
 //!   echoed id (RPC-002), and the fan-out task that pushes `TxUpdate`s.
 
 pub mod admin;
+pub mod connguard;
 pub mod http;
 pub mod logging;
 pub mod session;
@@ -172,6 +173,11 @@ pub struct ShardContext {
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
+    /// The pre-auth connection-abuse guard (SPEC-026 SEC-030/031), shared by
+    /// both transports so the per-IP view is unified. Installed once via
+    /// [`ShardContext::set_conn_guard`]; a default permissive guard is
+    /// materialized on first use if none is installed.
+    conn_guard: std::sync::OnceLock<Arc<crate::connguard::ConnGuard>>,
     /// Process start instant, for the `/health` `uptime_s` field (OBS-060).
     started: std::time::Instant,
     /// SPEC-025 OPS-030: the shard is draining for a rolling restart. New
@@ -266,6 +272,7 @@ impl ShardContext {
             ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
+            conn_guard: std::sync::OnceLock::new(),
             started: std::time::Instant::now(),
             effective_config: std::sync::OnceLock::new(),
             draining: std::sync::atomic::AtomicBool::new(false),
@@ -443,6 +450,26 @@ impl ShardContext {
     /// The installed plugin registry, if any.
     pub fn plugins(&self) -> Option<&Arc<fluxum_core::plugin::PluginRegistry>> {
         self.plugins.get()
+    }
+
+    /// Install the pre-auth connection-abuse guard (SPEC-026 SEC-030/031),
+    /// built from `config.server.connection_limits`. Call before serving; a
+    /// second call is ignored. If never called, [`ShardContext::conn_guard`]
+    /// materializes a default permissive guard on first use.
+    pub fn set_conn_guard(&self, guard: Arc<crate::connguard::ConnGuard>) {
+        let _ = self.conn_guard.set(guard);
+    }
+
+    /// The shared connection-abuse guard, materializing a default permissive
+    /// one (SEC-030/031) if none was installed — so the transports always
+    /// gate through the same instance whether or not the server configured
+    /// limits explicitly.
+    pub fn conn_guard(&self) -> &Arc<crate::connguard::ConnGuard> {
+        self.conn_guard.get_or_init(|| {
+            Arc::new(crate::connguard::ConnGuard::new(
+                crate::connguard::ConnLimits::default(),
+            ))
+        })
     }
 
     /// Install the shard's blob store (SPEC-023 DMX-040): attaches it to the

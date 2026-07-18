@@ -168,6 +168,46 @@ pub struct Metrics {
     connections_total: AtomicU64,
     auth_success: AtomicU64,
     auth_failure: AtomicU64,
+    conn_rejected_conn_cap: AtomicU64,
+    conn_rejected_accept_rate: AtomicU64,
+    conn_rejected_failed_auth: AtomicU64,
+    conn_rejected_handshake_budget: AtomicU64,
+}
+
+/// Why the transports refused a connection on the pre-auth surface
+/// (SPEC-026 SEC-032) — the `reason` label of
+/// `fluxum_conn_rejected_total{shard, reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnRejectReason {
+    /// The peer IP was at its concurrent-connection cap (SEC-030).
+    ConnCap,
+    /// The peer IP exceeded its connection accept rate (SEC-030).
+    AcceptRate,
+    /// The peer IP is in failed-`Authenticate` backoff (SEC-031).
+    FailedAuth,
+    /// The handshake blew its time or size budget (SEC-031, slowloris).
+    HandshakeBudget,
+}
+
+impl ConnRejectReason {
+    /// The metric `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConnCap => "conn_cap",
+            Self::AcceptRate => "accept_rate",
+            Self::FailedAuth => "failed_auth",
+            Self::HandshakeBudget => "handshake_budget",
+        }
+    }
+
+    /// Every reason, so `/metrics` emits a zero series per label rather than
+    /// have one first appear only when it fires.
+    pub const ALL: [Self; 4] = [
+        Self::ConnCap,
+        Self::AcceptRate,
+        Self::FailedAuth,
+        Self::HandshakeBudget,
+    ];
 }
 
 impl Metrics {
@@ -193,6 +233,10 @@ impl Metrics {
             connections_total: AtomicU64::new(0),
             auth_success: AtomicU64::new(0),
             auth_failure: AtomicU64::new(0),
+            conn_rejected_conn_cap: AtomicU64::new(0),
+            conn_rejected_accept_rate: AtomicU64::new(0),
+            conn_rejected_failed_auth: AtomicU64::new(0),
+            conn_rejected_handshake_budget: AtomicU64::new(0),
         })
     }
 
@@ -306,6 +350,26 @@ impl Metrics {
             &self.auth_failure
         }
         .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// SEC-032: the transports refused a connection on the pre-auth surface.
+    pub fn note_conn_rejected(&self, reason: ConnRejectReason) {
+        self.conn_rejected_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current reject count for `reason`.
+    pub fn conn_rejected(&self, reason: ConnRejectReason) -> u64 {
+        self.conn_rejected_counter(reason).load(Ordering::Relaxed)
+    }
+
+    fn conn_rejected_counter(&self, reason: ConnRejectReason) -> &AtomicU64 {
+        match reason {
+            ConnRejectReason::ConnCap => &self.conn_rejected_conn_cap,
+            ConnRejectReason::AcceptRate => &self.conn_rejected_accept_rate,
+            ConnRejectReason::FailedAuth => &self.conn_rejected_failed_auth,
+            ConnRejectReason::HandshakeBudget => &self.conn_rejected_handshake_budget,
+        }
     }
 
     /// Render the `fluxum_*` block this shard owns (OBS-010..OBS-050) in
@@ -445,6 +509,24 @@ impl Metrics {
             self.auth_success.load(Ordering::Relaxed),
             self.auth_failure.load(Ordering::Relaxed),
         );
+
+        // --- pre-auth connection abuse rejections (SEC-032) ---
+        // Every reason label is emitted, even at zero, so an alert on a rate
+        // does not go stale-for-lack-of-series while the surface is healthy.
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_conn_rejected_total Connections refused on the pre-auth surface \
+             by reason (SPEC-026 SEC-032).\n\
+             # TYPE fluxum_conn_rejected_total counter"
+        );
+        for reason in ConnRejectReason::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_conn_rejected_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.conn_rejected(reason),
+            );
+        }
         out
     }
 }
