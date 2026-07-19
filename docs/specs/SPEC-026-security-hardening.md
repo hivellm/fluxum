@@ -105,7 +105,44 @@ server:
 
 Rejections increment `fluxum_conn_rejected_total{shard, reason}` with
 `reason ∈ {conn_cap, accept_rate, failed_auth, handshake_budget,
-proxy_preamble, proxy_header}` (SEC-032).
+proxy_preamble, proxy_header, blocked, global_cap}` (SEC-032).
+
+### Requirement: IP blocklist / allowlist and global ceiling
+- **SEC-033** [P1] The guard SHALL refuse (reason `blocked`) any resolved client IP that matches
+  `server.connection_limits.blocklist` (IP/CIDR, IPv4+IPv6), or a runtime ban, or — when
+  `server.connection_limits.allowlist` is non-empty — fails to match the allowlist (a non-empty
+  allowlist is **exclusive**; the blocklist still wins over an allowlist hit). The check runs before
+  any per-IP state is touched or allocated, so a flood of banned addresses cannot grow guard memory.
+  Runtime bans are managed via the admin API — `POST /bans` (`{"entry", "ttl_secs"?}`), `DELETE
+  /bans/{entry}`, `GET /bans` (static + runtime entries with remaining TTL) — are runtime state only
+  (a restart clears them; the static list is the durable path), and a TTL ban readmits by itself on
+  expiry.
+- **SEC-034** [P1] `server.connection_limits.max_total_conns` (`0` = uncapped, the default) SHALL
+  bound concurrent connections across **all** peers (reason `global_cap`), checked before per-IP
+  state — the backstop a many-IP distributed flood cannot walk past. Lowering it at runtime never
+  evicts live connections; it only gates new admissions.
+- Both lists and the ceiling are validated at load and hot-reloadable (OPS-040); with everything at
+  defaults the behavior is byte-identical to a guard without them.
+
+#### Scenario: A banned address is refused on both transports
+Given `10.9.9.9` runtime-banned via `POST /bans`
+When it attempts a TCP connection and an HTTP request before authenticating
+Then both are refused before any session work, counted as `blocked`, and `DELETE /bans/10.9.9.9`
+readmits it immediately.
+
+#### Scenario: A distributed flood hits the global ceiling
+Given `max_total_conns: 1000` and a flood from thousands of distinct addresses
+When connection 1001 arrives while 1000 are live
+Then it is refused with `global_cap`, established connections are untouched, and slots freed by
+disconnects readmit newcomers.
+
+```yaml
+server:
+  connection_limits:
+    blocklist: []                    # SEC-033 refused outright (IP/CIDR)
+    allowlist: []                    # SEC-033 non-empty = only these connect
+    max_total_conns: 0               # SEC-034 global ceiling (0 = uncapped)
+```
 
 ### Requirement: Trusted-proxy client-IP resolution
 - **SEC-035** [P1] When `server.trusted_proxies` (IP/CIDR list, IPv4+IPv6, default empty = off) names

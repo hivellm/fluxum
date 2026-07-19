@@ -30,11 +30,13 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use fluxum_core::config::ConnectionLimitsConfig;
 pub use fluxum_core::metrics::ConnRejectReason;
+use fluxum_core::net::{IpNet, IpSet};
 
 /// The resolved limits a [`ConnGuard`] enforces, in native units. Built from
 /// the serde [`ConnectionLimitsConfig`]; a `0`/absent limit becomes `None`.
@@ -155,21 +157,74 @@ impl IpState {
     }
 }
 
-/// The shared per-IP connection guard (SEC-030/031). One per server, shared
-/// by both transports through the `ShardContext` so the per-IP view is
-/// unified across TCP and HTTP.
+/// The static access lists (SEC-033): who is banned outright and — when the
+/// allowlist is non-empty — who alone is admitted. The blocklist wins over
+/// an allowlist hit, so an operator can carve exceptions out of an allowed
+/// block.
+#[derive(Debug, Default)]
+struct AccessLists {
+    block: IpSet,
+    allow: IpSet,
+    /// The raw blocklist entries, kept for `GET /admin/bans` listing.
+    block_entries: Vec<String>,
+}
+
+/// One runtime ban (SEC-033): an entry from `POST /admin/bans`, optionally
+/// expiring. Runtime state only — a restart clears it; the static config
+/// list is the durable path.
+#[derive(Debug, Clone, Copy)]
+struct RuntimeBan {
+    net: IpNet,
+    expires: Option<Instant>,
+}
+
+/// A runtime ban as listed by `GET /admin/bans`.
+#[derive(Debug, Clone)]
+pub struct BanInfo {
+    /// The entry as it was banned (IP or CIDR).
+    pub entry: String,
+    /// Remaining time, or `None` for a ban with no TTL.
+    pub remaining: Option<Duration>,
+}
+
+/// The per-IP map plus the global live-connection count, one lock: the
+/// SEC-034 ceiling check and the per-IP admission must be atomic with the
+/// counter they read, or two racing accepts could both squeeze past the
+/// last slot.
+#[derive(Debug, Default)]
+struct GuardState {
+    ips: HashMap<IpAddr, IpState>,
+    total_active: u32,
+}
+
+/// The shared per-IP connection guard (SEC-030/031/033/034). One per
+/// server, shared by both transports through the `ShardContext` so the
+/// per-IP view is unified across TCP and HTTP.
 #[derive(Debug)]
 pub struct ConnGuard {
     limits: ConnLimits,
-    ips: Mutex<HashMap<IpAddr, IpState>>,
+    state: Mutex<GuardState>,
+    /// SEC-033 static lists; hot-reloadable via `set_access_lists`.
+    access: RwLock<AccessLists>,
+    /// SEC-033 runtime bans, keyed by the entry string they were created
+    /// with; expired entries are purged lazily on check/list.
+    bans: Mutex<HashMap<String, RuntimeBan>>,
+    /// SEC-034 global concurrent-connection ceiling (`0` = uncapped);
+    /// hot-reloadable.
+    max_total_conns: AtomicU32,
 }
 
 impl ConnGuard {
-    /// A guard enforcing `limits`.
+    /// A guard enforcing `limits`, with empty access lists and no global
+    /// ceiling until [`ConnGuard::set_access_lists`] /
+    /// [`ConnGuard::set_max_total_conns`] install them.
     pub fn new(limits: ConnLimits) -> Self {
         Self {
             limits,
-            ips: Mutex::new(HashMap::new()),
+            state: Mutex::new(GuardState::default()),
+            access: RwLock::new(AccessLists::default()),
+            bans: Mutex::new(HashMap::new()),
+            max_total_conns: AtomicU32::new(0),
         }
     }
 
@@ -178,15 +233,123 @@ impl ConnGuard {
         &self.limits
     }
 
-    fn ips(&self) -> std::sync::MutexGuard<'_, HashMap<IpAddr, IpState>> {
-        self.ips.lock().unwrap_or_else(|e| e.into_inner())
+    fn state(&self) -> std::sync::MutexGuard<'_, GuardState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Install the SEC-033 static lists (boot and every hot reload).
+    ///
+    /// # Errors
+    /// An entry that is not an IP address or CIDR block; nothing is applied.
+    pub fn set_access_lists(
+        &self,
+        blocklist: &[String],
+        allowlist: &[String],
+    ) -> fluxum_core::Result<()> {
+        let block = IpSet::parse(blocklist)?;
+        let allow = IpSet::parse(allowlist)?;
+        *self
+            .access
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = AccessLists {
+            block,
+            allow,
+            block_entries: blocklist.to_vec(),
+        };
+        Ok(())
+    }
+
+    /// Install the SEC-034 global ceiling (`0` = uncapped). Lowering it
+    /// never evicts live connections; it only gates new admissions.
+    pub fn set_max_total_conns(&self, cap: u32) {
+        self.max_total_conns.store(cap, Ordering::Relaxed);
+    }
+
+    /// Ban `entry` (IP or CIDR) at runtime (SEC-033), optionally expiring
+    /// after `ttl`. Re-banning an entry replaces its TTL. Runtime state
+    /// only: a restart clears it, the static blocklist is the durable path.
+    ///
+    /// # Errors
+    /// `entry` is not an IP address or CIDR block.
+    pub fn ban(&self, entry: &str, ttl: Option<Duration>) -> fluxum_core::Result<()> {
+        let net: IpNet = entry.trim().parse()?;
+        let ban = RuntimeBan {
+            net,
+            expires: ttl.map(|t| Instant::now() + t),
+        };
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(entry.trim().to_owned(), ban);
+        Ok(())
+    }
+
+    /// Lift a runtime ban; `true` if the entry existed. Static blocklist
+    /// entries cannot be lifted here — they are config, not runtime state.
+    pub fn unban(&self, entry: &str) -> bool {
+        self.bans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(entry.trim())
+            .is_some()
+    }
+
+    /// The live runtime bans (expired ones purged), for `GET /admin/bans`.
+    pub fn runtime_bans(&self) -> Vec<BanInfo> {
+        let now = Instant::now();
+        let mut bans = self.bans.lock().unwrap_or_else(|e| e.into_inner());
+        bans.retain(|_, ban| ban.expires.is_none_or(|at| now < at));
+        let mut out: Vec<BanInfo> = bans
+            .iter()
+            .map(|(entry, ban)| BanInfo {
+                entry: entry.clone(),
+                remaining: ban.expires.map(|at| at.saturating_duration_since(now)),
+            })
+            .collect();
+        out.sort_by(|a, b| a.entry.cmp(&b.entry));
+        out
+    }
+
+    /// The static blocklist entries currently installed, for listing.
+    pub fn static_blocklist(&self) -> Vec<String> {
+        self.access
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .block_entries
+            .clone()
+    }
+
+    /// Whether SEC-033 refuses `ip`: statically blocked, runtime-banned
+    /// (unexpired), or absent from a non-empty allowlist.
+    fn is_blocked(&self, ip: IpAddr, now: Instant) -> bool {
+        {
+            let access = self
+                .access
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if access.block.contains(ip) {
+                return true;
+            }
+            if !access.allow.is_empty() && !access.allow.contains(ip) {
+                return true;
+            }
+        }
+        let mut bans = self.bans.lock().unwrap_or_else(|e| e.into_inner());
+        bans.retain(|_, ban| ban.expires.is_none_or(|at| now < at));
+        bans.values().any(|ban| ban.net.contains(ip))
+    }
+
+    /// The current total live-connection count (SEC-034 introspection).
+    pub fn total_active(&self) -> u32 {
+        self.state().total_active
     }
 
     /// Decide whether a new connection from `ip` may proceed. On success a
     /// [`ConnPermit`] is returned that holds the peer's concurrent-connection
-    /// slot until it drops. The checks run in the order backoff → accept-rate
-    /// → concurrency so a throttled or flooding peer is turned away before it
-    /// consumes a slot.
+    /// slot until it drops. The checks run in the order blocklist/allowlist
+    /// → global ceiling → backoff → accept-rate → concurrency, so a banned
+    /// or flooding peer is turned away before it touches (or allocates)
+    /// per-IP state.
     pub fn try_accept(
         self: &std::sync::Arc<Self>,
         ip: IpAddr,
@@ -199,7 +362,21 @@ impl ConnGuard {
         ip: IpAddr,
         now: Instant,
     ) -> Result<ConnPermit, ConnRejectReason> {
-        let mut ips = self.ips();
+        // SEC-033: a banned peer is refused before any per-IP state exists —
+        // under a many-IP flood the ban check must not be what grows the map.
+        if self.is_blocked(ip, now) {
+            return Err(ConnRejectReason::Blocked);
+        }
+
+        let mut guard_state = self.state();
+
+        // SEC-034: the global ceiling, before per-IP state is touched.
+        let cap = self.max_total_conns.load(Ordering::Relaxed);
+        if cap != 0 && guard_state.total_active >= cap {
+            return Err(ConnRejectReason::GlobalCap);
+        }
+
+        let ips = &mut guard_state.ips;
         let state = ips
             .entry(ip)
             .or_insert_with(|| IpState::new(&self.limits, now));
@@ -216,7 +393,7 @@ impl ConnGuard {
         if let Some(bucket) = state.accept.as_mut()
             && !bucket.try_take(now)
         {
-            self.gc_if_idle(&mut ips, ip, now);
+            self.gc_if_idle(ips, ip, now);
             return Err(ConnRejectReason::AcceptRate);
         }
 
@@ -224,11 +401,12 @@ impl ConnGuard {
         if let Some(cap) = self.limits.max_conns_per_ip
             && state.active >= cap
         {
-            self.gc_if_idle(&mut ips, ip, now);
+            self.gc_if_idle(ips, ip, now);
             return Err(ConnRejectReason::ConnCap);
         }
 
         state.active += 1;
+        guard_state.total_active = guard_state.total_active.saturating_add(1);
         Ok(ConnPermit {
             guard: std::sync::Arc::clone(self),
             ip,
@@ -246,8 +424,9 @@ impl ConnGuard {
         let Some(threshold) = self.limits.failed_auth_threshold else {
             return;
         };
-        let mut ips = self.ips();
-        let state = ips
+        let mut guard_state = self.state();
+        let state = guard_state
+            .ips
             .entry(ip)
             .or_insert_with(|| IpState::new(&self.limits, now));
         state.auth_failures = state.auth_failures.saturating_add(1);
@@ -270,8 +449,8 @@ impl ConnGuard {
     /// failure streak and any backoff, so a legitimate client that mistyped a
     /// token once is not punished after it gets in.
     pub fn note_auth_success(&self, ip: IpAddr) {
-        let mut ips = self.ips();
-        if let Some(state) = ips.get_mut(&ip) {
+        let mut guard_state = self.state();
+        if let Some(state) = guard_state.ips.get_mut(&ip) {
             state.auth_failures = 0;
             state.backoff_until = None;
         }
@@ -279,15 +458,17 @@ impl ConnGuard {
 
     /// The current concurrent-connection count for `ip` (tests/introspection).
     pub fn active_conns(&self, ip: IpAddr) -> u32 {
-        self.ips().get(&ip).map_or(0, |s| s.active)
+        self.state().ips.get(&ip).map_or(0, |s| s.active)
     }
 
     fn release(&self, ip: IpAddr) {
-        let mut ips = self.ips();
-        if let Some(state) = ips.get_mut(&ip) {
+        let mut guard_state = self.state();
+        if let Some(state) = guard_state.ips.get_mut(&ip) {
             state.active = state.active.saturating_sub(1);
         }
-        self.gc_if_idle(&mut ips, ip, Instant::now());
+        guard_state.total_active = guard_state.total_active.saturating_sub(1);
+        let ips = &mut guard_state.ips;
+        self.gc_if_idle(ips, ip, Instant::now());
     }
 
     fn gc_if_idle(&self, ips: &mut HashMap<IpAddr, IpState>, ip: IpAddr, now: Instant) {
@@ -433,6 +614,7 @@ mod tests {
             failed_auth_threshold: 0,
             failed_auth_backoff_base_ms: 100,
             failed_auth_backoff_max_ms: 1000,
+            ..ConnectionLimitsConfig::default()
         });
         assert!(l.max_conns_per_ip.is_none());
         assert!(l.accept_rate_per_sec.is_none());
@@ -454,6 +636,116 @@ mod tests {
     }
 
     #[test]
+    fn a_blocked_ip_is_refused_before_any_state_exists() {
+        let g = guard(limits());
+        g.set_access_lists(&["10.0.0.0/8".into()], &[]).unwrap();
+
+        assert_eq!(
+            g.try_accept(ip_of("10.1.2.3")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+        // The ban check allocated nothing: a flood of banned IPs cannot grow
+        // the map.
+        assert_eq!(g.state().ips.len(), 0);
+        // Anyone else still connects.
+        g.try_accept(ip(1)).unwrap();
+    }
+
+    #[test]
+    fn a_non_empty_allowlist_is_exclusive_and_the_blocklist_still_wins() {
+        let g = guard(limits());
+        g.set_access_lists(&["10.0.0.7".into()], &["10.0.0.0/8".into()])
+            .unwrap();
+
+        // In the allowed block: admitted.
+        g.try_accept(ip_of("10.0.0.1")).unwrap();
+        // Outside the allowlist: refused.
+        assert_eq!(
+            g.try_accept(ip_of("192.0.2.1")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+        // Allowed block but explicitly blocklisted: the ban wins.
+        assert_eq!(
+            g.try_accept(ip_of("10.0.0.7")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+    }
+
+    #[test]
+    fn runtime_bans_apply_expire_and_lift() {
+        let g = guard(limits());
+
+        g.ban("10.0.0.1", None).unwrap();
+        g.ban("192.0.2.0/24", Some(Duration::from_millis(20)))
+            .unwrap();
+        assert_eq!(
+            g.try_accept(ip_of("10.0.0.1")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+        assert_eq!(
+            g.try_accept(ip_of("192.0.2.9")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+        assert_eq!(g.runtime_bans().len(), 2);
+
+        // The TTL ban expires and readmits on its own.
+        std::thread::sleep(Duration::from_millis(30));
+        g.try_accept(ip_of("192.0.2.9")).unwrap();
+        assert_eq!(g.runtime_bans().len(), 1, "the expired ban is purged");
+
+        // Unban readmits; unbanning the unknown reports false.
+        assert!(g.unban("10.0.0.1"));
+        assert!(!g.unban("10.0.0.1"));
+        g.try_accept(ip_of("10.0.0.1")).unwrap();
+
+        // Garbage entries are rejected.
+        g.ban("not-an-ip", None).unwrap_err();
+    }
+
+    #[test]
+    fn the_global_ceiling_caps_across_distinct_ips() {
+        let mut l = limits();
+        l.accept_rate_per_sec = None;
+        let g = guard(l);
+        g.set_max_total_conns(2);
+
+        let _p1 = g.try_accept(ip(1)).unwrap();
+        let _p2 = g.try_accept(ip(2)).unwrap();
+        assert_eq!(g.total_active(), 2);
+        // A third connection from a *fresh* IP hits the global ceiling.
+        assert_eq!(
+            g.try_accept(ip(3)).unwrap_err(),
+            ConnRejectReason::GlobalCap
+        );
+
+        // Releasing a slot readmits; 0 uncaps entirely.
+        drop(_p1);
+        let _p3 = g.try_accept(ip(3)).unwrap();
+        g.set_max_total_conns(0);
+        let _p4 = g.try_accept(ip(4)).unwrap();
+        let _p5 = g.try_accept(ip(5)).unwrap();
+    }
+
+    #[test]
+    fn hot_swapping_the_lists_applies_to_the_next_accept() {
+        let g = guard(limits());
+        g.try_accept(ip_of("10.0.0.1")).unwrap();
+        g.set_access_lists(&["10.0.0.1".into()], &[]).unwrap();
+        assert_eq!(
+            g.try_accept(ip_of("10.0.0.1")).unwrap_err(),
+            ConnRejectReason::Blocked
+        );
+        g.set_access_lists(&[], &[]).unwrap();
+        g.try_accept(ip_of("10.0.0.1")).unwrap();
+        // A bad entry applies nothing.
+        g.set_access_lists(&["garbage".into()], &[]).unwrap_err();
+    }
+
+    fn ip_of(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
     fn idle_ip_entries_are_reclaimed() {
         let mut l = limits();
         l.accept_rate_per_sec = None;
@@ -461,10 +753,10 @@ mod tests {
         let g = guard(l);
         {
             let _p = g.try_accept(ip(1)).unwrap();
-            assert_eq!(g.ips().len(), 1);
+            assert_eq!(g.state().ips.len(), 1);
         }
         // Permit dropped, entry has nothing live/pending → reclaimed.
         assert_eq!(g.active_conns(ip(1)), 0);
-        assert_eq!(g.ips().len(), 0, "a fully idle IP is forgotten");
+        assert_eq!(g.state().ips.len(), 0, "a fully idle IP is forgotten");
     }
 }

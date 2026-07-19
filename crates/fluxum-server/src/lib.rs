@@ -458,6 +458,15 @@ impl ShardContext {
                 tracing::warn!(error = %e, "server.trusted_proxies not applied");
             }
         }
+        let guard = self.conn_guard();
+        if let Err(e) = guard.set_access_lists(
+            &config.server.connection_limits.blocklist,
+            &config.server.connection_limits.allowlist,
+        ) {
+            // Same unreachable-through-the-loader reasoning as above.
+            tracing::warn!(error = %e, "connection_limits block/allowlist not applied");
+        }
+        guard.set_max_total_conns(config.server.connection_limits.max_total_conns);
         *self
             .reloadable
             .write()

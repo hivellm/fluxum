@@ -63,7 +63,10 @@ fn family_golden_ping_vector_holds_on_the_fluxum_side() {
     ];
 
     let codec = FrameCodec::default();
-    assert_eq!(codec.encode(&PING_FRAME[FRAME_HEADER_LEN..]).unwrap(), PING_FRAME);
+    assert_eq!(
+        codec.encode(&PING_FRAME[FRAME_HEADER_LEN..]).unwrap(),
+        PING_FRAME
+    );
 
     let (frame, consumed) = codec.decode(&PING_FRAME).unwrap().unwrap();
     assert_eq!(consumed, PING_FRAME.len());

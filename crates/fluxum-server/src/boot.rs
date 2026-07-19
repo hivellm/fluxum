@@ -115,13 +115,15 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         ServerPeerRegistry::empty(),
     );
 
-    Ok(ShardContext::new(
-        engine,
-        subs,
-        auth,
-        shard,
-        COMMIT_BROADCAST_CAPACITY,
-    ))
+    let ctx = ShardContext::new(engine, subs, auth, shard, COMMIT_BROADCAST_CAPACITY);
+    // SPEC-026 §4: the pre-auth guard enforces what the operator configured,
+    // not the built-in defaults. (The SEC-033/034 lists and global ceiling
+    // land through `install_config` → `publish_reloadable`, the same path a
+    // hot reload takes.)
+    ctx.set_conn_guard(Arc::new(crate::connguard::ConnGuard::new(
+        crate::connguard::ConnLimits::from_config(&config.server.connection_limits),
+    )));
+    Ok(ctx)
 }
 
 /// Depth of the shard-wide commit broadcast the fan-out task consumes.

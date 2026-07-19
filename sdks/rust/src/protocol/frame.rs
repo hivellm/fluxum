@@ -124,20 +124,23 @@ impl FrameCodec {
     ///   fires from the 4-byte header alone (RPC-061), respond with a 413
     ///   `Error` and close.
     pub fn decode<'a>(&self, buf: &'a [u8]) -> Result<Option<(Frame<'a>, usize)>, FrameError> {
-        let decoded = thunder::wire::decode_frame_raw(buf, self.max_frame_bytes as usize).map_err(
-            |err| match err {
-                thunder::wire::DecodeError::FrameTooLarge { body, .. } => FrameError::TooLarge {
-                    len: body as u64,
-                    max: self.max_frame_bytes,
-                },
-                // `decode_frame_raw` reports the framing only: a body it
-                // cannot slice is too large, full stop. Body-shaped failures
-                // (`Rmp`, `KeepAlive`) belong to the typed path, which Fluxum
-                // does not use — its bodies are its own `[tag, payload]`
-                // catalog, decoded by the caller from the borrowed slice.
-                other => unreachable!("raw frame decode cannot fail with {other:?}"),
-            },
-        )?;
+        let decoded =
+            thunder::wire::decode_frame_raw(buf, self.max_frame_bytes as usize).map_err(|err| {
+                match err {
+                    thunder::wire::DecodeError::FrameTooLarge { body, .. } => {
+                        FrameError::TooLarge {
+                            len: body as u64,
+                            max: self.max_frame_bytes,
+                        }
+                    }
+                    // `decode_frame_raw` reports the framing only: a body it
+                    // cannot slice is too large, full stop. Body-shaped failures
+                    // (`Rmp`, `KeepAlive`) belong to the typed path, which Fluxum
+                    // does not use — its bodies are its own `[tag, payload]`
+                    // catalog, decoded by the caller from the borrowed slice.
+                    other => unreachable!("raw frame decode cannot fail with {other:?}"),
+                }
+            })?;
 
         let Some((body, total)) = decoded else {
             return Ok(None);

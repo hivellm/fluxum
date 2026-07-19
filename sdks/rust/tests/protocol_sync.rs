@@ -111,10 +111,7 @@ fn no_vendored_file_is_left_behind_or_missing() {
         .collect();
     found.sort();
 
-    let mut expected: Vec<String> = VENDORED_MODULES
-        .iter()
-        .map(|m| format!("{m}.rs"))
-        .collect();
+    let mut expected: Vec<String> = VENDORED_MODULES.iter().map(|m| format!("{m}.rs")).collect();
     expected.sort();
 
     assert_eq!(

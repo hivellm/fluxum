@@ -174,6 +174,8 @@ pub struct Metrics {
     conn_rejected_handshake_budget: AtomicU64,
     conn_rejected_proxy_preamble: AtomicU64,
     conn_rejected_proxy_header: AtomicU64,
+    conn_rejected_blocked: AtomicU64,
+    conn_rejected_global_cap: AtomicU64,
 }
 
 /// Why the transports refused a connection on the pre-auth surface
@@ -194,6 +196,11 @@ pub enum ConnRejectReason {
     ProxyPreamble,
     /// A malformed `X-Forwarded-For` from a trusted proxy (SEC-035).
     ProxyHeader,
+    /// The resolved client IP is banned — statically configured, runtime
+    /// ban, or absent from a non-empty allowlist (SEC-033).
+    Blocked,
+    /// The global concurrent-connection ceiling is full (SEC-034).
+    GlobalCap,
 }
 
 impl ConnRejectReason {
@@ -206,18 +213,22 @@ impl ConnRejectReason {
             Self::HandshakeBudget => "handshake_budget",
             Self::ProxyPreamble => "proxy_preamble",
             Self::ProxyHeader => "proxy_header",
+            Self::Blocked => "blocked",
+            Self::GlobalCap => "global_cap",
         }
     }
 
     /// Every reason, so `/metrics` emits a zero series per label rather than
     /// have one first appear only when it fires.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 8] = [
         Self::ConnCap,
         Self::AcceptRate,
         Self::FailedAuth,
         Self::HandshakeBudget,
         Self::ProxyPreamble,
         Self::ProxyHeader,
+        Self::Blocked,
+        Self::GlobalCap,
     ];
 }
 
@@ -250,6 +261,8 @@ impl Metrics {
             conn_rejected_handshake_budget: AtomicU64::new(0),
             conn_rejected_proxy_preamble: AtomicU64::new(0),
             conn_rejected_proxy_header: AtomicU64::new(0),
+            conn_rejected_blocked: AtomicU64::new(0),
+            conn_rejected_global_cap: AtomicU64::new(0),
         })
     }
 
@@ -384,6 +397,8 @@ impl Metrics {
             ConnRejectReason::HandshakeBudget => &self.conn_rejected_handshake_budget,
             ConnRejectReason::ProxyPreamble => &self.conn_rejected_proxy_preamble,
             ConnRejectReason::ProxyHeader => &self.conn_rejected_proxy_header,
+            ConnRejectReason::Blocked => &self.conn_rejected_blocked,
+            ConnRejectReason::GlobalCap => &self.conn_rejected_global_cap,
         }
     }
 

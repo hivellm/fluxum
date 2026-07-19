@@ -55,9 +55,9 @@ impl FromStr for IpNet {
             Some((a, p)) => (a, Some(p)),
             None => (s, None),
         };
-        let addr: IpAddr = addr_str.parse().map_err(|_| {
-            FluxumError::config(format!("'{s}': not an IP address or CIDR block"))
-        })?;
+        let addr: IpAddr = addr_str
+            .parse()
+            .map_err(|_| FluxumError::config(format!("'{s}': not an IP address or CIDR block")))?;
         // Normalize the network address too, so `::ffff:10.0.0.0/104`-style
         // entries and plain v4 entries agree on family.
         let addr = addr.to_canonical();

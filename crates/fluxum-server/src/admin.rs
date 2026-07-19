@@ -98,6 +98,11 @@ pub async fn dispatch(
         ("POST", ["plugins", name, "enable"]) => plugin_set_disabled(ctx, name, false),
         ("POST", ["drain"]) => drain(ctx),
         ("POST", ["config", "reload"]) => config_reload(ctx),
+        ("GET", ["bans"]) => bans_list(ctx),
+        ("POST", ["bans"]) => ban_create(ctx, body),
+        // The entry may itself contain `/` (a CIDR block), so everything
+        // after `/bans/` is rejoined into one entry.
+        ("DELETE", ["bans", entry @ ..]) if !entry.is_empty() => ban_delete(ctx, &entry.join("/")),
         _ => AdminResponse::err(404, None, "not found"),
     }
 }
@@ -145,7 +150,63 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["plugins", _, "disable" | "enable"]
             | ["drain"]
             | ["config", "reload"]
+            | ["bans", ..]
     )
+}
+
+// --- /bans (SPEC-026 SEC-033: runtime IP/CIDR bans) ------------------------------
+
+/// `GET /bans`: static blocklist entries plus live runtime bans with their
+/// remaining TTL (`null` = no expiry).
+fn bans_list(ctx: &Arc<ShardContext>) -> AdminResponse {
+    let guard = ctx.conn_guard();
+    let runtime: Vec<Value> = guard
+        .runtime_bans()
+        .into_iter()
+        .map(|ban| {
+            json!({
+                "entry": ban.entry,
+                "remaining_ttl_ms": ban.remaining.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            })
+        })
+        .collect();
+    AdminResponse::ok(
+        None,
+        json!({
+            "static": guard.static_blocklist(),
+            "runtime": runtime,
+        }),
+    )
+}
+
+/// `POST /bans` `{"entry": "<ip-or-cidr>", "ttl_secs": <optional>}`: ban an
+/// address or block at runtime, optionally expiring. Runtime state only —
+/// a restart clears it; `server.connection_limits.blocklist` is the durable
+/// path.
+fn ban_create(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
+    let request: Value = match serde_json::from_slice(body) {
+        Ok(request) => request,
+        Err(e) => return AdminResponse::err(400, None, format!("bad ban request: {e}")),
+    };
+    let Some(entry) = request.get("entry").and_then(Value::as_str) else {
+        return AdminResponse::err(400, None, "ban request needs an `entry` (IP or CIDR)");
+    };
+    let ttl_secs = request.get("ttl_secs").and_then(Value::as_u64);
+    let ttl = ttl_secs.map(std::time::Duration::from_secs);
+    match ctx.conn_guard().ban(entry, ttl) {
+        Ok(()) => AdminResponse::ok(None, json!({ "banned": entry, "ttl_secs": ttl_secs })),
+        Err(e) => AdminResponse::err(400, None, e.to_string()),
+    }
+}
+
+/// `DELETE /bans/{entry}`: lift a runtime ban. Static (config) entries are
+/// not liftable here — edit the config and reload for those.
+fn ban_delete(ctx: &Arc<ShardContext>, entry: &str) -> AdminResponse {
+    if ctx.conn_guard().unban(entry) {
+        AdminResponse::ok(None, json!({ "unbanned": entry }))
+    } else {
+        AdminResponse::err(404, None, format!("no runtime ban for `{entry}`"))
+    }
 }
 
 fn split_path(path: &str) -> Vec<&str> {

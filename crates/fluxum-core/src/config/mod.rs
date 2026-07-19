@@ -133,6 +133,19 @@ pub struct ConnectionLimitsConfig {
     pub failed_auth_backoff_base_ms: u64,
     /// Ceiling for the exponential failed-auth backoff, milliseconds.
     pub failed_auth_backoff_max_ms: u64,
+    /// Addresses refused outright, before any other check (SPEC-026
+    /// SEC-033): IP or CIDR entries, IPv4/IPv6. Empty = nobody is banned by
+    /// config. Runtime bans via `POST /admin/bans` merge with this list.
+    pub blocklist: Vec<String>,
+    /// When non-empty, **only** these addresses may connect (SEC-033,
+    /// exclusive): IP or CIDR entries. Empty (the default) admits everyone
+    /// the other checks admit. The blocklist still wins over an allowlist
+    /// hit, so an operator can carve exceptions out of an allowed block.
+    pub allowlist: Vec<String>,
+    /// Global ceiling on concurrent connections across *all* peers
+    /// (SEC-034): the backstop a distributed many-IP flood cannot walk past.
+    /// `0` = uncapped.
+    pub max_total_conns: u32,
 }
 
 impl Default for ConnectionLimitsConfig {
@@ -145,6 +158,9 @@ impl Default for ConnectionLimitsConfig {
             failed_auth_threshold: 10,
             failed_auth_backoff_base_ms: 100,
             failed_auth_backoff_max_ms: 30_000,
+            blocklist: Vec::new(),
+            allowlist: Vec::new(),
+            max_total_conns: 0,
         }
     }
 }
@@ -887,6 +903,16 @@ impl Config {
         if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
             return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
         }
+        if let Err(e) = crate::net::IpSet::parse(&self.server.connection_limits.blocklist) {
+            return Err(FluxumError::config(format!(
+                "server.connection_limits.blocklist: {e}"
+            )));
+        }
+        if let Err(e) = crate::net::IpSet::parse(&self.server.connection_limits.allowlist) {
+            return Err(FluxumError::config(format!(
+                "server.connection_limits.allowlist: {e}"
+            )));
+        }
         if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)
             && self.auth.secret.as_deref().is_none_or(str::is_empty)
         {
@@ -1035,6 +1061,9 @@ pub const RELOADABLE_KEYS: &[&str] = &[
     "logging.level",
     "logging.format",
     "server.trusted_proxies",
+    "server.connection_limits.blocklist",
+    "server.connection_limits.allowlist",
+    "server.connection_limits.max_total_conns",
     "observability.slow_reducer_threshold_us",
     "reducer.shard_max_reducers_per_sec",
     "subscriptions.send_buffer_bytes",

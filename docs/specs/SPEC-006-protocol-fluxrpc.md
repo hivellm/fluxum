@@ -546,6 +546,9 @@ hot path.
   | `POST` | `/query` | One-off read-only SQL query |
   | `GET` | `/view/:name` | Call a `#[fluxum::view]` function |
   | `POST` | `/procedure/:name` | Call a `#[fluxum::procedure]` function (admin) [P2] |
+  | `GET` | `/bans` | Static blocklist + runtime bans with remaining TTL (SPEC-026 SEC-033) |
+  | `POST` | `/bans` | Ban an IP/CIDR at runtime, optional TTL (SPEC-026 SEC-033) |
+  | `DELETE` | `/bans/:entry` | Lift a runtime ban (SPEC-026 SEC-033) |
 
   Paths are unversioned — there is no `/v1` prefix. The `/rpc` path on the same port belongs to
   the binary Streamable HTTP transport (RPC-004..RPC-007) and does NOT use the JSON envelopes
