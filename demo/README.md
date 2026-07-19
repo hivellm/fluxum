@@ -68,3 +68,15 @@ One real fix already landed from this hunt: the page closes its client on
 allows ~6 per origin over HTTP/1.1 — a page that reloaded without closing
 leaked one each time, and after six every request queued forever, which looks
 exactly like a hung server.
+
+## Known issue: presence disappears after a reload
+
+`OnlineUser` is keyed by `identity`, so two live connections from the same
+identity share one row — and the first `on_disconnect` deletes it for both.
+Reload the page and the old session, expiring a minute later, erases the new
+session's presence.
+
+That is a modelling bug in the demo module rather than in the SDK: correct
+presence is keyed by `ConnectionId`, or refcounted per identity. Left in place
+because it is a good illustration of the class — the table reads as obviously
+right until two connections collide on one primary key.

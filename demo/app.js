@@ -198,6 +198,9 @@ async function connectAs(name) {
     tables: TABLES,
   });
   db = client;
+  // Exposed on purpose: poking at the live cache from the devtools console is
+  // half the point of a demo.
+  window.db = client;
 
   const redraw = () => {
     renderChat(client);

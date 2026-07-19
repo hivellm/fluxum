@@ -18,7 +18,13 @@
 // rejecting it, so `FluxumFrameReader` only has to *skip* keep-alives, not
 // parse them out of the byte stream itself.
 
-import { FrameReader, DEFAULT_MAX_FRAME_BYTES as THUNDER_MAX_FRAME } from '@hivehub/thunder';
+// The `/wire` subpath, not the package root: it carries the frame codec with
+// no Node transports behind it, so nothing in this SDK's graph reaches for
+// `fs`/`net`/`tls`. The root entry still imports those at its top level for
+// Thunder's own client and server, which a browser cannot resolve — the
+// subpath exists precisely so consumers like this one do not have to care
+// (hivellm/thunder#10, shipped in 0.2.1).
+import { FrameReader, DEFAULT_MAX_FRAME_BYTES as THUNDER_MAX_FRAME } from '@hivehub/thunder/wire';
 import { decode as decodeMsg, encode as encodeMsg } from '@msgpack/msgpack';
 
 /** Bytes of the length prefix (the family standard). */

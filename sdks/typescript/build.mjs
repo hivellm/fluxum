@@ -5,11 +5,14 @@
 //   dist/index.cjs     CJS for `require`
 //   dist/fluxum.min.js browser ESM, dependencies inlined
 //
-// The browser build inlines `@hivehub/thunder` and `@msgpack/msgpack` because
-// a browser cannot resolve a bare specifier — a `<script type="module">` page
-// with no build step (SDK-081) would fail on the import, not on anything the
-// SDK does. The npm builds leave them external so a consuming bundler can
-// dedupe them against its own copy.
+// The browser build inlines `@hivehub/thunder/wire` and `@msgpack/msgpack`
+// because a browser cannot resolve a bare specifier — a `<script
+// type="module">` page with no build step (SDK-081) would fail on the import,
+// not on anything the SDK does. The npm builds leave them external so a
+// consuming bundler can dedupe them against its own copy.
+//
+// No Node builtins need aliasing away: `protocol.ts` imports Thunder's
+// `/wire` subpath, whose graph is the codec alone.
 //
 // The size gate is asserted here rather than trusted: SDK-083 caps the
 // hand-written runtime at 50 KB min+gzip, and a budget nobody measures is a
@@ -56,14 +59,6 @@ await build({
   // takes; its dynamic import sits in a try/catch that already reports the
   // actionable error.
   external: ['node:net'],
-  // `fs`/`net`/`tls` come from `@hivehub/thunder`, whose single entry imports
-  // them at the top level for its Node client. Fluxum uses only FrameReader.
-  // See src/node-stub.js — workaround for hivellm/thunder#10.
-  alias: {
-    fs: './src/node-stub.js',
-    net: './src/node-stub.js',
-    tls: './src/node-stub.js',
-  },
 });
 
 const minified = readFileSync('dist/fluxum.min.js');

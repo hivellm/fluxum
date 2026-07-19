@@ -67,6 +67,17 @@ pub struct Task {
 }
 
 /// Who is currently connected, maintained by the lifecycle hooks.
+///
+/// # Known limitation: keyed by identity, not by connection
+///
+/// One identity with two live connections shares one row, so the first
+/// `on_disconnect` deletes presence for both — reload the demo page and the
+/// expiring old session erases the new one's row. Observed in practice, not
+/// theoretical.
+///
+/// Correct presence is keyed by `ConnectionId`, or refcounted per identity.
+/// Left as-is because the shape is what makes the bug legible: the table reads
+/// as obviously right until two connections share a primary key.
 #[fluxum::table(public)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnlineUser {

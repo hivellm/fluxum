@@ -94,9 +94,23 @@ export interface FluxumClientOptions {
   fetch?: typeof globalThis.fetch;
 }
 
+/**
+ * A request awaiting its reply — or replies.
+ *
+ * Plural on purpose: a `Subscribe` carrying N queries is answered with N
+ * `InitialData` frames, every one echoing the same request id (SPEC-006
+ * RPC-032, "one entry per query" — the server emits one message per query,
+ * not one message listing every query). A correlation map that resolves on
+ * the first reply drops the rest **silently**: the first table populates and
+ * the others simply look empty, with no error anywhere.
+ */
 interface Pending {
-  resolve: (message: DecodedMessage) => void;
+  resolve: (messages: DecodedMessage[]) => void;
   reject: (err: Error) => void;
+  /** How many replies this request expects. */
+  expected: number;
+  /** What has arrived so far. */
+  collected: DecodedMessage[];
 }
 
 interface DecodedMessage {
@@ -125,7 +139,7 @@ export class FluxumClient {
    * Reconciling inside `resubscribe` would run once per query batch and delete
    * rows the next batch is about to restore.
    */
-  #pendingSnapshot: unknown[] | null = null;
+  #pendingSnapshot: unknown[][] | null = null;
 
   #transport: Transport | null = null;
   #nextId = 1;
@@ -197,9 +211,17 @@ export class FluxumClient {
 
   /** Register subscription queries and await the `InitialData` snapshot. */
   async subscribe(queries: string[]): Promise<void> {
+    if (queries.length === 0) return;
     for (const query of queries) this.#queries.add(query);
-    const message = await this.#request('Subscribe', (id) => [id, queries]);
-    this.#applyInitialData(message.payload, { reconcile: false });
+    // One `InitialData` per query, all echoing this request's id.
+    const messages = await this.#requestMany(
+      'Subscribe',
+      (id) => [id, queries],
+      queries.length,
+    );
+    for (const message of messages) {
+      this.#applyInitialData(message.payload, { reconcile: false });
+    }
   }
 
   /** Drop subscriptions by their server-assigned query ids. */
@@ -299,17 +321,28 @@ export class FluxumClient {
         resubscribe: async () => {
           if (this.#queries.size === 0) return;
           const queries = [...this.#queries];
-          const message = await this.#request('Subscribe', (id) => [id, queries]);
+          const messages = await this.#requestMany(
+            'Subscribe',
+            (id) => [id, queries],
+            queries.length,
+          );
           // Stashed for the reconcile step, which must run after every query
           // is registered — reconciling per-query would delete rows the next
           // query is about to restore.
-          this.#pendingSnapshot = message.payload;
+          this.#pendingSnapshot = messages.map((m) => m.payload);
         },
         reconcile: async () => {
-          if (this.#pendingSnapshot !== null) {
-            this.#applyInitialData(this.#pendingSnapshot, { reconcile: true });
-            this.#pendingSnapshot = null;
-          }
+          if (this.#pendingSnapshot === null) return;
+          // Merged into one reconcile pass: `RowCache.reconcile` treats a
+          // table absent from its input as unsubscribed and drops its rows,
+          // so feeding it one query at a time would delete everything the
+          // other queries cover.
+          const tables = this.#pendingSnapshot.flatMap((payload) => {
+            const [, , t] = payload as [unknown, unknown, unknown];
+            return Array.isArray(t) ? t : [];
+          });
+          this.#pendingSnapshot = null;
+          this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
         },
       },
       this.#options.reconnect ?? {},
@@ -326,13 +359,27 @@ export class FluxumClient {
 
   // --- Request correlation (RPC-002) ---------------------------------------
 
+  /** Send a request expecting exactly one reply. */
   async #request(tag: string, build: (id: number) => unknown[]): Promise<DecodedMessage> {
+    const [first] = await this.#requestMany(tag, build, 1);
+    // Unreachable: `#requestMany` resolves only once `expected` replies are
+    // collected, and `expected` is 1 here.
+    if (first === undefined) throw new Error(`${tag} produced no reply`);
+    return first;
+  }
+
+  /** Send a request expecting `expected` replies, all echoing its id. */
+  async #requestMany(
+    tag: string,
+    build: (id: number) => unknown[],
+    expected: number,
+  ): Promise<DecodedMessage[]> {
     const transport = this.#transport;
     if (transport === null || this.#closed) throw new Error('client is not connected');
 
     const id = this.#nextId++;
-    const settled = new Promise<DecodedMessage>((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
+    const settled = new Promise<DecodedMessage[]>((resolve, reject) => {
+      this.#pending.set(id, { resolve, reject, expected, collected: [] });
     });
     await transport.send(encodeMessage(tag, build(id)));
     return settled;
@@ -382,10 +429,20 @@ export class FluxumClient {
   #settle(id: number, produce: () => DecodedMessage | Error): void {
     const pending = this.#pending.get(id);
     if (pending === undefined) return;
-    this.#pending.delete(id);
+
     const result = produce();
-    if (result instanceof Error) pending.reject(result);
-    else pending.resolve(result);
+    if (result instanceof Error) {
+      // An error ends the request whatever it was expecting: the server stops
+      // at the first failing query in a batch rather than answering the rest.
+      this.#pending.delete(id);
+      pending.reject(result);
+      return;
+    }
+
+    pending.collected.push(result);
+    if (pending.collected.length < pending.expected) return;
+    this.#pending.delete(id);
+    pending.resolve(pending.collected);
   }
 
   // --- Cache application ----------------------------------------------------

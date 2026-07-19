@@ -115,6 +115,57 @@ test('concurrent reducer calls are correlated by id, not by arrival', { skip }, 
   assert.equal(results[2]?.status, 'fulfilled');
 });
 
+const ONLINE: TableSchema = {
+  name: 'OnlineUser',
+  pkOfRow: (row) => new RowReader(row).read('Identity') as string,
+  pkOfDelete: (entry) => new RowReader(entry).read('Identity') as string,
+};
+
+test('a multi-query subscribe populates every table, not just the first', { skip }, async (t) => {
+  // The server answers a batched Subscribe with one InitialData PER QUERY,
+  // each echoing the same request id (RPC-032). A client that resolves its
+  // pending id on the first reply drops the rest silently — the first table
+  // fills and the others look simply empty, with no error to notice.
+  const server = await startServer('client-multiquery');
+  const db = await FluxumClient.connect({
+    url: server.httpUrl,
+    tables: [CHAT, TASK, ONLINE],
+  });
+  // One hook, registered once `batched` exists below, so every client is
+  // closed before the server dies — otherwise the survivors start reconnect
+  // loops that never give up and hold the process open.
+  let batched: FluxumClient | null = null;
+  t.after(async () => {
+    await Promise.all([db.close(), batched?.close()]);
+    await server.stop();
+  });
+
+  // Give each of the three tables a row: chat and task by calling reducers,
+  // OnlineUser by simply being connected (the on_connect hook).
+  await db.subscribe(['SELECT * FROM ChatMessage']);
+  await db.callReducer('send_chat', [1, 'row for the batch test']);
+  await db.callReducer('add_task', ['task for the batch test']);
+
+  // A second client subscribes to all three at once — the case under test.
+  batched = await FluxumClient.connect({
+    url: server.httpUrl,
+    tables: [CHAT, TASK, ONLINE],
+    token: new TextEncoder().encode('batched'),
+  });
+
+  await batched.subscribe([
+    'SELECT * FROM ChatMessage',
+    'SELECT * FROM Task',
+    'SELECT * FROM OnlineUser',
+  ]);
+
+  assert.ok(batched.cache.rows('ChatMessage').length > 0, 'first query populated');
+  assert.ok(
+    batched.cache.rows('OnlineUser').length > 0,
+    'the LAST query populated too — this is what silently broke',
+  );
+});
+
 test('owner_only rows are filtered by the server, not the client', { skip }, async (t) => {
   // DM-060: two identities subscribing to the same query get different rows.
   // The demo's Task table carries #[visibility(owner_only(owner))].
