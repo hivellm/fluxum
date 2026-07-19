@@ -8,22 +8,32 @@
 //! env-filter directive (`info,fluxum_core=debug`), and `RUST_LOG` — when
 //! set — overrides the configured value (OBS-082, env beats config).
 //!
-//! # Why one reload handle covers both keys
+//! # Why the filter is a separate layer
 //!
-//! `logging.level` and `logging.format` are reloadable together (OPS-040)
-//! because the format decides the *layer type* and the level decides its
-//! filter — swapping them separately would need two handles and could leave
-//! a half-applied pair visible to a concurrent log line. Instead the whole
-//! filtered layer is boxed behind a single [`reload::Layer`], so one atomic
-//! write publishes both.
+//! `logging.level` and `logging.format` are reloadable together (OPS-040).
+//! The obvious shape — one boxed layer carrying a per-layer `with_filter`,
+//! behind one [`reload::Layer`] — does not work: a `Filtered` layer gets its
+//! `FilterId` when it is added to the subscriber, and boxing it inside a
+//! reload layer erases that registration. The process then panics on its
+//! first log line with *"a `Filtered` layer was used, but it had no
+//! `FilterId`"*.
+//!
+//! So the level rides a **global** filter layer and the format rides the
+//! boxed fmt layer, each behind its own reload handle. [`LogReloadHandle`]
+//! holds both and publishes them together, which keeps the OPS-040 promise
+//! that one reload applies the whole pair.
 
 use fluxum_core::config::{LogFormat, LoggingConfig};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
 
-/// The composed (formatted + filtered) layer, type-erased so `json` and
-/// `pretty` are the same type and can replace one another at runtime.
-type BoxedLayer = Box<dyn Layer<Registry> + Send + Sync>;
+/// The subscriber the format layer sits on: the registry with the reloadable
+/// level filter already applied.
+type Filtered = tracing_subscriber::layer::Layered<reload::Layer<EnvFilter, Registry>, Registry>;
+
+/// The format layer, type-erased so `json` and `pretty` are the same type and
+/// can replace one another at runtime.
+type BoxedLayer = Box<dyn Layer<Filtered> + Send + Sync>;
 
 /// Build the [`EnvFilter`] for `level`: `RUST_LOG` if present, else the
 /// configured directive, falling back to `info` when neither parses.
@@ -37,18 +47,16 @@ fn env_filter(level: &str) -> EnvFilter {
 /// current-span fields so per-reducer context (`shard`, `reducer`,
 /// `duration_us`) rides each line (OBS-071/072).
 fn layer_for(config: &LoggingConfig) -> BoxedLayer {
-    let filter = env_filter(&config.level);
+    // No `with_filter` here: see the module docs — a per-layer filter inside
+    // a boxed reload layer loses its `FilterId` and panics on first use. The
+    // level is applied by the global filter layer instead.
     match config.format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
             .with_current_span(true)
             .with_span_list(false)
-            .with_filter(filter)
             .boxed(),
-        LogFormat::Pretty => tracing_subscriber::fmt::layer()
-            .pretty()
-            .with_filter(filter)
-            .boxed(),
+        LogFormat::Pretty => tracing_subscriber::fmt::layer().pretty().boxed(),
     }
 }
 
@@ -56,7 +64,10 @@ fn layer_for(config: &LoggingConfig) -> BoxedLayer {
 /// reload change the level and format of the *running* process with no
 /// restart and no dropped lines.
 #[derive(Clone)]
-pub struct LogReloadHandle(reload::Handle<BoxedLayer, Registry>);
+pub struct LogReloadHandle {
+    fmt: reload::Handle<BoxedLayer, Filtered>,
+    filter: reload::Handle<EnvFilter, Registry>,
+}
 
 impl std::fmt::Debug for LogReloadHandle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,7 +86,13 @@ impl LogReloadHandle {
     /// Returns an error string if the subscriber this handle points at has
     /// been dropped (only possible once the process is tearing down).
     pub fn apply(&self, config: &LoggingConfig) -> Result<(), String> {
-        self.0
+        // Filter first: widening the level before swapping the format can
+        // only produce extra lines, whereas swapping the format first leaves
+        // a window where the new writer runs under the old level.
+        self.filter
+            .reload(env_filter(&config.level))
+            .map_err(|e| format!("logging reload failed: {e}"))?;
+        self.fmt
             .reload(layer_for(config))
             .map_err(|e| format!("logging reload failed: {e}"))
     }
@@ -90,12 +107,14 @@ impl LogReloadHandle {
 /// # Errors
 /// Returns an error string if a global subscriber is already installed.
 pub fn init(config: &LoggingConfig) -> Result<LogReloadHandle, String> {
-    let (layer, handle) = reload::Layer::new(layer_for(config));
+    let (filter_layer, filter) = reload::Layer::new(env_filter(&config.level));
+    let (fmt_layer, fmt) = reload::Layer::new(layer_for(config));
     tracing_subscriber::registry()
-        .with(layer)
+        .with(filter_layer)
+        .with(fmt_layer)
         .try_init()
         .map_err(|e| e.to_string())?;
-    Ok(LogReloadHandle(handle))
+    Ok(LogReloadHandle { fmt, filter })
 }
 
 #[cfg(test)]

@@ -496,6 +496,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxum-demo"
+version = "0.1.0"
+dependencies = [
+ "fluxum-core",
+ "fluxum-macros",
+]
+
+[[package]]
 name = "fluxum-dst"
 version = "0.1.0"
 dependencies = [
@@ -551,12 +559,14 @@ dependencies = [
  "criterion",
  "fluxum-cli",
  "fluxum-core",
+ "fluxum-demo",
  "fluxum-macros",
  "fluxum-protocol",
  "rmp-serde",
  "serde_json",
  "sha2",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",

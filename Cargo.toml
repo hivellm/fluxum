@@ -20,6 +20,7 @@ criterion = "0.5"
 # alongside whatever depends on it. They are `publish = false` and stay inside
 # the workspace.
 fluxum-core = { path = "crates/fluxum-core" }
+fluxum-demo = { path = "crates/fluxum-demo" }
 fluxum-macros = { path = "crates/fluxum-macros" }
 fluxum-protocol = { path = "crates/fluxum-protocol" }
 fluxum-testmod = { path = "crates/fluxum-testmod" }

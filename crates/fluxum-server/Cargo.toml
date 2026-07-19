@@ -12,10 +12,14 @@ publish = false
 
 [dependencies]
 fluxum-core.workspace = true
+# The application this server hosts. A Fluxum module is a crate, linked in —
+# swap this dependency to host a different one.
+fluxum-demo.workspace = true
 fluxum-protocol.workspace = true
 rmp-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "signal", "sync", "time"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

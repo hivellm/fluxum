@@ -1,0 +1,17 @@
+[package]
+name = "fluxum-demo"
+description = "The Fluxum demo module: chat, presence and per-user tasks (T6.5) — the application the reference server links by default"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Internal to the workspace: never goes to crates.io. Only `fluxum-sdk` is
+# published (SPEC-011 SDK-071).
+publish = false
+
+[dependencies]
+fluxum-core.workspace = true
+fluxum-macros.workspace = true
+
+[lints]
+workspace = true
