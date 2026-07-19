@@ -312,7 +312,11 @@ async fn wrong_content_type_is_415() {
 async fn authenticate_issues_a_session_and_reducer_call_commits() {
     let server = start(HttpOptions::default()).await;
     let session = authenticate(server.local_addr, b"alice").await;
-    assert_eq!(session.len(), 64, "SHA-256 hex session token");
+    assert_eq!(
+        session.len(),
+        32,
+        "128-bit CSPRNG session token, hex (SEC-050)"
+    );
 
     // A reducer call with the session header commits and returns a result.
     let call = ClientMessage::ReducerCall(ReducerCall {

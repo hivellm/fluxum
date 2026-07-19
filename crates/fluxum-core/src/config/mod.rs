@@ -65,6 +65,8 @@ pub struct ServerConfig {
     pub max_frame_bytes: ByteSize,
     /// Pre-auth connection-abuse limits (SPEC-026 SEC-030/031).
     pub connection_limits: ConnectionLimitsConfig,
+    /// Streamable HTTP session-token security (SPEC-026 SEC-050..053).
+    pub session: SessionConfig,
     /// Listen backlog for both listeners (SEC-042): pending un-accepted
     /// connections the kernel queues. `0` = the built-in default (1024).
     /// Raise alongside `somaxconn` on a directly exposed port.
@@ -104,6 +106,7 @@ impl Default for ServerConfig {
             idle_timeout_secs: 60,
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
             connection_limits: ConnectionLimitsConfig::default(),
+            session: SessionConfig::default(),
             accept_backlog: 0,
             tcp_keepalive_secs: 0,
             tcp_defer_accept_secs: 0,
@@ -197,6 +200,46 @@ impl Default for ConnectionLimitsConfig {
             max_tracked_ips: 100_000,
             overload_shed_fraction: 0.90,
             overload_shed_all_fraction: 0.98,
+        }
+    }
+}
+
+/// Streamable HTTP session-token security (SPEC-026 SEC-050..053). The
+/// `Fluxum-Session` token is the bearer credential for every post-auth HTTP
+/// request, so on a directly exposed port these knobs govern how hard a
+/// stolen token is to obtain, replay, and outlive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SessionConfig {
+    /// Bind each session to the client IP that authenticated it (SEC-051):
+    /// a request presenting the token from a different IP is refused and
+    /// counted. Off by default — roaming clients (mobile, NAT rebinding)
+    /// would otherwise be logged out on every network change. Composes with
+    /// `server.trusted_proxies`: the *resolved* client IP is bound, not the
+    /// proxy socket peer.
+    pub bind_client_ip: bool,
+    /// Rotate the token this often, seconds (SEC-052): after issue, the next
+    /// request past the interval is answered with a fresh token and the old
+    /// one enters a short grace window for in-flight requests. `0` = no
+    /// interval rotation (a re-auth still rotates).
+    pub rotate_interval_secs: u64,
+    /// Grace window, seconds, during which a just-rotated token is still
+    /// honored for in-flight requests (SEC-052). `0` = the old token dies
+    /// the instant it rotates.
+    pub rotate_grace_secs: u64,
+    /// Absolute session lifetime, seconds (SEC-052): a session older than
+    /// this is expired regardless of activity, on top of the RPC-060 idle
+    /// expiry. `0` = no absolute cap (idle expiry only).
+    pub absolute_lifetime_secs: u64,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            bind_client_ip: false,
+            rotate_interval_secs: 0,
+            rotate_grace_secs: 30,
+            absolute_lifetime_secs: 0,
         }
     }
 }

@@ -103,6 +103,9 @@ pub async fn dispatch(
         // The entry may itself contain `/` (a CIDR block), so everything
         // after `/bans/` is rejoined into one entry.
         ("DELETE", ["bans", entry @ ..]) if !entry.is_empty() => ban_delete(ctx, &entry.join("/")),
+        ("GET", ["sessions"]) => sessions_list(ctx),
+        ("DELETE", ["sessions"]) => sessions_terminate_query(ctx, path),
+        ("DELETE", ["sessions", id]) => sessions_terminate(ctx, id),
         _ => AdminResponse::err(404, None, "not found"),
     }
 }
@@ -151,6 +154,61 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["drain"]
             | ["config", "reload"]
             | ["bans", ..]
+            | ["sessions", ..]
+    )
+}
+
+// --- /sessions (SPEC-026 SEC-053: session revocation) ----------------------------
+
+/// `GET /sessions`: every live HTTP session — id, identity, connection,
+/// age, bound IP — never any token material.
+fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
+    let Some(admin) = ctx.session_admin() else {
+        // A TCP-only / embedded assembly has no HTTP session directory.
+        return AdminResponse::ok(None, json!({ "sessions": [] }));
+    };
+    let sessions: Vec<Value> = admin
+        .list()
+        .iter()
+        .map(crate::SessionInfo::to_json)
+        .collect();
+    AdminResponse::ok(None, json!({ "sessions": sessions }))
+}
+
+/// `DELETE /sessions/{id}`: terminate one session — its stream drops and its
+/// next request is refused. `id` is the at-rest session id from `GET
+/// /sessions`, never a token.
+fn sessions_terminate(ctx: &Arc<ShardContext>, id: &str) -> AdminResponse {
+    let Some(admin) = ctx.session_admin() else {
+        return AdminResponse::err(404, None, "no HTTP session directory");
+    };
+    if admin.terminate(id) {
+        AdminResponse::ok(None, json!({ "terminated": id }))
+    } else {
+        AdminResponse::err(404, None, format!("no session `{id}`"))
+    }
+}
+
+/// `DELETE /sessions?identity=<hex>`: terminate every session for an
+/// identity — the operator's answer to a suspected credential compromise.
+fn sessions_terminate_query(ctx: &Arc<ShardContext>, path: &str) -> AdminResponse {
+    let Some(admin) = ctx.session_admin() else {
+        return AdminResponse::err(404, None, "no HTTP session directory");
+    };
+    let identity = path
+        .split_once('?')
+        .and_then(|(_, q)| q.split('&').find_map(|kv| kv.strip_prefix("identity=")));
+    let Some(identity) = identity else {
+        return AdminResponse::err(
+            400,
+            None,
+            "DELETE /sessions requires ?identity=<hex> (or use /sessions/{id})",
+        );
+    };
+    let count = admin.terminate_identity(identity);
+    AdminResponse::ok(
+        None,
+        json!({ "terminated_count": count, "identity": identity }),
     )
 }
 

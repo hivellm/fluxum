@@ -207,6 +207,51 @@ envelopes in [SPEC-006](SPEC-006-protocol-fluxrpc.md); per-reducer rate limiting
   `ctx.tx.query_pk::<__session__>(conn_id)` to look up the identity for a given
   connection.
 
+## 7a. Streamable HTTP session-token security (`AUTH-09x`, SPEC-026 SEC-050..053)
+
+On the Streamable HTTP transport the `Fluxum-Session` header is the bearer
+credential for every post-auth request. On a directly exposed port (SPEC-026),
+stealing it makes the thief the victim until it expires, so the token is
+hardened against theft and replay. (The TCP transport keeps its credential on
+one long-lived socket and needs none of this.)
+
+- **AUTH-090** [P0] The session token SHALL be **CSPRNG** output of at least
+  128 bits, independent of the caller's `Identity` — unpredictable regardless
+  of what else (identity, logs, metrics) leaks. Deriving it from the identity
+  and a counter is forbidden.
+- **AUTH-091** [P0] The server SHALL store only a **hash** of the token
+  (`SHA-256`), keyed on it; a disclosure of the session map yields no usable
+  token. Lookup hashes the presented token first (no secret-dependent
+  comparison in the clear). **Anti-fixation:** a `Fluxum-Session` value the
+  server never minted hashes to an absent id and is NEVER adopted — it is a
+  fresh unauthenticated handshake (which, if it authenticates, receives a
+  freshly minted token), never the client-supplied value.
+- **AUTH-092** [P1] Session **binding** MAY be enabled
+  (`server.session.bind_client_ip`, default off): the resolved client IP
+  (SPEC-026 SEC-035, not the proxy peer) is recorded at issue and a request
+  presenting the token from another IP is refused and counted. Default off so
+  roaming clients are not logged out on every network change.
+- **AUTH-093** [P1] The token SHALL **rotate** on re-authentication and, when
+  `server.session.rotate_interval_secs` is set, on that interval; a rotated
+  token is honored for a short `rotate_grace_secs` window for in-flight
+  requests. An `absolute_lifetime_secs` MAY cap total session age on top of
+  the RPC-060 idle expiry.
+- **AUTH-094** [P1] The admin API SHALL expose **revocation**: `GET /sessions`
+  (identity, connection, age, bound IP — never token material),
+  `DELETE /sessions/{id}`, and `DELETE /sessions?identity=<hex>`. A terminated
+  session's push stream drops and its next request is refused. Refusals are
+  counted as `fluxum_session_rejected_total{reason}` with
+  `reason ∈ {unknown_token, ip_mismatch, expired, revoked}`.
+
+```yaml
+server:
+  session:
+    bind_client_ip: false     # AUTH-092 bind to the authenticating client IP
+    rotate_interval_secs: 0    # AUTH-093 rotate this often (0 = only on re-auth)
+    rotate_grace_secs: 30      # AUTH-093 old-token grace window
+    absolute_lifetime_secs: 0  # AUTH-093 hard session-age cap (0 = idle only)
+```
+
 ## 8. Server-to-server identity
 
 A trusted backend service — for example, an ingestion service or an internal admin

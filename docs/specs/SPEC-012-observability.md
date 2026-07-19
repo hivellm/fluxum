@@ -163,6 +163,8 @@ of the correctness contract.
   fluxum_overload_state{shard}                 Gauge    // 0=normal, 1=shed_preauth, 2=shed_all_new
   fluxum_connguard_tracked_ips{shard}          Gauge    // per-IP guard entries currently tracked
   fluxum_connguard_evictions_total{shard}      Counter  // entries reclaimed under pressure
+  fluxum_session_rejected_total{shard, reason} Counter  // reason ∈ {unknown_token, ip_mismatch,
+                                                        // expired, revoked} (SPEC-026 SEC-053)
   ```
 
   Every `reason` label is emitted even at zero, so rate alerts never go

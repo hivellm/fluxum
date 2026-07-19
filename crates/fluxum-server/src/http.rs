@@ -21,22 +21,34 @@
 //! [`crate::tcp`] transport uses — so the fan-out treats HTTP and TCP
 //! subscribers identically. The router core ([`crate::session::Session`]) is
 //! transport-independent; this module is only HTTP framing over it.
+//!
+//! # Session-token security (SPEC-026 SEC-050..053)
+//!
+//! The `Fluxum-Session` token is the bearer credential for every post-auth
+//! request, so it is a CSPRNG value ([`crate::session_sec`]) stored only as a
+//! hash (the sessions map is keyed by `hex(SHA-256(token))`): a disclosure of
+//! the map yields no usable token, and a token the server never minted hashes
+//! to an absent id and is never adopted (anti-fixation). The transport also
+//! enforces the optional [`SessionPolicy`](crate::session_sec::SessionPolicy):
+//! client-IP binding, token rotation with a grace window, and an absolute
+//! lifetime. Live sessions are mirrored into a [`SessionControl`] directory so
+//! the admin API can list and terminate them.
 
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
 
+use fluxum_core::metrics::SessionRejectReason;
 use fluxum_protocol::{ClientMessage, Frame, FrameCodec, ServerMessage, codes};
 
 use crate::session::{Session, SessionState};
+use crate::session_sec::token_id;
 use crate::{ConnHandle, OutFrame, ShardContext};
 
 /// The one wire content type for `/rpc` (RPC — binary, never JSON).
@@ -69,6 +81,9 @@ pub struct HttpOptions {
     /// Listener/socket hardening knobs (SEC-042); defaults = today's
     /// behavior.
     pub socket: crate::sock::SocketOptions,
+    /// Session-token security policy (SEC-050..052); defaults = CSPRNG token,
+    /// hashed at rest, no binding/rotation/absolute-lifetime.
+    pub session: crate::session_sec::SessionPolicy,
 }
 
 impl Default for HttpOptions {
@@ -82,6 +97,7 @@ impl Default for HttpOptions {
             // directory exposes no filesystem at all.
             static_dir: None,
             socket: crate::sock::SocketOptions::default(),
+            session: crate::session_sec::SessionPolicy::default(),
         }
     }
 }
@@ -112,6 +128,16 @@ struct HttpSession {
     /// OPS-050); `None` = the default. Persisted here because this transport
     /// rebuilds a `Session` per request, and the binding must survive that.
     namespace: Option<Arc<crate::namespace::Namespace>>,
+    /// When the session was first minted (SEC-052 absolute lifetime).
+    created: Instant,
+    /// When the *current* token was issued (SEC-052 rotation interval).
+    issued: Instant,
+    /// The client IP the session authenticated from (SEC-051), when binding
+    /// is on. A request presenting the token from another IP is refused.
+    client_ip: Option<std::net::IpAddr>,
+    /// Set when an operator terminates the session (SEC-053): the next
+    /// request on it is refused and its stream dropped.
+    revoked: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Why a GET stream ended — it decides the session's fate (SPEC-021
@@ -131,23 +157,120 @@ enum GetExit {
 struct HttpState {
     ctx: Arc<ShardContext>,
     options: HttpOptions,
+    /// Live sessions, keyed by the at-rest id `hex(SHA-256(token))` (SEC-050):
+    /// only the hash is stored, never the token, and a presented token the
+    /// server never minted hashes to an id that is simply absent.
     sessions: Mutex<HashMap<String, HttpSession>>,
-    token_counter: AtomicU64,
+    /// Just-rotated tokens honored for a grace window (SEC-052): old id →
+    /// (current id, grace deadline), so an in-flight request carrying the
+    /// pre-rotation token still resolves briefly.
+    grace: Mutex<HashMap<String, (String, Instant)>>,
+    /// Resolved SEC-051/052 policy (binding, rotation, lifetime).
+    policy: crate::session_sec::SessionPolicy,
+    /// The sync directory the admin API lists and terminates through
+    /// (SEC-053); mirrors the sessions map's identifying fields.
+    control: Arc<SessionControl>,
 }
 
-impl HttpState {
-    /// Mint an unguessable session token: `SHA-256(identity ++ counter)`
-    /// hex. The identity is itself `SHA-256(client token)` (AUTH-001), so a
-    /// third party cannot forge it.
-    fn mint_token(&self, state: &SessionState) -> String {
-        let seq = self.token_counter.fetch_add(1, Ordering::Relaxed);
-        let mut hasher = Sha256::new();
-        if let SessionState::Authenticated { caller, .. } = state {
-            hasher.update(caller.identity.as_bytes());
+/// The admin-facing session directory (SPEC-026 SEC-053): a synchronous
+/// mirror of the sessions map holding exactly what an operator needs — never
+/// token material — plus the per-session shutdown signal and revoked flag,
+/// so terminating a session drops its stream and blocks its next request.
+#[derive(Default)]
+struct SessionControl {
+    entries: std::sync::Mutex<HashMap<String, ControlEntry>>,
+}
+
+struct ControlEntry {
+    identity_hex: String,
+    connection_id: u128,
+    created: Instant,
+    client_ip: Option<std::net::IpAddr>,
+    shutdown: Arc<Notify>,
+    revoked: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl SessionControl {
+    fn insert(&self, id: String, entry: ControlEntry) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, entry);
+    }
+
+    fn remove(&self, id: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(id);
+    }
+
+    /// Re-key an entry when its token rotates (SEC-052), preserving its
+    /// shutdown/revoked handles so a revocation mid-rotation still lands.
+    fn rekey(&self, old_id: &str, new_id: String) {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(entry) = entries.remove(old_id) {
+            entries.insert(new_id, entry);
         }
-        hasher.update(seq.to_le_bytes());
-        let digest = hasher.finalize();
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+impl crate::SessionAdmin for SessionControl {
+    fn list(&self) -> Vec<crate::SessionInfo> {
+        let entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out: Vec<crate::SessionInfo> = entries
+            .iter()
+            .map(|(id, e)| crate::SessionInfo {
+                id: id.clone(),
+                identity: e.identity_hex.clone(),
+                connection_id: e.connection_id.to_string(),
+                age_secs: e.created.elapsed().as_secs(),
+                client_ip: e.client_ip.map(|ip| ip.to_string()),
+            })
+            .collect();
+        out.sort_by(|a, b| a.id.cmp(&b.id));
+        out
+    }
+
+    fn terminate(&self, id: &str) -> bool {
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Mark revoked and fire the stream shutdown before dropping the
+        // entry: an open GET stream ends and its handler evicts the session;
+        // a session with no stream is refused on its next request by the
+        // revoked flag the sessions map still holds.
+        if let Some(entry) = entries.remove(id) {
+            entry
+                .revoked
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            entry.shutdown.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn terminate_identity(&self, identity_hex: &str) -> usize {
+        let ids: Vec<String> = {
+            let entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries
+                .iter()
+                .filter(|(_, e)| e.identity_hex == identity_hex)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        ids.iter().filter(|id| self.terminate(id)).count()
     }
 }
 
@@ -160,11 +283,17 @@ pub async fn serve(
     let listener = crate::sock::bind(addr, options.socket).await?;
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(Notify::new());
+    let policy = options.session;
+    let control = Arc::new(SessionControl::default());
+    // SEC-053: expose the directory to the admin API before serving.
+    ctx.set_session_admin(Arc::clone(&control) as Arc<dyn crate::SessionAdmin>);
     let state = Arc::new(HttpState {
         ctx: Arc::clone(&ctx),
         options,
         sessions: Mutex::new(HashMap::new()),
-        token_counter: AtomicU64::new(1),
+        grace: Mutex::new(HashMap::new()),
+        policy,
+        control,
     });
 
     // Shard-wide commit fan-out (SUB-021) — one per shard, shared with TCP.
@@ -314,7 +443,8 @@ async fn serve_connection(
                 OverloadState::Normal => false,
                 OverloadState::ShedAllNew => true,
                 OverloadState::ShedPreauth => match request.header(SESSION_HEADER) {
-                    Some(token) => !state.sessions.lock().await.contains_key(&token),
+                    // A live session (by its resolved id) is established work.
+                    Some(token) => resolve_id(&state, &token).await.is_none(),
                     None => true,
                 },
             };
@@ -503,13 +633,56 @@ async fn handle_post(
 
     // Load or create the session's router state — including its OPS-050
     // namespace binding, which must survive this transport rebuilding a
-    // `Session` per request.
+    // `Session` per request. `resolved_id` is the session's *current* at-rest
+    // id (post-grace-follow) that a later state write / rotation targets.
+    let mut resolved_id: Option<String> = None;
     let (mut router_state, connection_id, new_session, mut namespace) =
         if let Some(token) = &session_token {
+            // SEC-050: resolve by the token's hash, following a grace mapping
+            // if this is a just-rotated token still in its window.
+            let id = resolve_id(state, token).await;
             let mut sessions = state.sessions.lock().await;
-            match sessions.get_mut(token) {
-                Some(sess) => {
+            match id
+                .as_ref()
+                .and_then(|id| sessions.get_mut(id).map(|s| (id, s)))
+            {
+                Some((id, sess)) => {
+                    // SEC-053: an operator terminated this session.
+                    if sess.revoked.load(std::sync::atomic::Ordering::SeqCst) {
+                        let (cid, id) = (sess.connection_id, id.clone());
+                        drop(sessions);
+                        state
+                            .ctx
+                            .metrics()
+                            .note_session_rejected(SessionRejectReason::Revoked);
+                        evict_session(state, &id, cid).await;
+                        return write_simple(stream, 404, "Not Found").await;
+                    }
+                    // SEC-052: absolute lifetime, on top of RPC-060 idle.
+                    if let Some(max) = state.policy.absolute_lifetime
+                        && sess.created.elapsed() >= max
+                    {
+                        let (cid, id) = (sess.connection_id, id.clone());
+                        drop(sessions);
+                        state
+                            .ctx
+                            .metrics()
+                            .note_session_rejected(SessionRejectReason::Expired);
+                        evict_session(state, &id, cid).await;
+                        return write_simple(stream, 404, "Not Found").await;
+                    }
+                    // SEC-051: a token presented from another IP is a
+                    // suspected hijack — refused and counted, session intact.
+                    if state.policy.bind_client_ip && sess.client_ip != Some(ip) {
+                        drop(sessions);
+                        state
+                            .ctx
+                            .metrics()
+                            .note_session_rejected(SessionRejectReason::IpMismatch);
+                        return write_simple(stream, 403, "Forbidden").await;
+                    }
                     sess.last_active = Instant::now();
+                    resolved_id = Some(id.clone());
                     (
                         sess.state.clone(),
                         sess.connection_id,
@@ -519,8 +692,19 @@ async fn handle_post(
                 }
                 None => {
                     drop(sessions);
-                    // Stale/expired session token (RPC-060).
-                    return write_simple(stream, 404, "Not Found").await;
+                    // SEC-050 anti-fixation: a token the server never minted is
+                    // NEVER adopted. If the request re-authenticates it starts a
+                    // fresh session (new token minted below); otherwise it is a
+                    // stale/expired session and gets the RPC-060 404.
+                    if carries_authenticate {
+                        (SessionState::Unauthenticated, 0, true, None)
+                    } else {
+                        state
+                            .ctx
+                            .metrics()
+                            .note_session_rejected(SessionRejectReason::UnknownToken);
+                        return write_simple(stream, 404, "Not Found").await;
+                    }
                 }
             }
         } else {
@@ -579,19 +763,40 @@ async fn handle_post(
                 },
             )
             .await;
-        let token = state.mint_token(&router_state);
+        // SEC-050: a CSPRNG token; only its hash id is stored (the map key).
+        let minted = crate::session_sec::mint();
+        let now = Instant::now();
+        let client_ip = state.policy.bind_client_ip.then_some(ip);
+        let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let identity_hex = identity_hex_of(&router_state);
         state.sessions.lock().await.insert(
-            token.clone(),
+            minted.id.clone(),
             HttpSession {
                 state: router_state.clone(),
                 connection_id,
-                shutdown,
+                shutdown: Arc::clone(&shutdown),
                 out_rx: Some(out_rx),
-                last_active: Instant::now(),
+                last_active: now,
                 namespace: namespace.clone(),
+                created: now,
+                issued: now,
+                client_ip,
+                revoked: Arc::clone(&revoked),
             },
         );
-        issued_token = Some(token);
+        // SEC-053: mirror into the admin directory.
+        state.control.insert(
+            minted.id.clone(),
+            ControlEntry {
+                identity_hex,
+                connection_id,
+                created: now,
+                client_ip,
+                shutdown,
+                revoked,
+            },
+        );
+        issued_token = Some(minted.raw);
         // RED-011: run the `on_connect` hooks for the fresh session, in its
         // own database; their diff is published with this request's commits.
         if let SessionState::Authenticated { caller, .. } = &router_state {
@@ -610,11 +815,35 @@ async fn handle_post(
                 }
             }
         }
-    } else if let Some(token) = &session_token {
-        // Persist any state change (e.g. a re-auth) back to the store.
-        if let Some(sess) = state.sessions.lock().await.get_mut(token) {
+    } else if let Some(id) = &resolved_id {
+        // Persist any state change (e.g. a re-auth) back to the store, and
+        // decide whether the token rotates (SEC-052): a re-auth always
+        // rotates, and so does crossing the rotate interval.
+        let reauthed = !was_authed && matches!(router_state, SessionState::Authenticated { .. });
+        let mut sessions = state.sessions.lock().await;
+        if let Some(sess) = sessions.get_mut(id) {
             sess.state = router_state.clone();
             sess.namespace = namespace.clone();
+            let due = state
+                .policy
+                .rotate_interval
+                .is_some_and(|iv| sess.issued.elapsed() >= iv);
+            // Re-key the session under a fresh token; the old id lingers in
+            // the grace map so an in-flight request with it still lands.
+            if (reauthed || due) && let Some(mut old) = sessions.remove(id) {
+                let minted = crate::session_sec::mint();
+                old.issued = Instant::now();
+                sessions.insert(minted.id.clone(), old);
+                drop(sessions);
+                state.control.rekey(id, minted.id.clone());
+                let deadline = Instant::now() + state.policy.rotate_grace;
+                state
+                    .grace
+                    .lock()
+                    .await
+                    .insert(id.clone(), (minted.id.clone(), deadline));
+                issued_token = Some(minted.raw);
+            }
         }
     }
     let _ = connection_id;
@@ -646,23 +875,47 @@ async fn handle_get(
     request: &Request,
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
-    let Some(token) = request.header("fluxum-session") else {
+    let Some(raw_token) = request.header("fluxum-session") else {
+        return write_simple(&mut stream, 404, "Not Found").await;
+    };
+    // SEC-050: resolve the token to its session id (grace-aware).
+    let Some(token) = resolve_id(state, &raw_token).await else {
+        state
+            .ctx
+            .metrics()
+            .note_session_rejected(SessionRejectReason::UnknownToken);
         return write_simple(&mut stream, 404, "Not Found").await;
     };
     // Take the outbound receiver + shutdown for this session.
     let (mut out_rx, shutdown, connection_id) = {
         let mut sessions = state.sessions.lock().await;
         match sessions.get_mut(&token) {
-            Some(sess) => match sess.out_rx.take() {
-                Some(rx) => (rx, Arc::clone(&sess.shutdown), sess.connection_id),
-                None => {
+            Some(sess) => {
+                // SEC-053/052/051: a revoked, over-lifetime, or IP-mismatched
+                // session must not open a push stream either.
+                if sess.revoked.load(std::sync::atomic::Ordering::SeqCst) {
                     drop(sessions);
-                    // A stream is already open for this session.
-                    return write_simple(&mut stream, 409, "Conflict").await;
+                    state
+                        .ctx
+                        .metrics()
+                        .note_session_rejected(SessionRejectReason::Revoked);
+                    return write_simple(&mut stream, 404, "Not Found").await;
                 }
-            },
+                match sess.out_rx.take() {
+                    Some(rx) => (rx, Arc::clone(&sess.shutdown), sess.connection_id),
+                    None => {
+                        drop(sessions);
+                        // A stream is already open for this session.
+                        return write_simple(&mut stream, 409, "Conflict").await;
+                    }
+                }
+            }
             None => {
                 drop(sessions);
+                state
+                    .ctx
+                    .metrics()
+                    .note_session_rejected(SessionRejectReason::UnknownToken);
                 return write_simple(&mut stream, 404, "Not Found").await;
             }
         }
@@ -760,6 +1013,13 @@ async fn evict_session(state: &Arc<HttpState>, token: &str, connection_id: u128)
     if evicted.is_none() {
         return; // already retired (a racing sweep or stream teardown)
     }
+    // Drop the admin-directory mirror and any grace mapping pointing here.
+    state.control.remove(token);
+    state
+        .grace
+        .lock()
+        .await
+        .retain(|old, (current, _)| old != token && current != token);
     state.ctx.metrics().note_disconnect(); // OBS-040
     state.ctx.connections.remove(connection_id).await;
     // Deregister from the session's own database (OPS-050).
@@ -1067,6 +1327,39 @@ fn connection_id_of(state: &SessionState) -> Option<u128> {
         SessionState::Authenticated { caller, .. } => Some(caller.connection_id.as_u128()),
         SessionState::Unauthenticated => None,
     }
+}
+
+/// The caller identity (hex) of an authenticated session, for the SEC-053
+/// admin directory; empty for an unauthenticated state.
+fn identity_hex_of(state: &SessionState) -> String {
+    match state {
+        SessionState::Authenticated { caller, .. } => {
+            use std::fmt::Write as _;
+            caller.identity.as_bytes().iter().fold(
+                String::with_capacity(caller.identity.as_bytes().len() * 2),
+                |mut acc, b| {
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                },
+            )
+        }
+        SessionState::Unauthenticated => String::new(),
+    }
+}
+
+/// Resolve a presented raw token to the at-rest id of a *live* session
+/// (SEC-050/052): the token's own hash if it keys a session, else a
+/// still-in-window grace mapping from a just-rotated token, else `None`
+/// (unknown — never adopted). Expired grace entries are purged here.
+async fn resolve_id(state: &Arc<HttpState>, raw_token: &str) -> Option<String> {
+    let id = token_id(raw_token);
+    if state.sessions.lock().await.contains_key(&id) {
+        return Some(id);
+    }
+    let mut grace = state.grace.lock().await;
+    let now = Instant::now();
+    grace.retain(|_, (_, deadline)| now < *deadline);
+    grace.get(&id).map(|(current, _)| current.clone())
 }
 
 /// Decode every FluxRPC frame in a POST body into client messages. A frame

@@ -29,6 +29,7 @@ pub mod logging;
 pub mod namespace;
 pub mod quota;
 pub mod session;
+pub mod session_sec;
 pub mod shard;
 pub mod sock;
 pub mod statics;
@@ -127,6 +128,50 @@ fn render_reloadable(config: &fluxum_core::config::Config) -> serde_json::Value 
     serde_json::Value::Object(out)
 }
 
+/// One live HTTP session as the admin API sees it (SPEC-026 SEC-053) — never
+/// any token material, only what an operator needs to identify and kill it.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    /// The at-rest session id (`hex(SHA-256(token))`) — safe to expose and
+    /// what `DELETE /sessions/{id}` targets; it is not the token.
+    pub id: String,
+    /// The caller identity (hex) this session authenticated as.
+    pub identity: String,
+    /// The session's connection id.
+    pub connection_id: String,
+    /// Seconds since the session was minted.
+    pub age_secs: u64,
+    /// The client IP bound to the session (SEC-051), if binding is on.
+    pub client_ip: Option<String>,
+}
+
+impl SessionInfo {
+    /// The JSON object the admin `/sessions` endpoint returns.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "id": self.id,
+            "identity": self.identity,
+            "connection_id": self.connection_id,
+            "age_secs": self.age_secs,
+            "client_ip": self.client_ip,
+        })
+    }
+}
+
+/// The Streamable HTTP session directory, exposed by the transport so the
+/// admin API can list and terminate sessions (SPEC-026 SEC-053). Sync so it
+/// is callable straight from the admin dispatch; terminating a session fires
+/// its stream-shutdown signal and marks it revoked, so the next request on
+/// it is refused and any open GET stream drops.
+pub trait SessionAdmin: Send + Sync {
+    /// Every live session (no token material).
+    fn list(&self) -> Vec<SessionInfo>;
+    /// Terminate one session by id; `true` if it existed.
+    fn terminate(&self, id: &str) -> bool;
+    /// Terminate every session for `identity` (hex); returns how many.
+    fn terminate_identity(&self, identity_hex: &str) -> usize;
+}
+
 /// What a hot reload re-reads and republishes through (OPS-040).
 struct ConfigSource {
     /// The YAML file the running config was loaded from, if any. A reload
@@ -219,6 +264,10 @@ pub struct ShardContext {
     /// every connection admitted after it. Empty (the default) = proxy
     /// awareness off, socket peer is the client.
     trusted_proxies: std::sync::RwLock<Arc<fluxum_core::net::IpSet>>,
+    /// The Streamable HTTP session directory (SPEC-026 SEC-053), installed by
+    /// the HTTP transport at boot so the admin API can list and terminate
+    /// live sessions. `None` in an embedded/TCP-only assembly.
+    session_admin: std::sync::OnceLock<Arc<dyn SessionAdmin>>,
     /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
     /// inputs, every derived value with its source, and the per-kernel SIMD
     /// selection. Serialized at install so `/health` stays a clone, not a
@@ -297,6 +346,7 @@ impl ShardContext {
             reloadable: std::sync::RwLock::new(None),
             config_source: std::sync::Mutex::new(None),
             trusted_proxies: std::sync::RwLock::new(Arc::new(fluxum_core::net::IpSet::default())),
+            session_admin: std::sync::OnceLock::new(),
             send_buffer_bytes: AtomicU64::new(
                 fluxum_core::config::SubscriptionsConfig::default()
                     .send_buffer_bytes
@@ -526,6 +576,19 @@ impl ShardContext {
             .trusted_proxies
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(set);
+    }
+
+    /// Install the HTTP session directory (SPEC-026 SEC-053). The HTTP
+    /// transport calls this once at boot; a second call is ignored. Without
+    /// it the admin `/sessions` endpoints report an empty, un-actionable set
+    /// (a TCP-only or embedded assembly has no HTTP sessions).
+    pub fn set_session_admin(&self, admin: Arc<dyn SessionAdmin>) {
+        let _ = self.session_admin.set(admin);
+    }
+
+    /// The HTTP session directory, if the HTTP transport installed one.
+    pub fn session_admin(&self) -> Option<&Arc<dyn SessionAdmin>> {
+        self.session_admin.get()
     }
 
     /// SEC-041: the current admission-control verdict, published to the

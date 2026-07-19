@@ -41,6 +41,16 @@ pub const NONCE_LEN: usize = 24;
 /// At-rest key width: 256 bits.
 pub const KEY_LEN: usize = 32;
 
+/// `N` bytes from the OS CSPRNG (SPEC-009 AUTH-090: session tokens and any
+/// other secret that must be unpredictable regardless of what else leaks).
+#[must_use]
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    use chacha20poly1305::aead::rand_core::RngCore;
+    let mut out = [0u8; N];
+    OsRng.fill_bytes(&mut out);
+    out
+}
+
 /// One named 256-bit at-rest key. The bytes are zeroized on drop (SEC-010).
 #[derive(Clone)]
 pub struct AtRestKey {

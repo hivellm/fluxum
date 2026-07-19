@@ -106,6 +106,42 @@ impl ShardState {
     }
 }
 
+/// Why an HTTP session request was refused (SPEC-026 SEC-053) — the
+/// `reason` label of `fluxum_session_rejected_total{shard, reason}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionRejectReason {
+    /// The `Fluxum-Session` named no server-minted session (stale, expired,
+    /// or an attempted fixation).
+    UnknownToken,
+    /// The token was presented from an IP other than the one it was bound
+    /// to (SEC-051 — a suspected hijack).
+    IpMismatch,
+    /// The session passed its idle or absolute lifetime (SEC-052).
+    Expired,
+    /// The session was terminated by an operator (SEC-053 revocation).
+    Revoked,
+}
+
+impl SessionRejectReason {
+    /// The metric `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownToken => "unknown_token",
+            Self::IpMismatch => "ip_mismatch",
+            Self::Expired => "expired",
+            Self::Revoked => "revoked",
+        }
+    }
+
+    /// Every reason, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 4] = [
+        Self::UnknownToken,
+        Self::IpMismatch,
+        Self::Expired,
+        Self::Revoked,
+    ];
+}
+
 /// SEC-041 admission-control state (the `fluxum_overload_state` gauge):
 /// what the accept loops shed under load, ordered by severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -210,6 +246,10 @@ pub struct Metrics {
     conn_rejected_blocked: AtomicU64,
     conn_rejected_global_cap: AtomicU64,
     conn_rejected_overload: AtomicU64,
+    session_rejected_unknown_token: AtomicU64,
+    session_rejected_ip_mismatch: AtomicU64,
+    session_rejected_expired: AtomicU64,
+    session_rejected_revoked: AtomicU64,
     overload_state: AtomicU8,
     connguard_tracked_ips: AtomicU64,
     connguard_evictions: AtomicU64,
@@ -305,6 +345,10 @@ impl Metrics {
             conn_rejected_blocked: AtomicU64::new(0),
             conn_rejected_global_cap: AtomicU64::new(0),
             conn_rejected_overload: AtomicU64::new(0),
+            session_rejected_unknown_token: AtomicU64::new(0),
+            session_rejected_ip_mismatch: AtomicU64::new(0),
+            session_rejected_expired: AtomicU64::new(0),
+            session_rejected_revoked: AtomicU64::new(0),
             overload_state: AtomicU8::new(OverloadState::Normal as u8),
             connguard_tracked_ips: AtomicU64::new(0),
             connguard_evictions: AtomicU64::new(0),
@@ -452,6 +496,27 @@ impl Metrics {
     /// The current reject count for `reason`.
     pub fn conn_rejected(&self, reason: ConnRejectReason) -> u64 {
         self.conn_rejected_counter(reason).load(Ordering::Relaxed)
+    }
+
+    /// SEC-053: an HTTP session request was refused.
+    pub fn note_session_rejected(&self, reason: SessionRejectReason) {
+        self.session_rejected_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current session-reject count for `reason`.
+    pub fn session_rejected(&self, reason: SessionRejectReason) -> u64 {
+        self.session_rejected_counter(reason)
+            .load(Ordering::Relaxed)
+    }
+
+    fn session_rejected_counter(&self, reason: SessionRejectReason) -> &AtomicU64 {
+        match reason {
+            SessionRejectReason::UnknownToken => &self.session_rejected_unknown_token,
+            SessionRejectReason::IpMismatch => &self.session_rejected_ip_mismatch,
+            SessionRejectReason::Expired => &self.session_rejected_expired,
+            SessionRejectReason::Revoked => &self.session_rejected_revoked,
+        }
     }
 
     fn conn_rejected_counter(&self, reason: ConnRejectReason) -> &AtomicU64 {
@@ -637,6 +702,22 @@ impl Metrics {
                 "fluxum_conn_rejected_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
                 reason.as_str(),
                 self.conn_rejected(reason),
+            );
+        }
+
+        // --- HTTP session rejections (SEC-053) ---
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_session_rejected_total HTTP session requests refused by reason \
+             (SPEC-026 SEC-053).\n\
+             # TYPE fluxum_session_rejected_total counter"
+        );
+        for reason in SessionRejectReason::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_session_rejected_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.session_rejected(reason),
             );
         }
 

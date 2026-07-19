@@ -549,6 +549,15 @@ hot path.
   | `GET` | `/bans` | Static blocklist + runtime bans with remaining TTL (SPEC-026 SEC-033) |
   | `POST` | `/bans` | Ban an IP/CIDR at runtime, optional TTL (SPEC-026 SEC-033) |
   | `DELETE` | `/bans/:entry` | Lift a runtime ban (SPEC-026 SEC-033) |
+  | `GET` | `/sessions` | List live HTTP sessions, no token material (SPEC-026 SEC-053) |
+  | `DELETE` | `/sessions/:id` | Terminate one session (SPEC-026 SEC-053) |
+  | `DELETE` | `/sessions?identity=` | Terminate every session for an identity (SPEC-026 SEC-053) |
+
+  The `Fluxum-Session` header value is an **opaque** token: clients echo it
+  verbatim and never parse or construct it. The server treats a value it did
+  not mint as unknown and never adopts it (anti-fixation; SPEC-026 SEC-050),
+  and MAY rotate the value it returns at any time — a client always uses the
+  most recent `Fluxum-Session` header it received.
 
   Paths are unversioned — there is no `/v1` prefix. The `/rpc` path on the same port belongs to
   the binary Streamable HTTP transport (RPC-004..RPC-007) and does NOT use the JSON envelopes

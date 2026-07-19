@@ -161,6 +161,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             max_frame_bytes,
             static_dir: config.server.static_dir.clone(),
             socket,
+            session: crate::session_sec::SessionPolicy::from_config(&config.server.session),
             ..HttpOptions::default()
         },
     )
