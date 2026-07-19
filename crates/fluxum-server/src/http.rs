@@ -268,7 +268,10 @@ async fn serve_connection(
             // static dir can never shadow `/rpc` or the admin surface.
             ("GET", path) if state.options.static_dir.is_some() => {
                 handle_static(&state, &mut stream, path).await?;
-                true
+                // `false`: do not keep this connection alive — see the header
+                // comment in `handle_static` for why the socket has to go back
+                // to the browser's pool immediately.
+                false
             }
             ("GET" | "POST", _) => {
                 write_simple(&mut stream, 404, "Not Found").await?;
@@ -565,28 +568,32 @@ async fn handle_get(
     // Chunked streaming response header.
     write_stream_header(&mut stream).await?;
 
-    // Prime the stream with one keep-alive frame (RPC-001/006: a zero-length
-    // frame receivers ignore, so this is inert).
-    //
-    // A push stream produces nothing until the first commit, and an
-    // intermediary that buffers a body-less response cannot tell a live
-    // stream from a stalled one. One frame makes it observably live.
-    //
-    // Honest limitation: this did NOT fix the ~15s delay seen before
-    // `fetch()` resolves under Playwright-driven Chromium, and neither did
-    // padding it to 2 KB. `curl` and Node receive these headers and this
-    // frame in single-digit milliseconds against the same server, so the
-    // delay is downstream of what this code controls — most likely the test
-    // harness's network interception buffering an endless chunked response.
-    // Left in as cheap liveness, not claimed as a fix.
-    if write_chunk(&mut stream, &FrameCodec::keepalive()).await.is_err() {
-        return Ok(());
-    }
-
     let keepalive = state.options.keepalive;
     let idle = state.options.idle_timeout;
-    let mut keepalive_timer = tokio::time::interval(keepalive);
-    keepalive_timer.tick().await; // consume the immediate first tick
+
+    // The first keep-alive fires almost immediately; the configured cadence
+    // takes over after it.
+    //
+    // Not cosmetic — without it the browser transport is unusable, and the
+    // reason took measuring to find. A browser does not surface this response
+    // at all (`fetch()` stays unresolved, headers included) until a chunk
+    // written from *this loop* arrives. Writes issued before the loop are
+    // invisible to it: a priming frame right after the header changed nothing,
+    // and neither did padding that frame to 2 KB.
+    //
+    // The proof is in the timing. With the 20 s default the browser released
+    // the response at 20004 ms; dropping the cadence to 3 s moved it to
+    // 3055 ms; adding a 500 ms pre-loop write moved it to 3505 ms — always
+    // the first loop tick, never the writes before it. `curl` and Node see
+    // the headers in single-digit milliseconds either way, which is exactly
+    // why this survived every non-browser test.
+    //
+    // So the opening tick is what a browser waits on, and the cadence is what
+    // an idle connection needs afterwards (RPC-006). Both are keep-alive
+    // frames, which receivers ignore (RPC-001).
+    const OPENING_TICK: Duration = Duration::from_millis(50);
+    let mut keepalive_timer =
+        tokio::time::interval_at(Instant::now() + OPENING_TICK, keepalive);
 
     let mut exit = GetExit::Expired;
     let result = loop {
@@ -883,9 +890,18 @@ async fn handle_static(state: &Arc<HttpState>, stream: &mut TcpStream, path: &st
         return write_simple(stream, 404, "Not Found").await;
     };
 
+    // `Connection: close`, deliberately.
+    //
+    // A browser allows ~6 concurrent connections per origin on HTTP/1.1, and
+    // Fluxum's push stream (RPC-006) holds one of them for the session's whole
+    // life. Keeping asset connections alive means the page's own HTML, CSS and
+    // JS sit in that pool competing with it — and a page served from the same
+    // origin as `/rpc` can exhaust the pool before it ever opens the stream,
+    // leaving `GET /rpc` queued in the browser with no request on the wire and
+    // no error anywhere. Closing after each file returns the socket at once.
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
-         Cache-Control: no-cache\r\n\r\n",
+         Cache-Control: no-cache\r\nConnection: close\r\n\r\n",
         crate::statics::content_type(&file),
         body.len(),
     );
@@ -911,11 +927,17 @@ async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Re
 /// made every browser client hang at connect while Node (which does not sniff)
 /// worked fine. `nosniff` tells the browser there is nothing to guess.
 async fn write_stream_header(stream: &mut TcpStream) -> io::Result<()> {
-    let head = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {CONTENT_TYPE}\r\nTransfer-Encoding: chunked\r\n\
-         X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\r\n"
+    // `nosniff` because the content type is not one a browser recognises, and
+    // sniffing an unrecognised type means waiting for bytes a push stream has
+    // no reason to send yet. (It is not what caused the slow-open bug — see
+    // `handle_get` — but it is still the right header.)
+    const HEAD: &str = concat!(
+        "HTTP/1.1 200 OK\r\nContent-Type: ",
+        "application/x-fluxum",
+        "\r\nTransfer-Encoding: chunked\r\n",
+        "X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\r\n",
     );
-    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(HEAD.as_bytes()).await?;
     stream.flush().await
 }
 

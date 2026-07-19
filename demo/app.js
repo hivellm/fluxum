@@ -29,19 +29,25 @@ const decodeTask = (row) => {
   return { id: r.read('U64'), owner: r.read('Identity'), title: r.read('Str'), done: r.read('Bool') };
 };
 
+// OnlineUser is keyed by ConnectionId: one row per connection, so the same
+// identity legitimately appears twice with two tabs open.
 const decodePresence = (row) => {
   const r = new RowReader(row);
-  return { identity: r.read('Identity'), connectedAt: r.read('Timestamp') };
+  return {
+    connection: r.read('ConnectionId'),
+    identity: r.read('Identity'),
+    connectedAt: r.read('Timestamp'),
+  };
 };
 
 // `read('Identity')` returns hex already, not bytes.
 const pkU64 = (b) => String(new RowReader(b).read('U64'));
-const pkIdentity = (b) => new RowReader(b).read('Identity');
+const pkConnection = (b) => String(new RowReader(b).read('ConnectionId'));
 
 const TABLES = [
   { name: 'ChatMessage', pkOfRow: pkU64, pkOfDelete: pkU64 },
   { name: 'Task', pkOfRow: pkU64, pkOfDelete: pkU64 },
-  { name: 'OnlineUser', pkOfRow: pkIdentity, pkOfDelete: pkIdentity },
+  { name: 'OnlineUser', pkOfRow: pkConnection, pkOfDelete: pkConnection },
 ];
 
 const QUERIES = [

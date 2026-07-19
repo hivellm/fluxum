@@ -17,7 +17,7 @@
 //! see different rows, and connect/disconnect presence.
 
 use fluxum_core::reducer::ReducerContext;
-use fluxum_core::types::{Identity, Timestamp};
+use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_macros as fluxum;
 
 /// Force the linker to keep this crate, and with it every registration above.
@@ -66,23 +66,27 @@ pub struct Task {
     pub done: bool,
 }
 
-/// Who is currently connected, maintained by the lifecycle hooks.
+/// Who is currently connected — one row per **connection**, not per identity.
 ///
-/// # Known limitation: keyed by identity, not by connection
+/// Keyed by `ConnectionId` because presence is a property of a connection:
+/// keying it by identity means two tabs share one row, and the first one to
+/// disconnect deletes presence for both. That is not hypothetical — the demo
+/// page did exactly this, and reloading it made the expiring old session erase
+/// the new session's row.
 ///
-/// One identity with two live connections shares one row, so the first
-/// `on_disconnect` deletes presence for both — reload the demo page and the
-/// expiring old session erases the new one's row. Observed in practice, not
-/// theoretical.
-///
-/// Correct presence is keyed by `ConnectionId`, or refcounted per identity.
-/// Left as-is because the shape is what makes the bug legible: the table reads
-/// as obviously right until two connections share a primary key.
-#[fluxum::table(public)]
+/// `ephemeral` + `#[owner]` (SPEC-023 DMX-011) is the built-in answer: the
+/// engine drops this connection's rows on disconnect, in the same transaction
+/// as any `on_disconnect` hook, so presence and its cleanup fan out
+/// atomically. It also makes the table memory-only, which is right — presence
+/// from a previous run of the server is never true.
+#[fluxum::table(ephemeral)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct OnlineUser {
-    /// The connected identity.
+    /// The connection this presence belongs to; dropped when it closes.
     #[primary_key]
+    #[owner]
+    pub connection: ConnectionId,
+    /// Who is on the other end. Not unique: one identity may hold several.
     pub identity: Identity,
     /// When the connection was established.
     pub connected_at: Timestamp,
@@ -162,22 +166,20 @@ fn complete_task(ctx: &ReducerContext, id: u64) -> Result<(), String> {
 // --- Lifecycle --------------------------------------------------------------
 
 /// Record presence when a client connects (RED-012).
+///
+/// There is deliberately no matching `on_disconnect`: the `#[owner]` binding
+/// on [`OnlineUser`] makes the engine drop this connection's row itself
+/// (DMX-011). A hand-written hook would be a second implementation of the same
+/// rule, free to drift from it — and the earlier one did, deleting by identity
+/// and taking every other connection's presence with it.
 #[fluxum::on_connect]
 fn presence_up(ctx: &ReducerContext) -> Result<(), String> {
     ctx.tx
         .upsert(OnlineUser {
+            connection: ctx.connection_id,
             identity: ctx.identity,
             connected_at: ctx.timestamp,
         })
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// Drop presence when a client disconnects (RED-013).
-#[fluxum::on_disconnect]
-fn presence_down(ctx: &ReducerContext) -> Result<(), String> {
-    ctx.tx
-        .delete::<OnlineUser>(ctx.identity)
         .map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -169,7 +169,9 @@ test('the push stream refuses to open before authentication', async () => {
   const transport = new HttpTransport('http://localhost:15800', {
     fetch: async () => streaming([]),
   });
-  await assert.rejects(transport.openPushStream(), /before authenticating/);
+  // Now synchronous: it issues the request and returns, so a precondition
+  // failure throws rather than rejecting.
+  assert.throws(() => transport.openPushStream(), /before authenticating/);
 });
 
 test('the push stream delivers server-initiated frames', async () => {
@@ -185,7 +187,7 @@ test('the push stream delivers server-initiated frames', async () => {
   const tags = collect(transport);
 
   await transport.send(encodeMessage('Authenticate', [1, null, null, null, null]));
-  await transport.openPushStream();
+  transport.openPushStream();
   // The stream is drained off the call; let its microtasks settle.
   await new Promise((resolve) => setTimeout(resolve, 0));
 

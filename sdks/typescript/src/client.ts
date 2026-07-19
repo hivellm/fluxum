@@ -297,7 +297,7 @@ export class FluxumClient {
 
     // The push stream only exists on HTTP; on TCP the connection carries
     // server-initiated frames itself.
-    if (transport instanceof HttpTransport) await transport.openPushStream();
+    if (transport instanceof HttpTransport) transport.openPushStream();
   }
 
   #onDisconnected(reason: Error | null): void {

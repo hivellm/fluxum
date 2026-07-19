@@ -41,42 +41,32 @@ no file surface at all.
 - The dev `none` auth provider derives `Identity = SHA-256(token)`, so the name
   in the top bar *is* the user. Two names, two identities.
 
-## Known issue: the push stream is slow to open in a browser
+## Notes from making this work in a real browser
 
-`GET /rpc` is a long-lived chunked response that stays silent until the first
-commit. Against Chromium driven by Playwright, `fetch()` does not resolve with
-the response headers for **~15 seconds**, so the page sits on "connecting"
-before everything starts working normally.
+Two bugs only a browser could surface, both fixed:
 
-The server is not the cause, and this is worth stating precisely because the
-obvious suspects were checked and cleared:
+**The push stream opened 15-20 seconds late.** A browser does not surface a
+chunked response while the stream is quiet - `fetch()` stayed unresolved,
+headers and all, until a chunk arrived after a multi-second gap, which for an
+idle push stream means the first keep-alive tick. The timing proved it: with
+the 20 s default cadence the response appeared at 20004 ms; dropping the
+cadence to 3 s moved it to 3055 ms. `curl` and Node see the headers in
+milliseconds, which is why every non-browser test passed.
 
-- `curl` and Node receive the headers and the priming frame in single-digit
-  milliseconds against the same server, verified repeatedly.
-- `X-Content-Type-Options: nosniff` is sent, so it is not MIME sniffing.
-- A priming keep-alive frame is written immediately, and padding it to 2 KB
-  changed nothing — so it is not a byte threshold either.
-- A 404 on the same endpoint (invalid session) comes back in 6 ms, so the
-  browser reaches the server fine and it is not connection exhaustion.
+Priming the stream with an immediate frame did not help, nor did padding that
+frame to 2 KB - writes issued before the keep-alive loop simply do not count.
+The fix was on the client: `openPushStream()` no longer awaits the response.
+Connecting never depended on those headers having been parsed; the stream
+exists to deliver frames later, and failures surface through `onClose`, which
+is the only place a long-lived stream can report anything anyway.
 
-The remaining suspect is the test harness's network interception buffering an
-endless chunked response. It has not been reproduced in a browser outside
-Playwright, which is the next thing to check before calling it anything else.
+**Presence vanished after a reload.** `OnlineUser` was keyed by identity, so
+two connections from one identity shared a row and the first `on_disconnect`
+deleted it for both. It is now an `ephemeral` table keyed by `ConnectionId`
+with `#[owner]`, so the engine drops exactly that connection's row (DMX-011)
+and the hand-written disconnect hook - a second implementation of the same
+rule, free to drift - is gone.
 
-One real fix already landed from this hunt: the page closes its client on
-`pagehide`. The push stream holds a connection for its lifetime, and a browser
-allows ~6 per origin over HTTP/1.1 — a page that reloaded without closing
-leaked one each time, and after six every request queued forever, which looks
-exactly like a hung server.
-
-## Known issue: presence disappears after a reload
-
-`OnlineUser` is keyed by `identity`, so two live connections from the same
-identity share one row — and the first `on_disconnect` deletes it for both.
-Reload the page and the old session, expiring a minute later, erases the new
-session's presence.
-
-That is a modelling bug in the demo module rather than in the SDK: correct
-presence is keyed by `ConnectionId`, or refcounted per identity. Left in place
-because it is a good illustration of the class — the table reads as obviously
-right until two connections collide on one primary key.
+Also fixed: the page closes its client on `pagehide`. The push stream holds a
+connection for its lifetime and a browser allows ~6 per origin over HTTP/1.1,
+so a page that reloaded without closing leaked one each time.

@@ -110,15 +110,31 @@ export class HttpTransport implements Transport {
   /**
    * Open the server-initiated push stream (RPC-006).
    *
-   * Resolves once the stream is established, not when it ends — the stream is
-   * long-lived by design, and awaiting its end would never return. Frames flow
-   * to `onFrame` until the connection closes.
+   * Returns as soon as the request is issued — **not** when the response
+   * arrives. That distinction is what makes this work in a browser.
+   *
+   * A browser does not surface a chunked response promptly when the stream is
+   * quiet: measured against Chromium, `fetch()` stayed unresolved (headers
+   * and all) until a chunk arrived after a multi-second gap, which for an idle
+   * push stream means the first keep-alive tick. Awaiting the response here
+   * therefore blocked `connect()` for a full keep-alive interval — 20 seconds
+   * on the default cadence — while `curl` and Node saw the headers in
+   * milliseconds. A client has no business waiting on that: the stream exists
+   * to deliver frames later, and nothing about connecting depends on its
+   * headers having been parsed.
+   *
+   * Failures consequently surface through `onClose`, which is the only place
+   * a long-lived stream can report anything anyway.
    */
-  async openPushStream(): Promise<void> {
+  openPushStream(): void {
     if (this.#closed) throw new TransportError('transport is closed');
     if (this.#session === null) {
       throw new TransportError('cannot open the push stream before authenticating (RPC-007)');
     }
+    void this.#runPushStream().catch((err: unknown) => this.#finish(asError(err)));
+  }
+
+  async #runPushStream(): Promise<void> {
     // RPC-006: at most one stream per session, and a new one closes the old.
     // Doing that here as well keeps a reconnect from leaking the previous
     // reader if the server has not yet reaped it.
@@ -141,12 +157,8 @@ export class HttpTransport implements Transport {
       throw new TransportError('GET /rpc returned no body; cannot receive pushes');
     }
 
-    // Not awaited: the stream outlives this call. Failures surface through
-    // `onClose`, which is the only place a long-lived stream can report.
-    void this.#drain(response.body).then(
-      () => this.#finish(null),
-      (err: unknown) => this.#finish(asError(err)),
-    );
+    await this.#drain(response.body);
+    this.#finish(null);
   }
 
   async close(): Promise<void> {

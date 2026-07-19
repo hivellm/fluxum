@@ -66,7 +66,7 @@ test(
     // 3. Open the push stream, then call the reducer. The TxUpdate arrives on
     //    the stream rather than the POST response — that split is the whole
     //    reason GET /rpc exists (RPC-006).
-    await transport.openPushStream();
+    transport.openPushStream();
     messages.length = 0;
 
     // id, reducer, version, args, idempotency_key — `version` sits BEFORE the
