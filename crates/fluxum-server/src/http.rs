@@ -483,8 +483,22 @@ async fn serve_connection(
             }
             // Blob upload/download (SPEC-023 DMX-041) — out-of-band of the
             // 16 MB FluxRPC frame; shares this port with the admin surface.
+            // F-002: closed to the unauthenticated — a valid `Fluxum-Session`
+            // (an authenticated client) is required, so blob storage is not a
+            // free anonymous read/write surface on a directly exposed port.
+            ("POST", "/blob") if !is_authed_session(&state, &request).await => {
+                write_simple(&mut stream, 401, "Unauthorized").await?;
+                true
+            }
             ("POST", "/blob") => {
                 handle_blob_upload(&state.ctx, &mut stream, &request).await?;
+                true
+            }
+            ("GET", path)
+                if path.strip_prefix("/blob/").is_some()
+                    && !is_authed_session(&state, &request).await =>
+            {
+                write_simple(&mut stream, 401, "Unauthorized").await?;
                 true
             }
             ("GET", path) if path.strip_prefix("/blob/").is_some() => {
@@ -494,7 +508,16 @@ async fn serve_connection(
             }
             // The HTTP/JSON admin surface (RPC-050) shares this port.
             (method, path) if crate::admin::is_admin_path(path) => {
-                handle_admin(&state.ctx, &mut stream, method, path, &request.body).await?;
+                handle_admin(
+                    &state.ctx,
+                    &mut stream,
+                    method,
+                    path,
+                    &request.body,
+                    ip,
+                    &request,
+                )
+                .await?;
                 true
             }
             // Static files, last: every real route above wins, so enabling a
@@ -578,8 +601,27 @@ async fn handle_admin(
     method: &str,
     path: &str,
     body: &[u8],
+    client_ip: std::net::IpAddr,
+    request: &Request,
 ) -> io::Result<()> {
-    let response = crate::admin::dispatch(ctx, method, path, body).await;
+    // SEC-054: the operator credential travels in the `Fluxum-Operator`
+    // header, or (compat with `/audit`) a JSON `token` field in the body.
+    let operator_token = request.header("fluxum-operator").or_else(|| {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("token").and_then(|t| t.as_str()).map(str::to_owned))
+    });
+    let response = crate::admin::dispatch(
+        ctx,
+        crate::admin::AdminRequest {
+            method,
+            path,
+            body,
+            client_ip,
+            operator_token: operator_token.as_deref(),
+        },
+    )
+    .await;
     // `/metrics` returns a JSON string that is really Prometheus text.
     let (content_type, bytes) = match &response.body {
         serde_json::Value::String(text) => ("text/plain; version=0.0.4", text.clone().into_bytes()),
@@ -830,7 +872,9 @@ async fn handle_post(
                 .is_some_and(|iv| sess.issued.elapsed() >= iv);
             // Re-key the session under a fresh token; the old id lingers in
             // the grace map so an in-flight request with it still lands.
-            if (reauthed || due) && let Some(mut old) = sessions.remove(id) {
+            if (reauthed || due)
+                && let Some(mut old) = sessions.remove(id)
+            {
                 let minted = crate::session_sec::mint();
                 old.issued = Instant::now();
                 sessions.insert(minted.id.clone(), old);
@@ -1351,6 +1395,22 @@ fn identity_hex_of(state: &SessionState) -> String {
 /// (SEC-050/052): the token's own hash if it keys a session, else a
 /// still-in-window grace mapping from a just-rotated token, else `None`
 /// (unknown — never adopted). Expired grace entries are purged here.
+/// Whether the request carries a `Fluxum-Session` that resolves to a live,
+/// authenticated session (F-002 blob gate). A revoked session does not count.
+async fn is_authed_session(state: &Arc<HttpState>, request: &Request) -> bool {
+    let Some(raw) = request.header("fluxum-session") else {
+        return false;
+    };
+    let Some(id) = resolve_id(state, &raw).await else {
+        return false;
+    };
+    let sessions = state.sessions.lock().await;
+    sessions.get(&id).is_some_and(|s| {
+        !s.revoked.load(std::sync::atomic::Ordering::SeqCst)
+            && matches!(s.state, SessionState::Authenticated { .. })
+    })
+}
+
 async fn resolve_id(state: &Arc<HttpState>, raw_token: &str) -> Option<String> {
     let id = token_id(raw_token);
     if state.sessions.lock().await.contains_key(&id) {

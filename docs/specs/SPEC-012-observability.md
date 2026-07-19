@@ -165,6 +165,8 @@ of the correctness contract.
   fluxum_connguard_evictions_total{shard}      Counter  // entries reclaimed under pressure
   fluxum_session_rejected_total{shard, reason} Counter  // reason ∈ {unknown_token, ip_mismatch,
                                                         // expired, revoked} (SPEC-026 SEC-053)
+  fluxum_admin_rejected_total{shard, reason}   Counter  // reason ∈ {untrusted_ip, unauthenticated}
+                                                        // (SPEC-026 SEC-054)
   ```
 
   Every `reason` label is emitted even at zero, so rate alerts never go

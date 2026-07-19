@@ -197,7 +197,8 @@ fn caller(token: &[u8]) -> fluxum_core::reducer::ReducerCaller {
 }
 
 async fn audit(ctx: &Arc<ShardContext>, body: Value) -> (u16, Value) {
-    let resp = admin::dispatch(ctx, "POST", "/audit", &serde_json::to_vec(&body).unwrap()).await;
+    let body = serde_json::to_vec(&body).unwrap();
+    let resp = admin::dispatch(ctx, admin::AdminRequest::local("POST", "/audit", &body)).await;
     (resp.status, resp.body)
 }
 

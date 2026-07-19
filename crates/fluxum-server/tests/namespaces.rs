@@ -394,7 +394,11 @@ async fn metrics_carry_a_namespace_label_per_database() {
     acme.authenticate(Some("acme")).await;
     acme.write_note("counted").await;
 
-    let resp = fluxum_server::admin::dispatch(&h.ctx, "GET", "/metrics", &[]).await;
+    let resp = fluxum_server::admin::dispatch(
+        &h.ctx,
+        fluxum_server::admin::AdminRequest::local("GET", "/metrics", &[]),
+    )
+    .await;
     let text = match &resp.body {
         serde_json::Value::String(text) => text.clone(),
         other => panic!("expected metrics text, got {other:?}"),

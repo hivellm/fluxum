@@ -67,6 +67,8 @@ pub struct ServerConfig {
     pub connection_limits: ConnectionLimitsConfig,
     /// Streamable HTTP session-token security (SPEC-026 SEC-050..053).
     pub session: SessionConfig,
+    /// HTTP admin-surface access control (SPEC-026 SEC-054).
+    pub admin: AdminConfig,
     /// Listen backlog for both listeners (SEC-042): pending un-accepted
     /// connections the kernel queues. `0` = the built-in default (1024).
     /// Raise alongside `somaxconn` on a directly exposed port.
@@ -107,6 +109,7 @@ impl Default for ServerConfig {
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
             connection_limits: ConnectionLimitsConfig::default(),
             session: SessionConfig::default(),
+            admin: AdminConfig::default(),
             accept_backlog: 0,
             tcp_keepalive_secs: 0,
             tcp_defer_accept_secs: 0,
@@ -240,6 +243,42 @@ impl Default for SessionConfig {
             rotate_interval_secs: 0,
             rotate_grace_secs: 30,
             absolute_lifetime_secs: 0,
+        }
+    }
+}
+
+/// HTTP admin-surface access control (SPEC-026 SEC-054). The admin API
+/// (`/reducer`, `/query`, `/drain`, `/config/reload`, `/bans`, `/sessions`,
+/// …) shares `http_port` with `/rpc`, so on a directly exposed port it must
+/// be **safe by default**: reachable from loopback with no ceremony, but
+/// refused from any other address unless the operator explicitly opts an IP
+/// range in and presents a credential.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    /// Client IP ranges — beyond loopback, which is always allowed —
+    /// permitted to reach the gated admin routes (IP/CIDR, v4/v6). Empty
+    /// (the default) = loopback only. A request from a non-loopback IP not
+    /// listed here is refused `403` before any handler runs.
+    pub trusted: Vec<String>,
+    /// Require an operator credential (a configured `auth.server_peers`
+    /// token, in the `Fluxum-Operator` header or a JSON `token` field) on
+    /// gated routes reached from a *non-loopback* trusted IP (SEC-054).
+    /// Loopback never needs one — it is the operator's own host. Default
+    /// `true`: exposing admin remotely without a credential is refused.
+    pub require_operator: bool,
+    /// Keep `/health` and `/metrics` open (ungated) so load balancers and
+    /// Prometheus can always reach them (default `true`). Set `false` to put
+    /// them behind the same gate as the rest of the admin surface.
+    pub open_health_metrics: bool,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self {
+            trusted: Vec::new(),
+            require_operator: true,
+            open_health_metrics: true,
         }
     }
 }
@@ -982,6 +1021,9 @@ impl Config {
         if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
             return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
         }
+        if let Err(e) = crate::net::IpSet::parse(&self.server.admin.trusted) {
+            return Err(FluxumError::config(format!("server.admin.trusted: {e}")));
+        }
         if let Err(e) = crate::net::IpSet::parse(&self.server.connection_limits.blocklist) {
             return Err(FluxumError::config(format!(
                 "server.connection_limits.blocklist: {e}"
@@ -1159,6 +1201,9 @@ pub const RELOADABLE_KEYS: &[&str] = &[
     "server.connection_limits.blocklist",
     "server.connection_limits.allowlist",
     "server.connection_limits.max_total_conns",
+    "server.admin.trusted",
+    "server.admin.require_operator",
+    "server.admin.open_health_metrics",
     "observability.slow_reducer_threshold_us",
     "reducer.shard_max_reducers_per_sec",
     "subscriptions.send_buffer_bytes",

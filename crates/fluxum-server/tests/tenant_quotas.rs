@@ -402,7 +402,11 @@ async fn tenant_metrics_report_usage_against_the_quota() {
     acme.write_note("two").await.unwrap();
     let _ = acme.write_note("over").await; // trips the rate quota
 
-    let resp = fluxum_server::admin::dispatch(&h.ctx, "GET", "/metrics", &[]).await;
+    let resp = fluxum_server::admin::dispatch(
+        &h.ctx,
+        fluxum_server::admin::AdminRequest::local("GET", "/metrics", &[]),
+    )
+    .await;
     let text = match &resp.body {
         serde_json::Value::String(text) => text.clone(),
         other => panic!("expected metrics text, got {other:?}"),

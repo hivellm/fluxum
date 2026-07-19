@@ -123,6 +123,9 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     ctx.set_conn_guard(Arc::new(crate::connguard::ConnGuard::new(
         crate::connguard::ConnLimits::from_config(&config.server.connection_limits),
     )));
+    // SPEC-026 SEC-054: the admin access policy, from config. (Also
+    // republished on hot reload via `publish_reloadable`.)
+    ctx.set_admin_policy(crate::AdminPolicy::from_config(&config.server.admin)?);
     Ok(ctx)
 }
 

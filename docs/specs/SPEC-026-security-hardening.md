@@ -223,6 +223,42 @@ server:
   trusted_proxies: []                # SEC-035 IP/CIDR entries; empty = socket peer is the client
 ```
 
+### Requirement: Admin-surface access control
+The HTTP admin API (`/reducer`, `/query`, `/query/explain`, `/schema`, `/view`, `/drain`,
+`/config/reload`, `/plugins/*`, `/bans`, `/sessions`, `/audit`) shares `http_port` with `/rpc`.
+On the direct-exposure posture (no mandatory proxy, no TLS) it MUST be safe by default: an
+unauthenticated remote peer must not gain read/write/DoS over it.
+
+- **SEC-054** [P0] The admin dispatch SHALL enforce, before any handler runs: (a) a **network
+  gate** — loopback always passes; a non-loopback client is refused `403` (`untrusted_ip`) unless
+  its SEC-035 resolved IP is in `server.admin.trusted` (IP/CIDR, default empty = loopback only);
+  and (b) an **operator credential** — a request from a trusted *non-loopback* IP MUST present a
+  valid `auth.server_peers` token (in the `Fluxum-Operator` header or a JSON `token` field) when
+  `server.admin.require_operator` (default `true`), else `401` (`unauthenticated`). The token is
+  compared digest-to-digest and never logged. `/health` and `/metrics` stay ungated when
+  `server.admin.open_health_metrics` (default `true`) so scrapers and load balancers always reach
+  them. Refusals increment `fluxum_admin_rejected_total{reason}`.
+- **SEC-055** [P1] Admin reducer invocation (`POST /reducer/:name`) SHALL honor the same
+  `client_callable` gating a client session does — a schedule-only reducer is refused `403` even
+  for an operator (F-004). The `/blob` upload/download routes SHALL require an authenticated
+  `Fluxum-Session` (F-002); the unauthenticated blob surface is closed.
+- **SEC-056** [P2] `server.admin.*` SHALL be validated at load and hot-reloadable (OPS-040). With
+  defaults, the admin surface behaves exactly as before for a loopback operator.
+
+#### Scenario: A directly exposed node is safe by default
+Given a Fluxum node on a public IP with default config
+When a remote client calls `POST /reducer/:name` or `POST /query` with no credential
+Then the request is refused `403` before any handler runs, no write happens and no RLS-bypassing
+read is served, while the same call from loopback (the operator's own host) succeeds.
+
+```yaml
+server:
+  admin:
+    trusted: []                 # SEC-054 extra IP/CIDR ranges (beyond loopback); empty = loopback only
+    require_operator: true      # SEC-054 remote gated routes need a server-peer token
+    open_health_metrics: true   # SEC-054 keep /health and /metrics ungated for scrapers
+```
+
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).

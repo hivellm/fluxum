@@ -124,7 +124,7 @@ async fn ctx() -> Arc<ShardContext> {
 
 /// The schema document exactly as `fluxum schema export` writes it.
 async fn exported_schema(ctx: &Arc<ShardContext>) -> String {
-    let resp = admin::dispatch(ctx, "GET", "/schema", &[]).await;
+    let resp = admin::dispatch(ctx, admin::AdminRequest::local("GET", "/schema", &[])).await;
     assert_eq!(resp.status, 200);
     let body = serde_json::to_string(&resp.body).unwrap();
     fluxum_cli::canonical_schema(&body).unwrap()
@@ -173,7 +173,7 @@ async fn the_export_is_canonical_and_stable() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_document_carries_its_version_and_every_declared_surface() {
     let ctx = ctx().await;
-    let resp = admin::dispatch(&ctx, "GET", "/schema", &[]).await;
+    let resp = admin::dispatch(&ctx, admin::AdminRequest::local("GET", "/schema", &[])).await;
     let doc = &resp.body["payload"];
 
     assert_eq!(doc["document_version"], admin::SCHEMA_DOCUMENT_VERSION);

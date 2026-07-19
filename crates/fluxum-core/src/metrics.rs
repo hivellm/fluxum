@@ -142,6 +142,30 @@ impl SessionRejectReason {
     ];
 }
 
+/// Why an admin-API request was refused by the access guard (SPEC-026
+/// SEC-054) — the `reason` label of `fluxum_admin_rejected_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdminRejectReason {
+    /// The resolved client IP is neither loopback nor in `server.admin.trusted`.
+    UntrustedIp,
+    /// A gated route from a trusted non-loopback IP carried no valid operator
+    /// credential.
+    Unauthenticated,
+}
+
+impl AdminRejectReason {
+    /// The metric `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UntrustedIp => "untrusted_ip",
+            Self::Unauthenticated => "unauthenticated",
+        }
+    }
+
+    /// Every reason, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 2] = [Self::UntrustedIp, Self::Unauthenticated];
+}
+
 /// SEC-041 admission-control state (the `fluxum_overload_state` gauge):
 /// what the accept loops shed under load, ordered by severity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -250,6 +274,8 @@ pub struct Metrics {
     session_rejected_ip_mismatch: AtomicU64,
     session_rejected_expired: AtomicU64,
     session_rejected_revoked: AtomicU64,
+    admin_rejected_untrusted_ip: AtomicU64,
+    admin_rejected_unauthenticated: AtomicU64,
     overload_state: AtomicU8,
     connguard_tracked_ips: AtomicU64,
     connguard_evictions: AtomicU64,
@@ -349,6 +375,8 @@ impl Metrics {
             session_rejected_ip_mismatch: AtomicU64::new(0),
             session_rejected_expired: AtomicU64::new(0),
             session_rejected_revoked: AtomicU64::new(0),
+            admin_rejected_untrusted_ip: AtomicU64::new(0),
+            admin_rejected_unauthenticated: AtomicU64::new(0),
             overload_state: AtomicU8::new(OverloadState::Normal as u8),
             connguard_tracked_ips: AtomicU64::new(0),
             connguard_evictions: AtomicU64::new(0),
@@ -517,6 +545,24 @@ impl Metrics {
             SessionRejectReason::Expired => &self.session_rejected_expired,
             SessionRejectReason::Revoked => &self.session_rejected_revoked,
         }
+    }
+
+    /// SEC-054: an admin request was refused by the access guard.
+    pub fn note_admin_rejected(&self, reason: AdminRejectReason) {
+        match reason {
+            AdminRejectReason::UntrustedIp => &self.admin_rejected_untrusted_ip,
+            AdminRejectReason::Unauthenticated => &self.admin_rejected_unauthenticated,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current admin-reject count for `reason`.
+    pub fn admin_rejected(&self, reason: AdminRejectReason) -> u64 {
+        match reason {
+            AdminRejectReason::UntrustedIp => &self.admin_rejected_untrusted_ip,
+            AdminRejectReason::Unauthenticated => &self.admin_rejected_unauthenticated,
+        }
+        .load(Ordering::Relaxed)
     }
 
     fn conn_rejected_counter(&self, reason: ConnRejectReason) -> &AtomicU64 {
@@ -718,6 +764,22 @@ impl Metrics {
                 "fluxum_session_rejected_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
                 reason.as_str(),
                 self.session_rejected(reason),
+            );
+        }
+
+        // --- admin-surface access-guard rejections (SEC-054) ---
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_admin_rejected_total Admin-API requests refused by the access guard \
+             by reason (SPEC-026 SEC-054).\n\
+             # TYPE fluxum_admin_rejected_total counter"
+        );
+        for reason in AdminRejectReason::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_admin_rejected_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.admin_rejected(reason),
             );
         }
 

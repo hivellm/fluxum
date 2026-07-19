@@ -172,6 +172,46 @@ pub trait SessionAdmin: Send + Sync {
     fn terminate_identity(&self, identity_hex: &str) -> usize;
 }
 
+/// The resolved HTTP admin-surface access policy (SPEC-026 SEC-054): the
+/// network gate and operator-credential requirement the admin dispatch
+/// enforces. Built from [`fluxum_core::config::AdminConfig`].
+#[derive(Debug)]
+pub struct AdminPolicy {
+    /// IP ranges — beyond the always-allowed loopback — permitted to reach
+    /// gated admin routes.
+    pub trusted: fluxum_core::net::IpSet,
+    /// Whether a remote (trusted, non-loopback) gated request needs an
+    /// operator credential.
+    pub require_operator: bool,
+    /// Whether `/health` and `/metrics` stay ungated.
+    pub open_health_metrics: bool,
+}
+
+impl Default for AdminPolicy {
+    fn default() -> Self {
+        // Safe by default: loopback only, credential required for remote.
+        Self {
+            trusted: fluxum_core::net::IpSet::default(),
+            require_operator: true,
+            open_health_metrics: true,
+        }
+    }
+}
+
+impl AdminPolicy {
+    /// Resolve from config, or fail if `admin.trusted` has a bad entry.
+    ///
+    /// # Errors
+    /// A `server.admin.trusted` entry that is not an IP address or CIDR block.
+    pub fn from_config(cfg: &fluxum_core::config::AdminConfig) -> fluxum_core::Result<Self> {
+        Ok(Self {
+            trusted: fluxum_core::net::IpSet::parse(&cfg.trusted)?,
+            require_operator: cfg.require_operator,
+            open_health_metrics: cfg.open_health_metrics,
+        })
+    }
+}
+
 /// What a hot reload re-reads and republishes through (OPS-040).
 struct ConfigSource {
     /// The YAML file the running config was loaded from, if any. A reload
@@ -268,6 +308,10 @@ pub struct ShardContext {
     /// the HTTP transport at boot so the admin API can list and terminate
     /// live sessions. `None` in an embedded/TCP-only assembly.
     session_admin: std::sync::OnceLock<Arc<dyn SessionAdmin>>,
+    /// The HTTP admin-surface access policy (SPEC-026 SEC-054). Defaults to
+    /// the safe posture — loopback-only, operator credential required for
+    /// remote — so an assembly that never installs config is still safe.
+    admin_policy: std::sync::RwLock<Arc<AdminPolicy>>,
     /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
     /// inputs, every derived value with its source, and the per-kernel SIMD
     /// selection. Serialized at install so `/health` stays a clone, not a
@@ -347,6 +391,7 @@ impl ShardContext {
             config_source: std::sync::Mutex::new(None),
             trusted_proxies: std::sync::RwLock::new(Arc::new(fluxum_core::net::IpSet::default())),
             session_admin: std::sync::OnceLock::new(),
+            admin_policy: std::sync::RwLock::new(Arc::new(AdminPolicy::default())),
             send_buffer_bytes: AtomicU64::new(
                 fluxum_core::config::SubscriptionsConfig::default()
                     .send_buffer_bytes
@@ -518,6 +563,10 @@ impl ShardContext {
             tracing::warn!(error = %e, "connection_limits block/allowlist not applied");
         }
         guard.set_max_total_conns(config.server.connection_limits.max_total_conns);
+        match AdminPolicy::from_config(&config.server.admin) {
+            Ok(policy) => self.set_admin_policy(policy),
+            Err(e) => tracing::warn!(error = %e, "server.admin policy not applied"),
+        }
         *self
             .reloadable
             .write()
@@ -589,6 +638,24 @@ impl ShardContext {
     /// The HTTP session directory, if the HTTP transport installed one.
     pub fn session_admin(&self) -> Option<&Arc<dyn SessionAdmin>> {
         self.session_admin.get()
+    }
+
+    /// The live admin-surface access policy (SPEC-026 SEC-054).
+    pub fn admin_policy(&self) -> Arc<AdminPolicy> {
+        Arc::clone(
+            &self
+                .admin_policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Install the admin-surface access policy (boot and hot reload).
+    pub fn set_admin_policy(&self, policy: AdminPolicy) {
+        *self
+            .admin_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
     }
 
     /// SEC-041: the current admission-control verdict, published to the

@@ -18,6 +18,17 @@
 //! (`{ "success": bool, "request_id"?, "payload"|"error" }`); the paths are
 //! unversioned. Admin calls run under the server admin identity (RLS bypass,
 //! AUTH-062) — this surface is for trusted operators.
+//!
+//! # Access control (SPEC-026 SEC-054)
+//!
+//! Because this shares `http_port` with `/rpc` on a directly exposed port,
+//! [`dispatch`] enforces an access guard before any handler runs: loopback
+//! always passes, a non-loopback client is refused unless its resolved IP is
+//! in `server.admin.trusted`, and a trusted remote must present an operator
+//! credential (a `auth.server_peers` token in the `Fluxum-Operator` header or
+//! a JSON `token` field) when `server.admin.require_operator`. `/health` and
+//! `/metrics` stay ungated when `server.admin.open_health_metrics`. Admin
+//! reducer calls additionally honor `client_callable` (SEC-055).
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -76,14 +87,99 @@ fn envelope(
     Value::Object(object)
 }
 
-/// Dispatch one admin route. `method`/`path` are the request line; `body` is
-/// the raw request body (JSON, may be empty). Unknown routes → 404.
-pub async fn dispatch(
-    ctx: &Arc<ShardContext>,
-    method: &str,
-    path: &str,
-    body: &[u8],
-) -> AdminResponse {
+/// An admin request with the context the SEC-054 access guard needs: the
+/// resolved client IP and the operator credential (from the `Fluxum-Operator`
+/// header or a JSON `token` field).
+pub struct AdminRequest<'a> {
+    /// The HTTP method.
+    pub method: &'a str,
+    /// The request path (with any query string).
+    pub path: &'a str,
+    /// The raw request body (JSON, may be empty).
+    pub body: &'a [u8],
+    /// The SEC-035 resolved client IP.
+    pub client_ip: std::net::IpAddr,
+    /// The operator credential, if the request carried one.
+    pub operator_token: Option<&'a str>,
+}
+
+impl<'a> AdminRequest<'a> {
+    /// A loopback request with no operator credential — the shape a local
+    /// operator, or a test, makes. Loopback always passes the SEC-054 gate.
+    pub fn local(method: &'a str, path: &'a str, body: &'a [u8]) -> Self {
+        Self {
+            method,
+            path,
+            body,
+            client_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            operator_token: None,
+        }
+    }
+}
+
+/// The SEC-054 access-guard verdict for a route.
+enum Guard {
+    /// The route may run.
+    Allow,
+    /// The route is refused; serve this response.
+    Deny(AdminResponse),
+}
+
+/// Whether a route is always open (health/metrics) when the operator left
+/// them ungated — the tools a load balancer and Prometheus must always reach.
+fn is_open_route(path: &str) -> bool {
+    matches!(split_path(path).as_slice(), ["health"] | ["metrics"])
+}
+
+/// The SEC-054 access guard: loopback always passes; a non-loopback client is
+/// refused unless its IP is in `server.admin.trusted`, and then still needs a
+/// valid operator credential when `require_operator` is set. `/health` and
+/// `/metrics` bypass the guard when `open_health_metrics` is on.
+fn admin_guard(ctx: &Arc<ShardContext>, req: &AdminRequest) -> Guard {
+    let policy = ctx.admin_policy();
+    if policy.open_health_metrics && is_open_route(req.path) {
+        return Guard::Allow;
+    }
+    let ip = req.client_ip.to_canonical();
+    if ip.is_loopback() {
+        return Guard::Allow;
+    }
+    if !policy.trusted.contains(ip) {
+        ctx.metrics()
+            .note_admin_rejected(fluxum_core::metrics::AdminRejectReason::UntrustedIp);
+        return Guard::Deny(AdminResponse::err(
+            403,
+            None,
+            "admin API is not reachable from this address (SPEC-026 SEC-054)",
+        ));
+    }
+    if policy.require_operator {
+        let ok = req.operator_token.is_some_and(|token| {
+            matches!(
+                ctx.authenticator.authenticate(token.as_bytes()),
+                Ok(outcome) if outcome.server_peer.is_some()
+            )
+        });
+        if !ok {
+            ctx.metrics()
+                .note_admin_rejected(fluxum_core::metrics::AdminRejectReason::Unauthenticated);
+            return Guard::Deny(AdminResponse::err(
+                401,
+                None,
+                "admin API requires an operator credential (server-peer token) from a remote address (SPEC-026 SEC-054)",
+            ));
+        }
+    }
+    Guard::Allow
+}
+
+/// Dispatch one admin route, enforcing the SEC-054 access guard first.
+/// Unknown routes → 404.
+pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminResponse {
+    if let Guard::Deny(response) = admin_guard(ctx, &req) {
+        return response;
+    }
+    let (method, path, body) = (req.method, req.path, req.body);
     match (method, split_path(path).as_slice()) {
         ("GET", ["health"]) => health(ctx),
         ("GET", ["metrics"]) => metrics(ctx).await,
@@ -902,6 +998,22 @@ async fn reducer_call(ctx: &Arc<ShardContext>, name: &str, body: &[u8]) -> Admin
             503,
             request_id.as_deref(),
             "shard draining for restart; retry",
+        );
+    }
+    // F-004: the admin route honors the same client-callable gating a client
+    // session does — a schedule-only reducer (`client_callable = false`) is
+    // not invokable over HTTP, even by an operator. A reducer absent from the
+    // registry declaration table is treated as callable (defaults preserved).
+    if ctx
+        .engine
+        .registry()
+        .declaration(name)
+        .is_some_and(|(callable, _)| !callable)
+    {
+        return AdminResponse::err(
+            403,
+            request_id.as_deref(),
+            format!("reducer `{name}` is not client-callable (schedule-only)"),
         );
     }
     // The payload is the reducer's argument array (RPC-051).
