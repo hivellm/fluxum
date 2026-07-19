@@ -31,3 +31,12 @@ export type { ServerMessage } from './protocol.ts';
 
 export { FluxBinError, RowReader, decodeRow, toHex } from './fluxbin.ts';
 export type { FluxType, FluxValue } from './fluxbin.ts';
+
+export { RowCache, UnknownTableError } from './cache.ts';
+export type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts';
+
+export { BoundedQueue, QueueOverflowError } from './queue.ts';
+export type { BoundedQueueOptions } from './queue.ts';
+
+export { backoffDelay, reconnect, ReconnectFailedError } from './reconnect.ts';
+export type { BackoffOptions, ReconnectHandlers, ReconnectOptions } from './reconnect.ts';
