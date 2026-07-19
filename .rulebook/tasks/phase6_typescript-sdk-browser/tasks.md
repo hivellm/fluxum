@@ -33,11 +33,15 @@ budget — too much to land in one stretch without leaving something half-built.
   and takes the primary-key projection per table as a hook (SDK-040). That is the only schema
   knowledge the diff algorithm needs, which keeps codegen out of the runtime and the runtime
   inside the SDK-083 budget.
-- **Unit 4 (next)** — 1.7 + 1.8 + 1.9, schema-mismatch drill, packaging/size budget, conformance
-  runs. Note the pieces built so far are units, not a client: `FluxumClient` — the object that
-  owns a transport, correlates request ids (RPC-002), drives the cache and runs the reconnect
-  loop — is still to be assembled, and 1.7 is the natural place since the schema check lives on
-  the connection path.
+- **Unit 3b (done, committed)** — `FluxumClient`, assembling the units into the object an
+  application holds: id correlation (RPC-002), tag routing, reducer outcomes, cache application,
+  typed callbacks, reconnect. Proven against the **real server** — `tests/client.e2e.test.ts`
+  spawns `fluxum-server` with the demo module and asserts the full loop, out-of-order
+  correlation, and server-side `owner_only` filtering. 61 tests green, `tsc` clean.
+  This carries 1.7's `SchemaMismatchError` (thrown on `InitialData.schema_version` mismatch);
+  the refresh-and-reconnect half of 1.7 remains.
+- **Unit 4 (next)** — the rest of 1.7 (schema refresh + reconnect drill), 1.8 (packaging, size
+  budget), 1.9 (conformance runs).
 - **Unit 4** — 1.7 + 1.8 + 1.9, schema-mismatch drill, packaging/size budget, conformance runs.
 
 Note on 1.9: it requires the shared conformance corpus, which is its own task

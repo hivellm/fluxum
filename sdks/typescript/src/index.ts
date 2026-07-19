@@ -32,6 +32,9 @@ export type { ServerMessage } from './protocol.ts';
 export { FluxBinError, RowReader, decodeRow, toHex } from './fluxbin.ts';
 export type { FluxType, FluxValue } from './fluxbin.ts';
 
+export { FluxumClient, ReducerError, SchemaMismatchError, ServerError } from './client.ts';
+export type { FluxumClientOptions, RowListener } from './client.ts';
+
 export { RowCache, UnknownTableError } from './cache.ts';
 export type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts';
 
