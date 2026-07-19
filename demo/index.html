@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fluxum — live</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="dot" id="dot"></span>
+        <strong>Fluxum</strong>
+        <span class="muted">live table over the binary wire</span>
+      </div>
+      <div class="who">
+        <input id="identity" value="alice" aria-label="identity" spellcheck="false" />
+        <button id="switch" class="ghost">switch user</button>
+      </div>
+    </header>
+
+    <section class="stats" id="stats">
+      <div class="stat">
+        <span class="k">rows cached</span>
+        <span class="v" id="s-rows">0</span>
+      </div>
+      <div class="stat">
+        <span class="k">events</span>
+        <span class="v" id="s-events">0</span>
+      </div>
+      <div class="stat">
+        <span class="k">events/s</span>
+        <span class="v" id="s-rate">0</span>
+      </div>
+      <div class="stat">
+        <span class="k">round trip</span>
+        <span class="v" id="s-rtt">—</span>
+      </div>
+      <div class="stat wide">
+        <span class="k">identity</span>
+        <span class="v mono" id="s-id">—</span>
+      </div>
+    </section>
+
+    <main>
+      <section class="panel span2">
+        <div class="panel-head">
+          <h2>ChatMessage <span class="tag">public</span></h2>
+          <div class="controls">
+            <input id="msg" placeholder="write a row…" maxlength="200" spellcheck="false" />
+            <button id="send">insert</button>
+            <button id="storm" class="ghost">stream 10/s</button>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table id="chat-table">
+            <thead>
+              <tr>
+                <th class="num">id</th>
+                <th>sender</th>
+                <th class="num">channel</th>
+                <th>content</th>
+                <th class="num">sent_at</th>
+              </tr>
+            </thead>
+            <tbody id="chat-body">
+              <tr class="empty">
+                <td colspan="5">waiting for rows…</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="foot">
+          Every row arrives as a <code>TxUpdate</code> on the <code>GET /rpc</code> stream,
+          decoded from FluxBIN straight into the local cache. New rows flash.
+        </p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>Task <span class="tag warn">owner_only</span></h2>
+          <div class="controls">
+            <input id="task" placeholder="add a task…" maxlength="120" spellcheck="false" />
+            <button id="add">add</button>
+          </div>
+        </div>
+        <ul class="rows" id="task-body">
+          <li class="empty">no tasks yet</li>
+        </ul>
+        <p class="foot">
+          The server filters these per identity. Switch user and the table changes — the rows
+          are never sent, not merely hidden.
+        </p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>OnlineUser <span class="tag">presence</span></h2></div>
+        <ul class="chips" id="presence"></ul>
+        <p class="foot">Maintained by <code>on_connect</code> / <code>on_disconnect</code> hooks.</p>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

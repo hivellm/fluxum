@@ -1,7 +1,7 @@
 {
   "name": "@hivehub/fluxum",
   "version": "0.1.0",
-  "description": "Fluxum realtime database client — typed bindings over the HiveLLM binary wire (Thunder)",
+  "description": "Fluxum realtime database client \u2014 typed bindings over the HiveLLM binary wire (Thunder)",
   "type": "module",
   "license": "Apache-2.0",
   "engines": {
@@ -13,6 +13,7 @@
     "directory": "sdks/typescript"
   },
   "scripts": {
+    "build": "node build.mjs",
     "test": "node --test \"tests/*.test.ts\"",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
@@ -22,6 +23,23 @@
   },
   "devDependencies": {
     "@types/node": "^22",
+    "esbuild": "^0.28.1",
     "typescript": "^5"
-  }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./browser": "./dist/fluxum.min.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "sideEffects": false
 }

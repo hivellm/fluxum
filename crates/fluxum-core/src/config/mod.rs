@@ -65,6 +65,13 @@ pub struct ServerConfig {
     pub max_frame_bytes: ByteSize,
     /// Pre-auth connection-abuse limits (SPEC-026 SEC-030/031).
     pub connection_limits: ConnectionLimitsConfig,
+    /// Directory of static files served on unmatched `GET` paths, or empty
+    /// (the default) to serve none.
+    ///
+    /// Exists for browser clients: `/rpc` sends no CORS headers, so a page
+    /// that talks to Fluxum has to come from the same origin. Off by default —
+    /// a server nobody configured this on has no file surface.
+    pub static_dir: Option<PathBuf>,
 }
 
 impl Default for ServerConfig {
@@ -76,6 +83,7 @@ impl Default for ServerConfig {
             idle_timeout_secs: 60,
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
             connection_limits: ConnectionLimitsConfig::default(),
+            static_dir: None,
         }
     }
 }

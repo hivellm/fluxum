@@ -45,7 +45,9 @@ pub const CONTENT_TYPE: &str = "application/x-fluxum";
 pub const SESSION_HEADER: &str = "fluxum-session";
 
 /// Streamable HTTP tuning (RPC-060 idle expiry + keep-alive cadence).
-#[derive(Debug, Clone, Copy)]
+// No longer `Copy`: `static_dir` owns a path. Every use clones it once at
+// startup, so the cost is a string per server rather than per request.
+#[derive(Debug, Clone)]
 pub struct HttpOptions {
     /// Idle-session expiry: a session with no POST and an idle GET stream
     /// for this long expires (`408` on the stream, `404` on a stale POST).
@@ -57,6 +59,13 @@ pub struct HttpOptions {
     pub max_frame_bytes: u32,
     /// Per-session outbound queue depth (the SUB-042 send buffer).
     pub send_queue_depth: usize,
+    /// Directory served for unmatched `GET` paths, or `None` (the default) to
+    /// serve nothing.
+    ///
+    /// Exists because `/rpc` sends no CORS headers: a browser page that talks
+    /// to Fluxum must come from the same origin as `/rpc`. Off unless an
+    /// operator opts in, so a production server has no file surface at all.
+    pub static_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for HttpOptions {
@@ -66,6 +75,9 @@ impl Default for HttpOptions {
             keepalive: Duration::from_secs(20),
             max_frame_bytes: fluxum_protocol::DEFAULT_MAX_FRAME_BYTES,
             send_queue_depth: 1024,
+            // Serving files is opt-in: a database with no configured static
+            // directory exposes no filesystem at all.
+            static_dir: None,
         }
     }
 }
@@ -250,6 +262,12 @@ async fn serve_connection(
             // The HTTP/JSON admin surface (RPC-050) shares this port.
             (method, path) if crate::admin::is_admin_path(path) => {
                 handle_admin(&state.ctx, &mut stream, method, path, &request.body).await?;
+                true
+            }
+            // Static files, last: every real route above wins, so enabling a
+            // static dir can never shadow `/rpc` or the admin surface.
+            ("GET", path) if state.options.static_dir.is_some() => {
+                handle_static(&state, &mut stream, path).await?;
                 true
             }
             ("GET" | "POST", _) => {
@@ -547,6 +565,24 @@ async fn handle_get(
     // Chunked streaming response header.
     write_stream_header(&mut stream).await?;
 
+    // Prime the stream with one keep-alive frame (RPC-001/006: a zero-length
+    // frame receivers ignore, so this is inert).
+    //
+    // A push stream produces nothing until the first commit, and an
+    // intermediary that buffers a body-less response cannot tell a live
+    // stream from a stalled one. One frame makes it observably live.
+    //
+    // Honest limitation: this did NOT fix the ~15s delay seen before
+    // `fetch()` resolves under Playwright-driven Chromium, and neither did
+    // padding it to 2 KB. `curl` and Node receive these headers and this
+    // frame in single-digit milliseconds against the same server, so the
+    // delay is downstream of what this code controls — most likely the test
+    // harness's network interception buffering an endless chunked response.
+    // Left in as cheap liveness, not claimed as a fix.
+    if write_chunk(&mut stream, &FrameCodec::keepalive()).await.is_err() {
+        return Ok(());
+    }
+
     let keepalive = state.options.keepalive;
     let idle = state.options.idle_timeout;
     let mut keepalive_timer = tokio::time::interval(keepalive);
@@ -831,6 +867,33 @@ fn reason_phrase(code: u16) -> &'static str {
     }
 }
 
+/// Serve a file from `static_dir` (see [`crate::statics`]).
+///
+/// A path that would escape the root is answered 404 rather than 403: telling
+/// a prober which traversals were *rejected* rather than *absent* maps out the
+/// filesystem for them.
+async fn handle_static(state: &Arc<HttpState>, stream: &mut TcpStream, path: &str) -> io::Result<()> {
+    let Some(root) = state.options.static_dir.as_deref() else {
+        return write_simple(stream, 404, "Not Found").await;
+    };
+    let Some(file) = crate::statics::resolve(root, path) else {
+        return write_simple(stream, 404, "Not Found").await;
+    };
+    let Ok(body) = tokio::fs::read(&file).await else {
+        return write_simple(stream, 404, "Not Found").await;
+    };
+
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\r\n",
+        crate::statics::content_type(&file),
+        body.len(),
+    );
+    stream.write_all(head.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await
+}
+
 async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
@@ -839,10 +902,18 @@ async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Re
     stream.flush().await
 }
 
+/// Write the `GET /rpc` streaming response head (RPC-006).
+///
+/// `X-Content-Type-Options: nosniff` is load-bearing, not hygiene. Browsers
+/// MIME-sniff an unrecognised `Content-Type`, and sniffing needs bytes — so
+/// Chrome holds the `fetch()` promise unresolved until the first chunk
+/// arrives. A push stream is idle by definition until the first commit, which
+/// made every browser client hang at connect while Node (which does not sniff)
+/// worked fine. `nosniff` tells the browser there is nothing to guess.
 async fn write_stream_header(stream: &mut TcpStream) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {CONTENT_TYPE}\r\nTransfer-Encoding: chunked\r\n\
-         Cache-Control: no-cache\r\n\r\n"
+         X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await?;
     stream.flush().await

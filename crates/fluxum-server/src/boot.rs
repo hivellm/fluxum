@@ -156,6 +156,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         HttpOptions {
             idle_timeout: idle,
             max_frame_bytes,
+            static_dir: config.server.static_dir.clone(),
             ..HttpOptions::default()
         },
     )

@@ -11,6 +11,19 @@ import { HttpTransport } from '../src/transport/http.ts';
 
 import { BINARY, serverAvailable, startServer } from './support/server.ts';
 
+/**
+ * Poll until `ready`, or give up.
+ *
+ * `send` resolves once the request is on the wire; the response frames arrive
+ * through `onFrame` after that, so nothing here may assert immediately.
+ */
+async function waitFor(ready: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!ready() && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 test(
   'the full loop against a live server: auth, subscribe, reduce, receive',
   {
@@ -37,6 +50,7 @@ test(
       encodeMessage('Authenticate', [1, new Uint8Array(0), null, null, null]),
     );
 
+    await waitFor(() => messages.some((m) => m.tag === 'AuthResult'));
     const auth = messages.find((m) => m.tag === 'AuthResult');
     assert.ok(auth, `expected AuthResult, got ${JSON.stringify(messages.map((m) => m.tag))}`);
     assert.ok(transport.sessionId, 'the server issued a session id');
@@ -45,6 +59,7 @@ test(
     messages.length = 0;
     await transport.send(encodeMessage('Subscribe', [2, ['SELECT * FROM ChatMessage']]));
 
+    await waitFor(() => messages.some((m) => m.tag === 'InitialData'));
     const initial = messages.find((m) => m.tag === 'InitialData');
     assert.ok(initial, `expected InitialData, got ${JSON.stringify(messages.map((m) => m.tag))}`);
 
@@ -61,10 +76,7 @@ test(
     );
 
     // 4. Wait for the TxUpdate the commit fans out.
-    const deadline = Date.now() + 5000;
-    while (!messages.some((m) => m.tag === 'TxUpdate') && Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
+    await waitFor(() => messages.some((m) => m.tag === 'TxUpdate'));
 
     const tags = messages.map((m) => m.tag);
     assert.ok(

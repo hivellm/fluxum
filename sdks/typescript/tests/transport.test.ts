@@ -28,6 +28,21 @@ function collect(transport: HttpTransport): string[] {
   return tags;
 }
 
+
+/**
+ * Wait for the transport to surface `count` frames.
+ *
+ * `send` resolves once the request is on the wire, not once its response has
+ * been fully read — the frames arrive through `onFrame` afterwards. Asserting
+ * straight after `await send(...)` only ever passed by accident of timing.
+ */
+async function settle(tags: string[], count: number, timeoutMs = 1000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (tags.length < count && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
+}
+
 test('a POST response is decoded into message frames', async () => {
   const body = encodeMessage('AuthResult', [true, null]);
   const transport = new HttpTransport('http://localhost:15800', {
@@ -36,6 +51,7 @@ test('a POST response is decoded into message frames', async () => {
   const tags = collect(transport);
 
   await transport.send(encodeMessage('Authenticate', [1, null, null, null, null]));
+  await settle(tags, 1);
   assert.deepEqual(tags, ['AuthResult']);
 });
 
@@ -86,6 +102,7 @@ test('a frame split across chunk boundaries still arrives whole', async () => {
   const tags = collect(transport);
 
   await transport.send(encodeMessage('Ping', []));
+  await settle(tags, 1);
   assert.deepEqual(tags, ['TxUpdate']);
 });
 
@@ -102,6 +119,7 @@ test('several frames arriving in one chunk all surface', async () => {
   const tags = collect(transport);
 
   await transport.send(encodeMessage('Ping', []));
+  await settle(tags, 2);
   assert.deepEqual(tags, ['InitialData', 'TxUpdate']);
 });
 
@@ -116,6 +134,7 @@ test('keep-alives on the stream are consumed, not surfaced', async () => {
   const tags = collect(transport);
 
   await transport.send(encodeMessage('Ping', []));
+  await settle(tags, 1);
   assert.deepEqual(tags, ['TxUpdate']);
 });
 

@@ -48,7 +48,11 @@ export class HttpTransport implements Transport {
 
   constructor(url: string, options: HttpTransportOptions = {}) {
     this.#url = url.replace(/\/+$/, '') + '/rpc';
-    this.#fetch = options.fetch ?? globalThis.fetch;
+    // Bound, not merely referenced: in a browser `fetch` must be called with
+    // `this === window`, and detaching it throws "Illegal invocation". Node is
+    // forgiving here, so an unbound reference passes every test and fails only
+    // in the environment this transport exists for.
+    this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.#maxFrameBytes = options.maxFrameBytes ?? DEFAULT_MAX_FRAME_BYTES;
   }
 
@@ -95,6 +99,11 @@ export class HttpTransport implements Transport {
     if (issued !== null && issued !== '') this.#session = issued;
 
     if (response.body === null) return;
+
+    // Awaited: a POST response is finite (RPC-005 — it ends once every request
+    // in the body has been answered), so draining it here delivers this
+    // request's frames before `send` resolves. Backgrounding it instead makes
+    // delivery race the caller for no benefit.
     await this.#drain(response.body);
   }
 

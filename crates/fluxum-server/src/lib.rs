@@ -29,6 +29,7 @@ pub mod namespace;
 pub mod quota;
 pub mod session;
 pub mod shard;
+pub mod statics;
 pub mod tcp;
 
 use std::collections::HashMap;
