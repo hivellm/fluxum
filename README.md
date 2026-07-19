@@ -397,6 +397,7 @@ namespaces/multitenancy, and per-tenant resource quotas.
 - [Implementation DAG](docs/DAG.md) — dependency graph, 8 phases, gates, critical path
 - [Roadmap](docs/ROADMAP.md) — milestones to 0.1.0 and 0.2.0, parallel tracks, post-launch backlog
 - [Spec index](docs/specs/README.md) — 28 normative implementation specs (SPEC-001…SPEC-028)
+- [Deployment hardening](docs/DEPLOYMENT-HARDENING.md) — OS/socket/firewall baseline for a directly exposed port
 - [SpacetimeDB source dossier](docs/analysis/spacetimedb-code/README.md) — deep analysis of the real v2.7.0 codebase (~237k LOC); hard problems + adoptions in [10-hard-problems](docs/analysis/spacetimedb-code/10-hard-problems.md)
 - [Reference analysis](docs/analysis/README.md) — SpacetimeDB, Convex, SurrealDB design studies
 - [Contributing](CONTRIBUTING.md) — setup, conventions, spec-driven development

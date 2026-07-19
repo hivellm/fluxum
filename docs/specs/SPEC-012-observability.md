@@ -153,6 +153,21 @@ of the correctness contract.
   Auth outcomes are counted per the `AuthProvider` flow in
   [SPEC-009](SPEC-009-authentication.md).
 
+- **OBS-042** [P1] Pre-auth abuse and overload surface (SPEC-026 SEC-032/040/041):
+
+  ```
+  fluxum_conn_rejected_total{shard, reason}    Counter  // reason ∈ {conn_cap, accept_rate,
+                                                        // failed_auth, handshake_budget,
+                                                        // proxy_preamble, proxy_header,
+                                                        // blocked, global_cap, overload}
+  fluxum_overload_state{shard}                 Gauge    // 0=normal, 1=shed_preauth, 2=shed_all_new
+  fluxum_connguard_tracked_ips{shard}          Gauge    // per-IP guard entries currently tracked
+  fluxum_connguard_evictions_total{shard}      Counter  // entries reclaimed under pressure
+  ```
+
+  Every `reason` label is emitted even at zero, so rate alerts never go
+  stale-for-lack-of-series. The guard gauges refresh at scrape time.
+
 - **OBS-041** [P1] Per-client send buffer:
 
   ```

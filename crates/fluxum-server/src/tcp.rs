@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
 
 use fluxum_protocol::{ClientMessage, ErrorMessage, Frame, FrameCodec, ServerMessage, codes};
@@ -41,6 +41,9 @@ pub struct TcpOptions {
     /// Per-connection outbound queue depth (the SUB-042 send buffer, in
     /// frames). A full queue drops the connection.
     pub send_queue_depth: usize,
+    /// Listener/socket hardening knobs (SEC-042); defaults = today's
+    /// behavior.
+    pub socket: crate::sock::SocketOptions,
 }
 
 impl Default for TcpOptions {
@@ -49,6 +52,7 @@ impl Default for TcpOptions {
             idle_timeout: Some(Duration::from_secs(60)),
             max_frame_bytes: fluxum_protocol::DEFAULT_MAX_FRAME_BYTES,
             send_queue_depth: 1024,
+            socket: crate::sock::SocketOptions::default(),
         }
     }
 }
@@ -75,7 +79,7 @@ pub async fn serve(
     addr: impl tokio::net::ToSocketAddrs,
     options: TcpOptions,
 ) -> io::Result<TcpServer> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::sock::bind(addr, options.socket).await?;
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(Notify::new());
 
@@ -103,7 +107,26 @@ pub async fn serve(
                             tracing::debug!(target: "fluxum::tcp",
                                 "refused a connection: draining");
                         }
+                        // SEC-041: under overload, every new TCP connection is
+                        // pre-auth work by definition (a session only exists
+                        // after `Authenticate` on this very socket) — shed it
+                        // at accept, the cheapest possible point. Established
+                        // connections are their own long-lived sockets and are
+                        // never touched.
+                        Ok((stream, peer)) if accept_ctx.overload_state()
+                            != fluxum_core::metrics::OverloadState::Normal =>
+                        {
+                            accept_ctx
+                                .metrics()
+                                .note_conn_rejected(fluxum_core::metrics::ConnRejectReason::Overload);
+                            tracing::debug!(target: "fluxum::tcp", ip = %peer.ip(),
+                                "refused a connection: overload shed");
+                            drop(stream);
+                        }
                         Ok((stream, peer)) => {
+                            // SEC-042: keepalive so dead peers stop holding
+                            // connection slots.
+                            crate::sock::apply_keepalive(&stream, options.socket.tcp_keepalive);
                             // SEC-030/031: gate the pre-auth surface per peer IP
                             // before a session exists. A refusal is counted and
                             // the socket dropped (closed) — the cheapest signal
@@ -356,13 +379,17 @@ async fn drive_connection(
                     }
                     Ok(None) => break,
                     Err(too_large) => {
-                        // A frame over the limit gets the RPC-061 413 + close on
-                        // both sides of auth; pre-auth it is *also* a SEC-031
-                        // handshake-budget abuse event, so it is counted.
+                        // Post-auth, a frame over the limit gets the RPC-061
+                        // 413 + close — a real client deserves the diagnosis.
+                        // Pre-auth it is a SEC-031 handshake-budget abuse
+                        // event: counted and closed with ZERO response bytes
+                        // (SEC-043 cheap reject) — an unauthenticated flood
+                        // earns no amplification, however small.
                         if !authed {
                             ctx.metrics().note_conn_rejected(
                                 fluxum_core::metrics::ConnRejectReason::HandshakeBudget,
                             );
+                            break 'conn Ok(());
                         }
                         let msg =
                             error_frame(&codec, None, too_large.code(), too_large.to_string());

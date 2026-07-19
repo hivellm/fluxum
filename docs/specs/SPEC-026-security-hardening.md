@@ -105,7 +105,7 @@ server:
 
 Rejections increment `fluxum_conn_rejected_total{shard, reason}` with
 `reason ∈ {conn_cap, accept_rate, failed_auth, handshake_budget,
-proxy_preamble, proxy_header, blocked, global_cap}` (SEC-032).
+proxy_preamble, proxy_header, blocked, global_cap, overload}` (SEC-032).
 
 ### Requirement: IP blocklist / allowlist and global ceiling
 - **SEC-033** [P1] The guard SHALL refuse (reason `blocked`) any resolved client IP that matches
@@ -142,7 +142,50 @@ server:
     blocklist: []                    # SEC-033 refused outright (IP/CIDR)
     allowlist: []                    # SEC-033 non-empty = only these connect
     max_total_conns: 0               # SEC-034 global ceiling (0 = uncapped)
+    max_tracked_ips: 100000          # SEC-040 guard memory bound (0 = unbounded)
+    overload_shed_fraction: 0.90     # SEC-041 shed pre-auth at this load (0 = off)
+    overload_shed_all_fraction: 0.98 # SEC-041 shed all new at this load (0 = off)
+  accept_backlog: 0                  # SEC-042 listen backlog (0 = built-in 1024)
+  tcp_keepalive_secs: 0              # SEC-042 reap dead peers (0 = off)
+  tcp_defer_accept_secs: 0           # SEC-042 Linux TCP_DEFER_ACCEPT (0 = off)
 ```
+
+### Requirement: Overload resilience on a directly exposed port
+- **SEC-040** [P1] Guard memory SHALL be bounded: `server.connection_limits.max_tracked_ips`
+  (default 100000, `0` = unbounded) caps per-IP entries. At the cap, a pressure sweep reclaims
+  entries holding no live connection, no counting failed-auth streak, and no pending backoff —
+  what SEC-031 depends on is never reclaimed, so a distinct-IP flood cannot reset a brute-force
+  counter. If nothing is reclaimable the newcomer is admitted *untracked* (global caps still
+  apply) rather than let the defense become the OOM vector. Exposed as
+  `fluxum_connguard_tracked_ips` (gauge) and `fluxum_connguard_evictions_total` (counter).
+- **SEC-041** [P1] Admission control SHALL shed load before saturation: the load signal is the
+  highest of `total conns / max_total_conns` and `tracked IPs / max_tracked_ips` (only configured
+  caps contribute; heap is independently bounded by the SPEC-015 memory budget). At
+  `overload_shed_fraction` (default 0.90) new **pre-auth** connections are shed (reason
+  `overload`, zero response bytes); established authenticated sessions — including Streamable
+  HTTP requests presenting a live `Fluxum-Session` — keep working. At
+  `overload_shed_all_fraction` (default 0.98) all new connections are shed. The signal is
+  instantaneous, so recovery is immediate when load drains. State is `fluxum_overload_state`
+  (0/1/2) and every transition is logged. The admin surface (`/health`, `/metrics`, `/bans`)
+  MUST never be gated by admission control.
+- **SEC-042** [P2] Listener/socket hardening SHALL be configurable: `server.accept_backlog`
+  (`0` = built-in 1024), `server.tcp_keepalive_secs` (`0` = off) applied to accepted sockets so
+  dead peers stop holding slots, and `server.tcp_defer_accept_secs` (`0` = off; Linux
+  `TCP_DEFER_ACCEPT`, ignored-and-logged elsewhere). The SEC-031 handshake budget and RPC-060
+  idle timeout remain the pre-/post-auth read/idle knobs. All default to today's behavior.
+- **SEC-043** [P2] Every pre-auth rejection (blocked, caps, rates, backoff, handshake budget,
+  overload shed, spoofed preamble) SHALL close with zero response bytes and no per-connection
+  allocation beyond what was already read. Documented exceptions, HTTP only: a malformed
+  `X-Forwarded-For` from a *trusted* proxy answers `400` (a misconfiguration to surface, not an
+  attack), and a pre-auth oversized POST body answers `413` (HTTP requires a status line; the
+  response is one short head, no amplification).
+
+#### Scenario: A distinct-IP flood cannot destabilize the process
+Given a flood from tens of thousands of distinct addresses
+When it exceeds `max_tracked_ips` and pushes load past the shed fractions
+Then guard memory stays under the cap (evictions counted), new pre-auth connections are shed with
+zero bytes, established clients' reducer calls and TxUpdates keep flowing, and the moment the
+flood stops the next legitimate connection is admitted with no cool-down.
 
 ### Requirement: Trusted-proxy client-IP resolution
 - **SEC-035** [P1] When `server.trusted_proxies` (IP/CIDR list, IPv4+IPv6, default empty = off) names
@@ -183,5 +226,13 @@ server:
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).
-- Full WAF / L7 DDoS mitigation (deploy behind a proxy for that; this is basic in-process defense).
+- **Volumetric (link-saturation) DDoS absorption.** Fluxum's deployment posture is a *directly
+  exposed port* — no proxy or CDN is assumed in front — so everything below link saturation is
+  in scope and handled in-process (SEC-030..043: caps, bans, bounded guard memory, admission
+  control, cheap rejects, socket hardening; see `docs/DEPLOYMENT-HARDENING.md` for the OS
+  baseline). What remains out of scope is traffic that saturates the network link itself: no
+  userspace process can absorb a full NIC, and that fight belongs to the hosting provider or an
+  upstream scrubbing/anycast layer. The former phrasing ("deploy behind a proxy for DDoS") is
+  superseded.
+- WAF-style L7 payload inspection (request-content heuristics, bot fingerprinting).
 - Replacing column-level crypto (SPEC-017 remains the field-granularity mechanism).

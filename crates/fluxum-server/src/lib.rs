@@ -30,6 +30,7 @@ pub mod namespace;
 pub mod quota;
 pub mod session;
 pub mod shard;
+pub mod sock;
 pub mod statics;
 pub mod tcp;
 
@@ -525,6 +526,25 @@ impl ShardContext {
             .trusted_proxies
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(set);
+    }
+
+    /// SEC-041: the current admission-control verdict, published to the
+    /// `fluxum_overload_state` gauge with each state *transition* logged
+    /// exactly once. The accept loops call this per admission decision — it
+    /// is two counter reads and a compare, cheap enough for that path.
+    pub fn overload_state(&self) -> fluxum_core::metrics::OverloadState {
+        let state = self.conn_guard().overload_state();
+        let previous = self.metrics().swap_overload_state(state);
+        if previous != state {
+            tracing::warn!(
+                target: "fluxum::server",
+                shard = self.shard_id,
+                from = previous.as_str(),
+                to = state.as_str(),
+                "overload state changed"
+            );
+        }
+        state
     }
 
     /// Register an additional named database (SPEC-025 OPS-050). The

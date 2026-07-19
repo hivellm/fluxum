@@ -495,7 +495,9 @@ async fn oversized_frame_gets_413_then_closes() {
         ..TcpOptions::default()
     };
     let h = start(options).await;
+    // Post-auth, an oversized frame earns the RPC-061 diagnosis: 413, close.
     let mut client = Client::connect(h.server.local_addr).await;
+    client.authenticate(b"alice", 1).await;
     // A 4-byte header declaring 2 MB — rejected from the header alone.
     let header = 2_000_000u32.to_le_bytes();
     client.send_raw(&header).await;
@@ -506,6 +508,16 @@ async fn oversized_frame_gets_413_then_closes() {
         other => panic!("expected 413, got {other:?}"),
     }
     assert!(client.recv().await.is_none(), "connection closed after 413");
+
+    // Pre-auth the same bytes are a SEC-043 cheap reject: the connection
+    // closes with ZERO response bytes (no 413 to amplify with) and the
+    // abuse is counted against the handshake budget.
+    let mut preauth = Client::connect(h.server.local_addr).await;
+    preauth.send_raw(&header).await;
+    assert!(
+        preauth.recv().await.is_none(),
+        "pre-auth oversized frame closes silently"
+    );
     h.server.shutdown();
 }
 

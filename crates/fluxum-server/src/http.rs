@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
 
@@ -66,6 +66,9 @@ pub struct HttpOptions {
     /// to Fluxum must come from the same origin as `/rpc`. Off unless an
     /// operator opts in, so a production server has no file surface at all.
     pub static_dir: Option<std::path::PathBuf>,
+    /// Listener/socket hardening knobs (SEC-042); defaults = today's
+    /// behavior.
+    pub socket: crate::sock::SocketOptions,
 }
 
 impl Default for HttpOptions {
@@ -78,6 +81,7 @@ impl Default for HttpOptions {
             // Serving files is opt-in: a database with no configured static
             // directory exposes no filesystem at all.
             static_dir: None,
+            socket: crate::sock::SocketOptions::default(),
         }
     }
 }
@@ -153,7 +157,7 @@ pub async fn serve(
     addr: impl tokio::net::ToSocketAddrs,
     options: HttpOptions,
 ) -> io::Result<HttpServer> {
-    let listener = TcpListener::bind(addr).await?;
+    let listener = crate::sock::bind(addr, options.socket).await?;
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(HttpState {
@@ -178,6 +182,8 @@ pub async fn serve(
                 _ = accept_shutdown.notified() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else { continue };
+                    // SEC-042: keepalive so dead peers stop holding slots.
+                    crate::sock::apply_keepalive(&stream, state.options.socket.tcp_keepalive);
                     // SEC-030/031: gate the pre-auth surface per peer IP, the
                     // same guard the TCP transport uses (shared via ctx).
                     let ip = peer.ip();
@@ -292,6 +298,34 @@ async fn serve_connection(
                         reason = reason.as_str(), "refused a connection: pre-auth abuse limit");
                     return Ok(()); // drop, the cheapest refusal
                 }
+            }
+        }
+        // SEC-041 admission control, `/rpc` only — like the drain refusal
+        // below, it must NOT gate `/health`, `/metrics` or `/bans`: those
+        // are exactly the tools an operator fights an overload with. Under
+        // shed-preauth a request carrying a live session keeps working
+        // (established clients are the priority); anything pre-auth is
+        // dropped with zero response bytes. Under shed-all-new even session
+        // reattaches are dropped — but the sockets those sessions already
+        // hold keep streaming untouched.
+        if request.path == "/rpc" && matches!(request.method.as_str(), "POST" | "GET") {
+            use fluxum_core::metrics::OverloadState;
+            let shed = match state.ctx.overload_state() {
+                OverloadState::Normal => false,
+                OverloadState::ShedAllNew => true,
+                OverloadState::ShedPreauth => match request.header(SESSION_HEADER) {
+                    Some(token) => !state.sessions.lock().await.contains_key(&token),
+                    None => true,
+                },
+            };
+            if shed {
+                state
+                    .ctx
+                    .metrics()
+                    .note_conn_rejected(fluxum_core::metrics::ConnRejectReason::Overload);
+                tracing::debug!(target: "fluxum::http", %ip,
+                    "refused an /rpc request: overload shed");
+                return Ok(());
             }
         }
         let keep_alive = match (request.method.as_str(), request.path.as_str()) {

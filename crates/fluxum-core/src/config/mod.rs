@@ -65,6 +65,19 @@ pub struct ServerConfig {
     pub max_frame_bytes: ByteSize,
     /// Pre-auth connection-abuse limits (SPEC-026 SEC-030/031).
     pub connection_limits: ConnectionLimitsConfig,
+    /// Listen backlog for both listeners (SEC-042): pending un-accepted
+    /// connections the kernel queues. `0` = the built-in default (1024).
+    /// Raise alongside `somaxconn` on a directly exposed port.
+    pub accept_backlog: u32,
+    /// TCP keepalive probe time, seconds, applied to accepted sockets
+    /// (SEC-042): dead peers holding connection slots are reaped by the
+    /// kernel after this long. `0` (default) = keepalive off.
+    pub tcp_keepalive_secs: u64,
+    /// `TCP_DEFER_ACCEPT` window, seconds (SEC-042, Linux only): the kernel
+    /// completes the handshake but only wakes the accept loop when data
+    /// arrives, so bare-SYN/connect-and-idle floods never reach userspace.
+    /// `0` (default) = off; ignored (logged) on other platforms.
+    pub tcp_defer_accept_secs: u64,
     /// Reverse proxies / load balancers whose forwarding metadata is trusted
     /// (SPEC-026 SEC-035): IP or CIDR entries, IPv4/IPv6. Empty (the
     /// default) disables proxy awareness entirely — the socket peer address
@@ -91,6 +104,9 @@ impl Default for ServerConfig {
             idle_timeout_secs: 60,
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
             connection_limits: ConnectionLimitsConfig::default(),
+            accept_backlog: 0,
+            tcp_keepalive_secs: 0,
+            tcp_defer_accept_secs: 0,
             trusted_proxies: Vec::new(),
             static_dir: None,
         }
@@ -146,6 +162,21 @@ pub struct ConnectionLimitsConfig {
     /// (SEC-034): the backstop a distributed many-IP flood cannot walk past.
     /// `0` = uncapped.
     pub max_total_conns: u32,
+    /// Cap on tracked per-IP guard entries (SEC-040): a many-distinct-IP
+    /// flood grows the guard map at most to this size; beyond it,
+    /// pressure eviction reclaims idle entries (never one holding live
+    /// connections or an armed failed-auth streak). `0` = unbounded.
+    pub max_tracked_ips: u32,
+    /// Load fraction at which admission control starts shedding *pre-auth*
+    /// connections (SEC-041): the highest of `total conns / max_total_conns`
+    /// and `tracked IPs / max_tracked_ips` (only configured caps count).
+    /// Established, authenticated sessions are never shed. `0` disables
+    /// admission control.
+    pub overload_shed_fraction: f64,
+    /// Load fraction at which *all* new connections are shed (SEC-041),
+    /// including reattaching sessions; must be >= `overload_shed_fraction`.
+    /// `0` disables the shed-all stage.
+    pub overload_shed_all_fraction: f64,
 }
 
 impl Default for ConnectionLimitsConfig {
@@ -161,6 +192,11 @@ impl Default for ConnectionLimitsConfig {
             blocklist: Vec::new(),
             allowlist: Vec::new(),
             max_total_conns: 0,
+            // Generous: ~a few MB of guard state at worst, far below any
+            // OOM territory, while a normal deployment never notices.
+            max_tracked_ips: 100_000,
+            overload_shed_fraction: 0.90,
+            overload_shed_all_fraction: 0.98,
         }
     }
 }
@@ -911,6 +947,22 @@ impl Config {
         if let Err(e) = crate::net::IpSet::parse(&self.server.connection_limits.allowlist) {
             return Err(FluxumError::config(format!(
                 "server.connection_limits.allowlist: {e}"
+            )));
+        }
+        let (shed, shed_all) = (
+            self.server.connection_limits.overload_shed_fraction,
+            self.server.connection_limits.overload_shed_all_fraction,
+        );
+        if !(0.0..=1.0).contains(&shed) || !(0.0..=1.0).contains(&shed_all) {
+            return Err(FluxumError::config(format!(
+                "server.connection_limits.overload_shed_fraction/overload_shed_all_fraction: \
+                 must be in [0.0, 1.0], got {shed}/{shed_all}"
+            )));
+        }
+        if shed != 0.0 && shed_all != 0.0 && shed_all < shed {
+            return Err(FluxumError::config(format!(
+                "server.connection_limits.overload_shed_all_fraction ({shed_all}) must be >= \
+                 overload_shed_fraction ({shed})"
             )));
         }
         if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)

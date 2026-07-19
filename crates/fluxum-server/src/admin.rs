@@ -274,6 +274,13 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
         ctx.metrics()
             .set_subscriptions_active(i64::try_from(active).unwrap_or(i64::MAX));
     }
+    // SEC-040/041: refresh guard pressure + overload state at scrape time.
+    {
+        let guard = ctx.conn_guard();
+        ctx.metrics()
+            .set_connguard_pressure(guard.tracked_ips() as u64, guard.evictions_total());
+        let _ = ctx.overload_state(); // publishes the gauge + logs transitions
+    }
     // OBS-010..OBS-050: the shard's own counter block (the default database).
     let mut text = ctx.metrics().prometheus(health.last_tx_id);
     // SPEC-025 OPS-051: the same series per named namespace, each carrying a

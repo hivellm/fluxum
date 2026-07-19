@@ -19,10 +19,15 @@ fluxum-protocol.workspace = true
 rmp-serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "rt-multi-thread", "macros", "io-util", "signal", "sync", "time", "fs"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+# TCP_DEFER_ACCEPT is a raw setsockopt (SEC-042); Linux-only by definition.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 criterion.workspace = true

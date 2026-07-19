@@ -58,6 +58,14 @@ pub struct ConnLimits {
     pub failed_auth_backoff_base: Duration,
     /// Ceiling for the failed-auth backoff.
     pub failed_auth_backoff_max: Duration,
+    /// Cap on tracked per-IP entries (SEC-040; `None` = unbounded).
+    pub max_tracked_ips: Option<u32>,
+    /// Load fraction that starts shedding pre-auth connections (SEC-041;
+    /// `None` = admission control off).
+    pub overload_shed: Option<f64>,
+    /// Load fraction that sheds *all* new connections (SEC-041; `None` =
+    /// no shed-all stage).
+    pub overload_shed_all: Option<f64>,
 }
 
 impl ConnLimits {
@@ -75,6 +83,10 @@ impl ConnLimits {
             failed_auth_threshold: non_zero_u32(cfg.failed_auth_threshold),
             failed_auth_backoff_base: Duration::from_millis(cfg.failed_auth_backoff_base_ms),
             failed_auth_backoff_max: Duration::from_millis(cfg.failed_auth_backoff_max_ms),
+            max_tracked_ips: non_zero_u32(cfg.max_tracked_ips),
+            overload_shed: (cfg.overload_shed_fraction > 0.0).then_some(cfg.overload_shed_fraction),
+            overload_shed_all: (cfg.overload_shed_all_fraction > 0.0)
+                .then_some(cfg.overload_shed_all_fraction),
         }
     }
 }
@@ -212,6 +224,9 @@ pub struct ConnGuard {
     /// SEC-034 global concurrent-connection ceiling (`0` = uncapped);
     /// hot-reloadable.
     max_total_conns: AtomicU32,
+    /// SEC-040: lifetime count of pressure-evicted entries, for
+    /// `fluxum_connguard_evictions_total`.
+    evictions: std::sync::atomic::AtomicU64,
 }
 
 impl ConnGuard {
@@ -225,6 +240,7 @@ impl ConnGuard {
             access: RwLock::new(AccessLists::default()),
             bans: Mutex::new(HashMap::new()),
             max_total_conns: AtomicU32::new(0),
+            evictions: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -376,6 +392,25 @@ impl ConnGuard {
             return Err(ConnRejectReason::GlobalCap);
         }
 
+        // SEC-040: bound the tracked-IP map. A brand-new IP that would push
+        // the map past the cap first triggers a pressure sweep; if even that
+        // frees nothing (every entry is live or mid-streak), the connection
+        // is admitted *untracked* — per-IP checks are skipped for it, but
+        // the global ceiling above still applies and, crucially, the guard
+        // itself cannot become the OOM vector.
+        let ips = &mut guard_state.ips;
+        if !ips.contains_key(&ip)
+            && let Some(cap) = self.limits.max_tracked_ips
+            && ips.len() >= cap as usize
+            && Self::evict_under_pressure(ips, now, &self.evictions) == 0
+        {
+            guard_state.total_active = guard_state.total_active.saturating_add(1);
+            return Ok(ConnPermit {
+                guard: std::sync::Arc::clone(self),
+                ip,
+                tracked: false,
+            });
+        }
         let ips = &mut guard_state.ips;
         let state = ips
             .entry(ip)
@@ -410,7 +445,81 @@ impl ConnGuard {
         Ok(ConnPermit {
             guard: std::sync::Arc::clone(self),
             ip,
+            tracked: true,
         })
+    }
+
+    /// SEC-040 pressure sweep: evict every entry with no live connections,
+    /// no failed-auth streak, and no pending backoff — the *relaxed* idle
+    /// test (a partially drained accept bucket is forfeited; under memory
+    /// pressure, bounded memory beats perfect rate history). One O(n) sweep
+    /// reclaims many slots at once, so a sustained distinct-IP flood pays
+    /// it rarely, not per connection. Returns how many were evicted.
+    ///
+    /// What is *never* evicted — entries holding live connections or an
+    /// armed/counting failed-auth streak — is exactly what SEC-031 needs
+    /// preserved: an attacker cannot reset a brute-force counter by
+    /// flooding the guard with strangers.
+    fn evict_under_pressure(
+        ips: &mut HashMap<IpAddr, IpState>,
+        now: Instant,
+        evictions: &std::sync::atomic::AtomicU64,
+    ) -> usize {
+        let before = ips.len();
+        ips.retain(|_, s| {
+            s.active > 0 || s.auth_failures > 0 || s.backoff_until.is_some_and(|until| now < until)
+        });
+        let evicted = before - ips.len();
+        if evicted > 0 {
+            evictions.fetch_add(evicted as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        evicted
+    }
+
+    /// Lifetime SEC-040 pressure evictions (`fluxum_connguard_evictions_total`).
+    pub fn evictions_total(&self) -> u64 {
+        self.evictions.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Currently tracked per-IP entries (`fluxum_connguard_tracked_ips`).
+    pub fn tracked_ips(&self) -> usize {
+        self.state().ips.len()
+    }
+
+    /// SEC-041: the admission-control verdict, computed instantaneously
+    /// from live load — the highest of `total conns / max_total_conns` and
+    /// `tracked IPs / max_tracked_ips` (only configured caps contribute).
+    /// Instantaneous by design: the moment a flood stops and connections
+    /// drain, the verdict is `Normal` again with no cool-down to wait out.
+    pub fn overload_state(&self) -> fluxum_core::metrics::OverloadState {
+        use fluxum_core::metrics::OverloadState;
+        let Some(shed) = self.limits.overload_shed else {
+            return OverloadState::Normal;
+        };
+        let (total_active, tracked) = {
+            let state = self.state();
+            (state.total_active, state.ips.len())
+        };
+        let mut load = 0.0_f64;
+        let total_cap = self.max_total_conns.load(Ordering::Relaxed);
+        if total_cap != 0 {
+            load = load.max(f64::from(total_active) / f64::from(total_cap));
+        }
+        if let Some(tracked_cap) = self.limits.max_tracked_ips {
+            #[allow(clippy::cast_precision_loss)]
+            let pressure = tracked as f64 / f64::from(tracked_cap);
+            load = load.max(pressure);
+        }
+        if let Some(shed_all) = self.limits.overload_shed_all
+            && load >= shed_all
+        {
+            return OverloadState::ShedAllNew;
+        }
+        if load >= shed {
+            OverloadState::ShedPreauth
+        } else {
+            OverloadState::Normal
+        }
     }
 
     /// Record a failed `Authenticate` from `ip` (SEC-031): once the
@@ -425,6 +534,18 @@ impl ConnGuard {
             return;
         };
         let mut guard_state = self.state();
+        // SEC-040: recording a failure may not grow the map past its cap
+        // either. If a pressure sweep frees nothing, the failure goes
+        // unrecorded — under an active distinct-IP flood, bounded memory
+        // wins over a perfect streak count for a brand-new address.
+        let ips = &mut guard_state.ips;
+        if !ips.contains_key(&ip)
+            && let Some(cap) = self.limits.max_tracked_ips
+            && ips.len() >= cap as usize
+            && Self::evict_under_pressure(ips, now, &self.evictions) == 0
+        {
+            return;
+        }
         let state = guard_state
             .ips
             .entry(ip)
@@ -461,14 +582,19 @@ impl ConnGuard {
         self.state().ips.get(&ip).map_or(0, |s| s.active)
     }
 
-    fn release(&self, ip: IpAddr) {
+    fn release(&self, ip: IpAddr, tracked: bool) {
         let mut guard_state = self.state();
-        if let Some(state) = guard_state.ips.get_mut(&ip) {
+        // An untracked permit (SEC-040 saturation) owns no per-IP slot: a
+        // tracked entry for the same address created later must not be
+        // decremented by a stranger's release.
+        if tracked && let Some(state) = guard_state.ips.get_mut(&ip) {
             state.active = state.active.saturating_sub(1);
         }
         guard_state.total_active = guard_state.total_active.saturating_sub(1);
-        let ips = &mut guard_state.ips;
-        self.gc_if_idle(ips, ip, Instant::now());
+        if tracked {
+            let ips = &mut guard_state.ips;
+            self.gc_if_idle(ips, ip, Instant::now());
+        }
     }
 
     fn gc_if_idle(&self, ips: &mut HashMap<IpAddr, IpState>, ip: IpAddr, now: Instant) {
@@ -485,6 +611,10 @@ impl ConnGuard {
 pub struct ConnPermit {
     guard: std::sync::Arc<ConnGuard>,
     ip: IpAddr,
+    /// `false` when the guard admitted this connection without a per-IP
+    /// entry (SEC-040 saturation): the drop then releases only the global
+    /// slot, never a stranger's per-IP count.
+    tracked: bool,
 }
 
 impl ConnPermit {
@@ -496,7 +626,7 @@ impl ConnPermit {
 
 impl Drop for ConnPermit {
     fn drop(&mut self) {
-        self.guard.release(self.ip);
+        self.guard.release(self.ip, self.tracked);
     }
 }
 
@@ -743,6 +873,99 @@ mod tests {
 
     fn ip_of(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[test]
+    fn pressure_eviction_reclaims_lingering_entries_and_counts() {
+        let mut l = limits();
+        // A slow bucket (burst 1, ~1 s refill) keeps entries non-idle after
+        // release, so they linger for the pressure sweep to find.
+        l.accept_rate_per_sec = Some(1.0);
+        l.max_conns_per_ip = None;
+        l.max_tracked_ips = Some(2);
+        let g = guard(l);
+
+        drop(g.try_accept(ip(1)).unwrap());
+        drop(g.try_accept(ip(2)).unwrap());
+        assert_eq!(
+            g.tracked_ips(),
+            2,
+            "released entries linger (drained buckets)"
+        );
+
+        // A third IP hits the cap: the sweep reclaims both idle entries.
+        let _p3 = g.try_accept(ip(3)).unwrap();
+        assert_eq!(g.evictions_total(), 2);
+        assert_eq!(g.tracked_ips(), 1, "only the newcomer remains");
+    }
+
+    #[test]
+    fn saturation_never_evicts_live_conns_or_armed_streaks() {
+        let mut l = limits();
+        l.accept_rate_per_sec = None;
+        l.max_conns_per_ip = Some(1);
+        l.failed_auth_threshold = Some(2);
+        l.max_tracked_ips = Some(2);
+        let g = guard(l);
+
+        // Slot 1: a live connection. Slot 2: a counting failed-auth streak.
+        let p1 = g.try_accept(ip(1)).unwrap();
+        g.note_auth_failure(ip(2));
+        assert_eq!(g.tracked_ips(), 2);
+
+        // A newcomer finds every entry protected: admitted *untracked*, the
+        // map does not grow, and nothing about ip(1)/ip(2) was lost.
+        let p3 = g.try_accept(ip(3)).unwrap();
+        assert_eq!(g.tracked_ips(), 2, "saturated map does not grow");
+        assert_eq!(g.evictions_total(), 0);
+        // The untracked release never decrements a stranger's count.
+        drop(p3);
+        assert_eq!(g.active_conns(ip(1)), 1);
+        // SEC-031 preserved: ip(2)'s streak kept counting all along.
+        g.note_auth_failure(ip(2));
+        assert_eq!(
+            g.try_accept(ip(2)).unwrap_err(),
+            ConnRejectReason::FailedAuth
+        );
+        // An unrecordable failure from a fresh IP is dropped, not grown.
+        g.note_auth_failure(ip(4));
+        assert_eq!(g.tracked_ips(), 2);
+        drop(p1);
+    }
+
+    #[test]
+    fn overload_state_follows_load_and_recovers_instantly() {
+        use fluxum_core::metrics::OverloadState;
+        let mut l = limits();
+        l.accept_rate_per_sec = None;
+        l.max_conns_per_ip = None;
+        l.overload_shed = Some(0.5);
+        l.overload_shed_all = Some(0.9);
+        let g = guard(l);
+        g.set_max_total_conns(10);
+
+        assert_eq!(g.overload_state(), OverloadState::Normal);
+        let permits: Vec<_> = (0u8..5).map(|i| g.try_accept(ip(i)).unwrap()).collect();
+        assert_eq!(g.overload_state(), OverloadState::ShedPreauth);
+        let more: Vec<_> = (5u8..9).map(|i| g.try_accept(ip(i)).unwrap()).collect();
+        assert_eq!(g.overload_state(), OverloadState::ShedAllNew);
+
+        // The signal is instantaneous: drained load is Normal load.
+        drop(more);
+        assert_eq!(g.overload_state(), OverloadState::ShedPreauth);
+        drop(permits);
+        assert_eq!(g.overload_state(), OverloadState::Normal);
+
+        // No overload_shed configured → always Normal.
+        let mut off = limits();
+        off.overload_shed = None;
+        let g = guard(off);
+        g.set_max_total_conns(1);
+        let _p = g.try_accept(ip(1)).unwrap();
+        assert_eq!(
+            g.overload_state(),
+            fluxum_core::metrics::OverloadState::Normal
+        );
     }
 
     #[test]

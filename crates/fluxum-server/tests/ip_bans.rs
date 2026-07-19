@@ -96,6 +96,10 @@ fn make_ctx() -> Arc<ShardContext> {
     let limits = ConnLimits {
         accept_rate_per_sec: None,
         max_conns_per_ip: None,
+        // Admission control (SEC-041) has its own suite; off here so the
+        // pure SEC-033/034 refusals are what these tests observe.
+        overload_shed: None,
+        overload_shed_all: None,
         ..ConnLimits::default()
     };
     ctx.set_conn_guard(Arc::new(ConnGuard::new(limits)));

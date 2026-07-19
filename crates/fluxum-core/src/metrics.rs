@@ -106,6 +106,39 @@ impl ShardState {
     }
 }
 
+/// SEC-041 admission-control state (the `fluxum_overload_state` gauge):
+/// what the accept loops shed under load, ordered by severity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OverloadState {
+    /// Normal admission.
+    Normal = 0,
+    /// Under pressure: new pre-auth connections are shed; established
+    /// authenticated sessions (and their reattaches) keep working.
+    ShedPreauth = 1,
+    /// Saturated: every new connection is shed; only already-established
+    /// sockets keep working.
+    ShedAllNew = 2,
+}
+
+impl OverloadState {
+    /// The transition-log label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::ShedPreauth => "shed_preauth",
+            Self::ShedAllNew => "shed_all_new",
+        }
+    }
+
+    fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => Self::ShedPreauth,
+            2 => Self::ShedAllNew,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// Per-reducer counters (OBS-010) plus the latency histogram (OBS-011).
 #[derive(Debug, Default, Clone)]
 struct ReducerStat {
@@ -176,6 +209,10 @@ pub struct Metrics {
     conn_rejected_proxy_header: AtomicU64,
     conn_rejected_blocked: AtomicU64,
     conn_rejected_global_cap: AtomicU64,
+    conn_rejected_overload: AtomicU64,
+    overload_state: AtomicU8,
+    connguard_tracked_ips: AtomicU64,
+    connguard_evictions: AtomicU64,
 }
 
 /// Why the transports refused a connection on the pre-auth surface
@@ -201,6 +238,8 @@ pub enum ConnRejectReason {
     Blocked,
     /// The global concurrent-connection ceiling is full (SEC-034).
     GlobalCap,
+    /// Admission control shed the connection under load (SEC-041).
+    Overload,
 }
 
 impl ConnRejectReason {
@@ -215,12 +254,13 @@ impl ConnRejectReason {
             Self::ProxyHeader => "proxy_header",
             Self::Blocked => "blocked",
             Self::GlobalCap => "global_cap",
+            Self::Overload => "overload",
         }
     }
 
     /// Every reason, so `/metrics` emits a zero series per label rather than
     /// have one first appear only when it fires.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::ConnCap,
         Self::AcceptRate,
         Self::FailedAuth,
@@ -229,6 +269,7 @@ impl ConnRejectReason {
         Self::ProxyHeader,
         Self::Blocked,
         Self::GlobalCap,
+        Self::Overload,
     ];
 }
 
@@ -263,6 +304,10 @@ impl Metrics {
             conn_rejected_proxy_header: AtomicU64::new(0),
             conn_rejected_blocked: AtomicU64::new(0),
             conn_rejected_global_cap: AtomicU64::new(0),
+            conn_rejected_overload: AtomicU64::new(0),
+            overload_state: AtomicU8::new(OverloadState::Normal as u8),
+            connguard_tracked_ips: AtomicU64::new(0),
+            connguard_evictions: AtomicU64::new(0),
         })
     }
 
@@ -322,6 +367,26 @@ impl Metrics {
     /// The current shard lifecycle state (OBS-050, `/health`).
     pub fn shard_state(&self) -> ShardState {
         ShardState::from_u8(self.shard_state.load(Ordering::Relaxed))
+    }
+
+    /// SEC-041: publish the admission-control state; returns the previous
+    /// one so the caller can log the transition exactly once.
+    pub fn swap_overload_state(&self, state: OverloadState) -> OverloadState {
+        OverloadState::from_u8(self.overload_state.swap(state as u8, Ordering::Relaxed))
+    }
+
+    /// The current SEC-041 admission-control state.
+    pub fn overload_state(&self) -> OverloadState {
+        OverloadState::from_u8(self.overload_state.load(Ordering::Relaxed))
+    }
+
+    /// SEC-040: publish the guard's tracked-IP gauge and eviction counter
+    /// (the `/metrics` handler syncs these from the guard before rendering).
+    pub fn set_connguard_pressure(&self, tracked_ips: u64, evictions_total: u64) {
+        self.connguard_tracked_ips
+            .store(tracked_ips, Ordering::Relaxed);
+        self.connguard_evictions
+            .store(evictions_total, Ordering::Relaxed);
     }
 
     /// OBS-050: the last tx id replayed during recovery.
@@ -399,6 +464,7 @@ impl Metrics {
             ConnRejectReason::ProxyHeader => &self.conn_rejected_proxy_header,
             ConnRejectReason::Blocked => &self.conn_rejected_blocked,
             ConnRejectReason::GlobalCap => &self.conn_rejected_global_cap,
+            ConnRejectReason::Overload => &self.conn_rejected_overload,
         }
     }
 
@@ -573,6 +639,26 @@ impl Metrics {
                 self.conn_rejected(reason),
             );
         }
+
+        // --- overload / guard pressure (SEC-040/041) ---
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_overload_state Admission control: 0 normal, 1 shed_preauth, \
+             2 shed_all_new (SPEC-026 SEC-041).\n\
+             # TYPE fluxum_overload_state gauge\n\
+             fluxum_overload_state{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_connguard_tracked_ips Per-IP guard entries currently tracked \
+             (SPEC-026 SEC-040).\n\
+             # TYPE fluxum_connguard_tracked_ips gauge\n\
+             fluxum_connguard_tracked_ips{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_connguard_evictions_total Guard entries reclaimed under pressure \
+             (SPEC-026 SEC-040).\n\
+             # TYPE fluxum_connguard_evictions_total counter\n\
+             fluxum_connguard_evictions_total{{shard=\"{shard}\"}} {}",
+            self.overload_state.load(Ordering::Relaxed),
+            self.connguard_tracked_ips.load(Ordering::Relaxed),
+            self.connguard_evictions.load(Ordering::Relaxed),
+        );
         out
     }
 }

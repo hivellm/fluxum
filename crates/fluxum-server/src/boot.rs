@@ -150,6 +150,8 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
 
     let http_addr = format!("{}:{}", config.server.tcp_host, config.server.http_port);
     let tcp_addr = format!("{}:{}", config.server.tcp_host, config.server.tcp_port);
+    // SEC-042: listener hardening knobs, shared by both listeners.
+    let socket = crate::sock::SocketOptions::from_config(&config.server);
 
     let http = http::serve(
         Arc::clone(&ctx),
@@ -158,6 +160,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             idle_timeout: idle,
             max_frame_bytes,
             static_dir: config.server.static_dir.clone(),
+            socket,
             ..HttpOptions::default()
         },
     )
@@ -173,6 +176,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         TcpOptions {
             idle_timeout: idle,
             max_frame_bytes,
+            socket,
             ..TcpOptions::default()
         },
     )
