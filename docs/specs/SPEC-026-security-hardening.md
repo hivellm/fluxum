@@ -104,7 +104,44 @@ server:
 ```
 
 Rejections increment `fluxum_conn_rejected_total{shard, reason}` with
-`reason ∈ {conn_cap, accept_rate, failed_auth, handshake_budget}` (SEC-032).
+`reason ∈ {conn_cap, accept_rate, failed_auth, handshake_budget,
+proxy_preamble, proxy_header}` (SEC-032).
+
+### Requirement: Trusted-proxy client-IP resolution
+- **SEC-035** [P1] When `server.trusted_proxies` (IP/CIDR list, IPv4+IPv6, default empty = off) names
+  the socket peer, the transports SHALL resolve the effective client IP from the peer's forwarding
+  metadata and key every per-IP defense (SEC-030/031 caps, backoff, bans) on that resolved IP. On HTTP
+  the resolution is `X-Forwarded-For` under the rightmost-untrusted rule (walk right to left, skip
+  trusted hops; the first untrusted address is the client; an all-trusted chain falls back to its
+  leftmost entry). Forwarding metadata from a peer NOT in the list MUST be ignored (header) — never
+  honored. A malformed `X-Forwarded-For` from a trusted proxy MUST reject the request (`400`), counted
+  as `proxy_header`.
+- **SEC-036** [P1] On TCP the resolution is the PROXY protocol v2 binary preamble, accepted only from
+  trusted peers and read within the SEC-031 handshake time budget. A preamble from an untrusted peer,
+  or a malformed one from a trusted peer, MUST close the connection with zero response bytes, counted
+  as `proxy_preamble`. A trusted peer that opens with ordinary frames (no preamble) is the proxy host
+  acting as its own client. `LOCAL` commands and `UNSPEC` families resolve to the peer itself. The v1
+  text preamble is unsupported.
+- **SEC-037** [P2] `server.trusted_proxies` SHALL be validated at load and hot-reloadable (OPS-040);
+  a reload applies to connections admitted after it. With the list empty the transports MUST behave
+  byte-identically to a build without proxy awareness.
+
+#### Scenario: Per-IP caps bite the client, not the proxy
+Given Fluxum behind a load balancer listed in `server.trusted_proxies`
+When one client behind the proxy floods connections while another stays modest
+Then the flooding client's resolved IP is throttled and the modest client keeps connecting, and the
+proxy's own IP is never capped.
+
+#### Scenario: Spoofed forwarding metadata is refused
+Given a client NOT listed in `server.trusted_proxies`
+When it sends an `X-Forwarded-For` header or opens with a PROXY v2 preamble
+Then the header is ignored (the socket peer stays the client IP) and the preamble closes the
+connection with nothing written, counted as `proxy_preamble`.
+
+```yaml
+server:
+  trusted_proxies: []                # SEC-035 IP/CIDR entries; empty = socket peer is the client
+```
 
 ## 5. Non-goals
 

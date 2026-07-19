@@ -22,7 +22,11 @@ pub fn resolve(root: &Path, url_path: &str) -> Option<PathBuf> {
     let trimmed = url_path.split(['?', '#']).next().unwrap_or(url_path);
     let relative = trimmed.trim_start_matches('/');
     // A bare `/` (or a directory) means the index.
-    let relative = if relative.is_empty() { "index.html" } else { relative };
+    let relative = if relative.is_empty() {
+        "index.html"
+    } else {
+        relative
+    };
 
     let mut out = root.to_path_buf();
     for component in Path::new(relative).components() {
@@ -122,7 +126,10 @@ mod tests {
 
     #[test]
     fn content_types_cover_what_a_module_page_needs() {
-        assert_eq!(content_type(Path::new("i.html")), "text/html; charset=utf-8");
+        assert_eq!(
+            content_type(Path::new("i.html")),
+            "text/html; charset=utf-8"
+        );
         assert_eq!(
             content_type(Path::new("a.js")),
             "text/javascript; charset=utf-8"

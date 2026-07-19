@@ -62,6 +62,7 @@ pub mod hw;
 pub mod index;
 pub mod metrics;
 pub mod migration;
+pub mod net;
 pub mod plugin;
 pub mod reducer;
 pub mod scheduler;

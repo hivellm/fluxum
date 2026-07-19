@@ -172,6 +172,8 @@ pub struct Metrics {
     conn_rejected_accept_rate: AtomicU64,
     conn_rejected_failed_auth: AtomicU64,
     conn_rejected_handshake_budget: AtomicU64,
+    conn_rejected_proxy_preamble: AtomicU64,
+    conn_rejected_proxy_header: AtomicU64,
 }
 
 /// Why the transports refused a connection on the pre-auth surface
@@ -187,6 +189,11 @@ pub enum ConnRejectReason {
     FailedAuth,
     /// The handshake blew its time or size budget (SEC-031, slowloris).
     HandshakeBudget,
+    /// A PROXY protocol preamble from an untrusted peer, or a malformed one
+    /// from a trusted proxy (SEC-036).
+    ProxyPreamble,
+    /// A malformed `X-Forwarded-For` from a trusted proxy (SEC-035).
+    ProxyHeader,
 }
 
 impl ConnRejectReason {
@@ -197,16 +204,20 @@ impl ConnRejectReason {
             Self::AcceptRate => "accept_rate",
             Self::FailedAuth => "failed_auth",
             Self::HandshakeBudget => "handshake_budget",
+            Self::ProxyPreamble => "proxy_preamble",
+            Self::ProxyHeader => "proxy_header",
         }
     }
 
     /// Every reason, so `/metrics` emits a zero series per label rather than
     /// have one first appear only when it fires.
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 6] = [
         Self::ConnCap,
         Self::AcceptRate,
         Self::FailedAuth,
         Self::HandshakeBudget,
+        Self::ProxyPreamble,
+        Self::ProxyHeader,
     ];
 }
 
@@ -237,6 +248,8 @@ impl Metrics {
             conn_rejected_accept_rate: AtomicU64::new(0),
             conn_rejected_failed_auth: AtomicU64::new(0),
             conn_rejected_handshake_budget: AtomicU64::new(0),
+            conn_rejected_proxy_preamble: AtomicU64::new(0),
+            conn_rejected_proxy_header: AtomicU64::new(0),
         })
     }
 
@@ -369,6 +382,8 @@ impl Metrics {
             ConnRejectReason::AcceptRate => &self.conn_rejected_accept_rate,
             ConnRejectReason::FailedAuth => &self.conn_rejected_failed_auth,
             ConnRejectReason::HandshakeBudget => &self.conn_rejected_handshake_budget,
+            ConnRejectReason::ProxyPreamble => &self.conn_rejected_proxy_preamble,
+            ConnRejectReason::ProxyHeader => &self.conn_rejected_proxy_header,
         }
     }
 

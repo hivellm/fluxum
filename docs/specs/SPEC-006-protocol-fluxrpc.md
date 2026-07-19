@@ -98,6 +98,14 @@ hot path.
   | `http_port` | 15800 | HTTP/JSON admin API (§7) + FluxRPC Streamable HTTP at `/rpc` (RPC-004..RPC-007) |
   | `tcp_port` | 15801 | FluxRPC over raw TCP |
 
+  **Transport preamble (trusted proxies).** When `server.trusted_proxies` names the socket peer
+  (SPEC-026 SEC-035/036), a TCP connection MAY open with a PROXY protocol v2 binary preamble ahead
+  of the first FluxRPC frame; the server consumes it before framing begins and it is never part of
+  the message stream. From any peer not in that list the preamble bytes are a protocol error, not a
+  frame — the connection is closed without a response. The v1 text preamble is not supported. On the
+  Streamable HTTP transport the equivalent metadata travels in `X-Forwarded-For`, honored under the
+  same trust rule. Clients and SDKs never send either; this is proxy-to-server plumbing only.
+
 - **RPC-004** [P0] **Streamable HTTP transport.** The server SHALL expose FluxRPC over
   Streamable HTTP at path `/rpc` on `http_port`, via two methods: `POST /rpc` (client-initiated
   requests with streamed responses, RPC-005) and `GET /rpc` (server-initiated push stream,

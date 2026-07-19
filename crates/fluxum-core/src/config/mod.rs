@@ -65,6 +65,14 @@ pub struct ServerConfig {
     pub max_frame_bytes: ByteSize,
     /// Pre-auth connection-abuse limits (SPEC-026 SEC-030/031).
     pub connection_limits: ConnectionLimitsConfig,
+    /// Reverse proxies / load balancers whose forwarding metadata is trusted
+    /// (SPEC-026 SEC-035): IP or CIDR entries, IPv4/IPv6. Empty (the
+    /// default) disables proxy awareness entirely — the socket peer address
+    /// is the client IP, and forwarding metadata is never honored. When a
+    /// peer *is* listed here, its `X-Forwarded-For` (HTTP) and PROXY
+    /// protocol v2 preamble (TCP) resolve the real client IP that every
+    /// per-IP defense then keys on.
+    pub trusted_proxies: Vec<String>,
     /// Directory of static files served on unmatched `GET` paths, or empty
     /// (the default) to serve none.
     ///
@@ -83,6 +91,7 @@ impl Default for ServerConfig {
             idle_timeout_secs: 60,
             max_frame_bytes: ByteSize(u64::from(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES)),
             connection_limits: ConnectionLimitsConfig::default(),
+            trusted_proxies: Vec::new(),
             static_dir: None,
         }
     }
@@ -875,6 +884,9 @@ impl Config {
                 "subscriptions.fanout_concurrency: must be >= 1",
             ));
         }
+        if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
+            return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
+        }
         if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)
             && self.auth.secret.as_deref().is_none_or(str::is_empty)
         {
@@ -1022,6 +1034,7 @@ fn parse_env_scalar(raw: &str) -> Value {
 pub const RELOADABLE_KEYS: &[&str] = &[
     "logging.level",
     "logging.format",
+    "server.trusted_proxies",
     "observability.slow_reducer_threshold_us",
     "reducer.shard_max_reducers_per_sec",
     "subscriptions.send_buffer_bytes",

@@ -22,6 +22,7 @@
 
 pub mod admin;
 pub mod boot;
+pub mod clientip;
 pub mod connguard;
 pub mod http;
 pub mod logging;
@@ -211,6 +212,12 @@ pub struct ShardContext {
     /// until the assembly calls [`ShardContext::install_config`]; a reload
     /// without it is refused rather than guessing a path.
     config_source: std::sync::Mutex<Option<ConfigSource>>,
+    /// The live `server.trusted_proxies` set (SPEC-026 SEC-035): peers whose
+    /// forwarding metadata resolves the real client IP. Hot-reloadable —
+    /// each accept/request reads the current `Arc`, so a reload applies to
+    /// every connection admitted after it. Empty (the default) = proxy
+    /// awareness off, socket peer is the client.
+    trusted_proxies: std::sync::RwLock<Arc<fluxum_core::net::IpSet>>,
     /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
     /// inputs, every derived value with its source, and the per-kernel SIMD
     /// selection. Serialized at install so `/health` stays a clone, not a
@@ -288,6 +295,7 @@ impl ShardContext {
             draining: std::sync::atomic::AtomicBool::new(false),
             reloadable: std::sync::RwLock::new(None),
             config_source: std::sync::Mutex::new(None),
+            trusted_proxies: std::sync::RwLock::new(Arc::new(fluxum_core::net::IpSet::default())),
             send_buffer_bytes: AtomicU64::new(
                 fluxum_core::config::SubscriptionsConfig::default()
                     .send_buffer_bytes
@@ -442,6 +450,14 @@ impl ShardContext {
             .set_shard_max_reducers_per_sec(config.reducer.shard_max_reducers_per_sec);
         self.send_buffer_bytes
             .store(config.subscriptions.send_buffer_bytes.0, Ordering::Relaxed);
+        match fluxum_core::net::IpSet::parse(&config.server.trusted_proxies) {
+            Ok(set) => self.set_trusted_proxies(set),
+            // Unreachable through the loader (validate() parses the same
+            // list), but a hand-built Config must not poison the live set.
+            Err(e) => {
+                tracing::warn!(error = %e, "server.trusted_proxies not applied");
+            }
+        }
         *self
             .reloadable
             .write()
@@ -480,6 +496,26 @@ impl ShardContext {
                 crate::connguard::ConnLimits::default(),
             ))
         })
+    }
+
+    /// The live trusted-proxy set (SPEC-026 SEC-035). Cheap: clones an
+    /// `Arc`, so accept loops and per-request paths read it freely.
+    pub fn trusted_proxies(&self) -> Arc<fluxum_core::net::IpSet> {
+        Arc::clone(
+            &self
+                .trusted_proxies
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Replace the trusted-proxy set (boot and hot reload both land here via
+    /// [`ShardContext::publish_reloadable`]).
+    pub fn set_trusted_proxies(&self, set: fluxum_core::net::IpSet) {
+        *self
+            .trusted_proxies
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(set);
     }
 
     /// Register an additional named database (SPEC-025 OPS-050). The

@@ -181,19 +181,32 @@ pub async fn serve(
                     // SEC-030/031: gate the pre-auth surface per peer IP, the
                     // same guard the TCP transport uses (shared via ctx).
                     let ip = peer.ip();
-                    match state.ctx.conn_guard().try_accept(ip) {
-                        Ok(permit) => {
-                            let conn_state = Arc::clone(&state);
-                            let conn_shutdown = accept_shutdown.clone();
-                            tokio::spawn(async move {
-                                let _ = serve_connection(conn_state, stream, ip, permit, conn_shutdown).await;
-                            });
-                        }
-                        Err(reason) => {
-                            state.ctx.metrics().note_conn_rejected(reason);
-                            tracing::debug!(target: "fluxum::http", %ip, reason = reason.as_str(),
-                                "refused a connection: pre-auth abuse limit");
-                            drop(stream);
+                    let trusted = state.ctx.trusted_proxies();
+                    if !trusted.is_empty() && trusted.contains(ip.to_canonical()) {
+                        // SEC-035: a trusted proxy names the real client in
+                        // `X-Forwarded-For`, which lives in the request — so
+                        // admission is deferred to the first parsed request,
+                        // where the guard can key on the *client*.
+                        let conn_state = Arc::clone(&state);
+                        let conn_shutdown = accept_shutdown.clone();
+                        tokio::spawn(async move {
+                            let _ = serve_connection(conn_state, stream, ip, Admission::Proxied(trusted), conn_shutdown).await;
+                        });
+                    } else {
+                        match state.ctx.conn_guard().try_accept(ip) {
+                            Ok(permit) => {
+                                let conn_state = Arc::clone(&state);
+                                let conn_shutdown = accept_shutdown.clone();
+                                tokio::spawn(async move {
+                                    let _ = serve_connection(conn_state, stream, ip, Admission::Direct(permit), conn_shutdown).await;
+                                });
+                            }
+                            Err(reason) => {
+                                state.ctx.metrics().note_conn_rejected(reason);
+                                tracing::debug!(target: "fluxum::http", %ip, reason = reason.as_str(),
+                                    "refused a connection: pre-auth abuse limit");
+                                drop(stream);
+                            }
                         }
                     }
                 }
@@ -207,24 +220,80 @@ pub async fn serve(
     })
 }
 
+/// How a connection was admitted, which decides where its client IP comes
+/// from (SEC-035).
+enum Admission {
+    /// An ordinary peer: admitted at accept, the socket peer is the client.
+    /// The permit holds the SEC-030 slot for the connection's whole life.
+    Direct(crate::connguard::ConnPermit),
+    /// The peer is a trusted proxy: each request's `X-Forwarded-For`
+    /// resolves the client, and the guard runs on the first request once
+    /// that client is known.
+    Proxied(Arc<fluxum_core::net::IpSet>),
+}
+
 /// Serve one HTTP/1.1 connection: parse a request, dispatch `/rpc`, and
 /// (for POST) keep the connection alive for the next request.
 async fn serve_connection(
     state: Arc<HttpState>,
     mut stream: TcpStream,
-    ip: std::net::IpAddr,
-    permit: crate::connguard::ConnPermit,
+    peer_ip: std::net::IpAddr,
+    admission: Admission,
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
-    // Holds the peer's SEC-030 concurrent-connection slot for the connection's
-    // whole life (a GET stream can be long-lived); released on drop.
-    let _permit = permit;
+    // Holds the SEC-030 concurrent-connection slot for the connection's
+    // whole life (a GET stream can be long-lived); released on drop. On a
+    // proxied connection it is empty until the first request names the
+    // client and the guard admits it.
+    let (mut permit, trusted) = match admission {
+        Admission::Direct(p) => (Some(p), None),
+        Admission::Proxied(t) => (None, Some(t)),
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(4096);
     loop {
         let request = match read_request(&mut stream, &mut buf).await? {
             Some(request) => request,
             None => return Ok(()), // clean close
         };
+        // SEC-035: the IP everything downstream attributes this request to —
+        // the socket peer, or the `X-Forwarded-For` client resolved under
+        // the rightmost-untrusted rule when the peer is a trusted proxy.
+        let ip = match &trusted {
+            None => peer_ip,
+            Some(trusted) => match crate::clientip::resolve_forwarded_for(
+                peer_ip.to_canonical(),
+                request.header("x-forwarded-for").as_deref(),
+                trusted,
+            ) {
+                Ok(ip) => ip,
+                Err(e) => {
+                    // A trusted proxy sending garbage attribution is a
+                    // misconfiguration: reject loudly, count it (SEC-035).
+                    state
+                        .ctx
+                        .metrics()
+                        .note_conn_rejected(fluxum_core::metrics::ConnRejectReason::ProxyHeader);
+                    tracing::warn!(target: "fluxum::http", proxy = %peer_ip, error = %e,
+                        "rejected a request: malformed X-Forwarded-For from a trusted proxy");
+                    write_simple(&mut stream, 400, "Bad Request").await?;
+                    return Ok(());
+                }
+            },
+        };
+        // SEC-030/031 on a proxied connection: admit on the resolved client
+        // the first time it is known. Keyed on the client, not the proxy —
+        // otherwise every per-IP cap would throttle the proxy itself.
+        if permit.is_none() && trusted.is_some() {
+            match state.ctx.conn_guard().try_accept(ip) {
+                Ok(p) => permit = Some(p),
+                Err(reason) => {
+                    state.ctx.metrics().note_conn_rejected(reason);
+                    tracing::debug!(target: "fluxum::http", %ip, proxy = %peer_ip,
+                        reason = reason.as_str(), "refused a connection: pre-auth abuse limit");
+                    return Ok(()); // drop, the cheapest refusal
+                }
+            }
+        }
         let keep_alive = match (request.method.as_str(), request.path.as_str()) {
             // SPEC-025 OPS-030: while draining, refuse *new* `/rpc` work
             // with a retryable 503 so the client reconnects to the restarted
@@ -592,8 +661,7 @@ async fn handle_get(
     // an idle connection needs afterwards (RPC-006). Both are keep-alive
     // frames, which receivers ignore (RPC-001).
     const OPENING_TICK: Duration = Duration::from_millis(50);
-    let mut keepalive_timer =
-        tokio::time::interval_at(Instant::now() + OPENING_TICK, keepalive);
+    let mut keepalive_timer = tokio::time::interval_at(Instant::now() + OPENING_TICK, keepalive);
 
     let mut exit = GetExit::Expired;
     let result = loop {
@@ -879,7 +947,11 @@ fn reason_phrase(code: u16) -> &'static str {
 /// A path that would escape the root is answered 404 rather than 403: telling
 /// a prober which traversals were *rejected* rather than *absent* maps out the
 /// filesystem for them.
-async fn handle_static(state: &Arc<HttpState>, stream: &mut TcpStream, path: &str) -> io::Result<()> {
+async fn handle_static(
+    state: &Arc<HttpState>,
+    stream: &mut TcpStream,
+    path: &str,
+) -> io::Result<()> {
     let Some(root) = state.options.static_dir.as_deref() else {
         return write_simple(stream, 404, "Not Found").await;
     };

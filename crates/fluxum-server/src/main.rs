@@ -61,7 +61,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(err) => {
             eprintln!("cannot start the async runtime: {err}");
@@ -129,9 +132,7 @@ async fn run(
     // Registers the source so `POST /config/reload` and SIGHUP can re-read it
     // (SPEC-025 OPS-040). Done after binding so a config that cannot serve
     // never becomes the reloadable baseline.
-    server
-        .ctx
-        .install_config(config_path, config, log_handle);
+    server.ctx.install_config(config_path, config, log_handle);
 
     tracing::info!(
         http = %server.http.local_addr,
@@ -181,7 +182,9 @@ fn spawn_reload_watcher(ctx: Arc<ShardContext>) {
                 Ok(changed) => tracing::info!(keys = ?changed, "SIGHUP: config reloaded"),
                 // A bad config on reload leaves the running one in place —
                 // the server keeps serving rather than dying on a typo.
-                Err(err) => tracing::error!(error = %err, "SIGHUP: reload rejected, keeping the running config"),
+                Err(err) => {
+                    tracing::error!(error = %err, "SIGHUP: reload rejected, keeping the running config")
+                }
             }
         }
     });

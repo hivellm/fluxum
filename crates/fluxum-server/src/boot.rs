@@ -17,9 +17,7 @@ use std::time::Duration;
 use fluxum_core::auth::{Authenticator, ServerPeerRegistry, provider_from_config};
 use fluxum_core::commitlog::{CommitLog, CommitLogOptions};
 use fluxum_core::config::Config;
-use fluxum_core::reducer::{
-    LifecycleHooks, ReducerEngine, ReducerRegistry, registered_reducers,
-};
+use fluxum_core::reducer::{LifecycleHooks, ReducerEngine, ReducerRegistry, registered_reducers};
 use fluxum_core::schema::Schema;
 use fluxum_core::store::MemStore;
 use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
@@ -97,7 +95,8 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         CommitLogOptions::default(),
     )?);
 
-    let (pipeline, worker) = TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default())?;
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default())?;
     tokio::spawn(worker.run());
 
     let reducers: Vec<_> = registered_reducers().collect();

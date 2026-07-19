@@ -109,21 +109,38 @@ pub async fn serve(
                             // the socket dropped (closed) — the cheapest signal
                             // to a flooding/throttled client.
                             let ip = peer.ip();
-                            match accept_ctx.conn_guard().try_accept(ip) {
-                                Ok(permit) => {
-                                    let conn_ctx = Arc::clone(&accept_ctx);
-                                    let conn_shutdown = accept_shutdown.clone();
-                                    tokio::spawn(async move {
-                                        if let Err(e) = drive_connection(conn_ctx, stream, ip, permit, options, conn_shutdown).await {
-                                            tracing::debug!(target: "fluxum::tcp", error = %e, "connection ended");
-                                        }
-                                    });
-                                }
-                                Err(reason) => {
-                                    accept_ctx.metrics().note_conn_rejected(reason);
-                                    tracing::debug!(target: "fluxum::tcp", %ip, reason = reason.as_str(),
-                                        "refused a connection: pre-auth abuse limit");
-                                    drop(stream);
+                            let trusted = accept_ctx.trusted_proxies();
+                            if !trusted.is_empty() && trusted.contains(ip.to_canonical()) {
+                                // SEC-036: a trusted proxy announces the real
+                                // client in a PROXY v2 preamble; the guard must
+                                // key on *that* IP, so admission happens after
+                                // the (bounded) preamble read.
+                                let conn_ctx = Arc::clone(&accept_ctx);
+                                let conn_shutdown = accept_shutdown.clone();
+                                tokio::spawn(async move {
+                                    handle_proxied_conn(conn_ctx, stream, ip, options, conn_shutdown).await;
+                                });
+                            } else {
+                                // SEC-036: with proxy awareness on, a preamble
+                                // from anyone *not* trusted is a protocol error
+                                // — detected in the read loop.
+                                let detect_preamble = !trusted.is_empty();
+                                match accept_ctx.conn_guard().try_accept(ip) {
+                                    Ok(permit) => {
+                                        let conn_ctx = Arc::clone(&accept_ctx);
+                                        let conn_shutdown = accept_shutdown.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = drive_connection(conn_ctx, stream, ip, permit, options, Vec::new(), detect_preamble, conn_shutdown).await {
+                                                tracing::debug!(target: "fluxum::tcp", error = %e, "connection ended");
+                                            }
+                                        });
+                                    }
+                                    Err(reason) => {
+                                        accept_ctx.metrics().note_conn_rejected(reason);
+                                        tracing::debug!(target: "fluxum::tcp", %ip, reason = reason.as_str(),
+                                            "refused a connection: pre-auth abuse limit");
+                                        drop(stream);
+                                    }
                                 }
                             }
                         }
@@ -142,6 +159,103 @@ pub async fn serve(
     })
 }
 
+/// Admit a connection from a trusted proxy (SEC-036): read the PROXY v2
+/// preamble first — bounded by the SEC-031 handshake time budget — resolve
+/// the real client IP from it, and only then run the guard, keyed on that
+/// IP. A trusted peer that opens with ordinary frame bytes instead of a
+/// preamble is the proxy host itself talking (a probe): it is admitted under
+/// its own IP. A malformed preamble is counted and the socket dropped.
+async fn handle_proxied_conn(
+    ctx: Arc<ShardContext>,
+    mut stream: TcpStream,
+    peer_ip: std::net::IpAddr,
+    options: TcpOptions,
+    server_shutdown: Arc<Notify>,
+) {
+    use crate::clientip::{V2Preamble, is_v2_signature_prefix, parse_v2_preamble};
+    use fluxum_core::metrics::ConnRejectReason;
+
+    let limits = *ctx.conn_guard().limits();
+    let deadline = limits
+        .handshake_timeout
+        .map(|budget| tokio::time::Instant::now() + budget);
+
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let mut chunk = [0u8; 1024];
+    let resolved = loop {
+        // Not a preamble: the trusted proxy host is its own client; the
+        // buffered bytes are the start of an ordinary frame stream.
+        if !is_v2_signature_prefix(&buf) {
+            break peer_ip;
+        }
+        if buf.len() >= crate::clientip::V2_SIG.len() {
+            match parse_v2_preamble(&buf) {
+                Ok(V2Preamble::Complete { source, consumed }) => {
+                    buf.drain(..consumed);
+                    // LOCAL/UNSPEC name no client: the proxy speaks for itself.
+                    break source.map_or(peer_ip, |ip| ip.to_canonical());
+                }
+                Ok(V2Preamble::Incomplete) => {}
+                Err(e) => {
+                    ctx.metrics()
+                        .note_conn_rejected(ConnRejectReason::ProxyPreamble);
+                    tracing::debug!(target: "fluxum::tcp", ip = %peer_ip, error = %e,
+                        "refused a connection: malformed PROXY v2 preamble from a trusted proxy");
+                    return;
+                }
+            }
+        }
+        let read = async {
+            match deadline {
+                Some(d) => tokio::time::timeout_at(d, stream.read(&mut chunk))
+                    .await
+                    .unwrap_or(Ok(0)),
+                None => stream.read(&mut chunk).await,
+            }
+        };
+        let n = tokio::select! {
+            _ = server_shutdown.notified() => return,
+            n = read => n.unwrap_or(0),
+        };
+        if n == 0 {
+            // EOF or handshake-budget expiry mid-preamble: a preamble that
+            // never finishes is a slowloris on the pre-auth surface.
+            ctx.metrics()
+                .note_conn_rejected(ConnRejectReason::HandshakeBudget);
+            return;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    };
+
+    // SEC-030/031: the guard now sees the *client*, not the proxy — this is
+    // the entire point: per-IP caps and backoff bite the abusive client
+    // while the proxy's other clients keep connecting.
+    match ctx.conn_guard().try_accept(resolved) {
+        Ok(permit) => {
+            if let Err(e) = drive_connection(
+                ctx,
+                stream,
+                resolved,
+                permit,
+                options,
+                buf,
+                false,
+                server_shutdown,
+            )
+            .await
+            {
+                tracing::debug!(target: "fluxum::tcp", error = %e, "connection ended");
+            }
+        }
+        Err(reason) => {
+            ctx.metrics().note_conn_rejected(reason);
+            tracing::debug!(target: "fluxum::tcp", ip = %resolved, proxy = %peer_ip,
+                reason = reason.as_str(), "refused a connection: pre-auth abuse limit");
+            drop(stream);
+        }
+    }
+}
+
 /// Drive one connection: read → route → write, with the idle timeout and
 /// frame-size limit, until EOF, a fatal frame error, or shutdown.
 ///
@@ -150,12 +264,19 @@ pub async fn serve(
 /// unauthenticated the SEC-031 handshake budget applies: a stricter pre-auth
 /// frame-size cap and an absolute time budget to reach a successful
 /// `Authenticate`, both to blunt slowloris.
+///
+/// `initial` seeds the frame buffer with bytes already read off the socket
+/// (what followed a trusted proxy's preamble); `detect_preamble` arms the
+/// SEC-036 check that refuses a PROXY v2 signature from an untrusted peer.
+#[allow(clippy::too_many_arguments)]
 async fn drive_connection(
     ctx: Arc<ShardContext>,
     stream: TcpStream,
     ip: std::net::IpAddr,
     permit: ConnPermit,
     options: TcpOptions,
+    initial: Vec<u8>,
+    detect_preamble: bool,
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
     let _permit = permit;
@@ -182,49 +303,72 @@ async fn drive_connection(
     let writer = tokio::spawn(writer_task(write_half, out_rx));
 
     let mut session = Session::new(Arc::clone(&ctx));
-    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut buf: Vec<u8> = initial;
     let mut read_chunk = [0u8; 8192];
+    let mut detect_preamble = detect_preamble;
 
     let result = 'conn: loop {
         let authed = session.is_authenticated();
         let active_codec = if authed { &codec } else { &handshake_codec };
-        // Drain any whole frames already buffered before reading more.
-        loop {
-            match active_codec.decode(&buf) {
-                Ok(Some((frame, consumed))) => {
-                    let owned: Option<Vec<u8>> = match frame {
-                        Frame::KeepAlive => None,
-                        Frame::Body(body) => Some(body.to_vec()),
-                    };
-                    buf.drain(..consumed);
-                    if let Some(body) = owned
-                        && !route_frame(
-                            &ctx,
-                            &mut session,
-                            ip,
-                            &codec,
-                            &body,
-                            &out_tx,
-                            &conn_shutdown,
-                        )
-                        .await
-                    {
+        // SEC-036: with proxy awareness on, an untrusted peer opening with
+        // the PROXY v2 signature is claiming to speak for someone else —
+        // refused silently (no response bytes), counted. While the first
+        // bytes are still an ambiguous prefix of the signature, hold off the
+        // codec (it would misread them as an oversized frame) and read more;
+        // the handshake deadline bounds that wait.
+        if detect_preamble {
+            if authed || !crate::clientip::is_v2_signature_prefix(&buf) {
+                detect_preamble = false; // ordinary traffic; stop checking
+            } else if buf.len() >= crate::clientip::V2_SIG.len() {
+                ctx.metrics()
+                    .note_conn_rejected(fluxum_core::metrics::ConnRejectReason::ProxyPreamble);
+                tracing::debug!(target: "fluxum::tcp", %ip,
+                    "refused a connection: PROXY v2 preamble from an untrusted peer");
+                break 'conn Ok(());
+            }
+        }
+        // Drain any whole frames already buffered before reading more. (With
+        // the preamble check still ambiguous, hold off the codec entirely —
+        // it would misread the signature bytes as an oversized frame.)
+        if !detect_preamble {
+            loop {
+                match active_codec.decode(&buf) {
+                    Ok(Some((frame, consumed))) => {
+                        let owned: Option<Vec<u8>> = match frame {
+                            Frame::KeepAlive => None,
+                            Frame::Body(body) => Some(body.to_vec()),
+                        };
+                        buf.drain(..consumed);
+                        if let Some(body) = owned
+                            && !route_frame(
+                                &ctx,
+                                &mut session,
+                                ip,
+                                &codec,
+                                &body,
+                                &out_tx,
+                                &conn_shutdown,
+                            )
+                            .await
+                        {
+                            break 'conn Ok(());
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(too_large) => {
+                        // A frame over the limit gets the RPC-061 413 + close on
+                        // both sides of auth; pre-auth it is *also* a SEC-031
+                        // handshake-budget abuse event, so it is counted.
+                        if !authed {
+                            ctx.metrics().note_conn_rejected(
+                                fluxum_core::metrics::ConnRejectReason::HandshakeBudget,
+                            );
+                        }
+                        let msg =
+                            error_frame(&codec, None, too_large.code(), too_large.to_string());
+                        let _ = out_tx.send(msg).await;
                         break 'conn Ok(());
                     }
-                }
-                Ok(None) => break,
-                Err(too_large) => {
-                    // A frame over the limit gets the RPC-061 413 + close on
-                    // both sides of auth; pre-auth it is *also* a SEC-031
-                    // handshake-budget abuse event, so it is counted.
-                    if !authed {
-                        ctx.metrics().note_conn_rejected(
-                            fluxum_core::metrics::ConnRejectReason::HandshakeBudget,
-                        );
-                    }
-                    let msg = error_frame(&codec, None, too_large.code(), too_large.to_string());
-                    let _ = out_tx.send(msg).await;
-                    break 'conn Ok(());
                 }
             }
         }
