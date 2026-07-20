@@ -51,6 +51,13 @@ fn generated_typescript_compiles_under_strict() {
 
     let dir = tempfile::tempdir().unwrap();
     fluxum_cli::generate::write_files(dir.path(), &files).unwrap();
+    // The gate covers the runtime-free binding set — `client.ts`, `types.ts`,
+    // `reducers.ts` — which SDK-021 requires to compile with zero manual
+    // stubs. `decoders.ts` (and `index.ts`, which re-exports it) deliberately
+    // import the runtime's schema-agnostic `decodeRow`: a generated decoder is
+    // a *with-runtime* convenience, validated where the runtime is present,
+    // not a compiles-alone binding.
+    //
     // The strictest reasonable configuration: if the emitted code needs a
     // manual stub or leans on `any`, this is where it shows.
     std::fs::write(
@@ -67,7 +74,7 @@ fn generated_typescript_compiles_under_strict() {
     "exactOptionalPropertyTypes": true,
     "noUncheckedIndexedAccess": true
   },
-  "include": ["*.ts"]
+  "include": ["client.ts", "types.ts", "reducers.ts"]
 }
 "#,
     )

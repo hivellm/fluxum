@@ -141,12 +141,116 @@ pub fn generate(schema: &Value) -> Result<BTreeMap<String, String>, String> {
     let mut files = BTreeMap::new();
     files.insert("client.ts".to_owned(), client_ts(&banner));
     files.insert("types.ts".to_owned(), types_ts(&banner, tables)?);
+    files.insert("decoders.ts".to_owned(), decoders_ts(&banner, tables)?);
     files.insert(
         "reducers.ts".to_owned(),
         reducers_ts(&banner, reducers, schema_version)?,
     );
     files.insert("index.ts".to_owned(), index_ts(&banner));
     Ok(files)
+}
+
+/// The FluxBIN reader method name for a column type, as exposed by the SDK's
+/// `RowReader.read(type)`. The reader takes the `FluxType` name verbatim, so
+/// this only needs to validate that the type is one the reader models — an
+/// unmodelled column is refused at generation rather than emitted as a decode
+/// that would desync every column after it.
+fn is_decodable(flux: &str) -> bool {
+    matches!(
+        flux,
+        "Bool"
+            | "I8"
+            | "I16"
+            | "I32"
+            | "I64"
+            | "U8"
+            | "U16"
+            | "U32"
+            | "U64"
+            | "EntityId"
+            | "F32"
+            | "F64"
+            | "Str"
+            | "Bytes"
+            | "Identity"
+            | "ConnectionId"
+            | "Timestamp"
+    )
+}
+
+/// Emit typed per-table decoders (`decode<Table>(row) -> <Table>`), unlike the
+/// runtime-free `types.ts` these DO import the SDK's schema-agnostic
+/// `decodeRow` — a generated decoder is a *with-runtime* convenience (it is
+/// what lets an application drop hand-written FluxBIN readers), so it is a
+/// separate file from the `tsc`-alone binding set.
+fn decoders_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
+    let mut out = String::from(banner);
+    out.push_str(
+        "import { decodeRow } from '@hivehub/fluxum';\n\
+         import type { FluxType } from '@hivehub/fluxum';\n",
+    );
+    // Import each table interface so the return types are the generated ones.
+    let names: Vec<&str> = tables
+        .iter()
+        .filter_map(|t| t.get("name").and_then(Value::as_str))
+        .collect();
+    if !names.is_empty() {
+        out.push_str(&format!("import type {{ {} }} from './types';\n", names.join(", ")));
+    }
+    out.push('\n');
+
+    for table in tables {
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("table has no name")?;
+        let columns = table
+            .get("columns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("table `{name}` has no columns"))?;
+
+        // The column descriptor list the schema-agnostic reader walks.
+        let mut descriptors = Vec::new();
+        for column in columns {
+            let col_name = column
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("table `{name}` has an unnamed column"))?;
+            let ty = column
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("column `{name}.{col_name}` has no type"))?;
+            if !is_decodable(ty) {
+                return Err(format!(
+                    "column `{name}.{col_name}` has unmodelled type `{ty}`: the row decoder \
+                     cannot read it. Model the type or remove the column."
+                ));
+            }
+            descriptors.push(format!("{{ name: '{col_name}', type: '{ty}' as FluxType }}"));
+        }
+
+        out.push_str(&doc_comment(
+            &[format!("Column layout of `{name}`, in FluxBIN wire order.")],
+            "",
+        ));
+        out.push_str(&format!(
+            "const {name}Columns = [{}] as const;\n\n",
+            descriptors.join(", ")
+        ));
+        out.push_str(&doc_comment(
+            &[
+                format!("Decode one `{name}` row from its FluxBIN bytes."),
+                "The columns are read in declaration order; a length mismatch throws.".to_owned(),
+            ],
+            "",
+        ));
+        out.push_str(&format!(
+            "export function decode{name}(row: Uint8Array): {name} {{\n\
+             \x20 return decodeRow(row, {name}Columns) as unknown as {name};\n\
+             }}\n\n"
+        ));
+    }
+    Ok(out)
 }
 
 /// The interface the generated wrappers call through, plus the branded
@@ -368,6 +472,7 @@ fn index_ts(banner: &str) -> String {
         "{banner}\
 export * from './client';\n\
 export * from './types';\n\
+export * from './decoders';\n\
 export * from './reducers';\n"
     )
 }
@@ -520,6 +625,39 @@ mod tests {
     fn a_document_without_a_schema_version_is_refused() {
         let mut bad = schema();
         bad.as_object_mut().unwrap().remove("schema_version");
+        assert!(generate(&bad).is_err());
+    }
+
+    #[test]
+    fn a_table_gets_a_typed_row_decoder() {
+        // The decoder closes the "hand-written decoders" gap: an application
+        // gets a typed `decodeTask(bytes): Task` from codegen, not by
+        // hand-listing columns. It reuses the runtime's schema-agnostic
+        // `decodeRow`, so it lives in its own file rather than the tsc-alone set.
+        let files = generate(&schema()).unwrap();
+        let decoders = &files["decoders.ts"];
+        assert!(decoders.contains("import { decodeRow } from '@hivehub/fluxum';"), "{decoders}");
+        assert!(decoders.contains("import type { Task } from './types';"), "{decoders}");
+        assert!(
+            decoders.contains("{ name: 'id', type: 'U64' as FluxType }"),
+            "{decoders}"
+        );
+        assert!(
+            decoders.contains("export function decodeTask(row: Uint8Array): Task {"),
+            "{decoders}"
+        );
+        assert!(
+            decoders.contains("return decodeRow(row, TaskColumns) as unknown as Task;"),
+            "{decoders}"
+        );
+    }
+
+    #[test]
+    fn an_unmodelled_column_is_refused_by_the_decoder() {
+        let mut bad = schema();
+        bad["tables"][0]["columns"][2]["type"] = serde_json::json!("SomeFutureType");
+        // types.ts tolerates it as `unknown`, but a decoder cannot read it —
+        // so generation fails rather than emit a decode that desyncs.
         assert!(generate(&bad).is_err());
     }
 }
