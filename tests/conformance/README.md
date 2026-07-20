@@ -34,8 +34,9 @@ where an SDK carries more than one.
 | `{"close": {"client"}}` | Close the session. |
 | `{"subscribe": {"client", "queries": [..], "as"?}}` | Register queries and await every `InitialData` (one per query, RPC-032), applied to the local cache. With `as`, bind the returned server-assigned `query_id`s under that label for a later `unsubscribe`. |
 | `{"unsubscribe": {"client", "handles"}}` | Drop the subscriptions whose `query_id`s were bound under the `handles` label. Rows only those queries held leave the cache; rows still covered by another subscription survive (SDK-044). |
-| `{"call": {"client", "reducer", "args", "expect_error"?: {"contains"}}}` | Call a reducer. Without `expect_error` the call must succeed; with it, the call must fail and the error message must contain the substring. |
-| `{"call_until_error": {"client", "reducer", "args", "attempts", "expect_error": {"contains"}}}` | Call the reducer up to `attempts` times, stopping at the first failure — which must match `expect_error`. For admission behavior (rate limits) where the exact rejection point depends on timing. Fails if every attempt succeeds. |
+| `{"call": {"client", "reducer", "args", "expect_error"?}}` | Call a reducer. Without `expect_error` the call must succeed; with it, the call must fail and match (see **Error expectations**). |
+| `{"call_until_error": {"client", "reducer", "args", "attempts", "expect_error"}}` | Call the reducer up to `attempts` times, stopping at the first failure — which must match `expect_error`. For admission behavior (rate limits) where the exact rejection point depends on timing. Fails if every attempt succeeds. |
+| `{"subscribe_error": {"client", "queries", "expect_error"}}` | A subscription the server refuses (unknown table, non-public table). The refusal must match `expect_error`. |
 | `{"await_row": {"client", "table", "where"}}` | Poll the local cache (≤ 5 s) until a row matches `where`. This is how a runner observes a `TxUpdate` landing without racing the push stream. |
 | `{"await_gone": {"client", "table", "where"}}` | Poll (≤ 5 s) until **no** row matches. |
 | `{"await_count": {"client", "table", "where"?, "count"}}` | Poll (≤ 5 s) until exactly `count` rows match `where` (`where` absent = all rows). For rows distinguishable only by a nondeterministic column — e.g. two connections sharing one identity. |
@@ -64,6 +65,18 @@ Auto-increment primary keys ARE deterministic on a fresh server (1, 2, 3…) and
 them literally — **until a restart**: recovery resumes the allocator from its reserved
 high-water block (STG-040), so ids allocated after a `restart_server` may jump. Post-restart
 rows match on content and use `"*"` for the id.
+
+## Error expectations
+
+An `expect_error` object asserts any subset of:
+
+- `code` — the stable SPEC-028 catalog code (e.g. `5000` for `REDUCER_UNKNOWN`). **The portable
+  assertion** — codes never move, and every SDK surfaces one.
+- `catalog` — the canonical `SCREAMING_SNAKE` name, when the error is a server-emitted `Error`
+  frame. A *reducer rejection* (the reducer returned `Err`) carries a code and an optional
+  application code, but no catalog name — assert `code` there, not `catalog`.
+- `contains` — a substring of the human message. SDK-specific wording; use sparingly, and pair it
+  with `code` so the assertion survives a message reword.
 
 ## What belongs here vs. an SDK's own suite
 

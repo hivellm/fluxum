@@ -43,6 +43,7 @@
     "multi-query-subscribe",
     "rate-limit",
     "reconnect-resync",
-    "unsubscribe"
+    "unsubscribe",
+    "error-mapping"
   ]
 }

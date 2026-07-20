@@ -1,0 +1,16 @@
+{
+  "name": "error-mapping",
+  "description": "Failures carry stable SPEC-028 catalog codes, not just messages: an unknown reducer, a reducer rejection, an unknown-table subscription, and a schedule-only/rate-limited call each map to their code so any SDK can branch on it.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+
+    { "call": { "client": "alice", "reducer": "no_such_reducer", "args": [],
+      "expect_error": { "code": 5000, "catalog": "REDUCER_UNKNOWN" } } },
+
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, ""],
+      "expect_error": { "code": 5001, "contains": "empty" } } },
+
+    { "subscribe_error": { "client": "alice", "queries": ["SELECT * FROM Nonexistent"],
+      "expect_error": { "code": 3001, "catalog": "SQL_UNKNOWN_TABLE" } } }
+  ]
+}

@@ -118,6 +118,33 @@ class Session {
 
 const AWAIT_MS = 5000;
 
+/** What a scenario asserts about a failure — any subset. */
+interface ExpectError {
+  /** Substring of the human message (SDK-specific wording, use sparingly). */
+  contains?: string;
+  /** The stable SPEC-028 catalog code — the portable assertion. */
+  code?: number;
+  /** The canonical SCREAMING_SNAKE catalog name, when the SDK exposes it. */
+  catalog?: string;
+}
+
+/** Assert a caught error matches `expect`; returns true so `assert.rejects` passes. */
+function matchError(err: unknown, expect: ExpectError): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  const code = (err as { code?: unknown })?.code;
+  const catalog = (err as { catalog?: unknown })?.catalog;
+  if (expect.contains !== undefined) {
+    assert.ok(message.includes(expect.contains), `error "${message}" lacks "${expect.contains}"`);
+  }
+  if (expect.code !== undefined) {
+    assert.equal(code, expect.code, `error code ${String(code)} != ${expect.code} ("${message}")`);
+  }
+  if (expect.catalog !== undefined) {
+    assert.equal(catalog, expect.catalog, `error catalog ${String(catalog)} != ${expect.catalog}`);
+  }
+  return true;
+}
+
 async function runStep(session: Session, step: Record<string, Record<string, unknown>>): Promise<void> {
   const [kind, body] = Object.entries(step)[0] as [string, Record<string, unknown>];
 
@@ -159,34 +186,33 @@ async function runStep(session: Session, step: Record<string, Record<string, unk
     case 'call': {
       const client = session.client(body['client']);
       const call = client.callReducer(String(body['reducer']), body['args'] as unknown[]);
-      const expectError = body['expect_error'] as { contains: string } | undefined;
+      const expectError = body['expect_error'] as ExpectError | undefined;
       if (expectError === undefined) {
         await call;
         return;
       }
-      await assert.rejects(call, (err: unknown) => {
-        const message = err instanceof Error ? err.message : String(err);
-        assert.ok(
-          message.includes(expectError.contains),
-          `error "${message}" does not contain "${expectError.contains}"`,
-        );
-        return true;
-      });
+      await assert.rejects(call, (err: unknown) => matchError(err, expectError));
+      return;
+    }
+    case 'subscribe_error': {
+      // A subscription the server refuses (unknown table, non-public table):
+      // the error arrives as an `Error` frame, surfaced as a typed rejection.
+      const expectError = body['expect_error'] as ExpectError;
+      await assert.rejects(
+        session.client(body['client']).subscribe(body['queries'] as string[]),
+        (err: unknown) => matchError(err, expectError),
+      );
       return;
     }
     case 'call_until_error': {
       const client = session.client(body['client']);
       const attempts = Number(body['attempts']);
-      const expectError = body['expect_error'] as { contains: string };
+      const expectError = body['expect_error'] as ExpectError;
       for (let i = 0; i < attempts; i += 1) {
         try {
           await client.callReducer(String(body['reducer']), body['args'] as unknown[]);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          assert.ok(
-            message.includes(expectError.contains),
-            `attempt ${i + 1} failed with "${message}", expected "${expectError.contains}"`,
-          );
+          matchError(err, expectError);
           return;
         }
       }
