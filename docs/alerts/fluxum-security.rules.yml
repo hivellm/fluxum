@@ -103,6 +103,57 @@ groups:
             IP. Expected only if admin is exposed beyond loopback; if not,
             investigate how the request reached the port.
 
+      # --- Query/reducer execution bounds (SEC-045/046/047) -------------------
+      - alert: FluxumQueryAborts
+        expr: sum(rate(fluxum_query_aborted_total[5m])) by (shard, reason) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Queries hitting the SEC-045 execution bounds on shard {{ $labels.shard }} ({{ $labels.reason }})"
+          description: >
+            Queries are being aborted ({{ $labels.reason }}) at
+            {{ printf "%.2f" $value }}/s — a caller issuing pathological scans,
+            or bounds tuned below the legitimate workload.
+          runbook: >
+            Inspect the offending SQL via the client, and `POST /query/explain`
+            to see its access path. If legitimate, add an index or raise
+            query.row_scan_budget / query.deadline_ms (hot-reloadable); if
+            hostile, tighten query.max_queries_per_sec_per_* for the source.
+
+      - alert: FluxumReducerAborts
+        expr: sum(rate(fluxum_reducer_aborted_total[5m])) by (shard, reason) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reducers aborted by the SEC-046 bounds on shard {{ $labels.shard }} ({{ $labels.reason }})"
+          description: >
+            Reducer transactions are being rolled back ({{ $labels.reason }}) at
+            {{ printf "%.2f" $value }}/s — a runaway or write-heavy reducer is
+            hitting the deadline / per-transaction ceiling.
+          runbook: >
+            The security log's reducer failure events name the reducer and
+            caller. Fix the reducer (chunk its writes, bound its loops) or
+            raise reducer.max_execution_ms / reducer.max_tx_bytes if the work
+            is legitimate.
+
+      - alert: FluxumQueryRateLimited
+        expr: sum(rate(fluxum_query_rate_limited_total[5m])) by (shard, bucket) > 5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Query admission refusals on shard {{ $labels.shard }} ({{ $labels.bucket }} bucket)"
+          description: >
+            Subscription registrations / one-off queries are being refused at
+            {{ printf "%.2f" $value }}/s. A sustained `source`-bucket rate with
+            a quiet `identity` bucket suggests token rotation from one source.
+          runbook: >
+            Identify the source IP from the security log. If hostile, ban it
+            (`POST /bans`); if a legitimate burst, raise
+            query.max_queries_per_sec_per_identity / _per_source.
+
       # --- Backpressure / availability (SPEC-012) -----------------------------
       - alert: FluxumSlowConsumerDrops
         expr: sum(rate(fluxum_subscriber_drops_total{reason="buffer_full"}[5m])) by (shard) > 1

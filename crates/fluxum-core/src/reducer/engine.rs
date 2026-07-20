@@ -35,7 +35,56 @@ use crate::txn::{CommitReceipt, TxPipeline};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
 use super::ratelimit::{RateLimiter, RateLimiterOptions};
-use super::{FluxValue, ReducerCaller, ReducerContext, ReducerRegistry, with_context};
+use super::{ExecBounds, FluxValue, ReducerCaller, ReducerContext, ReducerRegistry, with_context};
+
+/// Decode-time cap on `idempotency_key` (SPEC-021 / SEC-048, F-017): an
+/// over-length key is refused at admission, before the dedup table or any
+/// transaction is touched. Generous — a UUID is 36 bytes.
+pub const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+/// SEC-046 reducer execution bounds, interior-mutable for OPS-040 hot
+/// reload. `0` disables a bound; the built-in default is fully unbounded
+/// (embedders/tests) — the server config supplies generous production
+/// defaults.
+#[derive(Debug, Default)]
+pub struct ReducerBounds {
+    /// Cooperative execution deadline, milliseconds (`0` = none).
+    max_execution_ms: std::sync::atomic::AtomicU64,
+    /// Per-transaction write ceiling, bytes (`0` = unbounded).
+    max_tx_bytes: std::sync::atomic::AtomicU64,
+}
+
+impl ReducerBounds {
+    /// Publish new bounds (boot and OPS-040 hot reload). In-flight calls
+    /// keep the bounds they started with.
+    pub fn set(&self, max_execution_ms: u64, max_tx_bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.max_execution_ms.store(max_execution_ms, Relaxed);
+        self.max_tx_bytes.store(max_tx_bytes, Relaxed);
+    }
+
+    /// The current `(max_execution_ms, max_tx_bytes)` (`0` = off).
+    pub fn get(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.max_execution_ms.load(Relaxed),
+            self.max_tx_bytes.load(Relaxed),
+        )
+    }
+
+    /// The [`ExecBounds`] of a call starting **now** — the deadline clock
+    /// starts when the writer begins executing the body, not while the call
+    /// waits in the queue (queue pressure is TXN-011's problem).
+    fn starting_now(&self) -> ExecBounds {
+        let (max_execution_ms, max_tx_bytes) = self.get();
+        ExecBounds {
+            deadline: (max_execution_ms > 0).then(|| {
+                Instant::now() + std::time::Duration::from_millis(max_execution_ms)
+            }),
+            max_tx_bytes,
+        }
+    }
+}
 
 /// Which lifecycle moment a hook is registered for (SPEC-004 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +204,9 @@ pub struct ReducerEngine {
     server_identity: Identity,
     rate_limiter: RateLimiter,
     metrics: Arc<Metrics>,
+    /// SEC-046 client-call execution bounds (shared with the server's
+    /// OPS-040 hot-reload path).
+    bounds: Arc<ReducerBounds>,
 }
 
 impl ReducerEngine {
@@ -181,7 +233,15 @@ impl ReducerEngine {
             server_identity,
             rate_limiter: RateLimiter::new(RateLimiterOptions::default(), [server_identity]),
             metrics: Metrics::new(shard_id),
+            bounds: Arc::new(ReducerBounds::default()),
         }
+    }
+
+    /// The SEC-046 execution bounds handle — the server assembly publishes
+    /// `reducer.max_execution_ms` / `reducer.max_tx_bytes` through it (boot
+    /// and OPS-040 hot reload; internally synchronized, no `&mut` needed).
+    pub fn bounds(&self) -> &Arc<ReducerBounds> {
+        &self.bounds
     }
 
     /// The shard's `fluxum_*` metrics registry (SPEC-012 T5.6). The server
@@ -375,6 +435,7 @@ impl ReducerEngine {
 
         let registry = Arc::clone(&self.registry);
         let dispatch_name = name.to_owned();
+        let bounds = Arc::clone(&self.bounds);
         // OPS-020: tag the commit with its caller + reducer for the audit
         // trail.
         let meta = crate::txn::CommitMeta {
@@ -385,7 +446,10 @@ impl ReducerEngine {
             .pipeline
             .call_with(
                 meta,
-                Box::new(move |tx| registry.dispatch(caller, &dispatch_name, &args, tx)),
+                Box::new(move |tx| {
+                    // SEC-046: the deadline clock starts on the writer.
+                    registry.dispatch_bounded(caller, &dispatch_name, &args, tx, bounds.starting_now())
+                }),
             )
             .await;
 
@@ -407,6 +471,7 @@ impl ReducerEngine {
             }
             Err(error) => {
                 // OBS-010/013: the reducer returned Err or panicked → rollback.
+                self.note_abort(&error);
                 self.metrics
                     .record_reducer(name, ReducerOutcome::Err, duration_us);
                 self.metrics.note_rollback();
@@ -414,6 +479,20 @@ impl ReducerEngine {
                 self.warn_if_slow(name, duration_us);
                 Err(error)
             }
+        }
+    }
+
+    /// SEC-046 observability: count a bounds-driven abort under its reason.
+    fn note_abort(&self, error: &FluxumError) {
+        use crate::metrics::ReducerAbortReason;
+        match error.query_code() {
+            Some(fluxum_protocol::codes::REDUCER_DEADLINE_EXCEEDED) => {
+                self.metrics.note_reducer_aborted(ReducerAbortReason::Deadline);
+            }
+            Some(fluxum_protocol::codes::REDUCER_TX_BUDGET_EXCEEDED) => {
+                self.metrics.note_reducer_aborted(ReducerAbortReason::Alloc);
+            }
+            _ => {}
         }
     }
 
@@ -448,6 +527,24 @@ impl ReducerEngine {
                 .await
                 .map(CallOutcome::Committed);
         };
+        // SEC-048 (F-017): cap the key before it reaches the dedup table —
+        // an unbounded client-chosen string must not become an unbounded
+        // durable row.
+        if key.len() > MAX_IDEMPOTENCY_KEY_BYTES {
+            return self.reject(
+                name,
+                ReducerOutcome::Err,
+                Instant::now(),
+                FluxumError::query(
+                    fluxum_protocol::codes::REDUCER_BAD_ARGS,
+                    format!(
+                        "idempotency_key is {} bytes; the maximum is {MAX_IDEMPOTENCY_KEY_BYTES} \
+                         (SEC-048)",
+                        key.len()
+                    ),
+                ),
+            );
+        }
         let table = self
             .pipeline
             .store()
@@ -480,6 +577,7 @@ impl ReducerEngine {
         let dispatch_name = name.to_owned();
         let key_owned = key.to_owned();
         let flag = Arc::clone(&hit);
+        let bounds = Arc::clone(&self.bounds);
         let meta = crate::txn::CommitMeta {
             caller: identity,
             reducer_name: name.to_owned(),
@@ -499,7 +597,14 @@ impl ReducerEngine {
                         flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         return Err(FluxumError::Reducer("idempotency replay".into()));
                     }
-                    registry.dispatch(caller, &dispatch_name, &args, tx)?;
+                    // SEC-046: same bounds as the plain path.
+                    registry.dispatch_bounded(
+                        caller,
+                        &dispatch_name,
+                        &args,
+                        tx,
+                        bounds.starting_now(),
+                    )?;
                     idempotency::record(tx, table, &identity, &dispatch_name, &key_owned)
                 }),
             )
@@ -530,6 +635,7 @@ impl ReducerEngine {
                 Err(error)
             }
             Err(error) => {
+                self.note_abort(&error);
                 self.metrics
                     .record_reducer(name, ReducerOutcome::Err, duration_us);
                 self.metrics.note_rollback();

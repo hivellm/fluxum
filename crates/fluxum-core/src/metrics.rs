@@ -199,6 +199,81 @@ impl OverloadState {
     }
 }
 
+/// Why a query was aborted or refused by the execution bounds (SPEC-026
+/// SEC-045) — the `reason` label of `fluxum_query_aborted_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryAbortReason {
+    /// The `LIMIT` exceeded `query.max_limit` in `reject` mode.
+    Limit,
+    /// The evaluation hit the per-query row-scan budget.
+    ScanBudget,
+    /// The evaluation hit its wall-clock deadline.
+    Deadline,
+}
+
+impl QueryAbortReason {
+    /// The metric `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Limit => "limit",
+            Self::ScanBudget => "scan_budget",
+            Self::Deadline => "deadline",
+        }
+    }
+
+    /// Every reason, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 3] = [Self::Limit, Self::ScanBudget, Self::Deadline];
+}
+
+/// Why a reducer was aborted by the execution bounds (SPEC-026 SEC-046) —
+/// the `reason` label of `fluxum_reducer_aborted_total`. Every abort is a
+/// rollback: the panic→rollback isolation path guarantees no partial state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReducerAbortReason {
+    /// The cooperative execution deadline fired at a host-call boundary.
+    Deadline,
+    /// The per-transaction write ceiling was breached.
+    Alloc,
+}
+
+impl ReducerAbortReason {
+    /// The metric `reason` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Deadline => "deadline",
+            Self::Alloc => "alloc",
+        }
+    }
+
+    /// Every reason, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 2] = [Self::Deadline, Self::Alloc];
+}
+
+/// Which SEC-047 query-admission bucket refused a subscription registration
+/// or one-off query — the `bucket` label of
+/// `fluxum_query_rate_limited_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryRateBucket {
+    /// The per-identity token bucket.
+    Identity,
+    /// The source-keyed (client IP / connection) secondary bucket that
+    /// token rotation cannot refill.
+    Source,
+}
+
+impl QueryRateBucket {
+    /// The metric `bucket` label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Identity => "identity",
+            Self::Source => "source",
+        }
+    }
+
+    /// Every bucket, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 2] = [Self::Identity, Self::Source];
+}
+
 /// Per-reducer counters (OBS-010) plus the latency histogram (OBS-011).
 #[derive(Debug, Default, Clone)]
 struct ReducerStat {
@@ -279,6 +354,13 @@ pub struct Metrics {
     overload_state: AtomicU8,
     connguard_tracked_ips: AtomicU64,
     connguard_evictions: AtomicU64,
+    query_aborted_limit: AtomicU64,
+    query_aborted_scan_budget: AtomicU64,
+    query_aborted_deadline: AtomicU64,
+    reducer_aborted_deadline: AtomicU64,
+    reducer_aborted_alloc: AtomicU64,
+    query_rate_limited_identity: AtomicU64,
+    query_rate_limited_source: AtomicU64,
 }
 
 /// Why the transports refused a connection on the pre-auth surface
@@ -380,6 +462,13 @@ impl Metrics {
             overload_state: AtomicU8::new(OverloadState::Normal as u8),
             connguard_tracked_ips: AtomicU64::new(0),
             connguard_evictions: AtomicU64::new(0),
+            query_aborted_limit: AtomicU64::new(0),
+            query_aborted_scan_budget: AtomicU64::new(0),
+            query_aborted_deadline: AtomicU64::new(0),
+            reducer_aborted_deadline: AtomicU64::new(0),
+            reducer_aborted_alloc: AtomicU64::new(0),
+            query_rate_limited_identity: AtomicU64::new(0),
+            query_rate_limited_source: AtomicU64::new(0),
         })
     }
 
@@ -561,6 +650,63 @@ impl Metrics {
         match reason {
             AdminRejectReason::UntrustedIp => &self.admin_rejected_untrusted_ip,
             AdminRejectReason::Unauthenticated => &self.admin_rejected_unauthenticated,
+        }
+        .load(Ordering::Relaxed)
+    }
+
+    /// SEC-045: a query was aborted or refused by the execution bounds.
+    pub fn note_query_aborted(&self, reason: QueryAbortReason) {
+        self.query_aborted_counter(reason)
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current query-abort count for `reason`.
+    pub fn query_aborted(&self, reason: QueryAbortReason) -> u64 {
+        self.query_aborted_counter(reason).load(Ordering::Relaxed)
+    }
+
+    fn query_aborted_counter(&self, reason: QueryAbortReason) -> &AtomicU64 {
+        match reason {
+            QueryAbortReason::Limit => &self.query_aborted_limit,
+            QueryAbortReason::ScanBudget => &self.query_aborted_scan_budget,
+            QueryAbortReason::Deadline => &self.query_aborted_deadline,
+        }
+    }
+
+    /// SEC-046: a reducer was aborted (and rolled back) by the execution
+    /// bounds.
+    pub fn note_reducer_aborted(&self, reason: ReducerAbortReason) {
+        match reason {
+            ReducerAbortReason::Deadline => &self.reducer_aborted_deadline,
+            ReducerAbortReason::Alloc => &self.reducer_aborted_alloc,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current reducer-abort count for `reason`.
+    pub fn reducer_aborted(&self, reason: ReducerAbortReason) -> u64 {
+        match reason {
+            ReducerAbortReason::Deadline => &self.reducer_aborted_deadline,
+            ReducerAbortReason::Alloc => &self.reducer_aborted_alloc,
+        }
+        .load(Ordering::Relaxed)
+    }
+
+    /// SEC-047: the query-admission limiter refused a subscription
+    /// registration or one-off query.
+    pub fn note_query_rate_limited(&self, bucket: QueryRateBucket) {
+        match bucket {
+            QueryRateBucket::Identity => &self.query_rate_limited_identity,
+            QueryRateBucket::Source => &self.query_rate_limited_source,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The current query-rate-limited count for `bucket`.
+    pub fn query_rate_limited(&self, bucket: QueryRateBucket) -> u64 {
+        match bucket {
+            QueryRateBucket::Identity => &self.query_rate_limited_identity,
+            QueryRateBucket::Source => &self.query_rate_limited_source,
         }
         .load(Ordering::Relaxed)
     }
@@ -783,6 +929,50 @@ impl Metrics {
             );
         }
 
+        // --- query/reducer execution bounds (SEC-045/046/047) ---
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_query_aborted_total Queries aborted or refused by the execution \
+             bounds by reason (SPEC-026 SEC-045).\n\
+             # TYPE fluxum_query_aborted_total counter"
+        );
+        for reason in QueryAbortReason::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_query_aborted_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.query_aborted(reason),
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_reducer_aborted_total Reducers aborted (rolled back) by the \
+             execution bounds by reason (SPEC-026 SEC-046).\n\
+             # TYPE fluxum_reducer_aborted_total counter"
+        );
+        for reason in ReducerAbortReason::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_reducer_aborted_total{{shard=\"{shard}\", reason=\"{}\"}} {}",
+                reason.as_str(),
+                self.reducer_aborted(reason),
+            );
+        }
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_query_rate_limited_total Subscription registrations and one-off \
+             queries refused by the admission limiter by bucket (SPEC-026 SEC-047).\n\
+             # TYPE fluxum_query_rate_limited_total counter"
+        );
+        for bucket in QueryRateBucket::ALL {
+            let _ = writeln!(
+                out,
+                "fluxum_query_rate_limited_total{{shard=\"{shard}\", bucket=\"{}\"}} {}",
+                bucket.as_str(),
+                self.query_rate_limited(bucket),
+            );
+        }
+
         // --- overload / guard pressure (SEC-040/041) ---
         let _ = writeln!(
             out,
@@ -865,6 +1055,34 @@ mod tests {
         assert!(
             m.prometheus(0)
                 .contains("fluxum_shard_state{shard=\"0\"} 1")
+        );
+    }
+
+    /// SEC-045/046/047: the bounds counters accumulate per reason and every
+    /// label renders a series even at zero.
+    #[test]
+    fn execution_bounds_counters_accumulate_and_render() {
+        let m = Metrics::new(3);
+        m.note_query_aborted(QueryAbortReason::ScanBudget);
+        m.note_query_aborted(QueryAbortReason::ScanBudget);
+        m.note_query_aborted(QueryAbortReason::Deadline);
+        m.note_reducer_aborted(ReducerAbortReason::Alloc);
+        m.note_query_rate_limited(QueryRateBucket::Source);
+        assert_eq!(m.query_aborted(QueryAbortReason::ScanBudget), 2);
+        assert_eq!(m.query_aborted(QueryAbortReason::Limit), 0);
+        assert_eq!(m.reducer_aborted(ReducerAbortReason::Alloc), 1);
+        assert_eq!(m.query_rate_limited(QueryRateBucket::Source), 1);
+        let text = m.prometheus(0);
+        assert!(text.contains("fluxum_query_aborted_total{shard=\"3\", reason=\"scan_budget\"} 2"));
+        assert!(text.contains("fluxum_query_aborted_total{shard=\"3\", reason=\"limit\"} 0"));
+        assert!(text.contains("fluxum_query_aborted_total{shard=\"3\", reason=\"deadline\"} 1"));
+        assert!(text.contains("fluxum_reducer_aborted_total{shard=\"3\", reason=\"alloc\"} 1"));
+        assert!(text.contains("fluxum_reducer_aborted_total{shard=\"3\", reason=\"deadline\"} 0"));
+        assert!(
+            text.contains("fluxum_query_rate_limited_total{shard=\"3\", bucket=\"source\"} 1")
+        );
+        assert!(
+            text.contains("fluxum_query_rate_limited_total{shard=\"3\", bucket=\"identity\"} 0")
         );
     }
 

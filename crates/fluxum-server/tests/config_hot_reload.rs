@@ -203,15 +203,41 @@ async fn every_reloadable_key_reaches_its_live_consumer() {
     );
     assert_eq!(ctx.send_buffer_bytes(), 2 * 1024 * 1024);
 
+    // SEC-046: the RED-052 guard is mandatory-on — a reload that tries to
+    // disable it is rejected by validation and nothing is applied.
     write_config(
         dir.path(),
         "reducer:\n  shard_max_reducers_per_sec: 0\nsubscriptions:\n  send_buffer_bytes: 8MiB\n",
     );
+    let err = ctx.reload_config().expect_err("0 would disable the guard");
+    assert!(err.contains("shard_max_reducers_per_sec"), "{err}");
+    assert_eq!(
+        ctx.engine.rate_limiter().shard_max_reducers_per_sec(),
+        Some(1_000),
+        "a rejected reload applies nothing (OPS-041)"
+    );
+
+    // Retuning it (and the SEC-045/046/047 bounds) lands without a restart.
+    write_config(
+        dir.path(),
+        "reducer:\n  shard_max_reducers_per_sec: 2000\n  max_execution_ms: 1234\n  \
+         max_tx_bytes: 1MiB\nsubscriptions:\n  send_buffer_bytes: 8MiB\nquery:\n  \
+         max_queries_per_sec_per_identity: 7\n  max_queries_per_sec_per_source: 9\n",
+    );
     ctx.reload_config().unwrap();
     assert_eq!(
         ctx.engine.rate_limiter().shard_max_reducers_per_sec(),
-        None,
-        "the RED-052 guard can be disabled without a restart"
+        Some(2_000)
+    );
+    assert_eq!(
+        ctx.engine.bounds().get(),
+        (1_234, 1024 * 1024),
+        "the SEC-046 reducer bounds reach the engine"
+    );
+    assert_eq!(
+        ctx.query_limiter().rates(),
+        (7, 9),
+        "the SEC-047 admission rates reach the limiter"
     );
     assert_eq!(ctx.send_buffer_bytes(), 8 * 1024 * 1024);
 }

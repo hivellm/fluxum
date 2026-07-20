@@ -680,14 +680,23 @@ impl Default for SubscriptionsConfig {
     }
 }
 
-/// Reducer admission tuning (SPEC-004 §7).
+/// Reducer admission and execution tuning (SPEC-004 §7, SPEC-026 SEC-046).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReducerConfig {
     /// RED-052 global shard guard: total client reducer admissions per
     /// second before excess calls answer `503 "shard overloaded"`.
-    /// `0` disables the guard.
+    /// **Mandatory-on** (SEC-046, F-015): `0` is rejected at load — a shard
+    /// with a single writer must always carry an aggregate admission bound.
     pub shard_max_reducers_per_sec: u64,
+    /// SEC-046: cooperative execution deadline for one client reducer call,
+    /// milliseconds, polled at every host-call boundary; breach → rollback.
+    /// `0` disables. Default 10 s — generous; a reducer holding the single
+    /// writer that long is pathological.
+    pub max_execution_ms: u64,
+    /// SEC-046: ceiling on the estimated bytes one reducer transaction may
+    /// buffer through inserts/upserts; breach → rollback. `0` disables.
+    pub max_tx_bytes: ByteSize,
 }
 
 impl Default for ReducerConfig {
@@ -695,6 +704,63 @@ impl Default for ReducerConfig {
         Self {
             shard_max_reducers_per_sec:
                 crate::reducer::RateLimiterOptions::DEFAULT_SHARD_MAX_REDUCERS_PER_SEC,
+            max_execution_ms: 10_000,
+            max_tx_bytes: ByteSize(512 << 20),
+        }
+    }
+}
+
+/// How a `LIMIT` above `query.max_limit` is treated (SEC-045).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitAction {
+    /// Clamp to `max_limit` (default: bounded results, no client breakage).
+    #[default]
+    Clamp,
+    /// Refuse the query with a wire-ready 3030.
+    Reject,
+}
+
+/// Query execution bounds and admission rates (SPEC-026 SEC-045/047).
+///
+/// Every `0` disables that bound; the defaults are **generous** — sized so a
+/// legitimate workload never notices, while a single caller can no longer
+/// pin the snapshot evaluator or register queries without limit.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct QueryConfig {
+    /// Applied to queries that carry no `LIMIT` (`0` = none — today's
+    /// semantics; set it to bound implicit full-table snapshots).
+    pub default_limit: u32,
+    /// Ceiling on any effective `LIMIT` (`0` = unbounded).
+    pub max_limit: u32,
+    /// Clamp or reject a `LIMIT` above `max_limit`.
+    pub max_limit_action: LimitAction,
+    /// Rows the snapshot evaluator may touch per query before aborting with
+    /// 3031 (`0` = no budget).
+    pub row_scan_budget: u64,
+    /// Wall-clock evaluation deadline per query, milliseconds; breach
+    /// aborts with 3032 (`0` = none).
+    pub deadline_ms: u64,
+    /// SEC-047: subscription registrations + one-off queries per second per
+    /// caller identity (`0` = off). Server peers are exempt (AUTH-062).
+    pub max_queries_per_sec_per_identity: u64,
+    /// SEC-047: the source-keyed secondary bucket (resolved client IP, or
+    /// connection id where none exists) — token rotation cannot refill it
+    /// (`0` = off).
+    pub max_queries_per_sec_per_source: u64,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        Self {
+            default_limit: 0,
+            max_limit: 1_000_000,
+            max_limit_action: LimitAction::default(),
+            row_scan_budget: 10_000_000,
+            deadline_ms: 5_000,
+            max_queries_per_sec_per_identity: 500,
+            max_queries_per_sec_per_source: 2_000,
         }
     }
 }
@@ -772,8 +838,10 @@ pub struct Config {
     pub auth: AuthConfig,
     /// Subscription fan-out.
     pub subscriptions: SubscriptionsConfig,
-    /// Reducer admission tuning.
+    /// Reducer admission and execution tuning.
     pub reducer: ReducerConfig,
+    /// Query execution bounds and admission rates (SEC-045/047).
+    pub query: QueryConfig,
     /// Observability thresholds.
     pub observability: ObservabilityConfig,
     /// Logging.
@@ -1123,6 +1191,15 @@ impl Config {
                 "subscriptions.fanout_concurrency: must be >= 1",
             ));
         }
+        // SEC-046 (F-015): the RED-052 shard guard is mandatory-on — a
+        // single-writer shard must always carry an aggregate admission
+        // bound; raise the value instead of disabling it.
+        if self.reducer.shard_max_reducers_per_sec == 0 {
+            return Err(FluxumError::config(
+                "reducer.shard_max_reducers_per_sec: 0 would disable the RED-052 shard \
+                 guard, which is mandatory (SPEC-026 SEC-046); raise the value instead",
+            ));
+        }
         if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
             return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
         }
@@ -1359,6 +1436,15 @@ pub const RELOADABLE_KEYS: &[&str] = &[
     "server.admin.open_health_metrics",
     "observability.slow_reducer_threshold_us",
     "reducer.shard_max_reducers_per_sec",
+    "reducer.max_execution_ms",
+    "reducer.max_tx_bytes",
+    "query.default_limit",
+    "query.max_limit",
+    "query.max_limit_action",
+    "query.row_scan_budget",
+    "query.deadline_ms",
+    "query.max_queries_per_sec_per_identity",
+    "query.max_queries_per_sec_per_source",
     "subscriptions.send_buffer_bytes",
 ];
 
@@ -1789,6 +1875,11 @@ mod tests {
             (
                 "subscriptions:\n  fanout_concurrency: 0\n",
                 "subscriptions.fanout_concurrency",
+            ),
+            // SEC-046: the RED-052 shard guard is mandatory-on.
+            (
+                "reducer:\n  shard_max_reducers_per_sec: 0\n",
+                "reducer.shard_max_reducers_per_sec",
             ),
         ];
         for (yaml, key) in cases {

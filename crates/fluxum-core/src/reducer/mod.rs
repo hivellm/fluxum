@@ -82,10 +82,11 @@ use crate::store::{Row, TableId, TriggerKind, Tx};
 use crate::types::{ConnectionId, Identity, Timestamp};
 
 pub use engine::{
-    CallOutcome, LifecycleDef, LifecycleHooks, LifecycleKind, ReducerEngine, StartupReport,
+    CallOutcome, LifecycleDef, LifecycleHooks, LifecycleKind, MAX_IDEMPOTENCY_KEY_BYTES,
+    ReducerBounds, ReducerEngine, StartupReport,
 };
 pub use idempotency::{IDEMPOTENCY_TABLE, IDEMPOTENCY_TABLE_NAME, IdempotencyOptions};
-pub use ratelimit::{RateLimiter, RateLimiterOptions};
+pub use ratelimit::{QueryLimiter, QueryRejected, QuerySource, RateLimiter, RateLimiterOptions};
 pub use view::{
     MaterializedViewDef, MvAggregate, MvTopN, ReadOnlyTxHandle, ViewContext, ViewDef, ViewRegistry,
     registered_materialized_views,
@@ -437,21 +438,66 @@ impl ReducerRegistry {
         args: &[FluxValue],
         tx: &mut Tx<'_>,
     ) -> Result<()> {
+        self.dispatch_bounded(caller, name, args, tx, ExecBounds::default())
+    }
+
+    /// [`ReducerRegistry::dispatch`] under SEC-046 [`ExecBounds`] — the
+    /// engine's client path (deadline + write ceiling); scheduled and
+    /// lifecycle executions keep the unbounded form.
+    pub fn dispatch_bounded(
+        &self,
+        caller: ReducerCaller,
+        name: &str,
+        args: &[FluxValue],
+        tx: &mut Tx<'_>,
+        bounds: ExecBounds,
+    ) -> Result<()> {
         let registered = self
             .handlers
             .get(name)
             .ok_or_else(|| unknown_reducer(name))?;
-        with_context(self, caller, tx, |ctx| (registered.handler)(ctx, args))
+        with_context_bounded(self, caller, tx, bounds, |ctx| (registered.handler)(ctx, args))
     }
+}
+
+/// SEC-046 execution bounds for one reducer transaction: the cooperative
+/// wall-clock deadline (polled at every host-call boundary — the `ctx.tx`
+/// surface every table access goes through) and the per-transaction write
+/// ceiling. [`ExecBounds::default`] is fully unbounded (lifecycle hooks,
+/// scheduled executions, embedders); the engine derives client-call bounds
+/// from its configured [`engine::ReducerBounds`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExecBounds {
+    /// Abort (roll back) host calls past this instant. `None` = no deadline.
+    pub deadline: Option<std::time::Instant>,
+    /// Ceiling on the estimated bytes this transaction may buffer through
+    /// `insert`/`upsert`. `0` = unbounded.
+    pub max_tx_bytes: u64,
 }
 
 /// Run `body` with a [`ReducerContext`] over `tx` — the closure-shaped
 /// entry ([`ReducerRegistry::dispatch`] is the by-name shape). Used by
 /// lifecycle hooks, tests, and anywhere the reducer body is already in hand.
+/// Unbounded ([`ExecBounds::default`]); the engine's client path enters via
+/// [`with_context_bounded`].
 pub fn with_context<'t, 's, R>(
     registry: &'t ReducerRegistry,
     caller: ReducerCaller,
     tx: &'t mut Tx<'s>,
+    body: impl FnOnce(&ReducerContext<'_, 't, 's>) -> Result<R>,
+) -> Result<R> {
+    with_context_bounded(registry, caller, tx, ExecBounds::default(), body)
+}
+
+/// [`with_context`] under SEC-046 [`ExecBounds`]. A breached bound is
+/// **latched**: even a reducer that catches the typed error and returns
+/// `Ok` still rolls back — a caught deadline must not smuggle a partial
+/// write set into a commit.
+pub fn with_context_bounded<'t, 's, R>(
+    registry: &'t ReducerRegistry,
+    caller: ReducerCaller,
+    tx: &'t mut Tx<'s>,
+    bounds: ExecBounds,
     body: impl FnOnce(&ReducerContext<'_, 't, 's>) -> Result<R>,
 ) -> Result<R> {
     // SEC-020: seed the transaction's RNG from (tx_id, shard_id) before the
@@ -463,9 +509,32 @@ pub fn with_context<'t, 's, R>(
         caller,
         depth: Cell::new(0),
         rng: stdlib::Rng::new(seed),
+        bounds,
+        written_bytes: Cell::new(0),
+        breached: Cell::new(None),
     };
     let ctx = env.context();
-    body(&ctx)
+    let result = body(&ctx);
+    match env.breached.get() {
+        // SEC-046: the latch wins over a caught error — see above.
+        Some(code) if result.is_ok() => Err(bound_breach_error(code)),
+        _ => result,
+    }
+}
+
+/// The typed wire error of a breached SEC-046 bound.
+fn bound_breach_error(code: u16) -> FluxumError {
+    if code == codes::REDUCER_TX_BUDGET_EXCEEDED {
+        FluxumError::query(
+            codes::REDUCER_TX_BUDGET_EXCEEDED,
+            "reducer aborted: per-transaction write ceiling exceeded; rolled back (SEC-046)",
+        )
+    } else {
+        FluxumError::query(
+            codes::REDUCER_DEADLINE_EXCEEDED,
+            "reducer aborted: execution deadline exceeded; rolled back (SEC-046)",
+        )
+    }
 }
 
 /// Shared per-transaction state behind every [`TxHandle`] of one reducer
@@ -480,6 +549,14 @@ struct TxEnv<'t, 's> {
     /// `(tx_id, shard_id)` and shared by the whole call tree so nested
     /// reducers draw from one reproducible stream.
     rng: stdlib::Rng,
+    /// SEC-046 execution bounds for this call tree.
+    bounds: ExecBounds,
+    /// Estimated bytes buffered by this transaction's inserts/upserts,
+    /// checked against `bounds.max_tx_bytes`.
+    written_bytes: Cell<u64>,
+    /// The first breached bound's wire code — latched so a caught error
+    /// still rolls the transaction back (see [`with_context_bounded`]).
+    breached: Cell<Option<u16>>,
 }
 
 impl<'t, 's> TxEnv<'t, 's> {
@@ -617,6 +694,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .insert(table_of::<T>(), row.into_values())?;
+        self.charge_write(&stored)?;
         self.dispatch_triggers()?;
         T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
@@ -629,6 +707,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let stored = self
             .exclusive()?
             .upsert(table_of::<T>(), row.into_values())?;
+        self.charge_write(&stored)?;
         self.dispatch_triggers()?;
         T::from_values(self.decrypt_row::<T>(stored)?.values())
     }
@@ -874,18 +953,78 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
             .collect()
     }
 
+    /// SEC-046: poll the cooperative execution deadline. Sits inside
+    /// [`TxHandle::shared`]/[`TxHandle::exclusive`], so **every** host call
+    /// — reads, writes, nested dispatch, triggers — is a check point; a
+    /// runaway loop that never calls the host is bounded by the SEC-021
+    /// determinism rule (no I/O, no ambient time) making such a loop useless.
+    fn check_deadline(&self) -> Result<()> {
+        if let Some(deadline) = self.env.bounds.deadline
+            && std::time::Instant::now() > deadline
+        {
+            self.env
+                .breached
+                .set(Some(codes::REDUCER_DEADLINE_EXCEEDED));
+            return Err(bound_breach_error(codes::REDUCER_DEADLINE_EXCEEDED));
+        }
+        Ok(())
+    }
+
+    /// SEC-046: account one stored row against the per-transaction write
+    /// ceiling; breach → latch + typed error (rollback).
+    fn charge_write(&self, stored: &Row) -> Result<()> {
+        let max = self.env.bounds.max_tx_bytes;
+        if max == 0 {
+            return Ok(());
+        }
+        let written = self
+            .env
+            .written_bytes
+            .get()
+            .saturating_add(estimate_values_bytes(stored.values()));
+        self.env.written_bytes.set(written);
+        if written > max {
+            self.env
+                .breached
+                .set(Some(codes::REDUCER_TX_BUDGET_EXCEEDED));
+            return Err(bound_breach_error(codes::REDUCER_TX_BUDGET_EXCEEDED));
+        }
+        Ok(())
+    }
+
     /// Shared access to the transaction. Cannot be contended in correct
     /// usage (every method scopes its borrow); surfaced as an error, never
     /// a panic (RED-061).
     fn shared(&self) -> Result<Ref<'e, &'t mut Tx<'s>>> {
+        self.check_deadline()?;
         self.env.tx.try_borrow().map_err(|_| reentrant_handle())
     }
 
     /// Exclusive access to the transaction (write path). Same contention
     /// story as [`TxHandle::shared`].
     fn exclusive(&self) -> Result<RefMut<'e, &'t mut Tx<'s>>> {
+        self.check_deadline()?;
         self.env.tx.try_borrow_mut().map_err(|_| reentrant_handle())
     }
+}
+
+/// Estimate a stored row's in-memory footprint (SEC-046 write accounting):
+/// a fixed per-value overhead plus every owned payload byte, recursively.
+/// An estimate, deliberately — the ceiling is an availability bound, not an
+/// accounting ledger, so being within a small constant factor is enough.
+fn estimate_values_bytes(values: &[crate::store::RowValue]) -> u64 {
+    use crate::store::RowValue as V;
+    fn one(value: &crate::store::RowValue) -> u64 {
+        16 + match value {
+            V::Str(s) => s.len() as u64,
+            V::Bytes(b) => b.len() as u64,
+            V::Optional(Some(inner)) => one(inner),
+            V::List(items) | V::Struct(items) => items.iter().map(one).sum(),
+            V::Enum { payload, .. } => payload.iter().map(one).sum(),
+            _ => 0,
+        }
+    }
+    values.iter().map(one).sum()
 }
 
 /// The stable table id of `T` (STG-050).

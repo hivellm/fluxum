@@ -71,6 +71,9 @@ Then it receives only the rows changed while offline, not the full 100k-row snap
   pruned by the schedule worker; keys are scoped per `(Identity, reducer)`.
 - **CS-032** [P1] The SDK offline queue (CS-04x) MUST attach a stable `idempotency_key` to every queued
   call so reconnect replay is safe.
+- **CS-033** [P2] `idempotency_key` is capped at 256 bytes, enforced at admission before the dedup
+  table or any transaction is touched ([SPEC-026](SPEC-026-security-hardening.md) SEC-048, F-017);
+  an over-length key is refused with `5003 REDUCER_BAD_ARGS`.
 
 #### Scenario: Retry after reconnect applies once
 Given a client sent `transfer_funds` with `idempotency_key=K` and lost the ack

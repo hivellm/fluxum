@@ -469,3 +469,42 @@ async fn a_key_without_the_window_table_is_refused() {
             .is_ok()
     );
 }
+
+// --- SEC-048 (F-017): the decode-time key length cap -------------------------------
+
+#[tokio::test]
+async fn an_over_length_idempotency_key_is_refused_before_any_transaction() {
+    let dir = tempfile::tempdir().unwrap();
+    let h = boot(dir.path());
+
+    let oversized = "k".repeat(fluxum_core::reducer::MAX_IDEMPOTENCY_KEY_BYTES + 1);
+    let err = h
+        .engine
+        .call_idempotent(
+            caller(alice()),
+            "transfer",
+            vec![FluxValue::I64(100)],
+            Some(&oversized),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.query_code(),
+        Some(fluxum_protocol::codes::REDUCER_BAD_ARGS),
+        "{err}"
+    );
+    assert_eq!(balance(&h.store), 0, "nothing ran, nothing committed");
+
+    // A key exactly at the cap is admitted.
+    let at_cap = "k".repeat(fluxum_core::reducer::MAX_IDEMPOTENCY_KEY_BYTES);
+    h.engine
+        .call_idempotent(
+            caller(alice()),
+            "transfer",
+            vec![FluxValue::I64(100)],
+            Some(&at_cap),
+        )
+        .await
+        .unwrap();
+    assert_eq!(balance(&h.store), 100);
+}

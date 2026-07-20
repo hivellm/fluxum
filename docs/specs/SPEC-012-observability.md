@@ -172,6 +172,19 @@ of the correctness contract.
   Every `reason` label is emitted even at zero, so rate alerts never go
   stale-for-lack-of-series. The guard gauges refresh at scrape time.
 
+- **OBS-043** [P1] Query/reducer execution-bounds surface (SPEC-026 SEC-045/046/047):
+
+  ```
+  fluxum_query_aborted_total{shard, reason}      Counter  // reason ∈ {limit, scan_budget,
+                                                          // deadline} (SEC-045)
+  fluxum_reducer_aborted_total{shard, reason}    Counter  // reason ∈ {deadline, alloc} —
+                                                          // every abort is a rollback (SEC-046)
+  fluxum_query_rate_limited_total{shard, bucket} Counter  // bucket ∈ {identity, source}
+                                                          // (SEC-047 admission refusals)
+  ```
+
+  Like OBS-042, every label is emitted even at zero.
+
 - **OBS-041** [P1] Per-client send buffer:
 
   ```

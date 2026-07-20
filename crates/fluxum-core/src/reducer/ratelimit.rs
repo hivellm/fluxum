@@ -40,6 +40,15 @@ impl TokenBucket {
         }
     }
 
+    /// Credit the tokens earned since the last refill (shared by
+    /// [`TokenBucket::try_consume`] and the SEC-047 idle-entry sweep).
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
+        self.last_refill = now;
+        self.tokens =
+            (self.tokens + elapsed.as_secs_f64() * self.refill_per_sec).min(self.capacity);
+    }
+
     /// Retune an existing bucket to `rate` without handing out a free burst
     /// (SPEC-025 OPS-040): credit the tokens earned under the *old* rate
     /// first, then adopt the new one and clamp the balance to the new
@@ -57,10 +66,7 @@ impl TokenBucket {
 
     /// Refill by elapsed time, then consume one token if available.
     fn try_consume(&mut self, now: Instant) -> bool {
-        let elapsed = now.saturating_duration_since(self.last_refill);
-        self.last_refill = now;
-        self.tokens =
-            (self.tokens + elapsed.as_secs_f64() * self.refill_per_sec).min(self.capacity);
+        self.refill(now);
         if self.tokens >= 1.0 {
             self.tokens -= 1.0;
             true
@@ -216,6 +222,162 @@ impl RateLimiter {
             ))
         }
     }
+}
+
+// --- SEC-047: query-admission limiter --------------------------------------
+
+/// Where a query physically came from — the key of the SEC-047 secondary
+/// bucket. Preferably the **resolved client IP** (SEC-035: the proxy-aware
+/// address every per-IP defense keys on), falling back to the connection id
+/// where no IP exists (embedded/in-process transports). Keying a second
+/// bucket by source is what makes token rotation useless: a caller minting
+/// fresh identities still drains one source-keyed budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuerySource {
+    /// The resolved client IP (SEC-035).
+    Ip(std::net::IpAddr),
+    /// The connection id, when no client IP exists.
+    Connection(u128),
+}
+
+/// A refused query admission (SEC-047): which bucket refused and the
+/// client-facing retry estimate.
+#[derive(Debug, Clone, Copy)]
+pub struct QueryRejected {
+    /// The bucket that refused (drives the metric label).
+    pub bucket: crate::metrics::QueryRateBucket,
+    /// The refill estimate to advertise (SPEC-028 §4).
+    pub retry_after_ms: u32,
+}
+
+impl QueryRejected {
+    /// The wire-ready retryable 429 (SPEC-028 code 6003).
+    pub fn to_error(self) -> FluxumError {
+        FluxumError::query_retryable(
+            codes::SUB_QUERY_RATE_LIMITED,
+            format!(
+                "query admission rate exceeded ({} bucket, SEC-047); retry shortly",
+                self.bucket.as_str()
+            ),
+            Some(self.retry_after_ms),
+        )
+    }
+}
+
+/// Cap on tracked buckets per keyspace (SEC-047): bounds the memory an
+/// identity- or IP-rotating caller can pin. At the cap, idle (fully
+/// refilled) entries are swept; if none is reclaimable the *new* key is
+/// refused — fail closed under rotation pressure, never unbounded growth.
+const QUERY_LIMITER_MAX_TRACKED: usize = 100_000;
+
+/// SEC-047: token buckets in front of subscription registration and one-off
+/// queries — per **identity** and, secondarily, per **source**
+/// ([`QuerySource`]), so rotating tokens cannot mint fresh budget. Rates are
+/// interior-mutable for OPS-040 hot reload; `0` disables that bucket.
+///
+/// Admission-time only, like the reducer limiter: a refused query costs two
+/// HashMap probes and never touches a snapshot.
+#[derive(Debug, Default)]
+pub struct QueryLimiter {
+    identity_rate: std::sync::atomic::AtomicU64,
+    source_rate: std::sync::atomic::AtomicU64,
+    identities: Mutex<HashMap<Identity, TokenBucket>>,
+    sources: Mutex<HashMap<QuerySource, TokenBucket>>,
+}
+
+impl QueryLimiter {
+    /// A limiter with the given per-second rates (`0` = that bucket off).
+    pub fn new(identity_rate: u64, source_rate: u64) -> Self {
+        let limiter = Self::default();
+        limiter.set_rates(identity_rate, source_rate);
+        limiter
+    }
+
+    /// Publish new rates (boot and OPS-040 hot reload). Existing buckets
+    /// retune on their next check without a free burst (OPS-040).
+    pub fn set_rates(&self, identity_rate: u64, source_rate: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.identity_rate.store(identity_rate, Relaxed);
+        self.source_rate.store(source_rate, Relaxed);
+    }
+
+    /// The current `(identity, source)` rates (`0` = off).
+    pub fn rates(&self) -> (u64, u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        (
+            self.identity_rate.load(Relaxed),
+            self.source_rate.load(Relaxed),
+        )
+    }
+
+    /// Admit or refuse one subscription registration / one-off query for
+    /// `(identity, source)` (SEC-047). Both buckets are charged on success;
+    /// server peers must be exempted by the caller (AUTH-062 — the limiter
+    /// cannot tell a server identity from its bytes).
+    pub fn check(
+        &self,
+        identity: &Identity,
+        source: QuerySource,
+    ) -> std::result::Result<(), QueryRejected> {
+        use crate::metrics::QueryRateBucket;
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = Instant::now();
+        let identity_rate = self.identity_rate.load(Relaxed);
+        let source_rate = self.source_rate.load(Relaxed);
+        if !Self::charge(&self.identities, *identity, identity_rate, now) {
+            return Err(QueryRejected {
+                bucket: QueryRateBucket::Identity,
+                retry_after_ms: retry_after_ms(identity_rate),
+            });
+        }
+        if !Self::charge(&self.sources, source, source_rate, now) {
+            return Err(QueryRejected {
+                bucket: QueryRateBucket::Source,
+                retry_after_ms: retry_after_ms(source_rate),
+            });
+        }
+        Ok(())
+    }
+
+    /// Charge one token from `key`'s bucket in `map` (rate `0` = admit).
+    fn charge<K: std::hash::Hash + Eq + Copy>(
+        map: &Mutex<HashMap<K, TokenBucket>>,
+        key: K,
+        rate: u64,
+        now: Instant,
+    ) -> bool {
+        if rate == 0 {
+            return true;
+        }
+        #[allow(clippy::cast_precision_loss)] // admission rates, not money
+        let rate = rate as f64;
+        let mut map = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(&key) && map.len() >= QUERY_LIMITER_MAX_TRACKED {
+            // Reclaim idle entries: a fully refilled bucket has not been
+            // charged for at least one refill window.
+            map.retain(|_, bucket| {
+                bucket.refill(now);
+                bucket.tokens < bucket.capacity
+            });
+            if map.len() >= QUERY_LIMITER_MAX_TRACKED {
+                return false; // fail closed for brand-new keys under rotation pressure
+            }
+        }
+        let bucket = map
+            .entry(key)
+            .or_insert_with(|| TokenBucket::new(rate, now));
+        // OPS-040: adopt a reloaded rate without a free burst.
+        if (bucket.refill_per_sec - rate).abs() > f64::EPSILON {
+            bucket.retune(rate, now);
+        }
+        bucket.try_consume(now)
+    }
+}
+
+/// The SPEC-028 §4 refill estimate for a `rate`-per-second bucket.
+fn retry_after_ms(rate: u64) -> u32 {
+    let rate = u32::try_from(rate).unwrap_or(u32::MAX);
+    1_000u32.div_ceil(rate.max(1))
 }
 
 #[cfg(test)]
@@ -382,6 +544,71 @@ mod tests {
         assert!(
             limiter.check(&id(2), "f", 0).is_err(),
             "the lowered limit binds immediately"
+        );
+    }
+
+    // --- SEC-047: query-admission limiter ----------------------------------
+
+    #[test]
+    fn a_token_rotating_caller_cannot_exceed_the_source_bucket() {
+        use crate::metrics::QueryRateBucket;
+        // Identity bucket generous, source bucket 2/s: rotating identities
+        // mints fresh identity budget but drains ONE source budget.
+        let limiter = QueryLimiter::new(1_000, 2);
+        let source = QuerySource::Ip("203.0.113.9".parse().unwrap());
+        limiter.check(&id(1), source).unwrap();
+        limiter.check(&id(2), source).unwrap();
+        let rejected = limiter.check(&id(3), source).unwrap_err();
+        assert_eq!(rejected.bucket, QueryRateBucket::Source);
+        let err = rejected.to_error();
+        assert_eq!(err.query_code(), Some(codes::SUB_QUERY_RATE_LIMITED));
+        let wire = err.to_wire();
+        assert!(wire.retry_after_ms.is_some(), "retryable with an estimate");
+        // A different source still has its own budget.
+        limiter
+            .check(&id(4), QuerySource::Ip("203.0.113.10".parse().unwrap()))
+            .unwrap();
+    }
+
+    #[test]
+    fn the_identity_bucket_binds_across_sources() {
+        use crate::metrics::QueryRateBucket;
+        let limiter = QueryLimiter::new(2, 1_000);
+        let caller = id(5);
+        limiter
+            .check(&caller, QuerySource::Connection(1))
+            .unwrap();
+        limiter
+            .check(&caller, QuerySource::Connection(2))
+            .unwrap();
+        let rejected = limiter
+            .check(&caller, QuerySource::Connection(3))
+            .unwrap_err();
+        assert_eq!(rejected.bucket, QueryRateBucket::Identity);
+    }
+
+    #[test]
+    fn zero_rates_disable_the_query_limiter() {
+        let limiter = QueryLimiter::new(0, 0);
+        for i in 0..100u8 {
+            limiter.check(&id(i), QuerySource::Connection(1)).unwrap();
+        }
+        assert_eq!(limiter.rates(), (0, 0));
+    }
+
+    #[test]
+    fn reloaded_query_rates_retune_without_a_free_burst() {
+        let limiter = QueryLimiter::new(2, 0);
+        let caller = id(6);
+        let source = QuerySource::Connection(9);
+        limiter.check(&caller, source).unwrap();
+        limiter.check(&caller, source).unwrap();
+        assert!(limiter.check(&caller, source).is_err(), "exhausted");
+        // OPS-040: raising the rate must not refill the drained bucket.
+        limiter.set_rates(1_000, 0);
+        assert!(
+            limiter.check(&caller, source).is_err(),
+            "no free burst on retune"
         );
     }
 

@@ -679,7 +679,18 @@ subscriptions:
   send_buffer_bytes: 2097152        # 2 MiB per client
 
 reducer:
-  shard_max_reducers_per_sec: 200000  # RED-052 global shard guard; 0 disables
+  shard_max_reducers_per_sec: 200000  # RED-052 global shard guard; mandatory-on (SEC-046)
+  max_execution_ms: 10000             # SEC-046 cooperative deadline per client call (0 = off)
+  max_tx_bytes: 512MiB                # SEC-046 per-transaction write ceiling (0 = off)
+
+query:                                # SPEC-026 SEC-045/047 execution bounds + admission
+  default_limit: 0                    # implicit LIMIT for unlimited queries (0 = none)
+  max_limit: 1000000                  # ceiling on any effective LIMIT (0 = unbounded)
+  max_limit_action: clamp             # clamp | reject (reject answers 3030)
+  row_scan_budget: 10000000           # rows one evaluation may touch (0 = off)
+  deadline_ms: 5000                   # per-query wall clock (0 = off)
+  max_queries_per_sec_per_identity: 500  # SEC-047 per-caller admission (0 = off)
+  max_queries_per_sec_per_source: 2000   # SEC-047 per resolved-IP/connection (0 = off)
 
 observability:
   slow_reducer_threshold_us: 5000
@@ -699,7 +710,9 @@ no dropped connections:
 | `logging.level` | the live `tracing` filter |
 | `logging.format` | the live `tracing` layer |
 | `observability.slow_reducer_threshold_us` | the shard's metrics registry |
-| `reducer.shard_max_reducers_per_sec` | the RED-052 admission guard |
+| `reducer.shard_max_reducers_per_sec` | the RED-052 admission guard (0 is rejected — SEC-046) |
+| `reducer.max_execution_ms`, `reducer.max_tx_bytes` | the SEC-046 reducer execution bounds |
+| `query.*` (limits, scan budget, deadline, admission rates) | the SEC-045/047 query bounds and limiter |
 | `subscriptions.send_buffer_bytes` | each connection admitted after the reload |
 
 Everything else — ports, storage paths, shard count, auth — is **frozen**

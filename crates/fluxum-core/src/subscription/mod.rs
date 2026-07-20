@@ -127,6 +127,163 @@ struct MembershipSpec {
 /// correctly.
 type ValueKey = Vec<u8>;
 
+/// SEC-045 query execution bounds: the ceilings the snapshot evaluator
+/// enforces on every `InitialData` / one-off read. Interior-mutable atomics
+/// so the server's hot-reload path (OPS-040) can retune a *running* manager
+/// through the shared `Arc` without pausing evaluation.
+///
+/// Every field's zero value disables that bound — the built-in default is
+/// fully unbounded (today's behavior); the server config supplies generous
+/// production defaults and operators tighten per deployment.
+#[derive(Debug, Default)]
+pub struct QueryBounds {
+    /// Applied to queries that carry no `LIMIT` (`0` = none).
+    default_limit: std::sync::atomic::AtomicU32,
+    /// Ceiling on any effective `LIMIT` (`0` = unbounded).
+    max_limit: std::sync::atomic::AtomicU32,
+    /// `true`: a `LIMIT` above `max_limit` is rejected (3030); `false` (the
+    /// default): it is clamped to `max_limit`.
+    reject_over_max: std::sync::atomic::AtomicBool,
+    /// Rows the evaluator may touch per query before aborting (`0` = no
+    /// budget).
+    row_scan_budget: std::sync::atomic::AtomicU64,
+    /// Wall-clock evaluation deadline in milliseconds (`0` = none).
+    deadline_ms: std::sync::atomic::AtomicU64,
+}
+
+impl QueryBounds {
+    /// Publish new bounds (boot and OPS-040 hot reload land here).
+    pub fn set(
+        &self,
+        default_limit: u32,
+        max_limit: u32,
+        reject_over_max: bool,
+        row_scan_budget: u64,
+        deadline_ms: u64,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.default_limit.store(default_limit, Relaxed);
+        self.max_limit.store(max_limit, Relaxed);
+        self.reject_over_max.store(reject_over_max, Relaxed);
+        self.row_scan_budget.store(row_scan_budget, Relaxed);
+        self.deadline_ms.store(deadline_ms, Relaxed);
+    }
+
+    fn default_limit(&self) -> u32 {
+        self.default_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn max_limit(&self) -> u32 {
+        self.max_limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn reject_over_max(&self) -> bool {
+        self.reject_over_max
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn row_scan_budget(&self) -> u64 {
+        self.row_scan_budget
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn deadline_ms(&self) -> u64 {
+        self.deadline_ms.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Per-query scan accounting against [`QueryBounds`] (SEC-045): counts every
+/// candidate row the evaluator touches, aborts the evaluation when the
+/// row-scan budget or the wall-clock deadline is breached. The deadline is
+/// polled every [`DEADLINE_POLL_ROWS`] rows (and once at the end), so the
+/// hot path pays one `Cell` bump per row, not a clock read.
+struct ScanGuard {
+    budget: u64,
+    deadline: Option<std::time::Instant>,
+    scanned: std::cell::Cell<u64>,
+    aborted: std::cell::Cell<Option<crate::metrics::QueryAbortReason>>,
+}
+
+/// How many admitted rows pass between wall-clock deadline polls.
+const DEADLINE_POLL_ROWS: u64 = 256;
+
+impl ScanGuard {
+    fn new(bounds: &QueryBounds) -> Self {
+        let deadline_ms = bounds.deadline_ms();
+        Self {
+            budget: bounds.row_scan_budget(),
+            deadline: (deadline_ms > 0).then(|| {
+                std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms)
+            }),
+            scanned: std::cell::Cell::new(0),
+            aborted: std::cell::Cell::new(None),
+        }
+    }
+
+    /// Account one candidate row; `false` once the evaluation is aborted —
+    /// callers stop scanning (or filter everything out) from then on.
+    fn admit(&self) -> bool {
+        use crate::metrics::QueryAbortReason;
+        if self.aborted.get().is_some() {
+            return false;
+        }
+        QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let scanned = self.scanned.get() + 1;
+        self.scanned.set(scanned);
+        if self.budget > 0 && scanned > self.budget {
+            self.aborted.set(Some(QueryAbortReason::ScanBudget));
+            return false;
+        }
+        if scanned.is_multiple_of(DEADLINE_POLL_ROWS)
+            && let Some(deadline) = self.deadline
+            && std::time::Instant::now() > deadline
+        {
+            self.aborted.set(Some(QueryAbortReason::Deadline));
+            return false;
+        }
+        true
+    }
+
+    /// Whether the evaluation was aborted (loop-break form of [`Self::admit`]).
+    fn is_aborted(&self) -> bool {
+        self.aborted.get().is_some()
+    }
+
+    /// Surface an abort as its typed wire error (3031/3032), counting it;
+    /// also the final deadline poll (covers sorts and small-scan tails the
+    /// per-row cadence missed).
+    fn finish(&self, metrics: Option<&crate::metrics::Metrics>) -> Result<()> {
+        use crate::metrics::QueryAbortReason;
+        if self.aborted.get().is_none()
+            && let Some(deadline) = self.deadline
+            && std::time::Instant::now() > deadline
+        {
+            self.aborted.set(Some(QueryAbortReason::Deadline));
+        }
+        match self.aborted.get() {
+            None => Ok(()),
+            Some(reason) => {
+                if let Some(metrics) = metrics {
+                    metrics.note_query_aborted(reason);
+                }
+                Err(match reason {
+                    QueryAbortReason::ScanBudget => FluxumError::query(
+                        codes::SQL_SCAN_BUDGET_EXCEEDED,
+                        format!(
+                            "query aborted: row-scan budget of {} rows exceeded (SEC-045)",
+                            self.budget
+                        ),
+                    ),
+                    _ => FluxumError::query(
+                        codes::SQL_DEADLINE_EXCEEDED,
+                        "query aborted: execution deadline exceeded (SEC-045)",
+                    ),
+                })
+            }
+        }
+    }
+}
+
 /// Configurable subscription admission caps (SUB-044).
 #[derive(Debug, Clone, Copy)]
 pub struct SubscriptionLimits {
@@ -316,6 +473,12 @@ pub struct SubscriptionManager {
     table_watchers: HashMap<TableId, HashSet<QueryHash>>,
     /// Next per-connection query id (monotonic per connection).
     next_query_id: HashMap<u128, u32>,
+    /// SEC-045 query execution bounds, shared with the server's hot-reload
+    /// path. Defaults to fully unbounded (today's behavior).
+    bounds: Arc<QueryBounds>,
+    /// The shard metrics registry, once installed — the SEC-045 abort
+    /// counters land here. `None` (embedders, tests) skips counting.
+    metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl SubscriptionManager {
@@ -415,6 +578,45 @@ impl SubscriptionManager {
             indexed_columns: HashMap::new(),
             table_watchers: HashMap::new(),
             next_query_id: HashMap::new(),
+            bounds: Arc::new(QueryBounds::default()),
+            metrics: None,
+        }
+    }
+
+    /// Install the shared SEC-045 query bounds (assembly; the same `Arc` is
+    /// retuned by the server's OPS-040 hot-reload path).
+    pub fn set_query_bounds(&mut self, bounds: Arc<QueryBounds>) {
+        self.bounds = bounds;
+    }
+
+    /// Install the shard metrics registry so SEC-045 query aborts are
+    /// counted (`fluxum_query_aborted_total`). Called at assembly.
+    pub fn set_metrics(&mut self, metrics: Arc<crate::metrics::Metrics>) {
+        self.metrics = Some(metrics);
+    }
+
+    /// The effective `LIMIT` for a plan under the SEC-045 bounds: a query
+    /// without one gets `default_limit` (if configured); one above
+    /// `max_limit` is clamped — or rejected with a wire-ready 3030 in
+    /// `reject` mode.
+    fn effective_limit(&self, plan_limit: Option<u32>) -> Result<Option<u32>> {
+        let default_limit = self.bounds.default_limit();
+        let max_limit = self.bounds.max_limit();
+        let limit = plan_limit.or((default_limit > 0).then_some(default_limit));
+        match limit {
+            Some(n) if max_limit > 0 && n > max_limit => {
+                if self.bounds.reject_over_max() && plan_limit.is_some() {
+                    if let Some(metrics) = &self.metrics {
+                        metrics.note_query_aborted(crate::metrics::QueryAbortReason::Limit);
+                    }
+                    return Err(FluxumError::query(
+                        codes::SQL_LIMIT_REJECTED,
+                        format!("LIMIT {n} exceeds the configured maximum {max_limit} (SEC-045)"),
+                    ));
+                }
+                Ok(Some(max_limit))
+            }
+            other => Ok(other),
         }
     }
 
@@ -1068,6 +1270,11 @@ impl SubscriptionManager {
     ) -> Result<(InitialData, Vec<f64>)> {
         let table_id = plan.table_ids[0];
         let schema = self.table_schema(table_id)?;
+        // SEC-045: the effective LIMIT under the configured bounds (implicit
+        // default, clamp-or-reject over the maximum) and the per-query scan
+        // accounting the candidate paths below report into.
+        let limit = self.effective_limit(plan.limit)?;
+        let guard = ScanGuard::new(&self.bounds);
 
         // Candidate rows: spatial clauses go through the spatial index
         // (SUB-022); a `MATCH` goes through the inverted index (SPEC-019
@@ -1083,7 +1290,9 @@ impl SubscriptionManager {
             (Some(fts), None, _) => {
                 let mut rows = Vec::new();
                 for (row, score) in snapshot.fulltext_match(table_id, fts)? {
-                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if !guard.admit() {
+                        break;
+                    }
                     if keep(&row) {
                         rows.push(row);
                         scores.push(score);
@@ -1094,24 +1303,28 @@ impl SubscriptionManager {
             (None, Some(constraint), _) => self
                 .spatial_candidates(snapshot, table_id, *constraint)?
                 .into_iter()
-                .filter(|row| {
-                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    keep(row)
-                })
+                .filter(|row| guard.admit() && keep(row))
                 .collect(),
             (None, None, AccessPath::IndexScan(scan)) => {
-                self.index_scan_rows(plan, scan, viewer, snapshot, table_id, schema)?
+                self.index_scan_rows(plan, scan, viewer, snapshot, table_id, schema, &guard, limit)?
             }
-            (_, _, AccessPath::FullScan) => snapshot
-                .scan(table_id)?
-                .filter(|row| {
-                    QUERY_ROWS_SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    keep(row)
-                })
-                .cloned()
-                .collect(),
+            (_, _, AccessPath::FullScan) => {
+                let mut out = Vec::new();
+                for row in snapshot.scan(table_id)? {
+                    if !guard.admit() {
+                        break;
+                    }
+                    if keep(row) {
+                        out.push(row.clone());
+                    }
+                }
+                out
+            }
             (Some(_), Some(_), _) => unreachable!("compile rejects MATCH + spatial"),
         };
+        // SEC-045: an aborted candidate scan is a typed error, never a
+        // silently truncated result.
+        guard.finish(self.metrics.as_deref())?;
 
         // ORDER BY / LIMIT apply to InitialData ONLY (SUB-013). QP-020: an
         // index-served order skips the in-RAM sort. FTS-041: `ORDER BY
@@ -1152,10 +1365,12 @@ impl SubscriptionManager {
                 if order.descending { ord.reverse() } else { ord }
             });
         }
-        if let Some(limit) = plan.limit {
+        if let Some(limit) = limit {
             rows.truncate(limit as usize);
             scores.truncate(limit as usize);
         }
+        // SEC-045: the deadline also covers the sort/rank phase above.
+        guard.finish(self.metrics.as_deref())?;
 
         // SPEC-017 §6: decrypt-then-mask before the wire (CT-031/040/041).
         let rows: Vec<Row> = rows
@@ -1681,8 +1896,9 @@ impl SubscriptionManager {
         snapshot: &Snapshot,
         table_id: TableId,
         schema: &TableSchema,
+        guard: &ScanGuard,
+        limit: Option<u32>,
     ) -> Result<Vec<Row>> {
-        use std::sync::atomic::Ordering as AtomicOrdering;
         // QP-040/041: the AFTER cursor's bound already seeks to the order
         // value; what remains is skipping rows AT the cursor value up to (and
         // including) the cursor's primary key — the `(value = c AND pk ≤ k)`
@@ -1719,14 +1935,16 @@ impl SubscriptionManager {
             }
         };
         let residual_keep = |row: &Row| {
-            QUERY_ROWS_SCANNED.fetch_add(1, AtomicOrdering::Relaxed);
-            !cursor_skip(row)
+            guard.admit()
+                && !cursor_skip(row)
                 && plan.residual.as_ref().is_none_or(|f| f(row))
                 && self.row_visible(plan, row, viewer)
         };
         // QP-021: early stop only when the scan order IS the result order.
+        // SEC-045: the *effective* limit drives it, so a clamped/default
+        // LIMIT stops the walk exactly like an explicit one.
         let early_stop = if plan.ordered_by_index {
-            plan.limit.map(|n| n as usize)
+            limit.map(|n| n as usize)
         } else {
             None
         };
@@ -1746,6 +1964,8 @@ impl SubscriptionManager {
                         if early_stop.is_some_and(|n| rows.len() >= n) {
                             break 'probes;
                         }
+                    } else if guard.is_aborted() {
+                        break 'probes;
                     }
                 }
             } else {
@@ -1755,6 +1975,8 @@ impl SubscriptionManager {
                         if early_stop.is_some_and(|n| rows.len() >= n) {
                             break 'probes;
                         }
+                    } else if guard.is_aborted() {
+                        break 'probes;
                     }
                 }
             }

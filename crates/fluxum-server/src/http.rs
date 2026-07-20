@@ -791,6 +791,9 @@ async fn handle_post(
             router_state.clone(),
             namespace.clone(),
         );
+        // SEC-047: key the source-side query-admission bucket on the
+        // resolved client IP (proxy-aware, SEC-035).
+        session.set_source_ip(ip);
         for message in messages {
             let routed = session.handle(message).await;
             responses.extend(routed.responses);

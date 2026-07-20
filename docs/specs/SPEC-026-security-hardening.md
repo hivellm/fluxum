@@ -338,7 +338,92 @@ auth:
   max_permissive_identities: 10000     # SEC-062 distinct-identity cap for provider `none` (0 = off)
 ```
 
-## 5. Non-goals
+## 5. Query and reducer execution bounds (`SEC-045..048`, availability)
+
+A shard has a **single writer** and a shared snapshot evaluator, so one caller who can make
+either run unboundedly stalls every tenant on the shard (OWASP A06/A10, findings F-014..F-017).
+Connection-level admission (SEC-03x/04x above) guards *connections*; these requirements bound
+*execution* — what an already-admitted call may cost. Every bound defaults **generously** (a
+legitimate workload never notices) and every breach is a typed, counted error, never a silent
+truncation.
+
+### Requirement: Query execution bounds
+- **SEC-045** [P1] The snapshot evaluator (InitialData, one-off reads, `POST /query`) SHALL
+  enforce configurable bounds per query: `query.default_limit` (applied to queries carrying no
+  `LIMIT`; `0` = none, the default), `query.max_limit` (default 1,000,000; an effective `LIMIT`
+  above it is **clamped** or, with `query.max_limit_action: reject`, refused with `3030
+  SQL_LIMIT_REJECTED`), `query.row_scan_budget` (default 10,000,000 rows a single evaluation may
+  touch; breach aborts with `3031 SQL_SCAN_BUDGET_EXCEEDED`), and `query.deadline_ms` (default
+  5,000 ms wall clock, polled during the scan and after the sort/rank phase; breach aborts with
+  `3032 SQL_DEADLINE_EXCEEDED`). The effective (clamped/default) `LIMIT` MUST also drive the
+  QP-021 index-ordered early stop. A rejected/aborted `Subscribe` registers nothing. Aborts are
+  counted in `fluxum_query_aborted_total{reason ∈ limit, scan_budget, deadline}`. All keys are
+  hot-reloadable (OPS-040) through one shared handle covering every hosted database.
+
+### Requirement: Reducer execution bounds
+- **SEC-046** [P1] A client reducer call SHALL run under a **cooperative execution deadline**
+  (`reducer.max_execution_ms`, default 10,000; `0` = off) polled at every host-call boundary
+  (the `ctx.tx` surface all table access goes through — a loop that never calls the host is made
+  useless by the SEC-021 determinism rules), and a **per-transaction write ceiling**
+  (`reducer.max_tx_bytes`, default 512 MiB; `0` = off) charged on every insert/upsert's stored
+  size. A breach aborts with `5007 REDUCER_DEADLINE_EXCEEDED` / `5008
+  REDUCER_TX_BUDGET_EXCEEDED` and rolls the transaction back through the existing panic→rollback
+  isolation path; the breach is **latched**, so a reducer that catches the typed error and
+  returns `Ok` still rolls back. Lifecycle hooks and scheduled executions (server identity) are
+  exempt. Aborts are counted in `fluxum_reducer_aborted_total{reason ∈ deadline, alloc}`. The
+  RED-052 global shard guard is **mandatory-on**: `reducer.shard_max_reducers_per_sec: 0` is
+  rejected at config load and reload — a single-writer shard must always carry an aggregate
+  admission bound.
+
+### Requirement: Query admission rates
+- **SEC-047** [P1] Subscription registration and one-off queries SHALL pass a token-bucket
+  admission check **before any snapshot is touched**: a per-**identity** bucket
+  (`query.max_queries_per_sec_per_identity`, default 500) and a secondary per-**source** bucket
+  (`query.max_queries_per_sec_per_source`, default 2,000) keyed on the SEC-035 resolved client
+  IP (falling back to the connection id where none exists) — so rotating tokens mints fresh
+  identities but still drains one source budget. A batch `Subscribe` charges one token per
+  query. Server peers (AUTH-062) are exempt. A refusal is the retryable `6003
+  SUB_QUERY_RATE_LIMITED` carrying a `retry_after_ms` estimate, counted in
+  `fluxum_query_rate_limited_total{bucket ∈ identity, source}`. Tracked buckets are capped
+  (100,000 per keyspace) with idle-entry reclamation; at the cap a brand-new key is refused
+  (fail closed) rather than growing without bound. Rates are hot-reloadable and a retune never
+  hands out a free burst (OPS-040).
+
+### Requirement: Idempotency-key bound
+- **SEC-048** [P2] `idempotency_key` SHALL be capped at 256 bytes, enforced at admission before
+  the dedup table or any transaction is touched (F-017): an over-length key is refused with
+  `5003 REDUCER_BAD_ARGS`. A key exactly at the cap is admitted.
+
+#### Scenario: A hostile query cannot pin the evaluator
+Given `query.row_scan_budget: 100000` and `query.deadline_ms: 5000`
+When a caller submits an unfiltered query over a hundred-million-row table
+Then the evaluation aborts with `3031` (or `3032` if the clock fires first), the abort is
+counted, other tenants' queries and the write path proceed unaffected, and a later query inside
+the budget serves normally.
+
+#### Scenario: A runaway reducer cannot stall the writer
+Given `reducer.max_execution_ms: 10000`
+When a reducer spins past the deadline and then touches `ctx.tx`
+Then the call aborts with `5007`, the transaction rolls back with no commit-log entry and no
+subscription events, `fluxum_reducer_aborted_total{reason="deadline"}` increments, and the shard
+keeps serving.
+
+```yaml
+query:
+  default_limit: 0                     # SEC-045 implicit LIMIT for unlimited queries (0 = none)
+  max_limit: 1000000                   # SEC-045 ceiling on any effective LIMIT (0 = unbounded)
+  max_limit_action: clamp              # SEC-045 clamp | reject (reject answers 3030)
+  row_scan_budget: 10000000            # SEC-045 rows one evaluation may touch (0 = off)
+  deadline_ms: 5000                    # SEC-045 per-query wall clock (0 = off)
+  max_queries_per_sec_per_identity: 500   # SEC-047 per-caller admission (0 = off)
+  max_queries_per_sec_per_source: 2000    # SEC-047 per resolved-IP/connection (0 = off)
+reducer:
+  shard_max_reducers_per_sec: 200000   # RED-052; SEC-046: mandatory-on, 0 is rejected
+  max_execution_ms: 10000              # SEC-046 cooperative deadline (0 = off)
+  max_tx_bytes: 512MiB                 # SEC-046 per-transaction write ceiling (0 = off)
+```
+
+## 6. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).
 - **Volumetric (link-saturation) DDoS absorption.** Fluxum's deployment posture is a *directly

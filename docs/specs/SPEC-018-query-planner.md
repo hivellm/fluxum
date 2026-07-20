@@ -106,6 +106,13 @@ P2) and is the follow-up track, not this spec. No statistics/cost model — sele
   CT-041) SHALL be applied **within** the index-ordered scan, before counting toward `LIMIT`, so a
   top-N never returns fewer authorized rows than exist (no "hole" from post-limit filtering).
 
+- **QP-023** [P1] Every evaluation path (full scan, index scan, spatial, MATCH) runs under the
+  [SPEC-026](SPEC-026-security-hardening.md) SEC-045 execution bounds: the **effective** `LIMIT`
+  (implicit `query.default_limit`, clamped or rejected over `query.max_limit`) drives the QP-021
+  early stop exactly like an explicit one, the per-query row-scan budget accounts every candidate
+  row touched, and the wall-clock deadline covers the scan and the sort/rank phase. A breach is a
+  typed abort (3030/3031/3032), never a silently truncated result.
+
 ## 5. Range operators (SQL subset extension)
 
 - **QP-030** [P0] The subscription/query SQL subset (SUB-010) SHALL be extended with the comparison

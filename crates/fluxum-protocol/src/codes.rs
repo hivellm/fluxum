@@ -89,6 +89,13 @@ pub const SQL_TYPE_MISMATCH: u16 = 3004;
 pub const SQL_NO_SPATIAL_INDEX: u16 = 3010;
 /// 3020 — `AS OF` point older than the retained temporal window (RV-021).
 pub const SQL_AS_OF_OUT_OF_WINDOW: u16 = 3020;
+/// 3030 — `LIMIT` above the configured `query.max_limit` in `reject` mode
+/// (SEC-045).
+pub const SQL_LIMIT_REJECTED: u16 = 3030;
+/// 3031 — the query hit the per-query row-scan budget (SEC-045).
+pub const SQL_SCAN_BUDGET_EXCEEDED: u16 = 3031;
+/// 3032 — the query hit its wall-clock execution deadline (SEC-045).
+pub const SQL_DEADLINE_EXCEEDED: u16 = 3032;
 /// 3100 — `#[unique]` constraint violation (TXN-041).
 pub const SQL_UNIQUE_VIOLATION: u16 = 3100;
 /// 3101 — `#[check(expr)]` constraint violation (SPEC-022 RV-030).
@@ -122,6 +129,12 @@ pub const REDUCER_SCHEDULE_ONLY: u16 = 5004;
 pub const REDUCER_RATE_LIMITED: u16 = 5005;
 /// 5006 — unknown `#[fluxum::view]` name (RED-030).
 pub const REDUCER_UNKNOWN_VIEW: u16 = 5006;
+/// 5007 — the reducer hit its cooperative execution deadline; the
+/// transaction was rolled back (SEC-046).
+pub const REDUCER_DEADLINE_EXCEEDED: u16 = 5007;
+/// 5008 — the reducer's transaction exceeded the per-transaction write
+/// ceiling; the transaction was rolled back (SEC-046).
+pub const REDUCER_TX_BUDGET_EXCEEDED: u16 = 5008;
 
 // --- 6xxx SUB_ --------------------------------------------------------------
 
@@ -133,6 +146,11 @@ pub const SUB_TABLE_NOT_PUBLIC: u16 = 6001;
 /// CS-021): the subscription did not outlive the disconnect, so the client
 /// must `Subscribe` afresh rather than resume.
 pub const SUB_UNKNOWN_QUERY_ID: u16 = 6002;
+/// 6003 — per-identity / per-source query admission rate exceeded
+/// (SEC-047): subscription registrations and one-off queries are token-
+/// bucketed per caller, with a source-keyed secondary bucket so token
+/// rotation cannot mint fresh budget.
+pub const SUB_QUERY_RATE_LIMITED: u16 = 6003;
 
 // --- 7xxx STORAGE_ ----------------------------------------------------------
 
@@ -284,6 +302,46 @@ pub const CATALOG: &[CatalogEntry] = &[
         http_status: 400,
     },
     CatalogEntry {
+        code: SQL_AS_OF_OUT_OF_WINDOW,
+        name: "SQL_AS_OF_OUT_OF_WINDOW",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("22023"),
+        details_keys: &[],
+        message_template: "AS OF point predates the retained temporal window",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: SQL_LIMIT_REJECTED,
+        name: "SQL_LIMIT_REJECTED",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("54000"),
+        details_keys: &["limit", "max_limit"],
+        message_template: "LIMIT exceeds the configured maximum",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: SQL_SCAN_BUDGET_EXCEEDED,
+        name: "SQL_SCAN_BUDGET_EXCEEDED",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("54000"),
+        details_keys: &["budget"],
+        message_template: "query aborted: row-scan budget exceeded",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: SQL_DEADLINE_EXCEEDED,
+        name: "SQL_DEADLINE_EXCEEDED",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("57014"),
+        details_keys: &["deadline_ms"],
+        message_template: "query aborted: execution deadline exceeded",
+        http_status: 408,
+    },
+    CatalogEntry {
         code: SQL_UNIQUE_VIOLATION,
         name: "SQL_UNIQUE_VIOLATION",
         severity: Severity::Error,
@@ -291,6 +349,36 @@ pub const CATALOG: &[CatalogEntry] = &[
         sqlstate: Some("23505"),
         details_keys: &["table", "constraint"],
         message_template: "unique constraint violation",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: TXN_CHECK_VIOLATION,
+        name: "TXN_CHECK_VIOLATION",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("23514"),
+        details_keys: &["table", "constraint"],
+        message_template: "#[check] constraint violation",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: TXN_FK_VIOLATION,
+        name: "TXN_FK_VIOLATION",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("23503"),
+        details_keys: &["table", "constraint"],
+        message_template: "foreign-key constraint violation",
+        http_status: 400,
+    },
+    CatalogEntry {
+        code: TXN_NOT_NULL_VIOLATION,
+        name: "TXN_NOT_NULL_VIOLATION",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: Some("23502"),
+        details_keys: &["table", "column"],
+        message_template: "NULL written to a #[not_null] column",
         http_status: 400,
     },
     CatalogEntry {
@@ -384,6 +472,26 @@ pub const CATALOG: &[CatalogEntry] = &[
         http_status: 404,
     },
     CatalogEntry {
+        code: REDUCER_DEADLINE_EXCEEDED,
+        name: "REDUCER_DEADLINE_EXCEEDED",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: None,
+        details_keys: &["reducer"],
+        message_template: "reducer aborted: execution deadline exceeded; rolled back",
+        http_status: 408,
+    },
+    CatalogEntry {
+        code: REDUCER_TX_BUDGET_EXCEEDED,
+        name: "REDUCER_TX_BUDGET_EXCEEDED",
+        severity: Severity::Error,
+        retryable: false,
+        sqlstate: None,
+        details_keys: &["reducer"],
+        message_template: "reducer aborted: per-transaction write ceiling exceeded; rolled back",
+        http_status: 400,
+    },
+    CatalogEntry {
         code: SUB_LIMIT_EXCEEDED,
         name: "SUB_LIMIT_EXCEEDED",
         severity: Severity::Error,
@@ -412,6 +520,16 @@ pub const CATALOG: &[CatalogEntry] = &[
         details_keys: &["query_id"],
         message_template: "unknown query_id: subscribe again",
         http_status: 404,
+    },
+    CatalogEntry {
+        code: SUB_QUERY_RATE_LIMITED,
+        name: "SUB_QUERY_RATE_LIMITED",
+        severity: Severity::Error,
+        retryable: true,
+        sqlstate: None,
+        details_keys: &[],
+        message_template: "query admission rate exceeded; retry shortly",
+        http_status: 429,
     },
     CatalogEntry {
         code: STORAGE_INTERNAL,

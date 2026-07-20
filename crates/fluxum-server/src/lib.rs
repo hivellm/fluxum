@@ -324,6 +324,14 @@ pub struct ShardContext {
     ///
     /// [`EffectiveConfig`]: fluxum_core::hw::EffectiveConfig
     effective_config: std::sync::OnceLock<serde_json::Value>,
+    /// SPEC-026 SEC-045: the query execution bounds shared with every
+    /// subscription manager this process hosts (default database and
+    /// namespaces alike) — one handle, so a hot reload retunes them all.
+    query_bounds: Arc<fluxum_core::subscription::QueryBounds>,
+    /// SPEC-026 SEC-047: the per-identity / per-source query-admission
+    /// limiter in front of subscription registration and one-off queries.
+    /// Shard-wide (namespaces share it — the CPU being protected is shared).
+    query_limiter: Arc<fluxum_core::reducer::QueryLimiter>,
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -372,6 +380,16 @@ impl ShardContext {
     ) -> Arc<Self> {
         let (commit_tx, _) = broadcast::channel(commit_capacity.max(1));
         let admin_identity = fluxum_core::auth::server_identity("__admin__");
+        // SEC-045: every assembly gets the shared bounds handle and the
+        // shard metrics wired into its manager — bounds default to
+        // unbounded until `install_config`/`publish_reloadable` applies the
+        // operator's `query.*` keys. The limiter likewise starts off (rates
+        // 0) so an embedded assembly behaves exactly as before.
+        let query_bounds = Arc::new(fluxum_core::subscription::QueryBounds::default());
+        let query_limiter = Arc::new(fluxum_core::reducer::QueryLimiter::default());
+        let mut subscriptions = subscriptions;
+        subscriptions.set_query_bounds(Arc::clone(&query_bounds));
+        subscriptions.set_metrics(Arc::clone(engine.metrics()));
         Arc::new(Self {
             engine,
             subscriptions: Mutex::new(subscriptions),
@@ -403,7 +421,19 @@ impl ShardContext {
                     .send_buffer_bytes
                     .0,
             ),
+            query_bounds,
+            query_limiter,
         })
+    }
+
+    /// The SEC-045 query-bounds handle (shared with every hosted manager).
+    pub fn query_bounds(&self) -> &Arc<fluxum_core::subscription::QueryBounds> {
+        &self.query_bounds
+    }
+
+    /// The SEC-047 query-admission limiter.
+    pub fn query_limiter(&self) -> &Arc<fluxum_core::reducer::QueryLimiter> {
+        &self.query_limiter
     }
 
     /// Whether this shard is draining (SPEC-025 OPS-030). Checked by the
@@ -550,6 +580,24 @@ impl ShardContext {
         self.engine
             .rate_limiter()
             .set_shard_max_reducers_per_sec(config.reducer.shard_max_reducers_per_sec);
+        // SEC-046: the reducer execution bounds (deadline + write ceiling).
+        self.engine.bounds().set(
+            config.reducer.max_execution_ms,
+            config.reducer.max_tx_bytes.as_u64(),
+        );
+        // SEC-045/047: the query bounds every hosted manager shares, and the
+        // admission limiter's rates.
+        self.query_bounds.set(
+            config.query.default_limit,
+            config.query.max_limit,
+            config.query.max_limit_action == fluxum_core::config::LimitAction::Reject,
+            config.query.row_scan_budget,
+            config.query.deadline_ms,
+        );
+        self.query_limiter.set_rates(
+            config.query.max_queries_per_sec_per_identity,
+            config.query.max_queries_per_sec_per_source,
+        );
         self.send_buffer_bytes
             .store(config.subscriptions.send_buffer_bytes.0, Ordering::Relaxed);
         match fluxum_core::net::IpSet::parse(&config.server.trusted_proxies) {
@@ -714,6 +762,14 @@ impl ShardContext {
             return Err(fluxum_core::FluxumError::config(
                 "namespace name must be non-empty (OPS-050)",
             ));
+        }
+        // SEC-045: the tenant's manager shares this process's query-bounds
+        // handle (one reload retunes every database) and counts its aborts
+        // against its own engine's metrics. Registration happens before the
+        // namespace serves, so the try_lock cannot contend.
+        if let Ok(mut subs) = ns.subscriptions().try_lock() {
+            subs.set_query_bounds(Arc::clone(&self.query_bounds));
+            subs.set_metrics(Arc::clone(ns.engine().metrics()));
         }
         let mut map = self.namespaces.write().unwrap_or_else(|e| e.into_inner());
         if map.contains_key(ns.name()) {

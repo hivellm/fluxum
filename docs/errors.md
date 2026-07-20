@@ -85,6 +85,37 @@ spatial predicate on a table without a spatial index
 - SQLSTATE: `0A000`
 - details keys: `table`
 
+## 3020 `SQL_AS_OF_OUT_OF_WINDOW`
+
+AS OF point predates the retained temporal window
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `22023`
+
+## 3030 `SQL_LIMIT_REJECTED`
+
+LIMIT exceeds the configured maximum
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `54000`
+- details keys: `limit`, `max_limit`
+
+## 3031 `SQL_SCAN_BUDGET_EXCEEDED`
+
+query aborted: row-scan budget exceeded
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `54000`
+- details keys: `budget`
+
+## 3032 `SQL_DEADLINE_EXCEEDED`
+
+query aborted: execution deadline exceeded
+
+- severity: `error` · retryable: `false` · HTTP 408
+- SQLSTATE: `57014`
+- details keys: `deadline_ms`
+
 ## 3100 `SQL_UNIQUE_VIOLATION`
 
 unique constraint violation
@@ -92,6 +123,30 @@ unique constraint violation
 - severity: `error` · retryable: `false` · HTTP 400
 - SQLSTATE: `23505`
 - details keys: `table`, `constraint`
+
+## 3101 `TXN_CHECK_VIOLATION`
+
+#[check] constraint violation
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `23514`
+- details keys: `table`, `constraint`
+
+## 3102 `TXN_FK_VIOLATION`
+
+foreign-key constraint violation
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `23503`
+- details keys: `table`, `constraint`
+
+## 3103 `TXN_NOT_NULL_VIOLATION`
+
+NULL written to a #[not_null] column
+
+- severity: `error` · retryable: `false` · HTTP 400
+- SQLSTATE: `23502`
+- details keys: `table`, `column`
 
 ## 3200 `TXN_CONFLICT`
 
@@ -155,6 +210,20 @@ unknown view name
 - severity: `error` · retryable: `false` · HTTP 404
 - details keys: `view`
 
+## 5007 `REDUCER_DEADLINE_EXCEEDED`
+
+reducer aborted: execution deadline exceeded; rolled back
+
+- severity: `error` · retryable: `false` · HTTP 408
+- details keys: `reducer`
+
+## 5008 `REDUCER_TX_BUDGET_EXCEEDED`
+
+reducer aborted: per-transaction write ceiling exceeded; rolled back
+
+- severity: `error` · retryable: `false` · HTTP 400
+- details keys: `reducer`
+
 ## 6000 `SUB_LIMIT_EXCEEDED`
 
 subscription admission cap exceeded
@@ -175,6 +244,12 @@ unknown query_id: subscribe again
 
 - severity: `error` · retryable: `false` · HTTP 404
 - details keys: `query_id`
+
+## 6003 `SUB_QUERY_RATE_LIMITED`
+
+query admission rate exceeded; retry shortly
+
+- severity: `error` · retryable: `true` · HTTP 429
 
 ## 7000 `STORAGE_INTERNAL`
 

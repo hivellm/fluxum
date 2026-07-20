@@ -360,3 +360,76 @@ async fn a_bad_one_off_query_is_an_error_frame() {
         other => panic!("expected Error, got {other:?}"),
     }
 }
+
+// --- SPEC-026 SEC-047: query admission in front of subscribe + one-off ------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn query_admission_refuses_the_excess_and_a_rotated_identity_shares_the_source() {
+    let ctx = context().await;
+    // 2 queries/s per identity; source bucket generous for this half.
+    ctx.query_limiter().set_rates(2, 0);
+    let mut session = Session::new(Arc::clone(&ctx));
+    session.handle(auth_msg(1, b"alice")).await;
+
+    let one_off = |id: u32| {
+        ClientMessage::OneOffQuery(OneOffQuery {
+            id,
+            sql: "SELECT * FROM Chat".into(),
+        })
+    };
+    for id in [2, 3] {
+        let routed = session.handle(one_off(id)).await;
+        assert!(
+            matches!(routed.responses.first(), Some(ServerMessage::InitialData(_))),
+            "call {id} admitted"
+        );
+    }
+    let routed = session.handle(one_off(4)).await;
+    match routed.responses.first() {
+        Some(ServerMessage::Error(e)) => {
+            assert_eq!(e.code, 6003, "SUB_QUERY_RATE_LIMITED");
+            assert!(e.retryable, "a rate refusal is retryable");
+        }
+        other => panic!("expected the 6003 refusal, got {other:?}"),
+    }
+
+    // Token rotation: a NEW identity from the SAME source drains the shared
+    // source bucket instead of minting fresh budget.
+    ctx.query_limiter().set_rates(0, 2);
+    let source: std::net::IpAddr = "198.51.100.7".parse().unwrap();
+    let mut first = Session::new(Arc::clone(&ctx));
+    first.set_source_ip(source);
+    first.handle(auth_msg(1, b"carol")).await;
+    for id in [5, 6] {
+        let routed = first.handle(one_off(id)).await;
+        assert!(matches!(
+            routed.responses.first(),
+            Some(ServerMessage::InitialData(_))
+        ));
+    }
+    let mut rotated = Session::new(Arc::clone(&ctx));
+    rotated.set_source_ip(source);
+    rotated.handle(auth_msg(1, b"dave")).await; // fresh identity, same IP
+    let routed = rotated.handle(one_off(7)).await;
+    match routed.responses.first() {
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 6003),
+        other => panic!("rotation must not mint budget, got {other:?}"),
+    }
+    assert_eq!(
+        ctx.metrics()
+            .query_rate_limited(fluxum_core::metrics::QueryRateBucket::Source),
+        1
+    );
+
+    // Subscribe shares the same buckets: the next registration is refused too.
+    let routed = rotated
+        .handle(ClientMessage::Subscribe(Subscribe {
+            id: 8,
+            queries: vec!["SELECT * FROM Chat".into()],
+        }))
+        .await;
+    match routed.responses.first() {
+        Some(ServerMessage::Error(e)) => assert_eq!(e.code, 6003),
+        other => panic!("subscribe shares the admission buckets, got {other:?}"),
+    }
+}

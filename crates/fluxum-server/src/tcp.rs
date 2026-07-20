@@ -351,6 +351,9 @@ async fn drive_connection(
     let writer = tokio::spawn(writer_task(write_half, out_rx));
 
     let mut session = Session::new(Arc::clone(&ctx));
+    // SEC-047: key the source-side query-admission bucket on the resolved
+    // client IP (proxy-aware, SEC-035).
+    session.set_source_ip(ip);
     let mut buf: Vec<u8> = initial;
     let mut read_chunk = [0u8; 8192];
     let mut detect_preamble = detect_preamble;

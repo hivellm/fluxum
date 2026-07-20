@@ -78,6 +78,10 @@ pub struct Session {
     /// simply has no way to name another database's tables: cross-namespace
     /// access is unrepresentable rather than merely rejected.
     namespace: Option<Arc<crate::namespace::Namespace>>,
+    /// The resolved client IP (SEC-035), when the transport knows one — the
+    /// key of the SEC-047 source bucket that token rotation cannot refill.
+    /// `None` (embedded/in-process) falls back to the connection id.
+    source_ip: Option<std::net::IpAddr>,
 }
 
 impl Session {
@@ -87,7 +91,14 @@ impl Session {
             ctx,
             state: SessionState::Unauthenticated,
             namespace: None,
+            source_ip: None,
         }
+    }
+
+    /// Record the transport-resolved client IP (SEC-035) so the SEC-047
+    /// source bucket keys on it rather than the connection id.
+    pub fn set_source_ip(&mut self, ip: std::net::IpAddr) {
+        self.source_ip = Some(ip);
     }
 
     /// A session resumed from a persisted [`SessionState`] — the Streamable
@@ -98,6 +109,7 @@ impl Session {
             ctx,
             state,
             namespace: None,
+            source_ip: None,
         }
     }
 
@@ -113,6 +125,7 @@ impl Session {
             ctx,
             state,
             namespace,
+            source_ip: None,
         }
     }
 
@@ -441,6 +454,12 @@ impl Session {
         let mut manager = self.subscriptions().lock().await;
         let mut responses = Vec::with_capacity(queries.len());
         for sql in queries {
+            // SPEC-026 SEC-047: per-identity + per-source admission, one
+            // token per registration so a batch charges like a burst.
+            if let Err(e) = self.admit_query(&subscriber, connection) {
+                responses.push(from_error(Some(id), &e));
+                break;
+            }
             // SPEC-025 OPS-060: the tenant's subscription ceiling, read from
             // its own manager each time so the count cannot drift as
             // connections come and go — and re-checked per query, so a batch
@@ -484,7 +503,12 @@ impl Session {
     /// clause resolves a historical snapshot from the temporal window;
     /// RLS and masking apply exactly as live (RV-022).
     async fn one_off_query(&self, id: u32, sql: String) -> Routed {
-        let (_, subscriber, _) = self.authed();
+        let (_, subscriber, connection) = self.authed();
+        // SPEC-026 SEC-047: one-off reads share the subscription admission
+        // buckets — the snapshot evaluator being protected is the same.
+        if let Err(e) = self.admit_query(&subscriber, connection) {
+            return Routed::reply(from_error(Some(id), &e));
+        }
         let snapshot = match fluxum_core::sql::as_of_point(&sql) {
             Ok(Some(point)) => match self.store().snapshot_as_of(point) {
                 Ok(snapshot) => snapshot,
@@ -500,6 +524,36 @@ impl Session {
                 Routed::reply(ServerMessage::InitialData(initial))
             }
             Err(e) => Routed::reply(from_error(Some(id), &e)),
+        }
+    }
+
+    /// SPEC-026 SEC-047: admit one subscription registration / one-off
+    /// query. Server peers are exempt (AUTH-062); everyone else charges the
+    /// per-identity bucket and the source-keyed secondary bucket (resolved
+    /// client IP where the transport knows one, else the connection id), so
+    /// rotating tokens cannot mint fresh budget.
+    fn admit_query(
+        &self,
+        subscriber: &Subscriber,
+        connection: u128,
+    ) -> Result<(), FluxumError> {
+        if subscriber.is_server_peer {
+            return Ok(());
+        }
+        let source = self
+            .source_ip
+            .map(fluxum_core::reducer::QuerySource::Ip)
+            .unwrap_or(fluxum_core::reducer::QuerySource::Connection(connection));
+        match self
+            .ctx
+            .query_limiter()
+            .check(&subscriber.identity, source)
+        {
+            Ok(()) => Ok(()),
+            Err(rejected) => {
+                self.ctx.metrics().note_query_rate_limited(rejected.bucket);
+                Err(rejected.to_error())
+            }
         }
     }
 

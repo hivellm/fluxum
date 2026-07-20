@@ -448,7 +448,17 @@ are specializations of the reducer form.
 - **RED-052** Global shard-level rate limit [P1] — Each shard SHALL have a configurable global
   rate limit (`shard_max_reducers_per_sec`, default: 200,000). When the shard's total reducer
   throughput exceeds this limit, new `ReducerCall` messages SHALL receive
-  `Error { code: 503, message: "shard overloaded" }`.
+  `Error { code: 503, message: "shard overloaded" }`. *(Amended by
+  [SPEC-026](SPEC-026-security-hardening.md) SEC-046: the guard is **mandatory-on** — a config
+  value of `0` is rejected at load and reload; raise the value instead of disabling it.)*
+
+- **RED-053** Execution bounds [P1] — Beyond admission rates, an admitted client call runs under
+  the [SPEC-026](SPEC-026-security-hardening.md) SEC-046 execution bounds: a cooperative
+  wall-clock deadline (`reducer.max_execution_ms`) polled at every host-call boundary and a
+  per-transaction write ceiling (`reducer.max_tx_bytes`). A breach is a typed abort (5007/5008)
+  through the RED-061 rollback path — latched, so a swallowed error still rolls back — and is
+  counted in `fluxum_reducer_aborted_total{reason}`. Lifecycle and scheduled executions are
+  exempt.
 
 ## 8. Error handling
 
