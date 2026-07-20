@@ -16,7 +16,7 @@
 | ⬚ | phase6_postgres-parity-harness | 0/10 | postgres parity harness |
 | ⬚ | phase6_reducer-test-simulation-kit | 0/10 | reducer test simulation kit |
 | ⬚ | phase6_rust-sdk | 0/10 | rust sdk |
-| 🔄 | phase6_sdk-conformance-corpus | 0/8 | sdk conformance corpus |
+| 🔄 | phase6_sdk-conformance-corpus | 7/8 | sdk conformance corpus |
 | ⬚ | phase6_sdk-offline-local-persistence | 0/11 | sdk offline local persistence |
 | ⬚ | phase6_sdk-optimistic-mutations-offline-queue | 0/11 | sdk optimistic mutations offline queue |
 | ⬚ | phase6_seed-fixtures-migrate-plan | 0/10 | seed fixtures migrate plan |
