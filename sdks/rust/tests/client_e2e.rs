@@ -147,6 +147,37 @@ fn a_rejected_reducer_surfaces_as_a_typed_error() {
 }
 
 #[test]
+fn resume_offsets_advance_from_real_server_messages() {
+    // SPEC-021 CS-020: the client retains the highest applied tx_offset per
+    // subscription, fed by the InitialData snapshot and every live TxUpdate.
+    // This is the resume bookkeeping wired to the real connection (T6.4 1.3b).
+    if skip() {
+        return;
+    }
+    let server = Server::start("resume");
+    let db = Connection::connect(&server.tcp_url, b"", [chat_schema()]).expect("connect");
+
+    let ids = db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    let qid = ids[0];
+    let snapshot = db.applied_offset(qid).expect("an offset after InitialData");
+
+    db.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("one".into())])
+        .expect("send_chat");
+
+    // Wait for the TxUpdate to land, then the applied offset must have advanced
+    // past the snapshot's.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.cache_size() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let after = db.applied_offset(qid).expect("an offset after the TxUpdate");
+    assert!(
+        after > snapshot,
+        "the applied offset must advance: {after} !> {snapshot}"
+    );
+}
+
+#[test]
 fn concurrent_reducer_calls_are_correlated_by_id() {
     // RPC-002: with one worker thread per call sharing a connection, each
     // caller must get its OWN outcome, not whoever's reply arrived first.

@@ -21,9 +21,10 @@ use std::thread::JoinHandle;
 
 use crate::cache::{RowCache, RowEvent, TableDiff, TableSchema};
 use crate::protocol::{
-    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, ReducerCall, ServerMessage,
-    Subscribe, TableUpdate, TxUpdate, Unsubscribe,
+    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall,
+    ServerMessage, Subscribe, TableUpdate, TxUpdate, Unsubscribe,
 };
+use crate::resume::ResumeTracker;
 
 /// A client error.
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +90,12 @@ struct Shared {
     cache: Mutex<RowCache>,
     /// `"<Table>:<insert|delete|update>"` → listeners.
     listeners: Mutex<HashMap<String, Vec<RowListener>>>,
+    /// The highest applied `tx_offset` per subscription (SPEC-021 CS-020),
+    /// fed by every `InitialData`/`TxUpdate` this connection applies. It is
+    /// the bookkeeping a session-preserving resume (CS-021) consumes; on this
+    /// TCP client it also lets an application observe how current each
+    /// subscription is.
+    resume: Mutex<ResumeTracker>,
 }
 
 /// A connected Fluxum client.
@@ -124,6 +131,7 @@ impl Connection {
             pending: Mutex::new(HashMap::new()),
             cache: Mutex::new(RowCache::new(schemas)),
             listeners: Mutex::new(HashMap::new()),
+            resume: Mutex::new(ResumeTracker::new()),
         });
 
         let reader = {
@@ -205,23 +213,28 @@ impl Connection {
         let replies = self.request(ClientMessage::Subscribe(sub), id, queries.len())?;
 
         let mut ids = Vec::new();
-        let mut cache = self
-            .shared
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut events = Vec::new();
         for reply in replies {
             if let ServerMessage::InitialData(initial) = reply {
-                for (query_id, diffs) in group_by_query(&initial.tables) {
-                    ids.push(query_id);
-                    events.extend(cache.apply_query_diff(query_id, &diffs));
+                events.extend(apply_initial(&self.shared, &initial));
+                for table in &initial.tables {
+                    ids.push(table.query_id);
                 }
             }
         }
-        drop(cache);
         self.dispatch(events);
         Ok(ids)
+    }
+
+    /// The highest `tx_offset` this client has applied for `query_id`
+    /// (SPEC-021 CS-020), or `None` if nothing has been applied yet. How
+    /// current the subscription is.
+    pub fn applied_offset(&self, query_id: u32) -> Option<u64> {
+        self.shared
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .applied_offset(query_id)
     }
 
     /// Drop subscriptions by their server-assigned query ids (SUB-004). Rows
@@ -383,9 +396,42 @@ fn group_by_query(tables: &[TableUpdate]) -> Vec<(u32, Vec<TableDiff>)> {
     by_query
 }
 
+/// Apply an `InitialData` snapshot to the cache, feeding the resume tracker
+/// (SPEC-021 CS-020) and honouring a `cache_reset` (CS-022): when the server
+/// answered a `Resume` whose offset predated its retained window, the snapshot
+/// REPLACES the query's rows rather than merging, so the query's cached rows
+/// are cleared before it is applied.
+fn apply_initial(shared: &Shared, initial: &InitialData) -> Vec<RowEvent> {
+    let reset = shared
+        .resume
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_initial(initial);
+
+    let mut cache = shared
+        .cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut events = Vec::new();
+    for (query_id, diffs) in group_by_query(&initial.tables) {
+        if reset {
+            // CS-022: drop this query's prior rows before the fresh snapshot.
+            events.extend(cache.release_query(query_id));
+        }
+        events.extend(cache.apply_query_diff(query_id, &diffs));
+    }
+    events
+}
+
 /// Apply a server-initiated `TxUpdate` to the cache, attributing rows by their
-/// stamped `query_id` (SDK-044).
+/// stamped `query_id` (SDK-044) and advancing the resume offsets (CS-020).
 fn apply_tx_update(shared: &Shared, update: &TxUpdate) -> Vec<RowEvent> {
+    shared
+        .resume
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .apply_update(update);
+
     let mut cache = shared
         .cache
         .lock()
