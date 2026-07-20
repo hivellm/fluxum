@@ -260,6 +260,13 @@ pub struct ShardContext {
     /// Whether the DMX-020 row-TTL sweeper has been spawned (idempotent, as
     /// above).
     ttl_sweeper_started: std::sync::atomic::AtomicBool,
+    /// Whether the SUB-021 commit fan-out has been spawned. Both transports
+    /// request it on serve; only the first call spawns. Without this guard a
+    /// combined HTTP+TCP server runs TWO fan-out loops over one broadcast and
+    /// every subscriber receives every `TxUpdate` twice — which corrupts the
+    /// SDK-044 refcount in every client cache (an update leaves both the old
+    /// and the new row visible).
+    fanout_started: std::sync::atomic::AtomicBool,
     /// The shard's blob store (SPEC-023 DMX-040), once installed.
     blob_store: std::sync::OnceLock<Arc<fluxum_core::commitlog::BlobStore>>,
     /// The validated plugin registry (SPEC-020), once installed: drives
@@ -403,6 +410,7 @@ impl ShardContext {
             last_tx_id: AtomicU64::new(0),
             sweeper_started: std::sync::atomic::AtomicBool::new(false),
             ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
+            fanout_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
@@ -965,12 +973,20 @@ impl ShardContext {
 /// frame to every subscriber's queue, dropping a slow consumer on a full
 /// queue (SUB-042).
 ///
-/// A standalone `tcp::serve` / `http::serve` spawns one so a single-transport
-/// deployment works out of the box. The combined multi-transport assembly
-/// (the T5.4 `ShardHost`) instead spawns exactly one and starts each
-/// transport without its own — two fan-out tasks over one broadcast would
-/// double-deliver to a subscriber registered in the shared registry.
+/// Both transports request it on serve; the `fanout_started` guard makes the
+/// second call a no-op, exactly like the sweepers. This is not an
+/// optimization: two fan-out tasks over one broadcast double-deliver every
+/// `TxUpdate` to every subscriber, and a duplicated delivery corrupts the
+/// SDK-044 refcount in every client cache — an in-place update then leaves
+/// the old row cached alongside the new one (caught by the conformance
+/// corpus's `txupdate-diff` scenario).
 pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
+    if ctx
+        .fanout_started
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     // The default database's fan-out, plus one per registered namespace —
     // each over its own commit broadcast and subscription set, so a tenant's
     // commit is only ever evaluated against that tenant's subscriptions

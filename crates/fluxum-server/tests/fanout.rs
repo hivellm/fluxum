@@ -443,3 +443,46 @@ async fn tx_updates_carry_the_originating_shard_for_cross_shard_aggregation() {
     a.server.shutdown();
     b.server.shutdown();
 }
+
+// --- Both transports on one shard spawn ONE fan-out, not two ----------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_transports_deliver_each_commit_exactly_once() {
+    // The combined server serves TCP and HTTP over one ShardContext, and BOTH
+    // transports request the fan-out on serve. Before the `fanout_started`
+    // guard, that spawned two fan-out loops over one broadcast and every
+    // subscriber received every TxUpdate twice — which corrupts the SDK-044
+    // refcount in every client cache: the duplicated insert leaves the old
+    // row of an update pinned at refcount 1 forever, so the application sees
+    // both the pre-update and post-update rows. Caught by the conformance
+    // corpus's `txupdate-diff` scenario (TST-052).
+    let h = start(64).await;
+    let _http = fluxum_server::http::serve(
+        Arc::clone(&h.ctx),
+        "127.0.0.1:0",
+        fluxum_server::http::HttpOptions::default(),
+    )
+    .await
+    .unwrap();
+
+    let mut sub = Client::subscribed(h.server.local_addr, "SELECT * FROM Marker").await;
+    let diff = commit_row(&h.store, "Marker", 1, "once");
+    let tx_id = diff.tx_id;
+    h.ctx.publish_commit(diff);
+
+    let first = sub
+        .recv_update(Duration::from_secs(3))
+        .await
+        .expect("the commit fans out");
+    assert_eq!(first.tx_id, tx_id);
+
+    // The duplicate, if any, would arrive immediately behind the first —
+    // both copies come off the same broadcast receive. A short window is
+    // enough to catch it without slowing the suite.
+    let duplicate = sub.recv_update(Duration::from_millis(300)).await;
+    assert!(
+        duplicate.is_none(),
+        "a second fan-out loop delivered the same commit twice: {duplicate:?}"
+    );
+    h.server.shutdown();
+}
