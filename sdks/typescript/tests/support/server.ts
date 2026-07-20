@@ -60,6 +60,13 @@ export interface RunningServer {
   tcpUrl: string;
   process: ChildProcess;
   stop(): Promise<void>;
+  /**
+   * Kill the process and start it again on the SAME ports and data
+   * directory — a crash-and-recover, not a fresh server. Committed rows come
+   * back through commit-log recovery, and clients reconnect to the same
+   * address.
+   */
+  restart(): Promise<void>;
 }
 
 /** Start a server with the demo module, on fresh ports and a fresh data dir. */
@@ -68,42 +75,53 @@ export async function startServer(label: string, timeoutMs = 20_000): Promise<Ru
   const tcpPort = await freePort();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), `fluxum-${label}-`));
 
-  const child = spawn(BINARY, [], {
-    env: {
-      ...process.env,
-      // Config keys are FLUXUM_<PATH> with SINGLE underscores. A doubled
-      // separator is not an error — it is silently ignored, and the server
-      // quietly starts on the default ports.
-      FLUXUM_PROFILE: 'development',
-      FLUXUM_SERVER_HTTP_PORT: String(httpPort),
-      FLUXUM_SERVER_TCP_PORT: String(tcpPort),
-      FLUXUM_STORAGE_DATA_DIR: dataDir,
-      FLUXUM_STORAGE_COMMIT_LOG_DIR: path.join(dataDir, 'log'),
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const env = {
+    ...process.env,
+    // Config keys are FLUXUM_<PATH> with SINGLE underscores. A doubled
+    // separator is not an error — it is silently ignored, and the server
+    // quietly starts on the default ports.
+    FLUXUM_PROFILE: 'development',
+    FLUXUM_SERVER_HTTP_PORT: String(httpPort),
+    FLUXUM_SERVER_TCP_PORT: String(tcpPort),
+    FLUXUM_STORAGE_DATA_DIR: dataDir,
+    FLUXUM_STORAGE_COMMIT_LOG_DIR: path.join(dataDir, 'log'),
+  };
 
-  // Retained for the failure message: a server that dies during startup
-  // otherwise appears only as a connection timeout.
-  let output = '';
-  child.stdout?.on('data', (chunk: Buffer) => (output += chunk.toString()));
-  child.stderr?.on('data', (chunk: Buffer) => (output += chunk.toString()));
+  const launch = async (): Promise<ChildProcess> => {
+    const child = spawn(BINARY, [], { env, stdio: ['ignore', 'pipe', 'pipe'] });
 
-  try {
-    await waitForPort(httpPort, timeoutMs);
-  } catch (err) {
+    // Retained for the failure message: a server that dies during startup
+    // otherwise appears only as a connection timeout.
+    let output = '';
+    child.stdout?.on('data', (chunk: Buffer) => (output += chunk.toString()));
+    child.stderr?.on('data', (chunk: Buffer) => (output += chunk.toString()));
+
+    try {
+      await waitForPort(httpPort, timeoutMs);
+    } catch (err) {
+      child.kill();
+      throw new Error(`${(err as Error).message}\nserver output:\n${output}`);
+    }
+    return child;
+  };
+
+  let child = await launch();
+  const stopChild = async (): Promise<void> => {
+    if (child.exitCode !== null) return;
     child.kill();
-    throw new Error(`${(err as Error).message}\nserver output:\n${output}`);
-  }
+    await new Promise((resolve) => child.once('exit', resolve));
+  };
 
   return {
     httpUrl: `http://127.0.0.1:${httpPort}`,
     tcpUrl: `fluxum://127.0.0.1:${tcpPort}`,
-    process: child,
-    stop: async () => {
-      if (child.exitCode !== null) return;
-      child.kill();
-      await new Promise((resolve) => child.once('exit', resolve));
+    get process() {
+      return child;
+    },
+    stop: stopChild,
+    restart: async () => {
+      await stopChild();
+      child = await launch();
     },
   };
 }

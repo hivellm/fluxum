@@ -1,0 +1,21 @@
+{
+  "name": "reconnect-resync",
+  "description": "A server crash-and-recover: committed rows survive restart, a live client reconnects, resubscribes and resyncs, and updates committed after the restart still reach it.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "subscribe": { "client": "alice", "queries": ["SELECT * FROM ChatMessage"] } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, "before the crash"] } },
+    { "await_row": { "client": "alice", "table": "ChatMessage", "where": { "content": "before the crash" } } },
+
+    { "restart_server": {} },
+
+    { "connect": { "client": "bob", "token": "bob" } },
+    { "call": { "client": "bob", "reducer": "send_chat", "args": [1, "after the recovery"] } },
+
+    { "await_row": { "client": "alice", "table": "ChatMessage", "where": { "content": "after the recovery" } } },
+    { "expect_cache": { "client": "alice", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:alice", "channel": 1, "content": "before the crash", "sent_at": "*" },
+      { "id": "*", "sender": "$identity:bob", "channel": 1, "content": "after the recovery", "sent_at": "*" }
+    ] } }
+  ]
+}

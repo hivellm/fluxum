@@ -1,0 +1,15 @@
+{
+  "name": "rate-limit",
+  "description": "A reducer declaring max_rate is admission-limited per (identity, reducer): a client hammering it is rejected before a transaction opens (RED-050), and other identities are unaffected.",
+  "steps": [
+    { "connect": { "client": "spammer", "token": "spammer" } },
+    { "connect": { "client": "bystander", "token": "bystander" } },
+
+    { "call_until_error": { "client": "spammer", "reducer": "send_chat", "args": [1, "flood"],
+      "attempts": 60, "expect_error": { "contains": "rate limit exceeded" } } },
+
+    { "call": { "client": "bystander", "reducer": "send_chat", "args": [1, "unaffected"] } },
+
+    { "call": { "client": "spammer", "reducer": "add_task", "args": ["different reducer, own bucket"] } }
+  ]
+}

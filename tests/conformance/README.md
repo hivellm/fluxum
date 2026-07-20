@@ -34,11 +34,13 @@ where an SDK carries more than one.
 | `{"close": {"client"}}` | Close the session. |
 | `{"subscribe": {"client", "queries": [..]}}` | Register queries and await every `InitialData` (one per query, RPC-032), applied to the local cache. |
 | `{"call": {"client", "reducer", "args", "expect_error"?: {"contains"}}}` | Call a reducer. Without `expect_error` the call must succeed; with it, the call must fail and the error message must contain the substring. |
+| `{"call_until_error": {"client", "reducer", "args", "attempts", "expect_error": {"contains"}}}` | Call the reducer up to `attempts` times, stopping at the first failure — which must match `expect_error`. For admission behavior (rate limits) where the exact rejection point depends on timing. Fails if every attempt succeeds. |
 | `{"await_row": {"client", "table", "where"}}` | Poll the local cache (≤ 5 s) until a row matches `where`. This is how a runner observes a `TxUpdate` landing without racing the push stream. |
 | `{"await_gone": {"client", "table", "where"}}` | Poll (≤ 5 s) until **no** row matches. |
 | `{"await_count": {"client", "table", "where"?, "count"}}` | Poll (≤ 5 s) until exactly `count` rows match `where` (`where` absent = all rows). For rows distinguishable only by a nondeterministic column — e.g. two connections sharing one identity. |
 | `{"expect_cache": {"client", "table", "rows": [..]}}` | Exact set equality: every expected row matches exactly one cached row and nothing is left over. Order-independent. |
 | `{"expect_distinct_identities": {"clients": [..]}}` | The listed sessions all report pairwise distinct identities. |
+| `{"restart_server": {}}` | Kill the server process and start it again on the SAME ports and data directory — a crash-and-recover. Live clients are expected to reconnect, resubscribe and resync on their own; a scenario follows this with `await_row`/`expect_cache` to prove they did. |
 
 ## Value language
 
@@ -58,7 +60,9 @@ Expected values (in `where` and `rows`) use the same forms, plus two escapes:
   at runtime, so scenarios do not bake in a particular auth provider's derivation.
 
 Auto-increment primary keys ARE deterministic on a fresh server (1, 2, 3…) and scenarios assert
-them literally.
+them literally — **until a restart**: recovery resumes the allocator from its reserved
+high-water block (STG-040), so ids allocated after a `restart_server` may jump. Post-restart
+rows match on content and use `"*"` for the id.
 
 ## What belongs here vs. an SDK's own suite
 

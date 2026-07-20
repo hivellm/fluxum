@@ -40,6 +40,8 @@
     "txupdate-diff",
     "owner-only-visibility",
     "presence-ephemeral",
-    "multi-query-subscribe"
+    "multi-query-subscribe",
+    "rate-limit",
+    "reconnect-resync"
   ]
 }

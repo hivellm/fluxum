@@ -86,8 +86,36 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     let shard = 0_u32;
 
     // The commit log is what makes a restart non-destructive: the store is in
-    // memory, but every committed transaction is on disk and replayed on the
-    // way back up.
+    // memory, but every committed transaction is on disk and folded back in
+    // here (STG-030: newest verified checkpoint + log replay) BEFORE the
+    // pipeline opens. Skipping this is not a fresh start — it is a server
+    // that comes up empty over a non-empty log, whose STG-015 monotonicity
+    // check then rejects every new commit: no durability AND no writes.
+    // (Caught by the conformance corpus's reconnect-resync scenario.)
+    // First boot: the log directory does not exist yet. Created here rather
+    // than left to CommitLog::open (which also creates it) because recovery
+    // replays the directory FIRST, and an absent directory is an I/O error,
+    // not an empty log.
+    std::fs::create_dir_all(&config.storage.commit_log_dir)
+        .map_err(fluxum_core::FluxumError::from)?;
+    let repo = fluxum_core::checkpoint::CheckpointRepo::open(&config.storage.checkpoint_dir)?;
+    let recovery = fluxum_core::checkpoint::recover(
+        &store,
+        &repo,
+        &config.storage.commit_log_dir,
+        shard,
+    )?;
+    if recovery.last_tx_id.is_some() || !recovery.rejected.is_empty() {
+        tracing::info!(
+            target: "fluxum::server",
+            last_tx_id = ?recovery.last_tx_id,
+            checkpoint_tx_id = ?recovery.checkpoint_tx_id,
+            replayed_records = recovery.applied_records,
+            rejected_checkpoints = recovery.rejected.len(),
+            "recovered shard state (STG-030)"
+        );
+    }
+
     let log = Arc::new(CommitLog::open(
         &config.storage.commit_log_dir,
         shard,

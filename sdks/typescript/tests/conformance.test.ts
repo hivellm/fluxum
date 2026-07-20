@@ -71,11 +71,17 @@ function tableSchemas(): TableSchema[] {
 }
 
 /** Interpreter state: the named sessions a scenario builds up. */
+import type { RunningServer } from './support/server.ts';
+
 class Session {
   readonly clients = new Map<string, FluxumClient>();
-  readonly httpUrl: string;
-  constructor(httpUrl: string) {
-    this.httpUrl = httpUrl;
+  readonly server: RunningServer;
+  constructor(server: RunningServer) {
+    this.server = server;
+  }
+
+  get httpUrl(): string {
+    return this.server.httpUrl;
   }
 
   client(name: unknown): FluxumClient {
@@ -132,6 +138,10 @@ async function runStep(session: Session, step: Record<string, Record<string, unk
       await session.client(body['client']).close();
       return;
     }
+    case 'restart_server': {
+      await session.server.restart();
+      return;
+    }
     case 'subscribe': {
       await session.client(body['client']).subscribe(body['queries'] as string[]);
       return;
@@ -152,6 +162,25 @@ async function runStep(session: Session, step: Record<string, Record<string, unk
         );
         return true;
       });
+      return;
+    }
+    case 'call_until_error': {
+      const client = session.client(body['client']);
+      const attempts = Number(body['attempts']);
+      const expectError = body['expect_error'] as { contains: string };
+      for (let i = 0; i < attempts; i += 1) {
+        try {
+          await client.callReducer(String(body['reducer']), body['args'] as unknown[]);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          assert.ok(
+            message.includes(expectError.contains),
+            `attempt ${i + 1} failed with "${message}", expected "${expectError.contains}"`,
+          );
+          return;
+        }
+      }
+      assert.fail(`all ${attempts} calls succeeded; expected "${expectError.contains}"`);
       return;
     }
     case 'await_row':
@@ -220,7 +249,7 @@ for (const name of corpus.scenarios) {
 
   test(`conformance: ${name}`, { skip }, async (t) => {
     const server = await startServer(`conf-${name}`);
-    const session = new Session(server.httpUrl);
+    const session = new Session(server);
     t.after(async () => {
       await session.close();
       await server.stop();

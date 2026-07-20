@@ -161,6 +161,11 @@ export class FluxumClient {
   #schemaFailure: SchemaMismatchError | null = null;
   /** Settled by the reconnect loop while a schema drill is in flight. */
   #drill: { resolve: () => void; reject: (err: Error) => void } | null = null;
+  /** Resolved by `close()`, so a sleeping reconnect loop wakes and stops. */
+  #closeRequested: (() => void) | null = null;
+  readonly #closeSignal = new Promise<void>((resolve) => {
+    this.#closeRequested = resolve;
+  });
 
   private constructor(options: FluxumClientOptions) {
     this.#options = options;
@@ -284,6 +289,9 @@ export class FluxumClient {
     // A drill still in flight would otherwise hang its `subscribe` forever.
     this.#drill?.reject(reason);
     this.#drill = null;
+    // Wake a reconnect loop out of its backoff sleep so it can observe the
+    // close and stop, instead of retrying into a client that is gone.
+    this.#closeRequested?.();
     await this.#transport?.close();
   }
 
@@ -339,6 +347,9 @@ export class FluxumClient {
     void reconnect(
       {
         connect: async () => {
+          // Thrown rather than returned: `fatal` below recognizes the closed
+          // client and aborts the loop instead of scheduling another attempt.
+          if (this.#closed) throw new Error('client closed');
           await this.#openAndAuthenticate();
         },
         // Authentication happens inside connect: on this transport the token
@@ -396,7 +407,17 @@ export class FluxumClient {
       },
       {
         ...(this.#options.reconnect ?? {}),
-        fatal: (err) => err instanceof SchemaMismatchError,
+        // A backoff sleep races the close signal: `close()` during a 30 s
+        // backoff must stop the loop now, not half a minute later.
+        sleep: (ms) =>
+          new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, ms);
+            void this.#closeSignal.then(() => {
+              clearTimeout(timer);
+              resolve();
+            });
+          }),
+        fatal: (err) => this.#closed || err instanceof SchemaMismatchError,
       },
     ).then(
       () => {
@@ -414,9 +435,10 @@ export class FluxumClient {
         this.#drill = null;
         // With a drill in flight the error surfaces through the `subscribe`
         // that started it; otherwise nobody is awaiting, so it goes to the
-        // connection-level listeners.
+        // connection-level listeners — unless the loop stopped because the
+        // application closed the client, which is not a failure at all.
         if (drill !== null) drill.reject(error);
-        else this.#fail(error);
+        else if (!this.#closed) this.#fail(error);
       },
     );
   }
@@ -445,7 +467,15 @@ export class FluxumClient {
     const settled = new Promise<DecodedMessage[]>((resolve, reject) => {
       this.#pending.set(id, { resolve, reject, expected, collected: [] });
     });
-    await transport.send(encodeMessage(tag, build(id)));
+    try {
+      await transport.send(encodeMessage(tag, build(id)));
+    } catch (err) {
+      // The caller gets THIS error, so `settled` will never be awaited —
+      // removed unrejected, or a later disconnect would reject a promise
+      // with no listener and surface as an unhandled rejection.
+      this.#pending.delete(id);
+      throw err;
+    }
     return settled;
   }
 
