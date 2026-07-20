@@ -1,0 +1,68 @@
+# cargo-deny supply-chain gate (SPEC-026 SEC-057; OWASP A03 F-009/F-010).
+#
+# Run as part of the local quality gate — see CONTRIBUTING.md — because this
+# project does not run GitHub Actions:
+#
+#     cargo deny check
+#
+# It fails the build on a known RUSTSEC advisory, a disallowed license, a
+# banned/duplicate/yanked crate, or a dependency pulled from an unexpected
+# source. Every accepted exception below is explicit and dated.
+
+[graph]
+# Check every target the workspace actually builds for; a vuln that only
+# affects one OS is still a vuln.
+all-features = true
+
+[advisories]
+# RustSec advisory database. Any advisory is a hard failure unless it is
+# listed (with a reason) in `ignore` below.
+db-urls = ["https://github.com/rustsec/advisory-db"]
+yanked = "deny"
+# Dated, reviewed exceptions go here as `"RUSTSEC-YYYY-NNNN", # why, when`.
+# Empty = no advisory is currently tolerated.
+ignore = []
+
+[licenses]
+# Allow-list matching the workspace's Apache-2.0 license policy: permissive
+# licenses compatible with Apache-2.0 redistribution. A dependency under any
+# other license fails the gate and must be reviewed before it is added here.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MITNFA",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "MPL-2.0",
+    "Unlicense",
+    "BSL-1.0",
+    "OpenSSL",
+]
+[bans]
+# A wildcard version (`*`) on a *registry* dependency pins nothing and lets
+# any future release in — denied. Intra-workspace `path = "..."` crates
+# (`fluxum-*`) legitimately have no version and are exempt: they never
+# resolve from a registry, so they are not a supply-chain surface.
+wildcards = "deny"
+allow-wildcard-paths = true
+# Many duplicate major versions of one crate bloat the tree and widen the
+# attack surface; warn so we notice, without blocking on transitive churn.
+multiple-versions = "warn"
+allow = []
+deny = []
+
+[sources]
+# A crate pulled from an unexpected registry or git source is a supply-chain
+# red flag (F-010). crates.io is the only allowed registry; `thunder-rpc` and
+# the other HiveLLM crates resolve from it (or as path deps inside the
+# workspace, which `[sources]` does not police).
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

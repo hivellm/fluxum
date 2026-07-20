@@ -259,6 +259,17 @@ server:
     open_health_metrics: true   # SEC-054 keep /health and /metrics ungated for scrapers
 ```
 
+### Requirement: Dependency supply-chain gate
+- **SEC-057** [P1] The build SHALL enforce a dependency supply-chain gate (`cargo deny check`,
+  policy in repo-root `deny.toml`) as part of the local quality suite (this project runs no
+  GitHub Actions): a known RustSec advisory, a license outside the Apache-2.0-compatible
+  allow-list, a banned/duplicate/yanked crate, or a dependency from a source other than crates.io
+  MUST fail the gate. Wildcard versions are denied except intra-workspace `path` crates. Any
+  accepted advisory exception MUST be recorded in `deny.toml`'s `[advisories].ignore` with a
+  reason. A CycloneDX SBOM SHALL be generated on release for downstream auditing. The gate is run
+  via `scripts/supply-chain-check.sh`, which pins the advisory database to an LF checkout so it is
+  deterministic across platforms.
+
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).

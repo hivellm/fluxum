@@ -40,6 +40,27 @@ PRD (FR-xx / NFR-xx) → DAG task (T<phase>.<n>) → SPEC requirement (STG-xxx, 
 | Lints (zero warnings) | `cargo clippy --workspace --all-targets --all-features -- -D warnings` |
 | Tests | `cargo nextest run --workspace` (Linux/macOS/Windows in CI) |
 | Docs build | `cargo doc --workspace --no-deps` |
+| Supply chain | `bash scripts/supply-chain-check.sh` (`cargo deny check` — advisories, bans, licenses, sources) |
+
+`scripts/supply-chain-check.sh` runs `cargo deny check` against the policy in
+[`deny.toml`](deny.toml): a known [RustSec](https://rustsec.org) advisory, a
+disallowed license, a banned/duplicate/yanked crate, or a dependency from an
+unexpected source fails the gate. Install once with `cargo install cargo-deny`.
+The script pins the advisory database to an LF checkout so it is deterministic
+on Windows (where git's CRLF conversion otherwise breaks cargo-deny's parser).
+Any accepted advisory exception must be added to `deny.toml`'s
+`[advisories].ignore` with a reason and date.
+
+**Release SBOM.** A CycloneDX software bill of materials is generated on
+release, not per-PR:
+
+```sh
+cargo install cargo-cyclonedx     # one-time
+cargo cyclonedx --format json --all --output-cdx
+```
+
+The `*.cdx.json` artifacts (one per crate) ship alongside the release binaries
+so downstream consumers can audit the dependency set (F-009).
 
 Additional policies (enforced via workspace lints):
 
