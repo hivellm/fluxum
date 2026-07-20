@@ -415,6 +415,11 @@ pub struct Subscribed {
 pub struct SubscriptionManager {
     schema: Arc<Schema>,
     limits: SubscriptionLimits,
+    /// The module's declared schema version (MIG-001), stamped on every
+    /// `InitialData` so a generated SDK can check its embedded version
+    /// against the wire (SDK-043) — the SAME number `/schema` publishes
+    /// (SDK-002); the two diverging would make every client see a mismatch.
+    schema_version: u32,
     /// One entry per unique query (SUB-020).
     queries: HashMap<QueryHash, QueryState>,
     /// SPEC-021 CS-020: the highest offset committed on this shard — the
@@ -559,6 +564,9 @@ impl SubscriptionManager {
         Self {
             schema,
             limits,
+            // The same fallback as `/schema` uses: a module that never
+            // declared `#[fluxum::schema_version]` is version 1.
+            schema_version: crate::migration::declared_schema_version().unwrap_or(1),
             queries: HashMap::new(),
             last_offset: std::sync::atomic::AtomicU64::new(0),
             windows: std::sync::Mutex::new(HashMap::new()),
@@ -714,7 +722,7 @@ impl SubscriptionManager {
             .insert(name.to_owned());
         Ok(InitialData {
             id: 0,
-            schema_version: 0,
+            schema_version: self.schema_version,
             tx_offset: self.current_offset(),
             cache_reset: false,
             tables: vec![update],
@@ -1382,7 +1390,7 @@ impl SubscriptionManager {
         Ok((
             InitialData {
                 id: 0,
-                schema_version: 0,
+                schema_version: self.schema_version,
                 // CS-020: the snapshot's resume cursor.
                 tx_offset: self.current_offset(),
                 cache_reset: false,

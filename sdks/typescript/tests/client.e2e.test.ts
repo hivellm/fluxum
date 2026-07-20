@@ -6,7 +6,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { FluxumClient, ReducerError } from '../src/client.ts';
+import { FluxumClient, ReducerError, SchemaMismatchError } from '../src/client.ts';
 import type { TableSchema } from '../src/cache.ts';
 import { RowReader } from '../src/fluxbin.ts';
 import { BINARY, serverAvailable, startServer } from './support/server.ts';
@@ -164,6 +164,47 @@ test('a multi-query subscribe populates every table, not just the first', { skip
     batched.cache.rows('OnlineUser').length > 0,
     'the LAST query populated too — this is what silently broke',
   );
+});
+
+test('stale bindings surface a typed SchemaMismatchError, not mistyped rows', { skip }, async (t) => {
+  // SPEC-011 acceptance 9 against the real server: a client whose embedded
+  // schema_version does not match detects it on InitialData, refreshes the
+  // REAL GET /schema (loopback passes the SEC-054 guard), and — since the
+  // refreshed document confirms the bindings are stale — surfaces the typed
+  // error without ever applying a row. A matching client on the same server
+  // proves the gate does not false-positive.
+  const server = await startServer('client-schema-drill');
+  const stale = await FluxumClient.connect({
+    url: server.httpUrl,
+    tables: [CHAT],
+    schemaVersion: 999,
+  });
+  const current = await FluxumClient.connect({
+    url: server.httpUrl,
+    tables: [CHAT],
+    schemaVersion: 1,
+    token: new TextEncoder().encode('current'),
+  });
+  t.after(async () => {
+    await Promise.all([stale.close(), current.close()]);
+    await server.stop();
+  });
+
+  const inserted: Uint8Array[] = [];
+  stale.on('ChatMessage:insert', (row) => inserted.push(row));
+
+  await assert.rejects(stale.subscribe(['SELECT * FROM ChatMessage']), (err: unknown) => {
+    assert.ok(err instanceof SchemaMismatchError, `expected SchemaMismatchError, got ${String(err)}`);
+    assert.equal(err.expected, 999);
+    assert.equal(err.actual, 1, 'the refreshed /schema document named the real version');
+    assert.match(err.message, /fluxum generate/, 'the error tells the user the way out');
+    return true;
+  });
+  assert.equal(stale.cache.size, 0, 'nothing was applied under the wrong schema');
+  assert.equal(inserted.length, 0, 'no callback fired with a mistyped row');
+
+  await current.subscribe(['SELECT * FROM ChatMessage']);
+  assert.equal(current.cache.size, 0, 'the matching client subscribed cleanly');
 });
 
 test('owner_only rows are filtered by the server, not the client', { skip }, async (t) => {

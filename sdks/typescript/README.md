@@ -4,9 +4,25 @@ TypeScript / JavaScript client for [Fluxum](../../README.md). Runs in Node.js (F
 `fluxum://host:15801`) and in browsers (Streamable HTTP, `http(s)://host:15800`) from the same
 package — SPEC-011 SDK-082.
 
-> **Status:** the wire layer and FluxBIN row decoding are in place; the connection runtime and
-> generated bindings land with T6.2. `npm test` runs the current suite with no build step —
-> Node 24 strips types directly.
+> **Status:** generator, transports, cache, reconnect, `FluxumClient` and packaging are in
+> place; what remains is the shared conformance corpus (its own task). `npm test` runs the suite
+> with no build step — Node strips types directly. `npm run build` emits ESM + CJS + `.d.ts`
+> and the self-contained browser bundle (`dist/fluxum.min.js`), asserting the SDK-083 50 KB
+> min+gzip budget.
+
+## Schema mismatch (SDK-043)
+
+Pass `schemaVersion` (the version your generated bindings embed) to
+`FluxumClient.connect`. Every `InitialData` is checked against it **before** anything reaches
+the cache — generated types cannot change at runtime, so a mismatched snapshot is never
+applied, and no callback ever fires with a row the types would misread.
+
+On the first mismatch the client runs the drill: it re-fetches `GET /schema` (best-effort — a
+TCP client has no HTTP surface, and the admin guard may refuse a remote one) and reconnects
+once. If the fresh `InitialData` matches, the mismatch was a migration-window read and heals
+silently. If it does not, a typed `SchemaMismatchError` surfaces through the awaiting
+`subscribe` (or `onError` for background reconnects), reconnecting stops — retrying cannot
+regenerate bindings — and the fix is `fluxum generate`.
 
 ## Why the wire layer is not ours
 

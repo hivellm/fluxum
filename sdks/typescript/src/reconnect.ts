@@ -74,6 +74,12 @@ export interface ReconnectOptions extends BackoffOptions {
   sleep?: (ms: number) => Promise<void>;
   /** Called before each attempt, for logging or UI. */
   onAttempt?: (attempt: number, delayMs: number) => void;
+  /**
+   * A failure no retry can fix — a confirmed schema mismatch (SDK-043), for
+   * one. The loop rethrows it immediately instead of backing off toward a
+   * server that will give the same answer forever.
+   */
+  fatal?: (err: Error) => boolean;
 }
 
 const defaultSleep = (ms: number): Promise<void> =>
@@ -108,6 +114,7 @@ export async function reconnect(
       return attempt + 1;
     } catch (err) {
       last = err instanceof Error ? err : new Error(String(err));
+      if (options.fatal?.(last)) throw last;
     }
   }
 

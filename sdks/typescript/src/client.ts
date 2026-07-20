@@ -147,6 +147,20 @@ export class FluxumClient {
   #closed = false;
   /** Guards against two reconnect loops racing after a double failure. */
   #reconnecting = false;
+  /**
+   * Whether this mismatch episode already spent its one automatic
+   * refresh-and-reconnect pass (SDK-043). Reset when a reconnect delivers a
+   * matching `InitialData` — a later migration starts a fresh episode.
+   */
+  #mismatchRetried = false;
+  /**
+   * Set once a mismatch is CONFIRMED — the refresh or the retry saw the same
+   * wrong version again. From here reconnecting is pointless: the bindings
+   * cannot change at runtime, so every attempt would end the same way.
+   */
+  #schemaFailure: SchemaMismatchError | null = null;
+  /** Settled by the reconnect loop while a schema drill is in flight. */
+  #drill: { resolve: () => void; reject: (err: Error) => void } | null = null;
 
   private constructor(options: FluxumClientOptions) {
     this.#options = options;
@@ -219,6 +233,11 @@ export class FluxumClient {
       (id) => [id, queries],
       queries.length,
     );
+    // The version gate runs BEFORE anything is applied: a mismatched
+    // `InitialData` never reaches the cache, so the application never sees a
+    // row its generated types would misread (SDK-043).
+    const mismatch = this.#schemaMismatch(messages.map((m) => m.payload));
+    if (mismatch !== null) return this.#runSchemaDrill(mismatch);
     for (const message of messages) {
       this.#applyInitialData(message.payload, { reconcile: false });
     }
@@ -262,6 +281,9 @@ export class FluxumClient {
     this.#inbound.close(reason);
     for (const pending of this.#pending.values()) pending.reject(reason);
     this.#pending.clear();
+    // A drill still in flight would otherwise hang its `subscribe` forever.
+    this.#drill?.reject(reason);
+    this.#drill = null;
     await this.#transport?.close();
   }
 
@@ -308,7 +330,11 @@ export class FluxumClient {
     for (const pending of this.#pending.values()) pending.reject(err);
     this.#pending.clear();
 
-    if (this.#options.reconnect === false || this.#reconnecting) return;
+    // A confirmed schema failure is not retriable: the bindings are stale and
+    // reconnecting cannot regenerate them (SDK-043).
+    if (this.#options.reconnect === false || this.#reconnecting || this.#schemaFailure !== null) {
+      return;
+    }
     this.#reconnecting = true;
     void reconnect(
       {
@@ -326,10 +352,33 @@ export class FluxumClient {
             (id) => [id, queries],
             queries.length,
           );
+          const payloads = messages.map((m) => m.payload);
+          const mismatch = this.#schemaMismatch(payloads);
+          if (mismatch !== null) {
+            // Second sighting = confirmation: the refresh-and-reconnect pass
+            // already ran (or this reconnect IS that pass) and the server
+            // still answers with a version these bindings were not generated
+            // from. The error is fatal to the loop (see `fatal` below).
+            if (this.#mismatchRetried) {
+              throw this.#confirmMismatch(mismatch.expected, mismatch.actual);
+            }
+            // First sighting on a reconnect — the server migrated while this
+            // client was away. Run the refresh half of the drill here, then
+            // fail the attempt so the loop retries once against fresh state.
+            this.#mismatchRetried = true;
+            const refreshed = await this.#refreshSchemaVersion();
+            if (refreshed !== null && refreshed !== mismatch.expected) {
+              throw this.#confirmMismatch(mismatch.expected, refreshed);
+            }
+            throw new Error(
+              `InitialData.schema_version ${mismatch.actual} != ${mismatch.expected}; ` +
+                'refreshed the schema, retrying once (SDK-043)',
+            );
+          }
           // Stashed for the reconcile step, which must run after every query
           // is registered — reconciling per-query would delete rows the next
           // query is about to restore.
-          this.#pendingSnapshot = messages.map((m) => m.payload);
+          this.#pendingSnapshot = payloads;
         },
         reconcile: async () => {
           if (this.#pendingSnapshot === null) return;
@@ -345,14 +394,29 @@ export class FluxumClient {
           this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
         },
       },
-      this.#options.reconnect ?? {},
+      {
+        ...(this.#options.reconnect ?? {}),
+        fatal: (err) => err instanceof SchemaMismatchError,
+      },
     ).then(
       () => {
         this.#reconnecting = false;
+        // A matching InitialData ends the mismatch episode, if one was open.
+        this.#mismatchRetried = false;
+        const drill = this.#drill;
+        this.#drill = null;
+        drill?.resolve();
       },
       (err: unknown) => {
         this.#reconnecting = false;
-        this.#fail(err instanceof Error ? err : new Error(String(err)));
+        const error = err instanceof Error ? err : new Error(String(err));
+        const drill = this.#drill;
+        this.#drill = null;
+        // With a drill in flight the error surfaces through the `subscribe`
+        // that started it; otherwise nobody is awaiting, so it goes to the
+        // connection-level listeners.
+        if (drill !== null) drill.reject(error);
+        else this.#fail(error);
       },
     );
   }
@@ -445,15 +509,99 @@ export class FluxumClient {
     pending.resolve(pending.collected);
   }
 
+  // --- Schema-mismatch drill (SDK-043, SPEC-011 acceptance 9) ---------------
+
+  /**
+   * The first payload whose `schema_version` differs from the embedded one,
+   * or null when everything matches (or no version was embedded).
+   */
+  #schemaMismatch(payloads: unknown[][]): { expected: number; actual: number } | null {
+    const expected = this.#options.schemaVersion;
+    if (expected === undefined) return null;
+    for (const payload of payloads) {
+      const actual = Number(payload[1]);
+      if (actual !== expected) return { expected, actual };
+    }
+    return null;
+  }
+
+  /**
+   * SDK-043's mandated sequence: refresh the schema, reconnect once, and only
+   * when the mismatch is CONFIRMED surface the typed error. Resolves silently
+   * when the reconnect finds the server back on the bindings' version — a
+   * read racing a migration window looks exactly like this.
+   */
+  async #runSchemaDrill(mismatch: { expected: number; actual: number }): Promise<void> {
+    if (this.#mismatchRetried || this.#options.reconnect === false) {
+      throw this.#confirmMismatch(mismatch.expected, mismatch.actual);
+    }
+    this.#mismatchRetried = true;
+
+    // The refresh half. When /schema is reachable and still reports a version
+    // the bindings were not generated from, no reconnect can fix it — the
+    // confirmation is immediate.
+    const refreshed = await this.#refreshSchemaVersion();
+    if (refreshed !== null && refreshed !== mismatch.expected) {
+      throw this.#confirmMismatch(mismatch.expected, refreshed);
+    }
+
+    // Either the refreshed document matches the bindings (transient mismatch)
+    // or /schema was unreachable and InitialData remains the only witness.
+    // Reconnect once; the loop's resubscribe re-checks the version and either
+    // reconciles fresh data or confirms the failure.
+    const drill = new Promise<void>((resolve, reject) => {
+      this.#drill = { resolve, reject };
+    });
+    await this.#transport?.close();
+    return drill;
+  }
+
+  /** Record the terminal failure that blocks further reconnects. */
+  #confirmMismatch(expected: number, actual: number): SchemaMismatchError {
+    const err = new SchemaMismatchError(expected, actual);
+    this.#schemaFailure = err;
+    return err;
+  }
+
+  /**
+   * Best-effort `GET /schema` (SDK-043's refresh).
+   *
+   * Returns the server's current `schema_version`, or null when the document
+   * cannot be read: a TCP client has no HTTP surface to ask, and over HTTP
+   * the admin guard (SEC-054) only admits loopback and trusted operators.
+   * Null is not an error — the reconnect half of the drill decides from the
+   * next `InitialData` instead.
+   */
+  async #refreshSchemaVersion(): Promise<number | null> {
+    const base = this.#options.url.replace(/\/+$/, '');
+    if (!/^https?:\/\//i.test(base)) return null;
+    const fetchImpl = this.#options.fetch ?? globalThis.fetch.bind(globalThis);
+    try {
+      const response = await fetchImpl(`${base}/schema`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (!response.ok) return null;
+      const doc: unknown = await response.json();
+      // The admin surface wraps payloads in the RPC-052 envelope; an exported
+      // schema.json is the bare document. Accept both.
+      const payload =
+        typeof doc === 'object' && doc !== null && 'payload' in doc
+          ? (doc as { payload: unknown }).payload
+          : doc;
+      if (typeof payload !== 'object' || payload === null) return null;
+      const version = (payload as { schema_version?: unknown }).schema_version;
+      return typeof version === 'number' ? version : null;
+    } catch {
+      return null;
+    }
+  }
+
   // --- Cache application ----------------------------------------------------
 
   #applyInitialData(payload: unknown[], options: { reconcile: boolean }): void {
-    const [, schemaVersion, tables] = payload as [unknown, unknown, unknown];
-
-    const expected = this.#options.schemaVersion;
-    if (expected !== undefined && Number(schemaVersion) !== expected) {
-      throw new SchemaMismatchError(expected, Number(schemaVersion));
-    }
+    // The schema_version gate ran in the caller (#schemaMismatch) — by the
+    // time a payload reaches here it is known to match the bindings.
+    const [, , tables] = payload as [unknown, unknown, unknown];
 
     if (options.reconcile) {
       this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));

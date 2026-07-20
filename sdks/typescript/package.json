@@ -35,7 +35,10 @@
       "import": "./dist/index.js",
       "require": "./dist/index.cjs"
     },
-    "./browser": "./dist/fluxum.min.js"
+    "./browser": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/fluxum.min.js"
+    }
   },
   "files": [
     "dist",

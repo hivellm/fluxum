@@ -19,8 +19,11 @@
 // budget that has already been exceeded.
 
 import { build } from 'esbuild';
+import { execFileSync } from 'node:child_process';
+import { copyFileSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { globSync } from 'node:fs';
 import { gzipSync } from 'node:zlib';
-import { copyFileSync, readFileSync, rmSync } from 'node:fs';
 
 const BUDGET_BYTES = 50 * 1024;
 const ENTRY = 'src/index.ts';
@@ -48,6 +51,31 @@ await build({
   outfile: 'dist/index.cjs',
   packages: 'external',
 });
+
+// Typings come from tsc, not esbuild — esbuild does not emit declarations.
+// Resolved through require rather than `npx` so the build uses the workspace's
+// pinned compiler and never a network fetch.
+const require = createRequire(import.meta.url);
+execFileSync(
+  process.execPath,
+  [require.resolve('typescript/bin/tsc'), '-p', 'tsconfig.build.json'],
+  { stdio: 'inherit' },
+);
+if (!existsSync('dist/index.d.ts')) {
+  console.error('tsc emitted no dist/index.d.ts — the package.json "types" entry would dangle');
+  process.exit(1);
+}
+
+// `rewriteRelativeImportExtensions` rewrites specifiers in emitted JavaScript
+// but leaves them as `.ts` inside declaration files, where they would point at
+// sources this package does not ship. Rewritten here; relative specifiers
+// only, so bare imports (`@hivehub/thunder`) are untouched.
+for (const file of globSync('dist/**/*.d.ts')) {
+  const source = readFileSync(file, 'utf8');
+  const rewritten = source.replace(/(from\s+['"])(\.\.?\/[^'"]+)\.ts(['"])/g, '$1$2.js$3');
+  if (rewritten !== source) writeFileSync(file, rewritten);
+}
+console.log('declarations emitted (dist/*.d.ts)');
 
 await build({
   ...shared,

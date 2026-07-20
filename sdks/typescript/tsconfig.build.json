@@ -1,0 +1,15 @@
+{
+  // Declaration emission for the package (SDK-083: plain JS + .d.ts typings).
+  // esbuild produces the JavaScript; this config produces ONLY the typings,
+  // because esbuild does not emit declarations at all. `rewriteRelativeImportExtensions`
+  // is inherited, so the `.ts` specifiers in src become `.js` in the output.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "emitDeclarationOnly": true,
+    "declaration": true,
+    "outDir": "dist",
+    "rootDir": "src"
+  },
+  "include": ["src/**/*.ts"]
+}
