@@ -1,0 +1,23 @@
+{
+  "name": "multi-query-subscribe",
+  "description": "One batched Subscribe with N queries populates every table — the server answers one InitialData PER QUERY under one request id (RPC-032).",
+  "steps": [
+    { "connect": { "client": "writer", "token": "writer" } },
+    { "subscribe": { "client": "writer", "queries": ["SELECT * FROM ChatMessage"] } },
+    { "call": { "client": "writer", "reducer": "send_chat", "args": [7, "seed"] } },
+    { "call": { "client": "writer", "reducer": "add_task", "args": ["seeded task"] } },
+    { "await_row": { "client": "writer", "table": "ChatMessage", "where": { "content": "seed" } } },
+
+    { "connect": { "client": "batcher", "token": "batcher" } },
+    { "subscribe": { "client": "batcher", "queries": [
+      "SELECT * FROM ChatMessage",
+      "SELECT * FROM Task",
+      "SELECT * FROM OnlineUser"
+    ] } },
+    { "expect_cache": { "client": "batcher", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:writer", "channel": 7, "content": "seed", "sent_at": "*" }
+    ] } },
+    { "expect_cache": { "client": "batcher", "table": "Task", "rows": [] } },
+    { "await_row": { "client": "batcher", "table": "OnlineUser", "where": { "identity": "$identity:batcher" } } }
+  ]
+}

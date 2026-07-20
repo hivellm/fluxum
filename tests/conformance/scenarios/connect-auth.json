@@ -1,0 +1,12 @@
+{
+  "name": "connect-auth",
+  "description": "Distinct tokens produce distinct identities; connecting is presence (on_connect fires).",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "connect": { "client": "bob", "token": "bob" } },
+    { "expect_distinct_identities": { "clients": ["alice", "bob"] } },
+    { "subscribe": { "client": "alice", "queries": ["SELECT * FROM OnlineUser"] } },
+    { "await_row": { "client": "alice", "table": "OnlineUser", "where": { "identity": "$identity:alice" } } },
+    { "await_row": { "client": "alice", "table": "OnlineUser", "where": { "identity": "$identity:bob" } } }
+  ]
+}

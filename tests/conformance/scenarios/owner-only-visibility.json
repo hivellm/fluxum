@@ -1,0 +1,23 @@
+{
+  "name": "owner-only-visibility",
+  "description": "owner_only rows are filtered by the SERVER per subscriber: the same query yields different rows for different identities.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "connect": { "client": "bob", "token": "bob" } },
+    { "subscribe": { "client": "alice", "queries": ["SELECT * FROM Task"] } },
+    { "subscribe": { "client": "bob", "queries": ["SELECT * FROM Task"] } },
+
+    { "call": { "client": "alice", "reducer": "add_task", "args": ["alice's secret"] } },
+    { "await_row": { "client": "alice", "table": "Task", "where": { "title": "alice's secret" } } },
+    { "expect_cache": { "client": "bob", "table": "Task", "rows": [] } },
+
+    { "call": { "client": "bob", "reducer": "add_task", "args": ["bob's own"] } },
+    { "await_row": { "client": "bob", "table": "Task", "where": { "title": "bob's own" } } },
+    { "expect_cache": { "client": "alice", "table": "Task", "rows": [
+      { "id": "1", "owner": "$identity:alice", "title": "alice's secret", "done": false }
+    ] } },
+    { "expect_cache": { "client": "bob", "table": "Task", "rows": [
+      { "id": "2", "owner": "$identity:bob", "title": "bob's own", "done": false }
+    ] } }
+  ]
+}

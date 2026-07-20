@@ -1,0 +1,16 @@
+{
+  "name": "txupdate-diff",
+  "description": "Live TxUpdates apply as diffs: an insert lands, and a delete+insert of the same PK leaves one updated row, never a duplicate.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "subscribe": { "client": "alice", "queries": ["SELECT * FROM Task"] } },
+    { "call": { "client": "alice", "reducer": "add_task", "args": ["ship it"] } },
+    { "await_row": { "client": "alice", "table": "Task", "where": { "id": "1", "done": false } } },
+
+    { "call": { "client": "alice", "reducer": "complete_task", "args": [1] } },
+    { "await_row": { "client": "alice", "table": "Task", "where": { "id": "1", "done": true } } },
+    { "expect_cache": { "client": "alice", "table": "Task", "rows": [
+      { "id": "1", "owner": "$identity:alice", "title": "ship it", "done": true }
+    ] } }
+  ]
+}

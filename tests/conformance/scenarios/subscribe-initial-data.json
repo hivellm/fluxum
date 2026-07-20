@@ -1,0 +1,18 @@
+{
+  "name": "subscribe-initial-data",
+  "description": "A subscription's InitialData carries the rows that existed before it, exactly.",
+  "steps": [
+    { "connect": { "client": "writer", "token": "writer" } },
+    { "subscribe": { "client": "writer", "queries": ["SELECT * FROM ChatMessage"] } },
+    { "call": { "client": "writer", "reducer": "send_chat", "args": [1, "first"] } },
+    { "call": { "client": "writer", "reducer": "send_chat", "args": [2, "second"] } },
+    { "await_row": { "client": "writer", "table": "ChatMessage", "where": { "content": "second" } } },
+
+    { "connect": { "client": "reader", "token": "reader" } },
+    { "subscribe": { "client": "reader", "queries": ["SELECT * FROM ChatMessage"] } },
+    { "expect_cache": { "client": "reader", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:writer", "channel": 1, "content": "first", "sent_at": "*" },
+      { "id": "2", "sender": "$identity:writer", "channel": 2, "content": "second", "sent_at": "*" }
+    ] } }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "reducer-outcomes",
+  "description": "A committed reducer succeeds; a rejecting one surfaces its message; completing twice is idempotent.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, "hello"] } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, ""], "expect_error": { "contains": "empty" } } },
+    { "call": { "client": "alice", "reducer": "add_task", "args": ["write the corpus"] } },
+    { "call": { "client": "alice", "reducer": "complete_task", "args": [1] } },
+    { "call": { "client": "alice", "reducer": "complete_task", "args": [1] } },
+    { "call": { "client": "alice", "reducer": "complete_task", "args": [99], "expect_error": { "contains": "no task" } } }
+  ]
+}

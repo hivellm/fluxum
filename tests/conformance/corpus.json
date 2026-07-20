@@ -1,0 +1,45 @@
+{
+  "corpus_version": 1,
+  "server": {
+    "module": "demo",
+    "binary": "fluxum-server"
+  },
+  "tables": {
+    "ChatMessage": {
+      "primary_key": "id",
+      "columns": [
+        ["id", "U64"],
+        ["sender", "Identity"],
+        ["channel", "U32"],
+        ["content", "Str"],
+        ["sent_at", "Timestamp"]
+      ]
+    },
+    "Task": {
+      "primary_key": "id",
+      "columns": [
+        ["id", "U64"],
+        ["owner", "Identity"],
+        ["title", "Str"],
+        ["done", "Bool"]
+      ]
+    },
+    "OnlineUser": {
+      "primary_key": "connection",
+      "columns": [
+        ["connection", "ConnectionId"],
+        ["identity", "Identity"],
+        ["connected_at", "Timestamp"]
+      ]
+    }
+  },
+  "scenarios": [
+    "connect-auth",
+    "subscribe-initial-data",
+    "reducer-outcomes",
+    "txupdate-diff",
+    "owner-only-visibility",
+    "presence-ephemeral",
+    "multi-query-subscribe"
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "name": "presence-ephemeral",
+  "description": "Ephemeral presence: a connection appears as a row while it lives. One row per CONNECTION, not per identity.",
+  "steps": [
+    { "connect": { "client": "watcher", "token": "watcher" } },
+    { "subscribe": { "client": "watcher", "queries": ["SELECT * FROM OnlineUser"] } },
+    { "await_row": { "client": "watcher", "table": "OnlineUser", "where": { "identity": "$identity:watcher" } } },
+
+    { "connect": { "client": "guest", "token": "guest" } },
+    { "await_row": { "client": "watcher", "table": "OnlineUser", "where": { "identity": "$identity:guest" } } },
+
+    { "connect": { "client": "guest2", "token": "guest" } },
+    { "await_count": { "client": "watcher", "table": "OnlineUser", "count": 3 } },
+    { "expect_cache": { "client": "watcher", "table": "OnlineUser", "rows": [
+      { "connection": "*", "identity": "$identity:watcher", "connected_at": "*" },
+      { "connection": "*", "identity": "$identity:guest", "connected_at": "*" },
+      { "connection": "*", "identity": "$identity:guest2", "connected_at": "*" }
+    ] } }
+  ]
+}
