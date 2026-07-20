@@ -129,13 +129,13 @@ impl ServerPeerRegistry {
                     "auth.server_peers: peer name must be non-empty",
                 ));
             }
-            if peer.token.is_empty() {
+            if peer.token.expose_str().is_empty() {
                 return Err(FluxumError::config(format!(
                     "auth.server_peers: peer '{}' has an empty token",
                     peer.name
                 )));
             }
-            let token_digest: [u8; 32] = Sha256::digest(peer.token.as_bytes()).into();
+            let token_digest: [u8; 32] = Sha256::digest(peer.token.expose_str().as_bytes()).into();
             if entries.iter().any(|e| e.name == peer.name) {
                 return Err(FluxumError::config(format!(
                     "auth.server_peers: duplicate peer name '{}'",
@@ -197,8 +197,8 @@ pub fn provider_from_config(auth: &AuthConfig) -> Result<Arc<dyn AuthProvider>> 
 }
 
 fn required_secret(auth: &AuthConfig) -> Result<&[u8]> {
-    match auth.secret.as_deref() {
-        Some(secret) if !secret.is_empty() => Ok(secret.as_bytes()),
+    match auth.secret.as_ref() {
+        Some(secret) if !secret.expose_str().is_empty() => Ok(secret.expose_str().as_bytes()),
         _ => Err(FluxumError::config(format!(
             "auth.secret: required for auth.provider '{:?}'",
             auth.provider
@@ -215,7 +215,10 @@ pub fn enforce_loopback_guard(auth: &AuthConfig, listen_host: &str) -> Result<()
     Ok(())
 }
 
-fn is_loopback_host(host: &str) -> bool {
+/// Whether `host` names a loopback address (or `localhost`). Also
+/// `0.0.0.0`/`::` are NOT loopback — they bind every interface, so they are a
+/// public bind for the SEC-059 plaintext guard.
+pub fn is_loopback_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
@@ -339,14 +342,14 @@ mod tests {
     fn peer(name: &str, token: &str) -> ServerPeer {
         ServerPeer {
             name: name.to_owned(),
-            token: token.to_owned(),
+            token: token.to_owned().into(),
         }
     }
 
     fn auth_config(provider: AuthProviderKind, secret: Option<&str>) -> AuthConfig {
         AuthConfig {
             provider,
-            secret: secret.map(str::to_owned),
+            secret: secret.map(|s| s.to_owned().into()),
             server_peers: Vec::new(),
         }
     }

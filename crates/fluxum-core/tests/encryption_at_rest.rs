@@ -209,11 +209,11 @@ fn config_keyring_validates_key_material() {
         keys: vec![
             EncryptionKey {
                 id: "k1".into(),
-                key_hex: "ab".repeat(32),
+                key_hex: "ab".repeat(32).into(),
             },
             EncryptionKey {
                 id: "k2".into(),
-                key_hex: "cd".repeat(32),
+                key_hex: "cd".repeat(32).into(),
             },
         ],
     };
@@ -232,7 +232,7 @@ fn config_keyring_validates_key_material() {
         active_key_id: "ghost".into(),
         keys: vec![EncryptionKey {
             id: "k1".into(),
-            key_hex: "ab".repeat(32),
+            key_hex: "ab".repeat(32).into(),
         }],
     };
     assert!(dangling.keyring().is_err());

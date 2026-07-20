@@ -298,7 +298,7 @@ fn report_lists_key_ids_but_never_secrets() {
     config.transforms.keys.push(TransformKey {
         id: "orders_key".into(),
         scheme: fluxum_core::config::KeyScheme::X25519,
-        secret: secret_hex.clone(),
+        secret: secret_hex.clone().into(),
         previous: vec![],
     });
     let registry = PluginRegistry::build(&schema(), &config).unwrap();

@@ -69,6 +69,14 @@ pub struct ServerConfig {
     pub session: SessionConfig,
     /// HTTP admin-surface access control (SPEC-026 SEC-054).
     pub admin: AdminConfig,
+    /// Transport TLS (SPEC-026 SEC-059).
+    pub tls: TlsConfig,
+    /// Permit an authenticating listener on a non-loopback address without
+    /// TLS (SEC-059). Default `false`: a public bind with real auth and no
+    /// TLS is refused at startup, since bearer tokens and row data would
+    /// travel in cleartext. Set `true` only on a trusted network where the
+    /// link is encrypted below Fluxum (a service mesh, a VPN, localhost pods).
+    pub allow_plaintext: bool,
     /// Listen backlog for both listeners (SEC-042): pending un-accepted
     /// connections the kernel queues. `0` = the built-in default (1024).
     /// Raise alongside `somaxconn` on a directly exposed port.
@@ -110,6 +118,8 @@ impl Default for ServerConfig {
             connection_limits: ConnectionLimitsConfig::default(),
             session: SessionConfig::default(),
             admin: AdminConfig::default(),
+            tls: TlsConfig::default(),
+            allow_plaintext: false,
             accept_backlog: 0,
             tcp_keepalive_secs: 0,
             tcp_defer_accept_secs: 0,
@@ -283,6 +293,27 @@ impl Default for AdminConfig {
     }
 }
 
+/// Transport TLS (SPEC-026 SEC-059): optional built-in `rustls` termination
+/// on both listeners. Off by default — a deployment behind a TLS-terminating
+/// proxy or on a trusted network needs none. When a `cert`/`key` pair is set,
+/// both the FluxRPC/TCP and the HTTP listener terminate TLS before the first
+/// handshake byte is read.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// PEM certificate chain file (leaf first). Empty = TLS off.
+    pub cert: Option<PathBuf>,
+    /// PEM private key file (PKCS#8 or RSA). Required when `cert` is set.
+    pub key: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    /// Whether TLS is configured (both a cert and a key are set).
+    pub fn is_enabled(&self) -> bool {
+        self.cert.is_some() && self.key.is_some()
+    }
+}
+
 /// Async runtime tuning (SPEC-016 derived-defaults table).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -367,8 +398,8 @@ pub enum PageCompression {
 pub struct EncryptionKey {
     /// Stable key label, referenced by `active_key_id`.
     pub id: String,
-    /// The 256-bit key as 64 hex characters.
-    pub key_hex: String,
+    /// The 256-bit key as 64 hex characters (SEC-058: redacted, zeroized).
+    pub key_hex: crate::secret::Secret<String>,
 }
 
 /// At-rest encryption keyring (SPEC-026 SEC-010/012): an enable flag, the
@@ -412,7 +443,7 @@ impl EncryptionConfig {
         let mut active = None;
         let mut previous = Vec::new();
         for key in &self.keys {
-            let parsed = AtRestKey::from_hex(&key.id, &key.key_hex)?;
+            let parsed = AtRestKey::from_hex(&key.id, key.key_hex.expose_str())?;
             if key.id == self.active_key_id {
                 active = Some(parsed);
             } else {
@@ -552,8 +583,8 @@ pub enum AuthProvider {
 pub struct ServerPeer {
     /// Peer name; identity = SHA-256("SERVER:" + name).
     pub name: String,
-    /// Shared token the peer authenticates with.
-    pub token: String,
+    /// Shared token the peer authenticates with (SEC-058: redacted, zeroized).
+    pub token: crate::secret::Secret<String>,
 }
 
 /// Authentication configuration (SPEC-009).
@@ -563,8 +594,9 @@ pub struct AuthConfig {
     /// Provider kind.
     pub provider: AuthProvider,
     /// Provider secret (`token`: the token; `jwt`: verification key).
-    /// Supports `${VAR}` env expansion in the YAML file.
-    pub secret: Option<String>,
+    /// Supports `${VAR}` env expansion in the YAML file (SEC-058: redacted,
+    /// zeroized).
+    pub secret: Option<crate::secret::Secret<String>>,
     /// Trusted server peers.
     pub server_peers: Vec<ServerPeer>,
 }
@@ -737,9 +769,10 @@ pub enum PluginHost {
         /// Shared secret the sidecar authenticates this host with (PLG-031),
         /// sent in the Plugin RPC handshake. `None` leaves the sidecar
         /// unauthenticated — only appropriate for a loopback/same-pod
-        /// endpoint. Never logged or reported by `GET /plugins`.
+        /// endpoint. Never logged or reported by `GET /plugins` (SEC-058:
+        /// redacted, zeroized).
         #[serde(default)]
-        token: Option<String>,
+        token: Option<crate::secret::Secret<String>>,
     },
 }
 
@@ -789,11 +822,12 @@ pub struct TransformKey {
     pub id: String,
     /// The key scheme.
     pub scheme: KeyScheme,
-    /// The active 32-byte secret as 64 hex characters.
-    pub secret: String,
+    /// The active 32-byte secret as 64 hex characters (SEC-058: redacted,
+    /// zeroized).
+    pub secret: crate::secret::Secret<String>,
     /// Retired secrets (hex) still accepted for reads (rotation, CT-036).
     #[serde(default)]
-    pub previous: Vec<String>,
+    pub previous: Vec<crate::secret::Secret<String>>,
 }
 
 impl TransformsConfig {
@@ -816,7 +850,12 @@ impl TransformsConfig {
                     key.id
                 )));
             }
-            let ecies = EciesKey::from_hex(&key.id, &key.secret, &key.previous)?;
+            let previous: Vec<String> = key
+                .previous
+                .iter()
+                .map(|s| s.expose_str().to_owned())
+                .collect();
+            let ecies = EciesKey::from_hex(&key.id, key.secret.expose_str(), &previous)?;
             out.insert(key.id.clone(), ecies);
         }
         Ok(out)
@@ -842,7 +881,10 @@ impl TransformsConfig {
                     key.id
                 )));
             }
-            out.insert(key.id.clone(), SignKey::from_hex(&key.id, &key.secret)?);
+            out.insert(
+                key.id.clone(),
+                SignKey::from_hex(&key.id, key.secret.expose_str())?,
+            );
         }
         Ok(out)
     }
@@ -947,7 +989,10 @@ impl Config {
     }
 
     /// Semantic validation beyond YAML shape; every failure names its key.
-    fn validate(&self) -> Result<()> {
+    /// Public so a hand-built `Config` (tests, embedders) can be checked with
+    /// the same rules the loader applies — including the SEC-059
+    /// plaintext-on-public-bind guard.
+    pub fn validate(&self) -> Result<()> {
         if self.server.http_port == 0 {
             return Err(FluxumError::config("server.http_port: must be non-zero"));
         }
@@ -1051,11 +1096,48 @@ impl Config {
             )));
         }
         if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)
-            && self.auth.secret.as_deref().is_none_or(str::is_empty)
+            && self
+                .auth
+                .secret
+                .as_ref()
+                .is_none_or(|s| s.expose_str().is_empty())
         {
             return Err(FluxumError::config(format!(
                 "auth.secret: required for auth.provider '{:?}' (set it or use the development profile)",
                 self.auth.provider
+            )));
+        }
+        // SEC-059: TLS needs both halves.
+        match (&self.server.tls.cert, &self.server.tls.key) {
+            (Some(_), None) => {
+                return Err(FluxumError::config(
+                    "server.tls.key: required when server.tls.cert is set",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(FluxumError::config(
+                    "server.tls.cert: required when server.tls.key is set",
+                ));
+            }
+            _ => {}
+        }
+        // SEC-059: refuse a real-auth listener on a public (non-loopback) bind
+        // without TLS, unless the operator explicitly opts out for a trusted
+        // network. Otherwise bearer tokens and row data would cross the public
+        // interface in cleartext. (`none` auth is already loopback-guarded by
+        // AUTH-040, so this bites the `token`/`jwt` providers.)
+        let authenticating = matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt);
+        if authenticating
+            && !crate::auth::is_loopback_host(&self.server.tcp_host)
+            && !self.server.tls.is_enabled()
+            && !self.server.allow_plaintext
+        {
+            return Err(FluxumError::config(format!(
+                "server.tcp_host '{}' is a public bind with authentication but no TLS: bearer \
+                 tokens and data would travel in cleartext (SPEC-026 SEC-059). Set server.tls.cert \
+                 + server.tls.key, bind to loopback, or set server.allow_plaintext: true only if \
+                 the link is encrypted below Fluxum (mesh/VPN).",
+                self.server.tcp_host
             )));
         }
         Ok(())
@@ -1592,7 +1674,10 @@ mod tests {
         let file = write_config("auth:\n  provider: token\n  secret: ${MY_APP_SECRET}\n");
         let env = env_of(&[("MY_APP_SECRET", "s3cret")]);
         let cfg = Config::load_with(Some(file.path()), &env).unwrap();
-        assert_eq!(cfg.auth.secret.as_deref(), Some("s3cret"));
+        assert_eq!(
+            cfg.auth.secret.as_ref().map(|s| s.expose_str()),
+            Some("s3cret")
+        );
 
         // Unset variable → empty secret → typed validation error.
         let err = Config::load_with(Some(file.path()), &no_env).unwrap_err();
@@ -1678,6 +1763,9 @@ server:
   tcp_host: "0.0.0.0"
   http_port: 15800
   tcp_port: 15801
+  # A public bind behind a TLS-terminating proxy (SEC-059): the operator
+  # accepts plaintext on the trusted link between proxy and Fluxum.
+  allow_plaintext: true
 sharding:
   shards: auto
   strategy: hash
@@ -1719,7 +1807,7 @@ logging:
         assert_eq!(cfg.server.tcp_host, "0.0.0.0");
         assert!(cfg.sharding.shards.is_auto());
         assert_eq!(cfg.auth.server_peers.len(), 1);
-        assert_eq!(cfg.auth.server_peers[0].token, "peertoken");
+        assert_eq!(cfg.auth.server_peers[0].token.expose_str(), "peertoken");
         assert_eq!(cfg.simd, SimdMode::Auto);
         assert_eq!(cfg.subscriptions.send_buffer_bytes, ByteSize(2 << 20));
     }

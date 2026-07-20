@@ -20,14 +20,16 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
+use tokio_rustls::TlsAcceptor;
 
 use fluxum_protocol::{ClientMessage, ErrorMessage, Frame, FrameCodec, ServerMessage, codes};
 
 use crate::connguard::ConnPermit;
 use crate::session::Session;
+use crate::tls::MaybeTls;
 use crate::{ConnHandle, OutFrame, ShardContext};
 
 /// TCP transport tuning (RPC-060/061).
@@ -78,6 +80,19 @@ pub async fn serve(
     ctx: Arc<ShardContext>,
     addr: impl tokio::net::ToSocketAddrs,
     options: TcpOptions,
+) -> io::Result<TcpServer> {
+    serve_tls(ctx, addr, options, None).await
+}
+
+/// [`serve`] with optional built-in TLS termination (SPEC-026 SEC-059): when
+/// `tls` is set, a directly-accepted connection completes the TLS handshake
+/// before the first FluxRPC frame. A trusted-proxy connection (PROXY v2) is
+/// left plaintext — the proxy terminates TLS and forwards on a trusted link.
+pub async fn serve_tls(
+    ctx: Arc<ShardContext>,
+    addr: impl tokio::net::ToSocketAddrs,
+    options: TcpOptions,
+    tls: Option<TlsAcceptor>,
 ) -> io::Result<TcpServer> {
     let listener = crate::sock::bind(addr, options.socket).await?;
     let local_addr = listener.local_addr()?;
@@ -137,7 +152,8 @@ pub async fn serve(
                                 // SEC-036: a trusted proxy announces the real
                                 // client in a PROXY v2 preamble; the guard must
                                 // key on *that* IP, so admission happens after
-                                // the (bounded) preamble read.
+                                // the (bounded) preamble read. The proxy already
+                                // terminated TLS, so this hop stays plaintext.
                                 let conn_ctx = Arc::clone(&accept_ctx);
                                 let conn_shutdown = accept_shutdown.clone();
                                 tokio::spawn(async move {
@@ -152,8 +168,18 @@ pub async fn serve(
                                     Ok(permit) => {
                                         let conn_ctx = Arc::clone(&accept_ctx);
                                         let conn_shutdown = accept_shutdown.clone();
+                                        let tls = tls.clone();
                                         tokio::spawn(async move {
-                                            if let Err(e) = drive_connection(conn_ctx, stream, ip, permit, options, Vec::new(), detect_preamble, conn_shutdown).await {
+                                            // SEC-059: terminate TLS (if configured)
+                                            // before the first frame is read.
+                                            let conn = match MaybeTls::accept(stream, tls.as_ref()).await {
+                                                Ok(conn) => conn,
+                                                Err(e) => {
+                                                    tracing::debug!(target: "fluxum::tcp", error = %e, "TLS handshake failed");
+                                                    return;
+                                                }
+                                            };
+                                            if let Err(e) = drive_connection(conn_ctx, conn, ip, permit, options, Vec::new(), detect_preamble, conn_shutdown).await {
                                                 tracing::debug!(target: "fluxum::tcp", error = %e, "connection ended");
                                             }
                                         });
@@ -254,9 +280,10 @@ async fn handle_proxied_conn(
     // while the proxy's other clients keep connecting.
     match ctx.conn_guard().try_accept(resolved) {
         Ok(permit) => {
+            // The proxy already terminated TLS; this trusted hop is plaintext.
             if let Err(e) = drive_connection(
                 ctx,
-                stream,
+                MaybeTls::Plain(stream),
                 resolved,
                 permit,
                 options,
@@ -292,7 +319,7 @@ async fn handle_proxied_conn(
 #[allow(clippy::too_many_arguments)]
 async fn drive_connection(
     ctx: Arc<ShardContext>,
-    stream: TcpStream,
+    stream: MaybeTls,
     ip: std::net::IpAddr,
     permit: ConnPermit,
     options: TcpOptions,
@@ -301,7 +328,7 @@ async fn drive_connection(
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
     let _permit = permit;
-    let (mut read_half, write_half) = stream.into_split();
+    let (mut read_half, write_half) = tokio::io::split(stream);
     let codec = FrameCodec::new(options.max_frame_bytes);
     // SEC-031: a stricter codec while unauthenticated caps pre-auth frames,
     // so an oversized handshake is refused from its 4-byte header before its
@@ -550,10 +577,7 @@ async fn route_frame(
 }
 
 /// The writer task: drain the outbound queue to the socket in order.
-async fn writer_task(
-    mut write_half: tokio::net::tcp::OwnedWriteHalf,
-    mut out_rx: mpsc::Receiver<OutFrame>,
-) {
+async fn writer_task(mut write_half: WriteHalf<MaybeTls>, mut out_rx: mpsc::Receiver<OutFrame>) {
     while let Some(frame) = out_rx.recv().await {
         if write_half.write_all(&frame).await.is_err() {
             break;
@@ -577,7 +601,7 @@ enum ReadOutcome {
 /// the outcome; the handshake deadline is reported distinctly so the caller
 /// can drop silently and meter it rather than send a 408.
 async fn read_with_deadline(
-    read_half: &mut tokio::net::tcp::OwnedReadHalf,
+    read_half: &mut ReadHalf<MaybeTls>,
     chunk: &mut [u8],
     idle: Option<Duration>,
     handshake_deadline: Option<tokio::time::Instant>,

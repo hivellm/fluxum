@@ -430,6 +430,8 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
         ],
         "connections": ctx.metrics().connections_active(),
         "uptime_s": ctx.uptime_s(),
+        // SEC-059: transport-encryption posture — a boolean, never key material.
+        "tls": ctx.tls_enabled(),
     });
     // HWA-013: the effective configuration — probe inputs, derived values
     // with their sources, and the per-kernel SIMD selection. Pre-rendered at

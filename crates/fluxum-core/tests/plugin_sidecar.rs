@@ -268,7 +268,7 @@ fn proxy_with(capability: Capability, endpoint: String, token: Option<&str>) -> 
         capability,
         endpoint,
         timeout: TIMEOUT,
-        token: token.map(ToOwned::to_owned),
+        token: token.map(|t| t.to_owned().into()),
         breaker_cooldown: COOLDOWN,
     }))
 }
@@ -739,7 +739,7 @@ fn config_with_sidecar(endpoint: &str, token: Option<&str>) -> Config {
             host: PluginHost::Sidecar {
                 endpoint: endpoint.into(),
                 timeout_ms: TIMEOUT.as_millis() as u64,
-                token: token.map(ToOwned::to_owned),
+                token: token.map(|t| t.to_owned().into()),
             },
             applies_to: PluginScope {
                 tables: vec!["Item".into()],

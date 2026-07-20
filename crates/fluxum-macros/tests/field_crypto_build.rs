@@ -31,7 +31,7 @@ fn config_with_key() -> TransformsConfig {
         keys: vec![TransformKey {
             id: "ballots".into(),
             scheme: KeyScheme::X25519,
-            secret: "11".repeat(32),
+            secret: "11".repeat(32).into(),
             previous: vec![],
         }],
     }

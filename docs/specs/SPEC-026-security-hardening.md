@@ -270,6 +270,42 @@ server:
   via `scripts/supply-chain-check.sh`, which pins the advisory database to an LF checkout so it is
   deterministic across platforms.
 
+### Requirement: Config-secret hygiene
+- **SEC-058** [P1] Every secret configuration field — `auth.secret`, `auth.server_peers[].token`,
+  `encryption.keys[].key_hex`, `transforms.keys[].secret` (and `.previous`), and the sidecar
+  `token` — SHALL be a `Secret<T>` (`fluxum_core::secret`): its `Debug` and `Serialize` outputs
+  redact to `[redacted]` (never the bytes), it zeroizes on drop, and its plaintext is reachable
+  only through an explicit `expose_secret()` at the point of use. A serialized or `Debug`-printed
+  config therefore never leaks minting material (F-006). `Serialize` is deliberately lossy (the
+  config is loaded once and never rebuilt by re-serializing a secret); the hot-reload path re-reads
+  the file, and secrets are non-reloadable.
+
+### Requirement: Transport TLS and no-cleartext-on-public-bind
+- **SEC-059** [P1] The transports SHALL support optional built-in TLS termination (`rustls`) via
+  `server.tls.{cert,key}` (PEM files): when set, a **directly** accepted FluxRPC/TCP or HTTP
+  connection completes the TLS handshake before the first byte of the protocol is read. A
+  trusted-proxy connection (SEC-035/036) stays plaintext — the proxy terminated TLS and forwards on
+  a trusted link. The server SHALL **refuse to start** an *authenticating* listener (`token`/`jwt`
+  provider) on a non-loopback bind without TLS unless `server.allow_plaintext` is explicitly set,
+  since bearer tokens and row data would otherwise cross the public interface in cleartext (F-011).
+  `cert` without `key` (or vice versa) is a load error. The transport-encryption posture is
+  surfaced as a boolean in `GET /health` (`"tls": true|false`) and logged once per boot — never any
+  key material. TLS on/off is byte-transparent to the protocol.
+
+#### Scenario: A public authenticating bind demands TLS or an explicit opt-out
+Given `auth.provider: token` and `server.tcp_host: 0.0.0.0` with no `server.tls`
+When the server starts
+Then it refuses with an error naming the offending listener, unless `server.tls.cert`/`key` are set
+(handshake required before any frame) or `server.allow_plaintext: true` acknowledges a trusted link.
+
+```yaml
+server:
+  tls:
+    cert: /etc/fluxum/tls/cert.pem   # SEC-059 PEM chain; empty = TLS off
+    key:  /etc/fluxum/tls/key.pem    # SEC-059 PEM key; required with cert
+  allow_plaintext: false             # SEC-059 opt out of the public-bind TLS requirement
+```
+
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).

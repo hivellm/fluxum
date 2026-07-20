@@ -68,6 +68,7 @@ pub mod reducer;
 pub mod scheduler;
 pub mod schema;
 pub mod secevent;
+pub mod secret;
 pub mod shard;
 pub mod simd;
 pub mod sql;

@@ -614,13 +614,13 @@ mod tests {
                 TransformKey {
                     id: "k".into(),
                     scheme: KeyScheme::X25519,
-                    secret: "ab".repeat(32),
+                    secret: "ab".repeat(32).into(),
                     previous: vec![],
                 },
                 TransformKey {
                     id: "k".into(),
                     scheme: KeyScheme::X25519,
-                    secret: "cd".repeat(32),
+                    secret: "cd".repeat(32).into(),
                     previous: vec![],
                 },
             ],
@@ -631,7 +631,7 @@ mod tests {
             keys: vec![TransformKey {
                 id: "server".into(),
                 scheme: KeyScheme::Ed25519,
-                secret: "ab".repeat(32),
+                secret: "ab".repeat(32).into(),
                 previous: vec![],
             }],
         };

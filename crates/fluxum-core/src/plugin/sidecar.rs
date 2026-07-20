@@ -226,8 +226,9 @@ pub struct SidecarConfig {
     pub endpoint: String,
     /// Per-call budget.
     pub timeout: Duration,
-    /// The shared secret, when the manifest configures one. Never logged.
-    pub token: Option<String>,
+    /// The shared secret, when the manifest configures one. Never logged
+    /// (SEC-058: redacted in `Debug`, zeroized on drop).
+    pub token: Option<crate::secret::Secret<String>>,
     /// How long the breaker stays open before admitting a trial call. The
     /// registry uses [`BREAKER_COOLDOWN`]; it is a field so a deployment can
     /// tune recovery latency and a test need not sleep the default out.
@@ -476,7 +477,12 @@ impl SidecarProxy {
             version: PLUGIN_RPC_VERSION,
             plugin: self.config.name.clone(),
             capability: self.config.capability.name().to_owned(),
-            token: self.config.token.clone(),
+            // Exposed only here, at the point the handshake is sent on the wire.
+            token: self
+                .config
+                .token
+                .as_ref()
+                .map(|t| t.expose_str().to_owned()),
         });
         self.send(&mut conn, &hello, deadline)?;
         match self.recv(&mut conn, deadline)? {

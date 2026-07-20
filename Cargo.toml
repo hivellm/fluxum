@@ -55,6 +55,9 @@ thiserror = "2"
 # because Fluxum needs only the sans-IO wire codec, not the client or server.
 thunder-rpc = { version = "0.2.0", default-features = false }
 tokio = { version = "1", default-features = false }
+# Optional built-in transport TLS termination (SPEC-026 SEC-059). `ring` is the
+# default crypto provider; no aws-lc-rs C toolchain needed.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 trybuild = "1"

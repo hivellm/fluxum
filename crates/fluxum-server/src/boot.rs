@@ -155,8 +155,30 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
     let tcp_addr = format!("{}:{}", config.server.tcp_host, config.server.tcp_port);
     // SEC-042: listener hardening knobs, shared by both listeners.
     let socket = crate::sock::SocketOptions::from_config(&config.server);
+    // SEC-059: optional built-in TLS termination on both listeners.
+    let tls = match (&config.server.tls.cert, &config.server.tls.key) {
+        (Some(cert), Some(key)) => Some(crate::tls::load_acceptor(cert, key).map_err(
+            |source| BootError::Bind {
+                addr: format!("tls({}, {})", cert.display(), key.display()),
+                source,
+            },
+        )?),
+        _ => None,
+    };
+    let tls_on = tls.is_some();
+    // SEC-059: record the transport-encryption posture at boot (boolean only,
+    // never key material). A plaintext public bind is only reachable here
+    // because `allow_plaintext` was set (validate() would else have refused).
+    ctx.set_tls_enabled(tls_on);
+    tracing::info!(
+        target: "fluxum::server",
+        tls = tls_on,
+        tcp = %tcp_addr,
+        http = %http_addr,
+        "transport listeners: TLS {}", if tls_on { "on" } else { "off (plaintext)" }
+    );
 
-    let http = http::serve(
+    let http = http::serve_tls(
         Arc::clone(&ctx),
         &http_addr,
         HttpOptions {
@@ -167,6 +189,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             session: crate::session_sec::SessionPolicy::from_config(&config.server.session),
             ..HttpOptions::default()
         },
+        tls.clone(),
     )
     .await
     .map_err(|source| BootError::Bind {
@@ -174,7 +197,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         source,
     })?;
 
-    let tcp = tcp::serve(
+    let tcp = tcp::serve_tls(
         Arc::clone(&ctx),
         &tcp_addr,
         TcpOptions {
@@ -183,6 +206,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             socket,
             ..TcpOptions::default()
         },
+        tls,
     )
     .await
     .map_err(|source| {

@@ -40,15 +40,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
+use tokio_rustls::TlsAcceptor;
 
 use fluxum_core::metrics::SessionRejectReason;
 use fluxum_protocol::{ClientMessage, Frame, FrameCodec, ServerMessage, codes};
 
 use crate::session::{Session, SessionState};
 use crate::session_sec::token_id;
+use crate::tls::MaybeTls;
 use crate::{ConnHandle, OutFrame, ShardContext};
 
 /// The one wire content type for `/rpc` (RPC — binary, never JSON).
@@ -280,6 +281,19 @@ pub async fn serve(
     addr: impl tokio::net::ToSocketAddrs,
     options: HttpOptions,
 ) -> io::Result<HttpServer> {
+    serve_tls(ctx, addr, options, None).await
+}
+
+/// [`serve`] with optional built-in TLS termination (SPEC-026 SEC-059): a
+/// directly-accepted connection completes the TLS handshake before the first
+/// request; a trusted-proxy connection stays plaintext (the proxy terminated
+/// TLS and forwards on a trusted link).
+pub async fn serve_tls(
+    ctx: Arc<ShardContext>,
+    addr: impl tokio::net::ToSocketAddrs,
+    options: HttpOptions,
+    tls: Option<TlsAcceptor>,
+) -> io::Result<HttpServer> {
     let listener = crate::sock::bind(addr, options.socket).await?;
     let local_addr = listener.local_addr()?;
     let shutdown = Arc::new(Notify::new());
@@ -321,19 +335,30 @@ pub async fn serve(
                         // SEC-035: a trusted proxy names the real client in
                         // `X-Forwarded-For`, which lives in the request — so
                         // admission is deferred to the first parsed request,
-                        // where the guard can key on the *client*.
+                        // where the guard can key on the *client*. The proxy
+                        // already terminated TLS, so this hop stays plaintext.
                         let conn_state = Arc::clone(&state);
                         let conn_shutdown = accept_shutdown.clone();
                         tokio::spawn(async move {
-                            let _ = serve_connection(conn_state, stream, ip, Admission::Proxied(trusted), conn_shutdown).await;
+                            let _ = serve_connection(conn_state, MaybeTls::Plain(stream), ip, Admission::Proxied(trusted), conn_shutdown).await;
                         });
                     } else {
                         match state.ctx.conn_guard().try_accept(ip) {
                             Ok(permit) => {
                                 let conn_state = Arc::clone(&state);
                                 let conn_shutdown = accept_shutdown.clone();
+                                let tls = tls.clone();
                                 tokio::spawn(async move {
-                                    let _ = serve_connection(conn_state, stream, ip, Admission::Direct(permit), conn_shutdown).await;
+                                    // SEC-059: terminate TLS (if configured)
+                                    // before the first request is read.
+                                    let conn = match MaybeTls::accept(stream, tls.as_ref()).await {
+                                        Ok(conn) => conn,
+                                        Err(e) => {
+                                            tracing::debug!(target: "fluxum::http", error = %e, "TLS handshake failed");
+                                            return;
+                                        }
+                                    };
+                                    let _ = serve_connection(conn_state, conn, ip, Admission::Direct(permit), conn_shutdown).await;
                                 });
                             }
                             Err(reason) => {
@@ -370,7 +395,7 @@ enum Admission {
 /// (for POST) keep the connection alive for the next request.
 async fn serve_connection(
     state: Arc<HttpState>,
-    mut stream: TcpStream,
+    mut stream: MaybeTls,
     peer_ip: std::net::IpAddr,
     admission: Admission,
     server_shutdown: Arc<Notify>,
@@ -550,7 +575,7 @@ async fn serve_connection(
 /// the orphan). 404 when no blob store is installed; 413 above the cap.
 async fn handle_blob_upload(
     ctx: &Arc<ShardContext>,
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     request: &Request,
 ) -> io::Result<()> {
     /// Upload cap: generous (out-of-band of the 16 MB frame), still bounded.
@@ -577,7 +602,7 @@ async fn handle_blob_upload(
 /// 404 for an unknown hash or when no blob store is installed.
 async fn handle_blob_download(
     ctx: &Arc<ShardContext>,
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     hash: &str,
 ) -> io::Result<()> {
     let Some(blobs) = ctx.blob_store() else {
@@ -595,7 +620,7 @@ async fn handle_blob_download(
 
 async fn handle_admin(
     ctx: &Arc<ShardContext>,
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     method: &str,
     path: &str,
     body: &[u8],
@@ -634,7 +659,7 @@ async fn handle_admin(
 /// `POST /rpc`: route the body frames and return the response frames.
 async fn handle_post(
     state: &Arc<HttpState>,
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     ip: std::net::IpAddr,
     request: &Request,
 ) -> io::Result<()> {
@@ -919,7 +944,7 @@ async fn handle_post(
 /// keep-alives and idle expiry.
 async fn handle_get(
     state: &Arc<HttpState>,
-    mut stream: TcpStream,
+    mut stream: MaybeTls,
     request: &Request,
     server_shutdown: Arc<Notify>,
 ) -> io::Result<()> {
@@ -1169,7 +1194,7 @@ impl Request {
 }
 
 /// Read one HTTP/1.1 request; `None` on a clean connection close.
-async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<Option<Request>> {
+async fn read_request(stream: &mut MaybeTls, buf: &mut Vec<u8>) -> io::Result<Option<Request>> {
     // Read until the end of the header block.
     let headers_end = loop {
         if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
@@ -1233,7 +1258,7 @@ async fn read_request(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<O
 // --- HTTP/1.1 response writing -------------------------------------------------
 
 async fn write_response(
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     code: u16,
     reason: &str,
     session: Option<&str>,
@@ -1255,7 +1280,7 @@ async fn write_response(
 /// Write a non-FluxRPC response (admin JSON / metrics text) with an explicit
 /// content type.
 async fn write_json(
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     code: u16,
     content_type: &str,
     body: &[u8],
@@ -1291,7 +1316,7 @@ fn reason_phrase(code: u16) -> &'static str {
 /// filesystem for them.
 async fn handle_static(
     state: &Arc<HttpState>,
-    stream: &mut TcpStream,
+    stream: &mut MaybeTls,
     path: &str,
 ) -> io::Result<()> {
     let Some(root) = state.options.static_dir.as_deref() else {
@@ -1324,7 +1349,7 @@ async fn handle_static(
     stream.flush().await
 }
 
-async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Result<()> {
+async fn write_simple(stream: &mut MaybeTls, code: u16, reason: &str) -> io::Result<()> {
     let head = format!(
         "HTTP/1.1 {code} {reason}\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: 0\r\n\r\n"
     );
@@ -1340,7 +1365,7 @@ async fn write_simple(stream: &mut TcpStream, code: u16, reason: &str) -> io::Re
 /// arrives. A push stream is idle by definition until the first commit, which
 /// made every browser client hang at connect while Node (which does not sniff)
 /// worked fine. `nosniff` tells the browser there is nothing to guess.
-async fn write_stream_header(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_stream_header(stream: &mut MaybeTls) -> io::Result<()> {
     // `nosniff` because the content type is not one a browser recognises, and
     // sniffing an unrecognised type means waiting for bytes a push stream has
     // no reason to send yet. (It is not what caused the slow-open bug — see
@@ -1355,7 +1380,7 @@ async fn write_stream_header(stream: &mut TcpStream) -> io::Result<()> {
     stream.flush().await
 }
 
-async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
+async fn write_chunk(stream: &mut MaybeTls, data: &[u8]) -> io::Result<()> {
     let header = format!("{:x}\r\n", data.len());
     stream.write_all(header.as_bytes()).await?;
     stream.write_all(data).await?;
@@ -1363,7 +1388,7 @@ async fn write_chunk(stream: &mut TcpStream, data: &[u8]) -> io::Result<()> {
     stream.flush().await
 }
 
-async fn write_last_chunk(stream: &mut TcpStream) -> io::Result<()> {
+async fn write_last_chunk(stream: &mut MaybeTls) -> io::Result<()> {
     stream.write_all(b"0\r\n\r\n").await?;
     stream.flush().await
 }

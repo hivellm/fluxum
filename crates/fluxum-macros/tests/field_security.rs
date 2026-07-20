@@ -222,13 +222,13 @@ fn vault_config() -> TransformsConfig {
             TransformKey {
                 id: "vault".into(),
                 scheme: KeyScheme::X25519,
-                secret: "aa".repeat(32),
+                secret: "aa".repeat(32).into(),
                 previous: vec![],
             },
             TransformKey {
                 id: "server".into(),
                 scheme: KeyScheme::Ed25519,
-                secret: "bb".repeat(32),
+                secret: "bb".repeat(32).into(),
                 previous: vec![],
             },
         ],

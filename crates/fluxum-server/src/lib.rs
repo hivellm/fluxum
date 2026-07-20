@@ -34,6 +34,7 @@ pub mod shard;
 pub mod sock;
 pub mod statics;
 pub mod tcp;
+pub mod tls;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -312,6 +313,10 @@ pub struct ShardContext {
     /// the safe posture — loopback-only, operator credential required for
     /// remote — so an assembly that never installs config is still safe.
     admin_policy: std::sync::RwLock<Arc<AdminPolicy>>,
+    /// Whether the transports terminate TLS (SPEC-026 SEC-059). A boolean
+    /// only — never key material — surfaced in `/health` so an operator can
+    /// confirm the encryption posture.
+    tls_enabled: std::sync::atomic::AtomicBool,
     /// The boot-time [`EffectiveConfig`] rendered once (HWA-013): probe
     /// inputs, every derived value with its source, and the per-kernel SIMD
     /// selection. Serialized at install so `/health` stays a clone, not a
@@ -392,6 +397,7 @@ impl ShardContext {
             trusted_proxies: std::sync::RwLock::new(Arc::new(fluxum_core::net::IpSet::default())),
             session_admin: std::sync::OnceLock::new(),
             admin_policy: std::sync::RwLock::new(Arc::new(AdminPolicy::default())),
+            tls_enabled: std::sync::atomic::AtomicBool::new(false),
             send_buffer_bytes: AtomicU64::new(
                 fluxum_core::config::SubscriptionsConfig::default()
                     .send_buffer_bytes
@@ -656,6 +662,17 @@ impl ShardContext {
             .admin_policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+    }
+
+    /// Record whether the transports terminate TLS (SPEC-026 SEC-059).
+    pub fn set_tls_enabled(&self, enabled: bool) {
+        self.tls_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the transports terminate TLS (`/health` posture, SEC-059).
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_enabled.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// SEC-041: the current admission-control verdict, published to the
