@@ -1,13 +1,13 @@
 ## 1. Implementation
-- [ ] 1.1 Fail-closed RLS visibility (F-003): make `shard_local` / `custom` / `member_of` either enforce a real filter or be rejected at schema-load with a clear error, so a declared rule never silently means "no filter" (`sql/mod.rs:743-765`); add a regression test per mode
-- [ ] 1.2 Asymmetric JWT provider variant (F-019): a verify-only provider that holds a public key, so the DB never stores token-minting material; symmetric HS256 stays available but is documented as lower-assurance
-- [ ] 1.3 Sidecar transport hardening (F-021): document and enforce mTLS-or-loopback as a hard requirement for the sidecar channel; treat a response decode failure as a breaker trip rather than a trusted value
-- [ ] 1.4 Bound permissive-auth identity minting (F-020): cap/observe distinct identities minted under permissive auth so it cannot be used to multiply identities without limit
-- [ ] 1.5 Metrics: `fluxum_rls_denied_total{mode}`, sidecar decode-failure / breaker-trip counter; wired for the new fail-closed paths
-- [ ] 1.6 Spec: SPEC-009 auth (asymmetric provider + permissive bound), SPEC RLS/visibility (fail-closed modes), SPEC sidecar (mandatory mTLS/loopback)
-- [ ] 1.7 Verification: a schema declaring an unimplemented visibility mode is rejected (or filters correctly) — never silently open; an asymmetric-provider token verifies with the public key and the DB holds no secret; a corrupt/unauthenticated sidecar response trips the breaker instead of being trusted; permissive-auth identity minting is bounded
+- [x] 1.1 Fail-closed RLS visibility (F-003, SEC-060): `shard_local` and `custom` are unimplemented and now rejected at schema load (`registry.rs::validate_table`) with a clear error — a declared-but-unenforced rule can never silently mean "no filter". `member_of` is NOT a gap (enforced by the subscription manager's membership index), `owner_only` is a per-row closure, `public_all` is intentionally open. Regression test per mode
+- [x] 1.2 Asymmetric verify-only JWT (F-019, SEC-061): `auth.jwt_algorithm` (rs256/es256/ed25519) + `auth.jwt_public_key`; `JwtProvider::verify_only` holds only the public key (no `EncodingKey`), so the DB cannot mint — `issue`/`encode` error, `refresh` returns the token unchanged. Symmetric hs256 stays the default, documented lower-assurance. Test: an issuer-signed ES256 token verifies, the DB cannot mint, a wrong-key token is rejected
+- [x] 1.3 Sidecar channel integrity (F-021, SEC-063): a non-loopback sidecar endpoint is refused at manifest build (the Plugin RPC channel is plaintext and responses are unauthenticated — an injection surface — until mTLS lands). A response decode failure already trips the breaker: `recv` maps a decode error to a `Protocol` failure via `self.error()` → `breaker.note_failure` and the value is discarded, never trusted (confirmed + documented). Test: public endpoint rejected, loopback/localhost accepted
+- [x] 1.4 Permissive-auth identity bound (F-020, SEC-062): `BoundedNoneProvider` caps distinct identities at `auth.max_permissive_identities` (default 10000, 0 = unbounded) — a new identity past the cap is refused, an already-admitted one keeps working. Test: cap bites the 3rd distinct, existing works, 0 = unbounded
+- [x] 1.5 Metrics: RLS is now fail-closed at *load* (the rule cannot exist at runtime), so no runtime `rls_denied` counter is needed — the failure is a startup error. The sidecar decode-failure / breaker-trip meters already exist (`SidecarStats`: `protocol` error counter + `breaker_opened_total`), and a decode failure feeds them via 1.3. Noted in the spec
+- [x] 1.6 Spec: SPEC-026 SEC-060..063 (fail-closed RLS, asymmetric JWT, permissive bound, sidecar loopback) with a config block; SPEC-009 auth-provider table + JWT-algorithm note (symmetric vs asymmetric assurance) + permissive bound
+- [x] 1.7 Verification: unit/integration tests per finding (registry fail-closed, jwt verify-only, bounded none, sidecar loopback rejection) — all green; full core + workspace suite + clippy green
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation
+- [x] 2.2 Write tests covering the new behavior
+- [x] 2.3 Run tests and confirm they pass

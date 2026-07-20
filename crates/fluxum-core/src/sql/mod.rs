@@ -742,9 +742,13 @@ pub fn explain(schema: &Schema, sql: &str) -> Result<serde_json::Value> {
 
 /// Compile a table's [`VisibilityRule`] into the [`RlsFn`] applied per
 /// subscriber (SUB-030). `None` means "no row-level filter" — the plan is
-/// not caller-parameterized. Only `owner_only` is enforced in T4.3;
-/// `shard_local` (needs the shard context of phase 5) and `custom` (SUB-032,
-/// P2) are documented gaps that currently impose no filter.
+/// not caller-parameterized. `owner_only` compiles to a per-row closure;
+/// `member_of` returns `None` here because it is enforced by the subscription
+/// manager against its live membership index (a pure row closure cannot see
+/// that state), while `caller_scoped` still buckets the plan per viewer.
+/// `shard_local` and `custom` are unreachable: they are rejected at schema
+/// load (SEC-060, fail-closed), so an unenforced rule can never silently
+/// impose no filter.
 fn compile_visibility(table: &TableSchema) -> Option<RlsFn> {
     match table.visibility {
         VisibilityRule::OwnerOnly { owner } => {
@@ -752,11 +756,6 @@ fn compile_visibility(table: &TableSchema) -> Option<RlsFn> {
                 row.value(owner) == Some(&RowValue::Identity(*viewer))
             }))
         }
-        // RV-040 `member_of` is evaluated by the subscription manager
-        // against its live membership index (the rule needs table state a
-        // pure row closure cannot see); `caller_scoped` still buckets the
-        // plan per viewer. `custom` (SUB-032 named predicates) stays a
-        // documented gap; `shard_local` needs the phase-5 shard context.
         VisibilityRule::PublicAll
         | VisibilityRule::ShardLocal
         | VisibilityRule::Custom(_)

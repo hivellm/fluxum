@@ -627,6 +627,24 @@ impl PluginRegistry {
                             .into(),
                     ));
                 }
+                // SEC-063 (F-021): the Plugin RPC channel is plaintext and the
+                // sidecar's *responses* are not authenticated (only Fluxum's
+                // Hello carries a token) — an on-path attacker on a non-loopback
+                // link could inject a response that Fluxum trusts-on-deserialize.
+                // Until mTLS lands, a sidecar endpoint MUST be loopback.
+                let host = endpoint
+                    .rsplit_once(':')
+                    .map_or(endpoint.as_str(), |(h, _)| h)
+                    .trim_start_matches('[')
+                    .trim_end_matches(']');
+                if !crate::auth::is_loopback_host(host) {
+                    return Err(fail(format!(
+                        "sidecar endpoint `{endpoint}` is not loopback: the Plugin RPC channel is \
+                         plaintext and sidecar responses are unauthenticated, so a non-loopback \
+                         endpoint is an injection surface. Run the sidecar on loopback/same-pod \
+                         (mTLS for remote sidecars is not yet supported) (SEC-063, fail-closed)"
+                    )));
+                }
                 let proxy = Arc::new(SidecarProxy::new(SidecarConfig {
                     name: decl.name.clone(),
                     capability,

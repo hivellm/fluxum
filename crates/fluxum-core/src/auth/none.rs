@@ -6,7 +6,11 @@
 //! ([`super::enforce_loopback_guard`]) so it can never be exposed on a
 //! public interface.
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
 use super::{AuthClaims, AuthProvider};
+use crate::types::Identity;
 
 /// Dev-mode provider (`auth.provider: none`): loopback-only, no validation.
 #[derive(Clone, Copy, Debug, Default)]
@@ -29,6 +33,65 @@ impl AuthProvider for NoneProvider {
     }
 }
 
+/// The permissive provider (`none`) bounded by a distinct-identity cap
+/// (SPEC-009 SEC-062, OWASP F-020). `none` accepts any token as its own
+/// identity, so without a bound a local caller could mint unbounded distinct
+/// identities. This wraps [`NoneProvider`] and caps how many *distinct*
+/// identities it will admit: a never-seen identity past the cap is refused,
+/// while an already-admitted one keeps working. `none` is loopback-only
+/// (AUTH-040), so this is defense-in-depth for dev mode.
+#[derive(Debug)]
+pub struct BoundedNoneProvider {
+    inner: NoneProvider,
+    cap: usize,
+    seen: Mutex<HashSet<Identity>>,
+}
+
+impl BoundedNoneProvider {
+    /// A permissive provider admitting at most `cap` distinct identities
+    /// (`0` = unbounded).
+    pub fn new(cap: u32) -> Self {
+        Self {
+            inner: NoneProvider,
+            cap: cap as usize,
+            seen: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// The number of distinct identities admitted so far (test introspection).
+    #[cfg(test)]
+    pub fn admitted(&self) -> usize {
+        self.seen.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+impl AuthProvider for BoundedNoneProvider {
+    fn authenticate(&self, token: &[u8]) -> std::result::Result<AuthClaims, String> {
+        let claims = self.inner.authenticate(token)?;
+        if self.cap == 0 {
+            return Ok(claims); // unbounded
+        }
+        let identity = claims.identity();
+        let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.contains(&identity) {
+            return Ok(claims); // an already-admitted identity always works
+        }
+        if seen.len() >= self.cap {
+            return Err(format!(
+                "permissive-auth distinct-identity cap ({}) reached (SEC-062); refusing a new \
+                 identity. Raise auth.max_permissive_identities or use a real auth provider",
+                self.cap
+            ));
+        }
+        seen.insert(identity);
+        Ok(claims)
+    }
+
+    fn refresh(&self, token: &[u8]) -> std::result::Result<Vec<u8>, String> {
+        self.inner.refresh(token)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -44,6 +107,29 @@ mod tests {
             assert_eq!(claims.identity(), Identity::from_token(token));
             assert!(claims.expires_at.is_none());
             assert!(claims.roles.is_empty());
+        }
+    }
+
+    #[test]
+    fn bounded_permissive_caps_distinct_identities() {
+        let p = BoundedNoneProvider::new(2);
+        // Two distinct identities are admitted.
+        p.authenticate(b"alice").unwrap();
+        p.authenticate(b"bob").unwrap();
+        assert_eq!(p.admitted(), 2);
+        // A third *new* identity is refused (SEC-062).
+        let err = p.authenticate(b"carol").unwrap_err();
+        assert!(err.contains("cap"), "{err}");
+        // But an already-admitted identity keeps working.
+        p.authenticate(b"alice").unwrap();
+        assert_eq!(p.admitted(), 2);
+    }
+
+    #[test]
+    fn a_zero_cap_is_unbounded() {
+        let p = BoundedNoneProvider::new(0);
+        for i in 0..1000u32 {
+            p.authenticate(format!("user-{i}").as_bytes()).unwrap();
         }
     }
 

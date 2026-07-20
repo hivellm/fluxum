@@ -626,6 +626,21 @@ fn the_token_never_reaches_the_plugins_report() {
     );
 }
 
+#[test]
+fn a_non_loopback_sidecar_endpoint_is_rejected() {
+    // SEC-063 (F-021): the Plugin RPC channel is plaintext and responses are
+    // unauthenticated, so a remote sidecar is an injection surface — refused
+    // at manifest build until mTLS lands.
+    let schema = Arc::new(Schema::from_tables([&ITEM]).unwrap());
+    let err = PluginRegistry::build(&schema, &config_with_sidecar("203.0.113.5:15899", None))
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("loopback"), "rejects a public sidecar: {err}");
+    // Loopback (and localhost) are accepted.
+    assert!(PluginRegistry::build(&schema, &config_with_sidecar("127.0.0.1:15899", None)).is_ok());
+    assert!(PluginRegistry::build(&schema, &config_with_sidecar("localhost:15899", None)).is_ok());
+}
+
 // --- 1.4: the circuit breaker -----------------------------------------------------
 
 #[test]

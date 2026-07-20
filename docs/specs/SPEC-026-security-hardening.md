@@ -306,6 +306,38 @@ server:
   allow_plaintext: false             # SEC-059 opt out of the public-bind TLS requirement
 ```
 
+### Requirement: Fail-closed access-control residuals
+- **SEC-060** [P1] Fail-closed row visibility (OWASP A01 F-003). A `#[visibility]` rule that is
+  *declared but has no enforcement path* MUST be rejected at schema load, never served with no
+  filter — a declared access control can never silently protect nothing. `shard_local` and
+  `custom` are unimplemented and so are hard load errors; `owner_only` (per-row closure),
+  `member_of` (subscription-manager membership index), and `public_all` (intentionally unfiltered)
+  are the enforced set.
+- **SEC-061** [P2] Asymmetric JWT (A07 F-019). `auth.jwt_algorithm` MAY select an asymmetric
+  algorithm (`rs256`/`es256`/`ed25519`); the provider is then **verify-only** — it holds only the
+  public key (`auth.jwt_public_key`), so a database compromise cannot mint tokens. `refresh`
+  returns the presented token unchanged (a fresh token comes from the external issuer). Symmetric
+  `hs256` (the default) stays available and is documented as lower-assurance (the DB holds the
+  minting secret).
+- **SEC-062** [P2] Permissive-auth identity bound (A07 F-020). The `none` provider caps the number
+  of *distinct* identities it will admit at `auth.max_permissive_identities` (default 10000, `0` =
+  unbounded): a never-seen identity past the cap is refused while an already-admitted one keeps
+  working, so permissive dev auth cannot multiply identities without limit. (`none` is loopback-only
+  regardless, AUTH-040.)
+- **SEC-063** [P2] Sidecar channel integrity (A08 F-021). The Plugin RPC sidecar channel is
+  plaintext and the sidecar's *responses* are unauthenticated (only Fluxum's Hello carries a
+  token), so a non-loopback endpoint is a response-injection surface. Until mTLS lands, a sidecar
+  endpoint MUST be loopback — a non-loopback endpoint is a hard manifest-build error. A response
+  that fails to decode is treated as a call failure (counted, feeds the PLG-031 breaker), never a
+  trusted value.
+
+```yaml
+auth:
+  jwt_algorithm: es256                 # SEC-061 asymmetric verify-only (hs256 = symmetric default)
+  jwt_public_key: /etc/fluxum/jwt.pub  # SEC-061 required for an asymmetric algorithm
+  max_permissive_identities: 10000     # SEC-062 distinct-identity cap for provider `none` (0 = off)
+```
+
 ## 5. Non-goals
 
 - Application-layer secrets management (module config injects keys via `FLUXUM_*`).

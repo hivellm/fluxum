@@ -154,8 +154,14 @@ envelopes in [SPEC-006](SPEC-006-protocol-fluxrpc.md); per-reducer rate limiting
   | Provider | Config | Description |
   |----------|--------|-------------|
   | `token` | `secret: <bytes>` | HMAC-SHA256 signed opaque token; `canonical_token` = raw token bytes (long-lived token, see AUTH-001) |
-  | `jwt` | `secret: <str>` | HS256 JWT verification (`jsonwebtoken`); `canonical_token` = `"{iss}|{sub}"` — identity is rotation-proof (AUTH-001) *(adopted from SpacetimeDB analysis, file 08)* |
-  | `none` | — | Dev mode: any token is accepted; identity = SHA-256(token) |
+  | `jwt` | `secret: <str>` (hs256) or `jwt_public_key` (asymmetric) | JWT verification (`jsonwebtoken`); `canonical_token` = `"{iss}|{sub}"` — identity is rotation-proof (AUTH-001) *(adopted from SpacetimeDB analysis, file 08)* |
+  | `none` | — | Dev mode: any token is accepted; identity = SHA-256(token); distinct identities bounded by `max_permissive_identities` (SEC-062) |
+
+  **JWT algorithm (SEC-061).** `auth.jwt_algorithm` (default `hs256`) selects the signature
+  scheme. `hs256` is symmetric — the DB holds the shared secret and can mint tokens (lower
+  assurance). `rs256`/`es256`/`ed25519` are asymmetric and **verify-only**: the DB holds only
+  `auth.jwt_public_key`, so a DB compromise cannot forge tokens; `refresh` returns the presented
+  token unchanged (a fresh token comes from the external issuer).
 
   Configuration in `config.yml`:
 

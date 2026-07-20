@@ -189,10 +189,35 @@ impl ServerPeerRegistry {
 
 /// Instantiate the configured built-in provider (AUTH-031).
 pub fn provider_from_config(auth: &AuthConfig) -> Result<Arc<dyn AuthProvider>> {
+    use crate::config::JwtAlgorithm;
     match auth.provider {
         AuthProviderKind::Token => Ok(Arc::new(TokenProvider::new(required_secret(auth)?))),
+        AuthProviderKind::Jwt if auth.jwt_algorithm.is_asymmetric() => {
+            // SEC-061 (F-019): verify-only asymmetric JWT — the DB holds only
+            // the public key and cannot mint tokens.
+            let Some(key_path) = &auth.jwt_public_key else {
+                return Err(FluxumError::config(format!(
+                    "auth.jwt_public_key: required for asymmetric auth.jwt_algorithm '{:?}' (SEC-061)",
+                    auth.jwt_algorithm
+                )));
+            };
+            let pem = std::fs::read(key_path).map_err(|e| {
+                FluxumError::config(format!("auth.jwt_public_key '{}': {e}", key_path.display()))
+            })?;
+            let algorithm = match auth.jwt_algorithm {
+                JwtAlgorithm::Rs256 => jsonwebtoken::Algorithm::RS256,
+                JwtAlgorithm::Es256 => jsonwebtoken::Algorithm::ES256,
+                JwtAlgorithm::Ed25519 => jsonwebtoken::Algorithm::EdDSA,
+                JwtAlgorithm::Hs256 => unreachable!("guarded by is_asymmetric"),
+            };
+            JwtProvider::verify_only(algorithm, &pem)
+                .map(|p| Arc::new(p) as Arc<dyn AuthProvider>)
+                .map_err(FluxumError::config)
+        }
         AuthProviderKind::Jwt => Ok(Arc::new(JwtProvider::new(required_secret(auth)?))),
-        AuthProviderKind::None => Ok(Arc::new(NoneProvider)),
+        AuthProviderKind::None => Ok(Arc::new(crate::auth::none::BoundedNoneProvider::new(
+            auth.max_permissive_identities,
+        ))),
     }
 }
 
@@ -351,6 +376,7 @@ mod tests {
             provider,
             secret: secret.map(|s| s.to_owned().into()),
             server_peers: Vec::new(),
+            ..AuthConfig::default()
         }
     }
 

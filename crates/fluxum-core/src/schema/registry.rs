@@ -199,6 +199,34 @@ fn validate_table(t: &'static TableSchema) -> Result<()> {
     if t.columns.is_empty() {
         return err("a table must have at least one column (DM-001)".into());
     }
+
+    // SEC-060 (fail-closed RLS, OWASP A01 F-003): a `#[visibility]` rule that
+    // is declared but not enforced would silently mean "no filter" — a
+    // declared access control that quietly protects nothing. `shard_local`
+    // and `custom` have no enforcement path yet, so a table declaring one is
+    // rejected at schema load rather than served wide open. (`owner_only` is
+    // a per-row closure, `member_of` is enforced by the subscription manager,
+    // `public_all` is intentionally unfiltered.)
+    match t.visibility {
+        super::VisibilityRule::ShardLocal => {
+            return err(
+                "#[visibility(shard_local)] is not implemented and has no enforcement path; a \
+                 table declaring it would be served with no row filter. Remove it or use \
+                 owner_only / member_of until shard-local visibility lands (SEC-060, fail-closed)"
+                    .into(),
+            );
+        }
+        super::VisibilityRule::Custom(name) => {
+            return err(format!(
+                "#[visibility(custom = {name:?})] is not implemented and has no enforcement path; \
+                 a table declaring it would be served with no row filter. Remove it or use \
+                 owner_only / member_of until custom predicates land (SEC-060, fail-closed)"
+            ));
+        }
+        super::VisibilityRule::PublicAll
+        | super::VisibilityRule::OwnerOnly { .. }
+        | super::VisibilityRule::MemberOf { .. } => {}
+    }
     let column = |ordinal: u16, referent: &str| -> Result<&'static super::ColumnSchema> {
         t.column(ordinal).ok_or_else(|| {
             FluxumError::Schema(format!(
@@ -600,6 +628,35 @@ mod tests {
         assert!(!FluxType::List(&FluxType::U64).is_keyable());
         assert!(FluxType::F32.is_float());
         assert!(!FluxType::U64.is_float());
+    }
+
+    #[test]
+    fn unenforced_visibility_rules_are_rejected_fail_closed() {
+        use crate::schema::VisibilityRule;
+        // SEC-060: a declared-but-unenforced rule must be a hard load error,
+        // never a silent "no filter".
+        static SHARD_LOCAL: TableSchema = TableSchema {
+            visibility: VisibilityRule::ShardLocal,
+            ..user_schema()
+        };
+        assert_schema_err(&SHARD_LOCAL, "shard_local");
+        static CUSTOM: TableSchema = TableSchema {
+            visibility: VisibilityRule::Custom("sensor_filter"),
+            ..user_schema()
+        };
+        assert_schema_err(&CUSTOM, "custom");
+        // The enforced rules still load.
+        static OWNER: TableSchema = TableSchema {
+            // Column 1 is the Identity column in `user_schema`.
+            visibility: VisibilityRule::OwnerOnly { owner: 1 },
+            ..user_schema()
+        };
+        assert!(Schema::from_tables([&OWNER]).is_ok());
+        static PUBLIC: TableSchema = TableSchema {
+            visibility: VisibilityRule::PublicAll,
+            ..user_schema()
+        };
+        assert!(Schema::from_tables([&PUBLIC]).is_ok());
     }
 
     #[test]

@@ -587,8 +587,14 @@ pub struct ServerPeer {
     pub token: crate::secret::Secret<String>,
 }
 
+/// Default cap on permissive-provider identities (SEC-062): generous, so dev
+/// never notices, bounded so it cannot multiply identities without limit.
+fn default_max_permissive_identities() -> u32 {
+    10_000
+}
+
 /// Authentication configuration (SPEC-009).
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct AuthConfig {
     /// Provider kind.
@@ -597,8 +603,62 @@ pub struct AuthConfig {
     /// Supports `${VAR}` env expansion in the YAML file (SEC-058: redacted,
     /// zeroized).
     pub secret: Option<crate::secret::Secret<String>>,
+    /// JWT signature algorithm (`provider: jwt`), default `hs256`
+    /// (symmetric). An **asymmetric** choice (`rs256`/`es256`/`ed25519`) is
+    /// verify-only: `jwt_public_key` holds the verification key and the DB
+    /// never stores token-minting material — a DB compromise cannot forge
+    /// tokens (SEC-061, F-019). Ignored for non-`jwt` providers.
+    pub jwt_algorithm: JwtAlgorithm,
+    /// PEM public key for an asymmetric `jwt_algorithm` (SEC-061): required
+    /// then, ignored otherwise. Not a secret (a public key), so it is not
+    /// redacted.
+    pub jwt_public_key: Option<PathBuf>,
+    /// Cap on distinct identities the permissive `none` provider will mint
+    /// (SEC-062, F-020): beyond it a *new* identity is refused (already-seen
+    /// ones keep working), so permissive dev auth cannot be used to multiply
+    /// identities without limit. `0` = unbounded. Ignored for other
+    /// providers. `none` is loopback-only regardless (AUTH-040).
+    #[serde(default = "default_max_permissive_identities")]
+    pub max_permissive_identities: u32,
     /// Trusted server peers.
     pub server_peers: Vec<ServerPeer>,
+}
+
+impl Default for AuthConfig {
+    fn default() -> Self {
+        Self {
+            provider: AuthProvider::default(),
+            secret: None,
+            jwt_algorithm: JwtAlgorithm::default(),
+            jwt_public_key: None,
+            max_permissive_identities: default_max_permissive_identities(),
+            server_peers: Vec::new(),
+        }
+    }
+}
+
+/// JWT signature algorithm (SPEC-009 SEC-061). `Hs256` is symmetric (the DB
+/// holds the shared secret and can mint); the rest are asymmetric verify-only
+/// (the DB holds only the public key).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JwtAlgorithm {
+    /// HMAC-SHA256, symmetric (default; the current behavior).
+    #[default]
+    Hs256,
+    /// RSA PKCS#1 v1.5 SHA-256, asymmetric verify-only.
+    Rs256,
+    /// ECDSA P-256 SHA-256, asymmetric verify-only.
+    Es256,
+    /// Ed25519 EdDSA, asymmetric verify-only.
+    Ed25519,
+}
+
+impl JwtAlgorithm {
+    /// Whether the algorithm is asymmetric (verify-only, needs a public key).
+    pub fn is_asymmetric(self) -> bool {
+        !matches!(self, Self::Hs256)
+    }
 }
 
 /// Subscription fan-out tuning (SPEC-005).
@@ -1095,7 +1155,18 @@ impl Config {
                  overload_shed_fraction ({shed})"
             )));
         }
-        if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)
+        // SEC-061: an asymmetric JWT provider verifies with a public key, not
+        // a shared secret — require the key, not `auth.secret`.
+        let asymmetric_jwt =
+            self.auth.provider == AuthProvider::Jwt && self.auth.jwt_algorithm.is_asymmetric();
+        if asymmetric_jwt {
+            if self.auth.jwt_public_key.is_none() {
+                return Err(FluxumError::config(format!(
+                    "auth.jwt_public_key: required for asymmetric auth.jwt_algorithm '{:?}' (SEC-061)",
+                    self.auth.jwt_algorithm
+                )));
+            }
+        } else if matches!(self.auth.provider, AuthProvider::Token | AuthProvider::Jwt)
             && self
                 .auth
                 .secret

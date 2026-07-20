@@ -33,25 +33,56 @@ struct Claims {
     roles: Vec<String>,
 }
 
-/// HS256 JWT provider (`auth.provider: jwt`).
+/// JWT provider (`auth.provider: jwt`). Symmetric HS256 holds an
+/// [`EncodingKey`] and can mint (and refresh) tokens; an asymmetric
+/// verify-only provider (SEC-061, F-019) holds only the public
+/// [`DecodingKey`], so a database compromise cannot forge tokens.
 pub struct JwtProvider {
-    encoding: EncodingKey,
+    /// `None` for a verify-only asymmetric provider (cannot mint).
+    encoding: Option<EncodingKey>,
     decoding: DecodingKey,
+    algorithm: Algorithm,
     validation: Validation,
     refresh_ttl_secs: u64,
 }
 
 impl JwtProvider {
-    /// Create a provider from the shared HS256 secret (`auth.secret`).
+    /// Create a symmetric HS256 provider from the shared secret
+    /// (`auth.secret`). The DB holds the minting secret.
     pub fn new(secret: impl AsRef<[u8]>) -> Self {
         let secret = secret.as_ref();
         Self {
-            encoding: EncodingKey::from_secret(secret),
+            encoding: Some(EncodingKey::from_secret(secret)),
             decoding: DecodingKey::from_secret(secret),
-            // HS256 only; `exp` required and validated (default 60s leeway).
+            algorithm: Algorithm::HS256,
+            // `exp` required and validated (default 60s leeway).
             validation: Validation::new(Algorithm::HS256),
             refresh_ttl_secs: DEFAULT_REFRESH_TTL_SECS,
         }
+    }
+
+    /// Create an asymmetric **verify-only** provider from a PEM public key
+    /// (SEC-061): the DB holds no token-minting material. `refresh` returns
+    /// the presented token unchanged (a new token must come from the external
+    /// issuer). `algorithm` selects RS256, ES256, or Ed25519.
+    ///
+    /// # Errors
+    /// The PEM is not a valid public key for `algorithm`.
+    pub fn verify_only(algorithm: Algorithm, public_key_pem: &[u8]) -> Result<Self, String> {
+        let decoding = match algorithm {
+            Algorithm::RS256 => DecodingKey::from_rsa_pem(public_key_pem),
+            Algorithm::ES256 => DecodingKey::from_ec_pem(public_key_pem),
+            Algorithm::EdDSA => DecodingKey::from_ed_pem(public_key_pem),
+            other => return Err(format!("unsupported asymmetric JWT algorithm {other:?}")),
+        }
+        .map_err(|e| format!("jwt public key: {e}"))?;
+        Ok(Self {
+            encoding: None,
+            decoding,
+            algorithm,
+            validation: Validation::new(algorithm),
+            refresh_ttl_secs: DEFAULT_REFRESH_TTL_SECS,
+        })
     }
 
     /// Override the lifetime granted to refreshed tokens (AUTH-022).
@@ -80,7 +111,11 @@ impl JwtProvider {
     }
 
     fn encode(&self, claims: &Claims) -> std::result::Result<Vec<u8>, String> {
-        jsonwebtoken::encode(&Header::new(Algorithm::HS256), claims, &self.encoding)
+        let encoding = self.encoding.as_ref().ok_or(
+            "this JWT provider is verify-only (asymmetric); it holds no signing key and cannot \
+             mint tokens (SEC-061)",
+        )?;
+        jsonwebtoken::encode(&Header::new(self.algorithm), claims, encoding)
             .map(String::into_bytes)
             .map_err(|e| format!("jwt signing failed: {e}"))
     }
@@ -111,8 +146,14 @@ impl AuthProvider for JwtProvider {
     }
 
     fn refresh(&self, token: &[u8]) -> std::result::Result<Vec<u8>, String> {
-        // New JWT with extended expiry and unchanged (iss, sub) — the
-        // refreshed bytes differ but the identity is invariant (AUTH-022).
+        // Verify-only (asymmetric): the DB cannot re-sign, so the presented
+        // token is returned unchanged — the identity is invariant and a fresh
+        // token comes from the external issuer (AUTH-022, SEC-061).
+        if self.encoding.is_none() {
+            return Ok(token.to_vec());
+        }
+        // Symmetric: a new JWT with extended expiry and unchanged (iss, sub) —
+        // the refreshed bytes differ but the identity is invariant (AUTH-022).
         let mut claims = self.decode(token)?;
         claims.exp = now_secs().saturating_add(self.refresh_ttl_secs);
         self.encode(&claims)
@@ -131,6 +172,17 @@ mod tests {
 
     const SECRET: &[u8] = b"jwt-test-secret";
 
+    // A throwaway EC P-256 keypair for the SEC-061 verify-only test.
+    const EC_PRIV_PK8: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgoPsDIASu9SvjLyxj\n\
+AsyKHdbzkTogSMbEYfuFlIpvhLqhRANCAARvo2K4Oet72HQdW8AFHo0T8hYgjhGz\n\
+8+zU7XZyYTjZkMaDyieORmEIQSOvAdhycgbq/TfZyPJe3WUNDNuAAqzN\n\
+-----END PRIVATE KEY-----\n";
+    const EC_PUB: &str = "-----BEGIN PUBLIC KEY-----\n\
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEb6NiuDnre9h0HVvABR6NE/IWII4R\n\
+s/Ps1O12cmE42ZDGg8onjkZhCEEjrwHYcnIG6v032cjyXt1lDQzbgAKszQ==\n\
+-----END PUBLIC KEY-----\n";
+
     fn provider() -> JwtProvider {
         JwtProvider::new(SECRET)
     }
@@ -144,6 +196,40 @@ mod tests {
         )
         .unwrap()
         .into_bytes()
+    }
+
+    #[test]
+    fn asymmetric_verify_only_validates_but_cannot_mint() {
+        // SEC-061 (F-019): the verify-only provider holds only the public key.
+        let p = JwtProvider::verify_only(Algorithm::ES256, EC_PUB.as_bytes()).unwrap();
+
+        // A token signed by the matching *private* key (the external issuer)
+        // verifies and yields the claims-based identity.
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "sub": "user-7",
+            "exp": now_secs() + 600,
+        });
+        let signing = EncodingKey::from_ec_pem(EC_PRIV_PK8.as_bytes()).unwrap();
+        let token = jsonwebtoken::encode(&Header::new(Algorithm::ES256), &claims, &signing)
+            .unwrap()
+            .into_bytes();
+        let out = p.authenticate(&token).unwrap();
+        assert_eq!(
+            out.identity(),
+            Identity::from_claims("https://issuer.example", "user-7")
+        );
+
+        // The DB cannot mint: no signing key.
+        let mint = p.issue("https://issuer.example", "user-7", 600);
+        assert!(mint.unwrap_err().contains("verify-only"));
+
+        // Refresh returns the presented token unchanged (identity invariant).
+        assert_eq!(p.refresh(&token).unwrap(), token);
+
+        // A token signed with the wrong (HS256) key is rejected.
+        let forged = sign(&claims);
+        assert!(p.authenticate(&forged).is_err());
     }
 
     #[test]
