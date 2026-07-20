@@ -1,0 +1,34 @@
+{
+  "name": "unsubscribe",
+  "description": "Unsubscribe stops delivery and drops the rows that subscription held (SUB-004). With two overlapping subscriptions, dropping one keeps rows the other still covers (SDK-044), and a later commit reaches only the surviving subscription.",
+  "steps": [
+    { "connect": { "client": "alice", "token": "alice" } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, "in channel one"] } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [2, "in channel two"] } },
+
+    { "connect": { "client": "reader", "token": "reader" } },
+    { "subscribe": { "client": "reader", "queries": ["SELECT * FROM ChatMessage WHERE channel = 1"], "as": "chan1" } },
+    { "subscribe": { "client": "reader", "queries": ["SELECT * FROM ChatMessage"], "as": "all" } },
+
+    { "await_row": { "client": "reader", "table": "ChatMessage", "where": { "content": "in channel two" } } },
+    { "expect_cache": { "client": "reader", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:alice", "channel": 1, "content": "in channel one", "sent_at": "*" },
+      { "id": "2", "sender": "$identity:alice", "channel": 2, "content": "in channel two", "sent_at": "*" }
+    ] } },
+
+    { "unsubscribe": { "client": "reader", "handles": "all" } },
+    { "await_gone": { "client": "reader", "table": "ChatMessage", "where": { "channel": 2 } } },
+    { "expect_cache": { "client": "reader", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:alice", "channel": 1, "content": "in channel one", "sent_at": "*" }
+    ] } },
+
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [1, "another in one"] } },
+    { "call": { "client": "alice", "reducer": "send_chat", "args": [2, "another in two"] } },
+
+    { "await_row": { "client": "reader", "table": "ChatMessage", "where": { "content": "another in one" } } },
+    { "expect_cache": { "client": "reader", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:alice", "channel": 1, "content": "in channel one", "sent_at": "*" },
+      { "id": "3", "sender": "$identity:alice", "channel": 1, "content": "another in one", "sent_at": "*" }
+    ] } }
+  ]
+}

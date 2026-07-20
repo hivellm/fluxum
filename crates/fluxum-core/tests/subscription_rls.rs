@@ -202,7 +202,7 @@ fn owner_only_filters_txupdate_diffs_per_subscriber() {
     let by_sub = |conn: u128| {
         deltas
             .iter()
-            .find(|d| d.subscribers == vec![conn])
+            .find(|d| d.connections() == vec![conn])
             .unwrap_or_else(|| panic!("no delta for connection {conn}"))
     };
     assert_eq!(by_sub(1).update.inserts.len(), 1, "Alice sees only her row");
@@ -216,22 +216,22 @@ fn owner_only_filters_txupdate_diffs_per_subscriber() {
     });
     let deltas = mgr.on_commit(&diff).unwrap();
     assert!(
-        deltas.iter().all(|d| d.subscribers != vec![1]),
+        deltas.iter().all(|d| d.connections() != vec![1]),
         "Alice gets no delta for a Bob-only commit"
     );
     // Bob and the server both do.
-    assert!(deltas.iter().any(|d| d.subscribers == vec![2]));
-    assert!(deltas.iter().any(|d| d.subscribers == vec![3]));
+    assert!(deltas.iter().any(|d| d.connections() == vec![2]));
+    assert!(deltas.iter().any(|d| d.connections() == vec![3]));
 
     // Deleting an Alice row is delivered to Alice (and server), not to Bob.
     let diff = commit(&store, |tx| {
         assert!(tx.delete(task_id, &[RowValue::U64(1)]).unwrap());
     });
     let deltas = mgr.on_commit(&diff).unwrap();
-    let alice_delta = deltas.iter().find(|d| d.subscribers == vec![1]).unwrap();
+    let alice_delta = deltas.iter().find(|d| d.connections() == vec![1]).unwrap();
     assert_eq!(alice_delta.update.deletes.len(), 1, "Alice sees her delete");
     assert!(
-        deltas.iter().all(|d| d.subscribers != vec![2]),
+        deltas.iter().all(|d| d.connections() != vec![2]),
         "Bob never saw Alice's row, so no delete for him"
     );
 }
@@ -296,7 +296,7 @@ fn two_client_task_scenario_isolates_owners() {
     });
     let deltas = mgr.on_commit(&diff).unwrap();
     assert!(
-        deltas.iter().all(|d| d.subscribers != vec![1]),
+        deltas.iter().all(|d| d.connections() != vec![1]),
         "Alice does not receive Bob's row (SPEC-001 acceptance)"
     );
 
@@ -305,7 +305,7 @@ fn two_client_task_scenario_isolates_owners() {
         tx.insert(task_id, task(2, ALICE, "review PR")).unwrap();
     });
     let deltas = mgr.on_commit(&diff).unwrap();
-    let alice_delta = deltas.iter().find(|d| d.subscribers == vec![1]).unwrap();
+    let alice_delta = deltas.iter().find(|d| d.connections() == vec![1]).unwrap();
     assert_eq!(
         alice_delta.update.inserts.len(),
         1,

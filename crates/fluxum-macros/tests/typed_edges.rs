@@ -156,7 +156,7 @@ fn traversal_is_an_index_scan_and_subscriptions_deliver_live_diffs() {
     let deltas = manager.on_commit(&add_edge(&store, 1, 12, 7)).unwrap();
     assert_eq!(deltas.len(), 1);
     assert_eq!(
-        deltas[0].subscribers,
+        deltas[0].connections(),
         vec![7],
         "edge add reaches the subscriber"
     );

@@ -42,6 +42,7 @@
     "presence-ephemeral",
     "multi-query-subscribe",
     "rate-limit",
-    "reconnect-resync"
+    "reconnect-resync",
+    "unsubscribe"
   ]
 }

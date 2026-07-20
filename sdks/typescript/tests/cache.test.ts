@@ -229,3 +229,64 @@ test('an empty snapshot for a subscribed table clears it', () => {
   assert.deepEqual(kinds(events), ['delete', 'delete']);
   assert.equal(c.size, 0);
 });
+
+// --- Per-query attribution and unsubscribe (SDK-044) ------------------------
+
+test('two queries hold one refcounted row; dropping one keeps it, dropping both frees it', () => {
+  // The whole point of per-query tracking: an overlapping row survives the
+  // loss of one subscription and fires nothing, then leaves on the last.
+  const c = cache();
+  const a = c.applyQueryDiff(1, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  const b = c.applyQueryDiff(2, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  assert.deepEqual(kinds(a), ['insert'], 'first query caches and fires');
+  assert.deepEqual(kinds(b), [], 'second query dedupes, fires nothing');
+  assert.equal(c.refcount('Task', row(1)), 2);
+
+  const dropA = c.releaseQuery(1);
+  assert.deepEqual(kinds(dropA), [], 'still held by query 2: no callback');
+  assert.equal(c.refcount('Task', row(1)), 1);
+  assert.equal(c.size, 1);
+
+  const dropB = c.releaseQuery(2);
+  assert.deepEqual(kinds(dropB), ['delete'], 'last holder gone: one delete');
+  assert.equal(c.size, 0);
+});
+
+test('unsubscribing a query drops the rows only it held', () => {
+  const c = cache();
+  c.applyQueryDiff(1, [{ table: 'Task', inserts: [row(1), row(2)], deletes: [] }]);
+  c.applyQueryDiff(2, [{ table: 'Task', inserts: [row(2), row(3)], deletes: [] }]);
+  assert.equal(c.size, 3, 'rows 1,2,3 with 2 shared');
+
+  const events = c.releaseQuery(1);
+  // Row 1 was query 1's alone (delete); row 2 is still held by query 2 (kept).
+  assert.deepEqual(kinds(events), ['delete']);
+  assert.equal(c.refcount('Task', row(1)), 0, 'row 1 gone');
+  assert.equal(c.refcount('Task', row(2)), 1, 'row 2 survives on query 2');
+  assert.equal(c.refcount('Task', row(3)), 1, 'row 3 untouched');
+});
+
+test('a query re-delivering a row it already holds is idempotent', () => {
+  // A reconnect replay must not inflate the refcount: the same query
+  // sending the same row twice holds it once.
+  const c = cache();
+  c.applyQueryDiff(1, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  const again = c.applyQueryDiff(1, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  assert.deepEqual(kinds(again), [], 'no second insert');
+  assert.equal(c.refcount('Task', row(1)), 1, 'held once, not twice');
+});
+
+test('a delete under a query releases that query’s hold', () => {
+  const c = cache();
+  c.applyQueryDiff(1, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  c.applyQueryDiff(2, [{ table: 'Task', inserts: [row(1)], deletes: [] }]);
+  // Query 1 sees the row deleted (PK-only entry).
+  const ev = c.applyQueryDiff(1, [{ table: 'Task', inserts: [], deletes: [del(1)] }]);
+  assert.deepEqual(kinds(ev), [], 'query 2 still holds it: no callback');
+  assert.equal(c.refcount('Task', row(1)), 1);
+  // Now releasing query 2 frees it — query 1 no longer holds it, so no
+  // double-release.
+  assert.deepEqual(kinds(c.releaseQuery(1)), [], 'query 1 already released its hold');
+  assert.deepEqual(kinds(c.releaseQuery(2)), ['delete']);
+  assert.equal(c.size, 0);
+});

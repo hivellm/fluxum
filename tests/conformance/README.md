@@ -32,7 +32,8 @@ where an SDK carries more than one.
 | --- | --- |
 | `{"connect": {"client", "token"?}}` | Open + authenticate a named session. `token` is UTF-8; absent = empty token. Resolves only once authenticated. |
 | `{"close": {"client"}}` | Close the session. |
-| `{"subscribe": {"client", "queries": [..]}}` | Register queries and await every `InitialData` (one per query, RPC-032), applied to the local cache. |
+| `{"subscribe": {"client", "queries": [..], "as"?}}` | Register queries and await every `InitialData` (one per query, RPC-032), applied to the local cache. With `as`, bind the returned server-assigned `query_id`s under that label for a later `unsubscribe`. |
+| `{"unsubscribe": {"client", "handles"}}` | Drop the subscriptions whose `query_id`s were bound under the `handles` label. Rows only those queries held leave the cache; rows still covered by another subscription survive (SDK-044). |
 | `{"call": {"client", "reducer", "args", "expect_error"?: {"contains"}}}` | Call a reducer. Without `expect_error` the call must succeed; with it, the call must fail and the error message must contain the substring. |
 | `{"call_until_error": {"client", "reducer", "args", "attempts", "expect_error": {"contains"}}}` | Call the reducer up to `attempts` times, stopping at the first failure — which must match `expect_error`. For admission behavior (rate limits) where the exact rejection point depends on timing. Fails if every attempt succeeds. |
 | `{"await_row": {"client", "table", "where"}}` | Poll the local cache (≤ 5 s) until a row matches `where`. This is how a runner observes a `TxUpdate` landing without racing the push stream. |

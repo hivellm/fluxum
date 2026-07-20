@@ -1078,9 +1078,7 @@ mod tests {
         assert!(text.contains("fluxum_query_aborted_total{shard=\"3\", reason=\"deadline\"} 1"));
         assert!(text.contains("fluxum_reducer_aborted_total{shard=\"3\", reason=\"alloc\"} 1"));
         assert!(text.contains("fluxum_reducer_aborted_total{shard=\"3\", reason=\"deadline\"} 0"));
-        assert!(
-            text.contains("fluxum_query_rate_limited_total{shard=\"3\", bucket=\"source\"} 1")
-        );
+        assert!(text.contains("fluxum_query_rate_limited_total{shard=\"3\", bucket=\"source\"} 1"));
         assert!(
             text.contains("fluxum_query_rate_limited_total{shard=\"3\", bucket=\"identity\"} 0")
         );

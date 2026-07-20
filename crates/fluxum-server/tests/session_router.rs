@@ -380,7 +380,10 @@ async fn query_admission_refuses_the_excess_and_a_rotated_identity_shares_the_so
     for id in [2, 3] {
         let routed = session.handle(one_off(id)).await;
         assert!(
-            matches!(routed.responses.first(), Some(ServerMessage::InitialData(_))),
+            matches!(
+                routed.responses.first(),
+                Some(ServerMessage::InitialData(_))
+            ),
             "call {id} admitted"
         );
     }

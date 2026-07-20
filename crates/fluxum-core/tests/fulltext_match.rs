@@ -354,7 +354,7 @@ fn live_diffs_are_boolean_and_term_pruned() {
         .on_commit(&commit_doc(100, "a dragon appears"))
         .unwrap();
     assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].subscribers, vec![1]);
+    assert_eq!(deltas[0].connections(), vec![1]);
 
     // A row with neither term reaches no plan.
     let deltas = manager
@@ -372,7 +372,7 @@ fn live_diffs_are_boolean_and_term_pruned() {
         .on_commit(&commit_doc(103, "the golden crown of the north"))
         .unwrap();
     assert_eq!(deltas.len(), 1);
-    assert_eq!(deltas[0].subscribers, vec![3]);
+    assert_eq!(deltas[0].connections(), vec![3]);
 
     // Deletes fan out through the same boolean predicate.
     let diff = {
@@ -382,5 +382,5 @@ fn live_diffs_are_boolean_and_term_pruned() {
     };
     let deltas = manager.on_commit(&diff).unwrap();
     assert_eq!(deltas.len(), 1, "the dragon delete reaches the dragon plan");
-    assert_eq!(deltas[0].subscribers, vec![1]);
+    assert_eq!(deltas[0].connections(), vec![1]);
 }

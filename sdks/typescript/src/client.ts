@@ -131,8 +131,20 @@ export class FluxumClient {
   readonly #pending = new Map<number, Pending>();
   readonly #listeners = new Map<string, Set<RowListener>>();
   readonly #errorListeners = new Set<(err: Error) => void>();
-  /** Live subscription queries, replayed verbatim on reconnect (SDK-047). */
-  readonly #queries = new Set<string>();
+  /**
+   * The SQL the application asked to subscribe to — the reconnect replay set
+   * (SDK-047). Added eagerly on `subscribe`, so a first attempt that hit a
+   * schema mismatch and reconnected still replays the query; removed on
+   * `unsubscribe` once no live id still uses it.
+   */
+  readonly #requested = new Set<string>();
+  /**
+   * Live subscriptions: server-assigned `query_id` → the SQL it registered.
+   * The id drives cache attribution (SDK-044); the SQL maps an unsubscribe
+   * back to its `#requested` entry. Rebuilt on reconnect, where the server
+   * reassigns ids.
+   */
+  readonly #live = new Map<number, string>();
   /**
    * The reconnect snapshot, held between `resubscribe` and `reconcile`.
    *
@@ -228,11 +240,21 @@ export class FluxumClient {
     };
   }
 
-  /** Register subscription queries and await the `InitialData` snapshot. */
-  async subscribe(queries: string[]): Promise<void> {
-    if (queries.length === 0) return;
-    for (const query of queries) this.#queries.add(query);
-    // One `InitialData` per query, all echoing this request's id.
+  /**
+   * Register subscription queries, await the `InitialData` snapshot, and
+   * return the server-assigned `query_id` for each — the handles
+   * {@link unsubscribe} takes (SUB-001). The ids come back in the same order
+   * as `queries`.
+   */
+  async subscribe(queries: string[]): Promise<number[]> {
+    if (queries.length === 0) return [];
+    // Eagerly recorded for reconnect replay (SDK-047), BEFORE the schema-
+    // version gate: an attempt that hits a mismatch and reconnects must
+    // still replay what the application asked for.
+    for (const query of queries) this.#requested.add(query);
+    // One `InitialData` per query, in request order (RPC-032) — the server
+    // pushes them in the order it registered the queries, so message[i]
+    // belongs to queries[i].
     const messages = await this.#requestMany(
       'Subscribe',
       (id) => [id, queries],
@@ -242,15 +264,48 @@ export class FluxumClient {
     // `InitialData` never reaches the cache, so the application never sees a
     // row its generated types would misread (SDK-043).
     const mismatch = this.#schemaMismatch(messages.map((m) => m.payload));
-    if (mismatch !== null) return this.#runSchemaDrill(mismatch);
-    for (const message of messages) {
-      this.#applyInitialData(message.payload, { reconcile: false });
+    if (mismatch !== null) {
+      await this.#runSchemaDrill(mismatch);
+      return [];
     }
+    const ids: number[] = [];
+    messages.forEach((message, i) => {
+      const sql = queries[i] ?? '';
+      // Each InitialData carries its query's id per table (RPC-032); apply
+      // under it so unsubscribe can later release exactly these rows, and
+      // remember the SQL so a reconnect can replay it.
+      for (const [queryId, diffs] of this.#toDiffsByQuery(message.payload[2])) {
+        ids.push(queryId);
+        this.#live.set(queryId, sql);
+        this.#dispatch(this.#cache.applyQueryDiff(queryId, diffs));
+      }
+    });
+    return ids;
   }
 
-  /** Drop subscriptions by their server-assigned query ids. */
+  /**
+   * Drop subscriptions by their server-assigned query ids (SUB-004). The
+   * rows those queries contributed leave the cache unless another live
+   * subscription still covers them, and a `delete` fires only for rows that
+   * actually became invisible (SDK-044).
+   */
   async unsubscribe(queryIds: number[]): Promise<void> {
-    await this.#request('Unsubscribe', (id) => [id, queryIds]);
+    if (queryIds.length === 0) return;
+    // Fire-and-forget: the server sends NO reply to Unsubscribe — delivery
+    // simply stops (RPC-024). Awaiting a correlated reply here would hang
+    // forever. The message still carries a request id for framing symmetry.
+    await this.#send('Unsubscribe', (id) => [id, queryIds]);
+    for (const queryId of queryIds) {
+      const sql = this.#live.get(queryId);
+      this.#live.delete(queryId);
+      // Stop replaying this SQL on reconnect once no live id still uses it
+      // (two subscriptions to the same SQL dedupe to one plan server-side,
+      // but the client tracks them as distinct ids).
+      if (sql !== undefined && ![...this.#live.values()].includes(sql)) {
+        this.#requested.delete(sql);
+      }
+      this.#dispatch(this.#cache.releaseQuery(queryId));
+    }
   }
 
   /**
@@ -356,8 +411,8 @@ export class FluxumClient {
         // travels in the same handshake that establishes the session.
         authenticate: async () => {},
         resubscribe: async () => {
-          if (this.#queries.size === 0) return;
-          const queries = [...this.#queries];
+          if (this.#requested.size === 0) return;
+          const queries = [...this.#requested];
           const messages = await this.#requestMany(
             'Subscribe',
             (id) => [id, queries],
@@ -386,6 +441,16 @@ export class FluxumClient {
                 'refreshed the schema, retrying once (SDK-043)',
             );
           }
+          // Rebind id → SQL: the server reassigned query ids on resubscribe.
+          // Response order matches request order (RPC-032), so payload[i]
+          // belongs to queries[i].
+          this.#live.clear();
+          payloads.forEach((payload, i) => {
+            const sql = queries[i] ?? '';
+            for (const queryId of this.#toDiffsByQuery(payload[2]).keys()) {
+              this.#live.set(queryId, sql);
+            }
+          });
           // Stashed for the reconcile step, which must run after every query
           // is registered — reconciling per-query would delete rows the next
           // query is about to restore.
@@ -401,8 +466,22 @@ export class FluxumClient {
             const [, , t] = payload as [unknown, unknown, unknown];
             return Array.isArray(t) ? t : [];
           });
+          const snapshots = this.#pendingSnapshot;
           this.#pendingSnapshot = null;
           this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
+          // Rebuild per-query membership: the server reassigned query ids on
+          // resubscribe, so the old attribution is stale. Refcounts were just
+          // rebuilt by `reconcile`; `trackQuery` only re-records which query
+          // holds what, leaving those counts untouched (SDK-044).
+          this.#cache.resetQueries();
+          for (const payload of snapshots) {
+            for (const [queryId, diffs] of this.#toDiffsByQuery(payload[2])) {
+              this.#cache.trackQuery(
+                queryId,
+                diffs.map((diff) => ({ table: diff.table, rows: diff.inserts })),
+              );
+            }
+          }
         },
       },
       {
@@ -454,6 +533,18 @@ export class FluxumClient {
     return first;
   }
 
+  /**
+   * Send a message that expects NO reply (RPC-024: `Unsubscribe`). It still
+   * carries a request id for framing symmetry, but nothing is registered in
+   * the correlation map, so no promise is left waiting for an answer that
+   * never comes.
+   */
+  async #send(tag: string, build: (id: number) => unknown[]): Promise<void> {
+    const transport = this.#transport;
+    if (transport === null || this.#closed) throw new Error('client is not connected');
+    await transport.send(encodeMessage(tag, build(this.#nextId++)));
+  }
+
   /** Send a request expecting `expected` replies, all echoing its id. */
   async #requestMany(
     tag: string,
@@ -500,9 +591,13 @@ export class FluxumClient {
     switch (message.tag) {
       case 'TxUpdate': {
         // Field 5 is `tables`; the four before it are tx_id, timestamp,
-        // reducer_name and caller.
-        const diffs = this.#toDiffs(message.payload[5]);
-        this.#dispatch(this.#cache.applyTxUpdate(diffs));
+        // reducer_name and caller. The server sends one TxUpdate per query
+        // id (its tables all share it), so attribute by query for the
+        // SDK-044 refcount — a row two subscriptions both see is one cached
+        // row that survives dropping either.
+        for (const [queryId, diffs] of this.#toDiffsByQuery(message.payload[5])) {
+          this.#dispatch(this.#cache.applyQueryDiff(queryId, diffs));
+        }
         return;
       }
       case 'Error': {
@@ -628,20 +723,6 @@ export class FluxumClient {
 
   // --- Cache application ----------------------------------------------------
 
-  #applyInitialData(payload: unknown[], options: { reconcile: boolean }): void {
-    // The schema_version gate ran in the caller (#schemaMismatch) — by the
-    // time a payload reaches here it is known to match the bindings.
-    const [, , tables] = payload as [unknown, unknown, unknown];
-
-    if (options.reconcile) {
-      this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
-      return;
-    }
-    // A fresh subscription is a diff from nothing: inserts only, so callbacks
-    // fire for the initial rows exactly as they would for live ones.
-    this.#dispatch(this.#cache.applyTxUpdate(this.#toDiffs(tables)));
-  }
-
   #toDiffs(tables: unknown): TableDiff[] {
     if (!Array.isArray(tables)) return [];
     return tables.map((entry) => {
@@ -653,6 +734,31 @@ export class FluxumClient {
         deletes: sliceRowList(deletes),
       };
     });
+  }
+
+  /** Group a `tables` list into per-`query_id` diffs (SUB-001/RPC-032). */
+  #toDiffsByQuery(tables: unknown): Map<number, TableDiff[]> {
+    const byQuery = new Map<number, TableDiff[]>();
+    if (!Array.isArray(tables)) return byQuery;
+    for (const entry of tables) {
+      const [, name, queryId, inserts, deletes] = entry as [
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+        unknown,
+      ];
+      const id = Number(queryId);
+      const diff: TableDiff = {
+        table: String(name),
+        inserts: sliceRowList(inserts),
+        deletes: sliceRowList(deletes),
+      };
+      const group = byQuery.get(id);
+      if (group === undefined) byQuery.set(id, [diff]);
+      else group.push(diff);
+    }
+    return byQuery;
   }
 
   #toSnapshots(tables: unknown): TableSnapshot[] {

@@ -78,9 +78,8 @@ impl ReducerBounds {
     fn starting_now(&self) -> ExecBounds {
         let (max_execution_ms, max_tx_bytes) = self.get();
         ExecBounds {
-            deadline: (max_execution_ms > 0).then(|| {
-                Instant::now() + std::time::Duration::from_millis(max_execution_ms)
-            }),
+            deadline: (max_execution_ms > 0)
+                .then(|| Instant::now() + std::time::Duration::from_millis(max_execution_ms)),
             max_tx_bytes,
         }
     }
@@ -448,7 +447,13 @@ impl ReducerEngine {
                 meta,
                 Box::new(move |tx| {
                     // SEC-046: the deadline clock starts on the writer.
-                    registry.dispatch_bounded(caller, &dispatch_name, &args, tx, bounds.starting_now())
+                    registry.dispatch_bounded(
+                        caller,
+                        &dispatch_name,
+                        &args,
+                        tx,
+                        bounds.starting_now(),
+                    )
                 }),
             )
             .await;
@@ -487,7 +492,8 @@ impl ReducerEngine {
         use crate::metrics::ReducerAbortReason;
         match error.query_code() {
             Some(fluxum_protocol::codes::REDUCER_DEADLINE_EXCEEDED) => {
-                self.metrics.note_reducer_aborted(ReducerAbortReason::Deadline);
+                self.metrics
+                    .note_reducer_aborted(ReducerAbortReason::Deadline);
             }
             Some(fluxum_protocol::codes::REDUCER_TX_BUDGET_EXCEEDED) => {
                 self.metrics.note_reducer_aborted(ReducerAbortReason::Alloc);

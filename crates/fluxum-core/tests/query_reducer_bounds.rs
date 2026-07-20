@@ -18,9 +18,7 @@ use fluxum_core::schema::{
     ColumnSchema, FluxType, Schema, Table, TableAccess, TableSchema, VisibilityRule,
 };
 use fluxum_core::store::{MemStore, RowValue, TableId};
-use fluxum_core::subscription::{
-    QueryBounds, Subscriber, SubscriptionLimits, SubscriptionManager,
-};
+use fluxum_core::subscription::{QueryBounds, Subscriber, SubscriptionLimits, SubscriptionManager};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
 use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_protocol::codes;
@@ -157,7 +155,12 @@ fn a_rejected_subscription_registers_nothing() {
     let (mut manager, bounds, _) = manager_with_bounds(&schema);
     bounds.set(0, 5, true, 0, 0);
     let err = manager
-        .subscribe(1, viewer(), "SELECT * FROM Item LIMIT 100", &store.snapshot())
+        .subscribe(
+            1,
+            viewer(),
+            "SELECT * FROM Item LIMIT 100",
+            &store.snapshot(),
+        )
         .unwrap_err();
     assert_eq!(err.query_code(), Some(codes::SQL_LIMIT_REJECTED), "{err}");
     assert_eq!(manager.plan_count(), 0, "no plan was registered");
@@ -196,7 +199,11 @@ fn a_slow_query_is_aborted_at_the_deadline() {
     let err = manager
         .snapshot_result(viewer(), "SELECT * FROM Item", &store.snapshot())
         .unwrap_err();
-    assert_eq!(err.query_code(), Some(codes::SQL_DEADLINE_EXCEEDED), "{err}");
+    assert_eq!(
+        err.query_code(),
+        Some(codes::SQL_DEADLINE_EXCEEDED),
+        "{err}"
+    );
     assert!(metrics.query_aborted(QueryAbortReason::Deadline) >= 1);
 }
 
@@ -339,7 +346,10 @@ async fn the_engine_rolls_back_a_write_ceiling_breach_and_counts_it() {
         0,
         "the transaction rolled back"
     );
-    assert_eq!(engine.metrics().reducer_aborted(ReducerAbortReason::Alloc), 1);
+    assert_eq!(
+        engine.metrics().reducer_aborted(ReducerAbortReason::Alloc),
+        1
+    );
 
     // Raised (or disabled) bounds admit the same reducer.
     engine.bounds().set(0, 0);
@@ -355,7 +365,10 @@ async fn the_engine_aborts_a_reducer_past_its_deadline_and_counts_it() {
     let dir = tempfile::tempdir().unwrap();
     let (engine, _) = engine(dir.path());
     engine.bounds().set(1, 0); // 1 ms; the body sleeps 5 ms before its host call
-    let err = engine.call(caller(), "slow_poke", vec![]).await.unwrap_err();
+    let err = engine
+        .call(caller(), "slow_poke", vec![])
+        .await
+        .unwrap_err();
     assert_eq!(
         err.query_code(),
         Some(codes::REDUCER_DEADLINE_EXCEEDED),

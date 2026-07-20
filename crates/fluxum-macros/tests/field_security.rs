@@ -189,7 +189,7 @@ fn diffs_project_per_viewer_and_masked_only_changes_stay_silent() {
     })
     .unwrap();
     let deltas = manager.on_commit(&tx.commit().unwrap()).unwrap();
-    let reached: Vec<u128> = deltas.iter().flat_map(|d| d.subscribers.clone()).collect();
+    let reached: Vec<u128> = deltas.iter().flat_map(|d| d.connections()).collect();
     assert_eq!(
         reached,
         vec![3],
@@ -209,7 +209,7 @@ fn diffs_project_per_viewer_and_masked_only_changes_stay_silent() {
     })
     .unwrap();
     let deltas = manager.on_commit(&tx.commit().unwrap()).unwrap();
-    let mut reached: Vec<u128> = deltas.iter().flat_map(|d| d.subscribers.clone()).collect();
+    let mut reached: Vec<u128> = deltas.iter().flat_map(|d| d.connections()).collect();
     reached.sort_unstable();
     assert_eq!(reached, vec![1, 2, 3]);
 }

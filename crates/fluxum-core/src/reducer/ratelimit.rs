@@ -351,7 +351,9 @@ impl QueryLimiter {
         }
         #[allow(clippy::cast_precision_loss)] // admission rates, not money
         let rate = rate as f64;
-        let mut map = map.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = map
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !map.contains_key(&key) && map.len() >= QUERY_LIMITER_MAX_TRACKED {
             // Reclaim idle entries: a fully refilled bucket has not been
             // charged for at least one refill window.
@@ -575,12 +577,8 @@ mod tests {
         use crate::metrics::QueryRateBucket;
         let limiter = QueryLimiter::new(2, 1_000);
         let caller = id(5);
-        limiter
-            .check(&caller, QuerySource::Connection(1))
-            .unwrap();
-        limiter
-            .check(&caller, QuerySource::Connection(2))
-            .unwrap();
+        limiter.check(&caller, QuerySource::Connection(1)).unwrap();
+        limiter.check(&caller, QuerySource::Connection(2)).unwrap();
         let rejected = limiter
             .check(&caller, QuerySource::Connection(3))
             .unwrap_err();

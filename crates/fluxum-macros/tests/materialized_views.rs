@@ -102,7 +102,7 @@ fn aggregates_maintain_incrementally_with_group_scoped_deltas() {
         ("eu".into(), 37)
     );
     assert_eq!(update.deletes.len(), 1, "the group's previous row retires");
-    assert_eq!(deltas[0].subscribers, vec![7]);
+    assert_eq!(deltas[0].connections(), vec![7]);
 
     // Deleting the last `us` row retires the group entirely.
     let table = store.table_id("Score").unwrap();

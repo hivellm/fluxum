@@ -107,6 +107,16 @@ function byteKey(bytes: Uint8Array): string {
 export class RowCache {
   readonly #tables = new Map<string, TableState>();
   #stale = false;
+  /**
+   * Which cached rows each subscription query currently holds (SDK-044):
+   * `queryId → table → byte-keys`. This is what makes unsubscribe correct
+   * under overlap — dropping a query releases exactly the rows it
+   * contributed, and a row still held by another query survives with no
+   * callback. Populated only when a caller applies a diff WITH a query id
+   * ({@link applyQueryDiff}); the untracked {@link applyTxUpdate} path leaves
+   * it empty.
+   */
+  readonly #queryKeys = new Map<number, Map<string, Set<string>>>();
 
   constructor(schemas: Iterable<TableSchema>) {
     for (const schema of schemas) {
@@ -201,6 +211,131 @@ export class RowCache {
     }
 
     return coalesce(inserts, deletes, (table) => this.#table(table).schema);
+  }
+
+  /**
+   * Apply a `TxUpdate` (or `InitialData`) that belongs to a KNOWN
+   * subscription query, tracking which rows the query holds so a later
+   * {@link releaseQuery} can drop exactly them (SDK-044).
+   *
+   * The refcount is still by byte identity across queries: a row two queries
+   * both deliver is cached once at refcount 2, and each query records it. The
+   * difference from {@link applyTxUpdate} is the gate — a query increments a
+   * row's refcount only the FIRST time it delivers that row, so a query
+   * re-sending a row it already holds (a reconnect replay) is idempotent
+   * rather than an inflated count.
+   */
+  applyQueryDiff(queryId: number, diffs: Iterable<TableDiff>): RowEvent[] {
+    const inserts: RowEvent[] = [];
+    const deletes: RowEvent[] = [];
+    const held = this.#heldByQuery(queryId);
+
+    for (const diff of diffs) {
+      const state = this.#table(diff.table);
+      const heldKeys = held.get(diff.table) ?? new Set<string>();
+      held.set(diff.table, heldKeys);
+
+      // Resolve deletes to their rows before inserts run — an insert under
+      // the same PK repoints the projection this lookup depends on.
+      const doomed: { pk: string; key: string; bytes: Uint8Array }[] = [];
+      for (const entry of diff.deletes) {
+        const pk = state.schema.pkOfDelete(entry);
+        const key = state.byPk.get(pk);
+        if (key === undefined) continue;
+        const cached = state.byKey.get(key);
+        if (cached !== undefined) doomed.push({ pk, key, bytes: cached.bytes });
+      }
+
+      for (const row of diff.inserts) {
+        const key = byteKey(row);
+        if (heldKeys.has(key)) continue; // this query already holds it: idempotent
+        heldKeys.add(key);
+        const existing = state.byKey.get(key);
+        if (existing !== undefined) {
+          existing.refs += 1; // visible through another query too (SDK-044)
+          continue;
+        }
+        state.byKey.set(key, { bytes: row, refs: 1 });
+        state.byPk.set(state.schema.pkOfRow(row), key);
+        inserts.push({ kind: 'insert', table: diff.table, row });
+      }
+
+      for (const { pk, key, bytes } of doomed) {
+        if (!heldKeys.has(key)) continue; // this query never held it
+        heldKeys.delete(key);
+        const entry = state.byKey.get(key);
+        if (entry === undefined) continue;
+        entry.refs -= 1;
+        if (entry.refs > 0) continue;
+        state.byKey.delete(key);
+        if (state.byPk.get(pk) === key) state.byPk.delete(pk);
+        deletes.push({ kind: 'delete', table: diff.table, row: bytes });
+      }
+    }
+
+    return coalesce(inserts, deletes, (table) => this.#table(table).schema);
+  }
+
+  /**
+   * Drop a subscription: release every row the query held (SDK-044) and
+   * return the net-difference events. A row still held by another query
+   * survives at a lower refcount and fires nothing; a row only this query
+   * held reaches refcount 0, leaves the cache, and fires one `delete`.
+   */
+  releaseQuery(queryId: number): RowEvent[] {
+    const held = this.#queryKeys.get(queryId);
+    if (held === undefined) return [];
+    this.#queryKeys.delete(queryId);
+
+    const deletes: RowEvent[] = [];
+    for (const [table, keys] of held) {
+      const state = this.#tables.get(table);
+      if (state === undefined) continue;
+      for (const key of keys) {
+        const entry = state.byKey.get(key);
+        if (entry === undefined) continue;
+        entry.refs -= 1;
+        if (entry.refs > 0) continue;
+        state.byKey.delete(key);
+        const pk = state.schema.pkOfRow(entry.bytes);
+        if (state.byPk.get(pk) === key) state.byPk.delete(pk);
+        deletes.push({ kind: 'delete', table, row: entry.bytes });
+      }
+    }
+    return deletes;
+  }
+
+  /**
+   * Forget all per-query membership without touching cached rows or their
+   * refcounts. Used on reconnect, where {@link reconcile} rebuilds refcounts
+   * from the fresh snapshot and {@link trackQuery} then re-establishes which
+   * query holds what (the server reassigns query ids on resubscribe).
+   */
+  resetQueries(): void {
+    this.#queryKeys.clear();
+  }
+
+  /**
+   * Record that `queryId` holds these rows, by byte identity, WITHOUT
+   * changing refcounts — the rows are already cached (post-reconcile). The
+   * companion of {@link resetQueries} on the reconnect path.
+   */
+  trackQuery(queryId: number, snapshots: Iterable<TableSnapshot>): void {
+    const held = this.#heldByQuery(queryId);
+    for (const snapshot of snapshots) {
+      const keys = held.get(snapshot.table) ?? new Set<string>();
+      held.set(snapshot.table, keys);
+      for (const row of snapshot.rows) keys.add(byteKey(row));
+    }
+  }
+
+  #heldByQuery(queryId: number): Map<string, Set<string>> {
+    let held = this.#queryKeys.get(queryId);
+    if (held === undefined) {
+      held = new Map();
+      this.#queryKeys.set(queryId, held);
+    }
+    return held;
   }
 
   /**

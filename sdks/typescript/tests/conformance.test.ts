@@ -75,6 +75,8 @@ import type { RunningServer } from './support/server.ts';
 
 class Session {
   readonly clients = new Map<string, FluxumClient>();
+  /** Query-id handles a `subscribe` step bound via `as`, for `unsubscribe`. */
+  readonly handles = new Map<string, number[]>();
   readonly server: RunningServer;
   constructor(server: RunningServer) {
     this.server = server;
@@ -143,7 +145,15 @@ async function runStep(session: Session, step: Record<string, Record<string, unk
       return;
     }
     case 'subscribe': {
-      await session.client(body['client']).subscribe(body['queries'] as string[]);
+      const ids = await session.client(body['client']).subscribe(body['queries'] as string[]);
+      if (typeof body['as'] === 'string') session.handles.set(body['as'], ids);
+      return;
+    }
+    case 'unsubscribe': {
+      const label = String(body['handles']);
+      const ids = session.handles.get(label);
+      assert.ok(ids, `unsubscribe names handle "${label}" before its subscribe bound it`);
+      await session.client(body['client']).unsubscribe(ids);
       return;
     }
     case 'call': {

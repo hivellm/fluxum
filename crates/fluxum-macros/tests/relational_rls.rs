@@ -170,7 +170,7 @@ fn diffs_are_scoped_and_membership_changes_flip_later_commits() {
     let deltas = manager.on_commit(&add_doc(&store, 100, 10)).unwrap();
     assert_eq!(deltas.len(), 1, "one caller-scoped bucket matched");
     assert_eq!(
-        deltas[0].subscribers,
+        deltas[0].connections(),
         vec![1],
         "only the member (RV-040 diffs)"
     );
@@ -184,7 +184,7 @@ fn diffs_are_scoped_and_membership_changes_flip_later_commits() {
         "the membership row itself is not a Document delta"
     );
     let deltas = manager.on_commit(&add_doc(&store, 101, 10)).unwrap();
-    let mut reached: Vec<u128> = deltas.iter().flat_map(|d| d.subscribers.clone()).collect();
+    let mut reached: Vec<u128> = deltas.iter().flat_map(|d| d.connections()).collect();
     reached.sort_unstable();
     assert_eq!(
         reached,
@@ -200,7 +200,7 @@ fn diffs_are_scoped_and_membership_changes_flip_later_commits() {
         manager.on_commit(&tx.commit().unwrap()).unwrap();
     }
     let deltas = manager.on_commit(&add_doc(&store, 102, 10)).unwrap();
-    let reached: Vec<u128> = deltas.iter().flat_map(|d| d.subscribers.clone()).collect();
+    let reached: Vec<u128> = deltas.iter().flat_map(|d| d.connections()).collect();
     assert_eq!(reached, vec![1], "departed member no longer receives docs");
 
     // And his one-off reads shrink accordingly (initial-data parity).

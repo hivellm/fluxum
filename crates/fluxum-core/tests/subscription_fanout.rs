@@ -174,7 +174,7 @@ fn commit_produces_incremental_insert_and_delete_diffs() {
     let deltas = mgr.on_commit(&diff).unwrap();
     assert_eq!(deltas.len(), 1, "one matched query");
     assert_eq!(rowlist_len(&deltas[0].update.inserts), 1, "only channel 7");
-    assert_eq!(deltas[0].subscribers, vec![1]);
+    assert_eq!(deltas[0].connections(), vec![1]);
 
     // Deleting the matching row shows up as a delete diff (PK-only).
     let diff = commit(&store, |tx| {
@@ -217,6 +217,32 @@ fn unsubscribe_and_disconnect_stop_delivery() {
     .unwrap();
     assert_eq!(mgr.plan_count(), 1, "dedup: one shared plan");
 
+    // SUB-001: each connection knows the (deduped) shared query by its OWN
+    // query_id, and on_commit stamps every target with the id THAT
+    // connection holds — the stamp an SDK needs to attribute rows to a
+    // subscription (SDK-044). The two connections subscribed as ids 1 and 1
+    // respectively (each connection's first query), so both are 1 here; a
+    // second query on connection 1 would be id 2 for it alone.
+    {
+        let diff = commit(&store, |tx| {
+            tx.insert(sensor_id, sensor(9, 7, 90, 0.0, 0.0)).unwrap();
+        });
+        let deltas = mgr.on_commit(&diff).unwrap();
+        assert_eq!(deltas.len(), 1, "one shared plan");
+        let mut stamped = deltas[0].subscribers.clone();
+        stamped.sort_unstable();
+        assert_eq!(
+            stamped,
+            vec![(1u128, a.query_id), (2u128, 1u32)],
+            "each connection is stamped with the query_id it assigned"
+        );
+        // Remove the probe row so the delivery assertions below start clean.
+        let undo = commit(&store, |tx| {
+            assert!(tx.delete(sensor_id, &[RowValue::U64(9)]).unwrap());
+        });
+        mgr.on_commit(&undo).unwrap();
+    }
+
     // Unsubscribe connection 1: its query_id stops, connection 2 remains.
     assert!(mgr.unsubscribe(1, a.query_id));
     assert!(
@@ -227,7 +253,7 @@ fn unsubscribe_and_disconnect_stop_delivery() {
         tx.insert(sensor_id, sensor(1, 7, 10, 0.0, 0.0)).unwrap();
     });
     let deltas = mgr.on_commit(&diff).unwrap();
-    assert_eq!(deltas[0].subscribers, vec![2], "only connection 2 remains");
+    assert_eq!(deltas[0].connections(), vec![2], "only connection 2 remains");
 
     // Disconnect connection 2: the plan is evicted entirely.
     mgr.disconnect(2);
@@ -306,7 +332,7 @@ fn value_level_pruning_selects_only_the_matching_value_plan() {
         1,
         "exactly one plan matched (O(1), not O(clients))"
     );
-    assert_eq!(deltas[0].subscribers, vec![42]);
+    assert_eq!(deltas[0].connections(), vec![42]);
     assert_eq!(rowlist_len(&deltas[0].update.inserts), 1);
 }
 

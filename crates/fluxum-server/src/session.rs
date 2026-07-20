@@ -532,11 +532,7 @@ impl Session {
     /// per-identity bucket and the source-keyed secondary bucket (resolved
     /// client IP where the transport knows one, else the connection id), so
     /// rotating tokens cannot mint fresh budget.
-    fn admit_query(
-        &self,
-        subscriber: &Subscriber,
-        connection: u128,
-    ) -> Result<(), FluxumError> {
+    fn admit_query(&self, subscriber: &Subscriber, connection: u128) -> Result<(), FluxumError> {
         if subscriber.is_server_peer {
             return Ok(());
         }
@@ -544,11 +540,7 @@ impl Session {
             .source_ip
             .map(fluxum_core::reducer::QuerySource::Ip)
             .unwrap_or(fluxum_core::reducer::QuerySource::Connection(connection));
-        match self
-            .ctx
-            .query_limiter()
-            .check(&subscriber.identity, source)
-        {
+        match self.ctx.query_limiter().check(&subscriber.identity, source) {
             Ok(()) => Ok(()),
             Err(rejected) => {
                 self.ctx.metrics().note_query_rate_limited(rejected.bucket);

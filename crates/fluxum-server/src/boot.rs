@@ -99,12 +99,8 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     std::fs::create_dir_all(&config.storage.commit_log_dir)
         .map_err(fluxum_core::FluxumError::from)?;
     let repo = fluxum_core::checkpoint::CheckpointRepo::open(&config.storage.checkpoint_dir)?;
-    let recovery = fluxum_core::checkpoint::recover(
-        &store,
-        &repo,
-        &config.storage.commit_log_dir,
-        shard,
-    )?;
+    let recovery =
+        fluxum_core::checkpoint::recover(&store, &repo, &config.storage.commit_log_dir, shard)?;
     if recovery.last_tx_id.is_some() || !recovery.rejected.is_empty() {
         tracing::info!(
             target: "fluxum::server",

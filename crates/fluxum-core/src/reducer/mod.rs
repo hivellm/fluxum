@@ -456,7 +456,9 @@ impl ReducerRegistry {
             .handlers
             .get(name)
             .ok_or_else(|| unknown_reducer(name))?;
-        with_context_bounded(self, caller, tx, bounds, |ctx| (registered.handler)(ctx, args))
+        with_context_bounded(self, caller, tx, bounds, |ctx| {
+            (registered.handler)(ctx, args)
+        })
     }
 }
 

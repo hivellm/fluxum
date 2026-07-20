@@ -268,7 +268,7 @@ fn ten_thousand_mutations_keep_every_client_cache_equal_to_server_state() {
         // Apply the fan-out diffs to each affected client's cache.
         let deltas = mgr.on_commit(&diff).unwrap();
         for delta in &deltas {
-            for &conn in &delta.subscribers {
+            for &(conn, _query_id) in &delta.subscribers {
                 clients[conn as usize].apply(&delta.update.deletes, &delta.update.inserts);
             }
         }

@@ -170,7 +170,8 @@ impl QueryBounds {
     }
 
     fn default_limit(&self) -> u32 {
-        self.default_limit.load(std::sync::atomic::Ordering::Relaxed)
+        self.default_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn max_limit(&self) -> u32 {
@@ -212,9 +213,8 @@ impl ScanGuard {
         let deadline_ms = bounds.deadline_ms();
         Self {
             budget: bounds.row_scan_budget(),
-            deadline: (deadline_ms > 0).then(|| {
-                std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms)
-            }),
+            deadline: (deadline_ms > 0)
+                .then(|| std::time::Instant::now() + std::time::Duration::from_millis(deadline_ms)),
             scanned: std::cell::Cell::new(0),
             aborted: std::cell::Cell::new(None),
         }
@@ -393,8 +393,21 @@ pub struct QueryDelta {
     pub query_hash: QueryHash,
     /// The shared, once-encoded table update (inserts + deletes).
     pub update: Arc<TableUpdate>,
-    /// The connections subscribed to this query — the fan-out targets.
-    pub subscribers: Vec<u128>,
+    /// The fan-out targets, each with the `query_id` THAT connection knows
+    /// this query by (SUB-001 — ids are assigned per connection). The
+    /// fan-out stamps it on the delivered `TxUpdate` so an SDK can attribute
+    /// rows to the subscription that produced them (SDK-044 bookkeeping,
+    /// unsubscribe refcounts). `0` for view deltas, which are name-addressed
+    /// (RV-011), not query-id-addressed.
+    pub subscribers: Vec<(u128, u32)>,
+}
+
+impl QueryDelta {
+    /// The target connection ids without their per-connection query ids —
+    /// what non-transport consumers (and most assertions) care about.
+    pub fn connections(&self) -> Vec<u128> {
+        self.subscribers.iter().map(|&(conn, _)| conn).collect()
+    }
 }
 
 /// The result of registering a subscription: the assigned `query_id` and the
@@ -1178,7 +1191,11 @@ impl SubscriptionManager {
             else {
                 continue;
             };
-            let mut subscribers: Vec<u128> = state.subscribers.iter().copied().collect();
+            let mut subscribers: Vec<(u128, u32)> = state
+                .subscribers
+                .iter()
+                .map(|&connection| (connection, self.query_id_of(connection, hash)))
+                .collect();
             subscribers.sort_unstable();
             let update = Arc::new(update);
             // CS-021: retain it for resumption, evicting past the bound.
@@ -1206,7 +1223,7 @@ impl SubscriptionManager {
             if subs.is_empty() {
                 continue;
             }
-            let mut subscribers: Vec<u128> = subs.iter().copied().collect();
+            let mut subscribers: Vec<(u128, u32)> = subs.iter().map(|&c| (c, 0)).collect();
             subscribers.sort_unstable();
             deltas.push(QueryDelta {
                 query_hash: QueryHash(crate::simd::global().hash64(name.as_bytes(), 0x4D56)),
@@ -1313,9 +1330,9 @@ impl SubscriptionManager {
                 .into_iter()
                 .filter(|row| guard.admit() && keep(row))
                 .collect(),
-            (None, None, AccessPath::IndexScan(scan)) => {
-                self.index_scan_rows(plan, scan, viewer, snapshot, table_id, schema, &guard, limit)?
-            }
+            (None, None, AccessPath::IndexScan(scan)) => self.index_scan_rows(
+                plan, scan, viewer, snapshot, table_id, schema, &guard, limit,
+            )?,
             (_, _, AccessPath::FullScan) => {
                 let mut out = Vec::new();
                 for row in snapshot.scan(table_id)? {
@@ -1848,6 +1865,22 @@ impl SubscriptionManager {
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&hash);
         }
+    }
+
+    /// The `query_id` `connection` holds for `hash` (SUB-001) — the handle
+    /// the client knows this query by. A connection has few queries, so the
+    /// linear probe over its handle map is cheaper than a maintained reverse
+    /// index. `0` when the connection does not hold the query (a race with
+    /// unsubscribe; the fan-out delivers nothing special for it).
+    fn query_id_of(&self, connection: u128, hash: QueryHash) -> u32 {
+        self.connections
+            .get(&connection)
+            .and_then(|handles| {
+                handles
+                    .iter()
+                    .find_map(|(qid, h)| (*h == hash).then_some(*qid))
+            })
+            .unwrap_or(0)
     }
 
     fn assign_query_id(&mut self, connection: u128) -> u32 {

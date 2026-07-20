@@ -1041,39 +1041,59 @@ pub(crate) fn spawn_fanout_for(
             };
 
             for delta in deltas {
-                let mut tx_update = SubscriptionManager::tx_update(&diff, &delta);
-                // SPEC-007 SHD-051: tag the originating shard so a client
-                // subscribed on several shards can attribute per-shard order.
-                tx_update.shard_id = ctx.shard_id;
-                // OBS-021: rows delivered per TxUpdate (insert + delete).
-                let rows: u64 = tx_update
-                    .tables
-                    .iter()
-                    .map(|t| u64::try_from(t.inserts.len() + t.deletes.len()).unwrap_or(u64::MAX))
-                    .sum();
-                let body = match ServerMessage::TxUpdate(tx_update).encode() {
-                    Ok(body) => body,
-                    Err(_) => continue,
-                };
-                let Ok(framed) = codec.encode(&body) else {
-                    continue;
-                };
-                let frame: OutFrame = Arc::new(framed);
-                for (conn_id, handle) in ctx.connections.handles_for(&delta.subscribers).await {
-                    match handle.sink.try_send(Arc::clone(&frame)) {
-                        // OBS-021: one TxUpdate delivered.
-                        Ok(()) => ctx.metrics().note_fanout(rows),
-                        // SUB-042 Full tier: never block — drop the consumer.
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(target: "fluxum::fanout", connection = conn_id,
+                // Group the targets by the query_id THEY know this query by
+                // (SUB-001: ids are assigned per connection). The rows were
+                // encoded once per delta (SUB-024); what is re-encoded per
+                // distinct id is only the envelope, and in the common case —
+                // clients subscribing in the same order — there is exactly
+                // one group. Without the stamp every TxUpdate said query_id
+                // 0 and no SDK could attribute rows to a subscription, which
+                // is what unsubscribe refcounting (SDK-044) hangs off.
+                let mut by_query_id: std::collections::BTreeMap<u32, Vec<u128>> =
+                    std::collections::BTreeMap::new();
+                for &(conn, query_id) in &delta.subscribers {
+                    by_query_id.entry(query_id).or_default().push(conn);
+                }
+                for (query_id, conns) in by_query_id {
+                    let mut tx_update = SubscriptionManager::tx_update(&diff, &delta);
+                    // SPEC-007 SHD-051: tag the originating shard so a client
+                    // subscribed on several shards can attribute per-shard order.
+                    tx_update.shard_id = ctx.shard_id;
+                    for table in &mut tx_update.tables {
+                        table.query_id = query_id;
+                    }
+                    // OBS-021: rows delivered per TxUpdate (insert + delete).
+                    let rows: u64 = tx_update
+                        .tables
+                        .iter()
+                        .map(|t| {
+                            u64::try_from(t.inserts.len() + t.deletes.len()).unwrap_or(u64::MAX)
+                        })
+                        .sum();
+                    let body = match ServerMessage::TxUpdate(tx_update).encode() {
+                        Ok(body) => body,
+                        Err(_) => continue,
+                    };
+                    let Ok(framed) = codec.encode(&body) else {
+                        continue;
+                    };
+                    let frame: OutFrame = Arc::new(framed);
+                    for (conn_id, handle) in ctx.connections.handles_for(&conns).await {
+                        match handle.sink.try_send(Arc::clone(&frame)) {
+                            // OBS-021: one TxUpdate delivered.
+                            Ok(()) => ctx.metrics().note_fanout(rows),
+                            // SUB-042 Full tier: never block — drop the consumer.
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                tracing::warn!(target: "fluxum::fanout", connection = conn_id,
                                 "subscriber dropped: send buffer full");
-                            ctx.metrics()
-                                .note_drop(fluxum_core::metrics::DropReason::BufferFull);
-                            handle.shutdown.notify_waiters();
-                            ctx.connections.remove(conn_id).await;
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            ctx.connections.remove(conn_id).await;
+                                ctx.metrics()
+                                    .note_drop(fluxum_core::metrics::DropReason::BufferFull);
+                                handle.shutdown.notify_waiters();
+                                ctx.connections.remove(conn_id).await;
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                ctx.connections.remove(conn_id).await;
+                            }
                         }
                     }
                 }
