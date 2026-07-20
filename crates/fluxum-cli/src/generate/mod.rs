@@ -8,6 +8,7 @@
 //! acceptance 11) — which is what lets a repository commit its bindings and
 //! diff them in review.
 
+pub mod rust;
 pub mod typescript;
 
 use std::collections::BTreeMap;
@@ -20,6 +21,8 @@ use crate::CliError;
 pub enum Lang {
     /// TypeScript (browser + Node), SDK-021.
     TypeScript,
+    /// Rust (the `fluxum-sdk` client crate), SDK-050.
+    Rust,
 }
 
 impl Lang {
@@ -27,6 +30,7 @@ impl Lang {
     pub fn parse(name: &str) -> Option<Self> {
         match name.to_ascii_lowercase().as_str() {
             "typescript" | "ts" => Some(Self::TypeScript),
+            "rust" | "rs" => Some(Self::Rust),
             _ => None,
         }
     }
@@ -35,6 +39,7 @@ impl Lang {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::TypeScript => "typescript",
+            Self::Rust => "rust",
         }
     }
 }
@@ -66,6 +71,7 @@ pub fn generate(
 ) -> Result<BTreeMap<String, String>, CliError> {
     match lang {
         Lang::TypeScript => typescript::generate(schema).map_err(CliError::Response),
+        Lang::Rust => rust::generate(schema).map_err(CliError::Response),
     }
 }
 
@@ -96,6 +102,8 @@ mod tests {
         assert_eq!(Lang::parse("typescript"), Some(Lang::TypeScript));
         assert_eq!(Lang::parse("TypeScript"), Some(Lang::TypeScript));
         assert_eq!(Lang::parse("ts"), Some(Lang::TypeScript));
+        assert_eq!(Lang::parse("rust"), Some(Lang::Rust));
+        assert_eq!(Lang::parse("rs"), Some(Lang::Rust));
         assert_eq!(Lang::parse("cobol"), None);
     }
 

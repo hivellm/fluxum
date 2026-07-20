@@ -148,7 +148,7 @@ COMMANDS:
                      both produce identical bytes, so bindings can be
                      committed and diffed in review.
 
-                     --lang    typescript | ts
+                     --lang    typescript | ts | rust | rs
 ";
 
 /// Run the CLI over `args` (without the program name). Returns the process
@@ -194,7 +194,7 @@ where
                 return 2;
             };
             let Some(lang) = generate::Lang::parse(&lang) else {
-                eprintln!("generate: unknown --lang `{lang}` (supported: typescript)");
+                eprintln!("generate: unknown --lang `{lang}` (supported: typescript, rust)");
                 return 2;
             };
             match generate::load_schema(&schema)
