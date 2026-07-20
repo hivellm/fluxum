@@ -1,0 +1,12 @@
+## 1. Implementation
+- [x] 1.1 Repo-root `deny.toml`: `[advisories]` (deny RUSTSEC + yanked, empty dated `ignore`), `[bans]` (deny wildcards except intra-workspace path crates, warn on duplicate majors), `[licenses]` (Apache-2.0-compatible allow-list), `[sources]` (crates.io the only allowed registry — covers `thunder-rpc` and every HiveLLM crate; workspace path deps are not policed by `[sources]`) (F-010)
+- [x] 1.2 Wired `cargo deny check` into the local gate via `scripts/supply-chain-check.sh`; runs pre-merge alongside the suite + clippy + coverage, no GitHub Actions. The script pins the advisory-db to an LF checkout so it is deterministic on Windows (git CRLF conversion otherwise breaks cargo-deny's TOML-frontmatter parser)
+- [x] 1.3 Triaged the initial output: `advisories ok, bans ok, licenses ok, sources ok` on a clean tree — no advisory/license exception needed (empty `[advisories].ignore`). The only real finding was intra-workspace path wildcards, resolved with `allow-wildcard-paths` (not an exception, a correct classification)
+- [~] 1.4 SBOM: CycloneDX generation documented as a release step (`cargo cyclonedx --format json --all`) in CONTRIBUTING; `*.cdx.json` ships alongside release binaries. **Not run here** — `cargo-cyclonedx` is not installed in this environment and installing it is out of scope for the pre-merge gate (SBOM is a release-time artifact, not a per-PR gate)
+- [x] 1.5 Docs: CONTRIBUTING quality-gate table gains the supply-chain row + policy/exception notes + the release SBOM step; SPEC-026 SEC-057 carries the normative requirement
+- [x] 1.6 Verification: `bash scripts/supply-chain-check.sh` is green on a clean tree; a negative test with a restrictive license allow-list fails with `error[rejected]: license is not explicitly allowed`, proving the gate bites. SBOM generate/validate waived with 1.4 (tool absent)
+
+## 2. Tail (docs + tests — check or waive with tailWaiver)
+- [x] 2.1 Update or create documentation covering the implementation — CONTRIBUTING gate table + notes; SPEC-026 SEC-057; deny.toml is self-documenting
+- [x] 2.2 Write tests covering the new behavior — build-gate config, so the behavioral check is the negative test in 1.6 (a restrictive license allow-list makes `cargo deny check` fail); a Rust unit test cannot meaningfully wrap an external `cargo deny` invocation
+- [x] 2.3 Run tests and confirm they pass — `cargo deny check` (advisories/bans/licenses/sources) green; workspace suite unaffected (no Rust code changed)
