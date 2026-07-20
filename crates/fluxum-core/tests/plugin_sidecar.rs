@@ -351,9 +351,13 @@ fn a_hanging_sidecar_is_cut_off_at_the_timeout_not_waited_out() {
     assert!(err.to_string().contains("timeout"), "{err}");
     // The budget is the query's, so the bound is what matters, not the
     // wire. Generous upper slack: a loaded CI box schedules threads late,
-    // and a flaky timing test is worse than a loose one.
+    // and a flaky timing test is worse than a loose one. The lower bound
+    // carries slack too: OS read timeouts run on coarse timer granularity
+    // (Windows observed firing at 149.92ms of a 150ms budget under load),
+    // and "a tick early" is not the failure this guards against — returning
+    // without waiting at all is.
     assert!(
-        elapsed >= TIMEOUT,
+        elapsed >= TIMEOUT.mul_f64(0.8),
         "must actually wait for the budget, not fail early: {elapsed:?}"
     );
     assert!(
