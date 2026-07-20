@@ -1,12 +1,12 @@
 ## 1. Implementation
-- [ ] 1.1 Structured `security`-target events (own tracing target so they survive the default `info` filter) for: auth success/failure (+ source IP, reason), connection-guard rejections, RLS/column-grant denials, and admin mutations (operator identity + route). Never log token bytes or secret material
-- [ ] 1.2 Consistent event schema: `event`, `outcome`, `identity`/`operator` (where known), `source_ip`, `reason`, `resource`; emitted via a single helper so fields stay uniform across call sites
-- [ ] 1.3 Raise the security-relevant denials from `debug` to the `security` target (auth failure, RLS deny, column-grant deny) so they are visible at default level without turning on global debug
-- [ ] 1.4 Reference Prometheus alert rules (shipped in `docs/`): auth-failure rate, rejection spike, slow-reducer WARN rate, queue/backpressure saturation; each with a short runbook note
-- [ ] 1.5 Spec: SPEC-012 gains the security-event trail + alerting requirement; logging spec documents the `security` target and the "never log secrets" rule
-- [ ] 1.6 Verification: an auth failure and an RLS denial are visible at default `info` on the `security` target with source IP and reason and no token bytes; admin mutations emit an operator-attributed event; the alert rules load and evaluate against the exported metrics
+- [x] 1.1 Structured `security`-target events (`fluxum_core::secevent`, own tracing target) for: auth success/failure (+ source IP, reason), connection-guard rejections, session-token rejections, and admin denials/mutations (operator + route). Never logs token bytes — identities are the public SHA-256 value. Wired at both transports' accept/auth/session paths and the admin dispatch/guard
+- [x] 1.2 Uniform schema via the single `secevent` helper set: `event`, `outcome`, and the applicable subset of `identity`/`operator`/`source_ip`/`reason`/`route` — field names cannot drift across call sites
+- [x] 1.3 Denials emit at `WARN` on the `security` target (visible at the default `info`); allows at `INFO`. The logging init pins `security=info` so the trail survives even a `warn` global floor (an explicit `RUST_LOG` still wins). Note (OBS-091): RLS is enforced by row *filtering* and column grants by *masking* — neither is a discrete per-request deny, so they emit no per-row event (high-frequency, low-signal); the discrete auth/conn/session/admin decisions are the trail, and an access-control *rejection* still surfaces via the reducer error log (OBS-071)
+- [x] 1.4 Reference Prometheus alert rules in `docs/alerts/fluxum-security.rules.yml`: auth-failure spike, connection-rejection spike, overload shedding, session IP-mismatch, admin access denied, slow-consumer drops — each with a runbook note. YAML validated (6 rules, 1 group)
+- [x] 1.5 Spec: SPEC-012 §9a OBS-090..092 (security-event trail + "never log secrets" + alerting), OBS-070 level table updated to point auth/security denials at the `security` target
+- [x] 1.6 Verification: `secevent` unit tests prove denials are visible at default `info` (and survive a `warn` floor) with source IP + reason and no secret; allow-events carry identity/operator attribution; events route on the dedicated `security` target. Alert-rule YAML validated. Admin-mutation attribution is exercised through the existing admin dispatch
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation — SPEC-012 §9a; the alert rules file is self-documenting with runbook notes
+- [x] 2.2 Write tests covering the new behavior — `secevent` unit tests (schema, level, target routing, no-secret)
+- [x] 2.3 Run tests and confirm they pass — `cargo test -p fluxum-core secevent` green; full workspace suite + clippy green

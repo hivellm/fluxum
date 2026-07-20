@@ -160,8 +160,7 @@ pub async fn serve(
                                     }
                                     Err(reason) => {
                                         accept_ctx.metrics().note_conn_rejected(reason);
-                                        tracing::debug!(target: "fluxum::tcp", %ip, reason = reason.as_str(),
-                                            "refused a connection: pre-auth abuse limit");
+                                        fluxum_core::secevent::conn_rejected(ip, reason.as_str());
                                         drop(stream);
                                     }
                                 }
@@ -272,8 +271,7 @@ async fn handle_proxied_conn(
         }
         Err(reason) => {
             ctx.metrics().note_conn_rejected(reason);
-            tracing::debug!(target: "fluxum::tcp", ip = %resolved, proxy = %peer_ip,
-                reason = reason.as_str(), "refused a connection: pre-auth abuse limit");
+            fluxum_core::secevent::conn_rejected(resolved, reason.as_str());
             drop(stream);
         }
     }
@@ -489,8 +487,23 @@ async fn route_frame(
     if is_auth_attempt {
         if session.is_authenticated() {
             ctx.conn_guard().note_auth_success(ip);
+            let id_hex = session
+                .caller()
+                .map(|c| {
+                    use std::fmt::Write as _;
+                    c.identity
+                        .as_bytes()
+                        .iter()
+                        .fold(String::new(), |mut a, b| {
+                            let _ = write!(a, "{b:02x}");
+                            a
+                        })
+                })
+                .unwrap_or_default();
+            fluxum_core::secevent::auth_success(ip, &id_hex);
         } else {
             ctx.conn_guard().note_auth_failure(ip);
+            fluxum_core::secevent::auth_failure(ip, "bad_credential");
         }
     }
 

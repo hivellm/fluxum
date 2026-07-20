@@ -1,0 +1,121 @@
+# Reference Prometheus alerting rules for the Fluxum security/abuse metrics
+# (SPEC-012 OBS-092; SPEC-026 SEC-03x/05x/054; OWASP A09 F-022).
+#
+# These are a STARTING POINT — tune the thresholds and `for` windows to your
+# deployment's baseline before relying on them. Load with:
+#
+#     # prometheus.yml
+#     rule_files:
+#       - /etc/prometheus/rules/fluxum-security.rules.yml
+#
+# Validate before deploying:  promtool check rules fluxum-security.rules.yml
+#
+# Every rule pairs with a structured `security`-target log event (see
+# docs/specs/SPEC-012 and the server logging init): the metric tells you a
+# rate is abnormal; the log tells you which source IP / identity / route.
+
+groups:
+  - name: fluxum-security
+    rules:
+      # --- Authentication abuse (SEC-031) -------------------------------------
+      - alert: FluxumAuthFailureSpike
+        expr: sum(rate(fluxum_conn_rejected_total{reason="failed_auth"}[5m])) by (shard) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sustained failed-auth backoff on shard {{ $labels.shard }}"
+          description: >
+            The pre-auth guard is arming failed-auth backoff at
+            {{ printf "%.2f" $value }}/s — a credential brute-force or a
+            misconfigured client. Correlate with the `security` log target's
+            `auth_failure` events to find the source IP(s).
+          runbook: >
+            Identify the source IP from the security log; if hostile, ban it
+            with `POST /bans {"entry": "<ip>"}` (SEC-033). If it is a broken
+            client, fix its credential. Persistent distributed sources: tighten
+            server.connection_limits.failed_auth_threshold.
+
+      # --- Connection flood / admission control (SEC-030/034/041) -------------
+      - alert: FluxumConnectionRejectionSpike
+        expr: sum(rate(fluxum_conn_rejected_total[5m])) by (shard) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High pre-auth connection rejection rate on shard {{ $labels.shard }}"
+          description: >
+            {{ printf "%.1f" $value }} connections/s are being refused pre-auth
+            (caps, rate, blocklist, global ceiling, overload). Likely a flood.
+          runbook: >
+            Check `fluxum_overload_state`; if >0 the node is shedding load and
+            protecting itself. Inspect the OS baseline (docs/DEPLOYMENT-HARDENING.md)
+            and consider upstream/provider volumetric filtering.
+
+      - alert: FluxumOverloadShedding
+        expr: max(fluxum_overload_state) by (shard) >= 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admission control is shedding load on shard {{ $labels.shard }}"
+          description: >
+            fluxum_overload_state = {{ $value }} (1 = shed pre-auth, 2 = shed
+            all new). Established clients keep working; new connections are
+            refused until load drains.
+          runbook: >
+            Sustained shedding means the node is at capacity. Scale out, raise
+            server.connection_limits.max_total_conns if the box has headroom,
+            or filter the flood upstream.
+
+      # --- Session hijack indicators (SEC-051/053) ----------------------------
+      - alert: FluxumSessionIpMismatch
+        expr: sum(rate(fluxum_session_rejected_total{reason="ip_mismatch"}[5m])) by (shard) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Session tokens presented from unexpected IPs on shard {{ $labels.shard }}"
+          description: >
+            A bound session token is being replayed from a different IP
+            ({{ printf "%.2f" $value }}/s) — a suspected token theft, or a
+            roaming client while server.session.bind_client_ip is on.
+          runbook: >
+            Correlate the `security` log's `session_rejected` (ip_mismatch)
+            events. If theft is confirmed, revoke the session
+            (`DELETE /sessions/{id}`) or all of the identity's
+            (`DELETE /sessions?identity=<hex>`).
+
+      # --- Admin-surface access control (SEC-054) -----------------------------
+      - alert: FluxumAdminAccessDenied
+        expr: sum(rate(fluxum_admin_rejected_total[5m])) by (shard, reason) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Admin API access denials on shard {{ $labels.shard }} ({{ $labels.reason }})"
+          description: >
+            The admin guard is refusing requests ({{ $labels.reason }}) at
+            {{ printf "%.2f" $value }}/s — someone is probing the ops surface
+            from an untrusted address or without a credential.
+          runbook: >
+            Correlate the `security` log's `admin_denied` events for the source
+            IP. Expected only if admin is exposed beyond loopback; if not,
+            investigate how the request reached the port.
+
+      # --- Backpressure / availability (SPEC-012) -----------------------------
+      - alert: FluxumSlowConsumerDrops
+        expr: sum(rate(fluxum_subscriber_drops_total{reason="buffer_full"}[5m])) by (shard) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Subscribers being dropped for slow consumption on shard {{ $labels.shard }}"
+          description: >
+            Per-client send buffers are overflowing ({{ printf "%.2f" $value }}/s
+            drops) — consumers cannot keep up with the fan-out, or a client is
+            stalled.
+          runbook: >
+            Check subscriber counts and network egress. Raise
+            subscriptions.send_buffer_bytes if the drops are legitimate bursts,
+            or investigate the slow client.

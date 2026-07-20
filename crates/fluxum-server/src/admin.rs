@@ -147,6 +147,7 @@ fn admin_guard(ctx: &Arc<ShardContext>, req: &AdminRequest) -> Guard {
     if !policy.trusted.contains(ip) {
         ctx.metrics()
             .note_admin_rejected(fluxum_core::metrics::AdminRejectReason::UntrustedIp);
+        fluxum_core::secevent::admin_denied(req.client_ip, req.path, "untrusted_ip");
         return Guard::Deny(AdminResponse::err(
             403,
             None,
@@ -163,6 +164,7 @@ fn admin_guard(ctx: &Arc<ShardContext>, req: &AdminRequest) -> Guard {
         if !ok {
             ctx.metrics()
                 .note_admin_rejected(fluxum_core::metrics::AdminRejectReason::Unauthenticated);
+            fluxum_core::secevent::admin_denied(req.client_ip, req.path, "unauthenticated");
             return Guard::Deny(AdminResponse::err(
                 401,
                 None,
@@ -173,6 +175,21 @@ fn admin_guard(ctx: &Arc<ShardContext>, req: &AdminRequest) -> Guard {
     Guard::Allow
 }
 
+/// Whether a route changes state (as opposed to a read) — the routes whose
+/// success emits a SEC-054 `admin_mutation` audit event.
+fn is_mutating_route(method: &str, path: &str) -> bool {
+    matches!(
+        (method, split_path(path).as_slice()),
+        ("POST", ["reducer", _])
+            | ("POST", ["drain"])
+            | ("POST", ["config", "reload"])
+            | ("POST", ["plugins", _, "disable" | "enable"])
+            | ("POST", ["bans"])
+            | ("DELETE", ["bans", ..])
+            | ("DELETE", ["sessions", ..])
+    )
+}
+
 /// Dispatch one admin route, enforcing the SEC-054 access guard first.
 /// Unknown routes → 404.
 pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminResponse {
@@ -180,7 +197,20 @@ pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminRe
         return response;
     }
     let (method, path, body) = (req.method, req.path, req.body);
-    match (method, split_path(path).as_slice()) {
+    // The operator this mutation is attributed to (SEC-054 audit): a peer's
+    // display name if a credential authenticated one, else `loopback` — never
+    // any token material.
+    let operator = req
+        .operator_token
+        .and_then(
+            |token| match ctx.authenticator.authenticate(token.as_bytes()) {
+                Ok(outcome) => outcome.server_peer.or(outcome.display_name),
+                Err(_) => None,
+            },
+        )
+        .unwrap_or_else(|| "loopback".to_owned());
+
+    let response = match (method, split_path(path).as_slice()) {
         ("GET", ["health"]) => health(ctx),
         ("GET", ["metrics"]) => metrics(ctx).await,
         ("GET", ["schema"]) => schema(ctx).await,
@@ -203,7 +233,12 @@ pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminRe
         ("DELETE", ["sessions"]) => sessions_terminate_query(ctx, path),
         ("DELETE", ["sessions", id]) => sessions_terminate(ctx, id),
         _ => AdminResponse::err(404, None, "not found"),
+    };
+    // SEC-054: a state-changing route that succeeded is an audit event.
+    if response.status < 400 && is_mutating_route(method, path) {
+        fluxum_core::secevent::admin_mutation(req.client_ip, &operator, path);
     }
+    response
 }
 
 // --- GET /plugins (SPEC-020 PLG-060) --------------------------------------------

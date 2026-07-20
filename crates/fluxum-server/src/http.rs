@@ -338,8 +338,7 @@ pub async fn serve(
                             }
                             Err(reason) => {
                                 state.ctx.metrics().note_conn_rejected(reason);
-                                tracing::debug!(target: "fluxum::http", %ip, reason = reason.as_str(),
-                                    "refused a connection: pre-auth abuse limit");
+                                fluxum_core::secevent::conn_rejected(ip, reason.as_str());
                                 drop(stream);
                             }
                         }
@@ -423,8 +422,7 @@ async fn serve_connection(
                 Ok(p) => permit = Some(p),
                 Err(reason) => {
                     state.ctx.metrics().note_conn_rejected(reason);
-                    tracing::debug!(target: "fluxum::http", %ip, proxy = %peer_ip,
-                        reason = reason.as_str(), "refused a connection: pre-auth abuse limit");
+                    fluxum_core::secevent::conn_rejected(ip, reason.as_str());
                     return Ok(()); // drop, the cheapest refusal
                 }
             }
@@ -697,6 +695,7 @@ async fn handle_post(
                             .ctx
                             .metrics()
                             .note_session_rejected(SessionRejectReason::Revoked);
+                        fluxum_core::secevent::session_rejected(ip, "revoked");
                         evict_session(state, &id, cid).await;
                         return write_simple(stream, 404, "Not Found").await;
                     }
@@ -710,6 +709,7 @@ async fn handle_post(
                             .ctx
                             .metrics()
                             .note_session_rejected(SessionRejectReason::Expired);
+                        fluxum_core::secevent::session_rejected(ip, "expired");
                         evict_session(state, &id, cid).await;
                         return write_simple(stream, 404, "Not Found").await;
                     }
@@ -721,6 +721,7 @@ async fn handle_post(
                             .ctx
                             .metrics()
                             .note_session_rejected(SessionRejectReason::IpMismatch);
+                        fluxum_core::secevent::session_rejected(ip, "ip_mismatch");
                         return write_simple(stream, 403, "Forbidden").await;
                     }
                     sess.last_active = Instant::now();
@@ -745,6 +746,7 @@ async fn handle_post(
                             .ctx
                             .metrics()
                             .note_session_rejected(SessionRejectReason::UnknownToken);
+                        fluxum_core::secevent::session_rejected(ip, "unknown_token");
                         return write_simple(stream, 404, "Not Found").await;
                     }
                 }
@@ -782,8 +784,10 @@ async fn handle_post(
     if !was_authed && carries_authenticate {
         if matches!(router_state, SessionState::Authenticated { .. }) {
             state.ctx.conn_guard().note_auth_success(ip);
+            fluxum_core::secevent::auth_success(ip, &identity_hex_of(&router_state));
         } else {
             state.ctx.conn_guard().note_auth_failure(ip);
+            fluxum_core::secevent::auth_failure(ip, "bad_credential");
         }
     }
 

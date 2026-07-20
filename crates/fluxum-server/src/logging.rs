@@ -37,10 +37,21 @@ type BoxedLayer = Box<dyn Layer<Filtered> + Send + Sync>;
 
 /// Build the [`EnvFilter`] for `level`: `RUST_LOG` if present, else the
 /// configured directive, falling back to `info` when neither parses.
+///
+/// The security-event target ([`fluxum_core::secevent::TARGET`]) is pinned to
+/// at least `info` (F-022): even if an operator quiets the global level to
+/// `warn`/`error`, the security trail's `INFO` allow-events (auth success,
+/// admin mutations) stay visible. An explicit `RUST_LOG` still wins — an
+/// operator who set it deliberately owns the outcome.
 fn env_filter(level: &str) -> EnvFilter {
-    EnvFilter::try_from_default_env()
-        .or_else(|_| EnvFilter::try_new(level))
-        .unwrap_or_else(|_| EnvFilter::new("info"))
+    if let Ok(filter) = EnvFilter::try_from_default_env() {
+        return filter;
+    }
+    let base = EnvFilter::try_new(level).unwrap_or_else(|_| EnvFilter::new("info"));
+    match format!("{}=info", fluxum_core::secevent::TARGET).parse() {
+        Ok(directive) => base.add_directive(directive),
+        Err(_) => base,
+    }
 }
 
 /// The formatted, filtered layer for `config`. JSON emits flattened

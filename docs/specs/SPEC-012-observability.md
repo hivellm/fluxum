@@ -232,7 +232,7 @@ of the correctness contract.
   | Level | Use |
   |-------|-----|
   | `ERROR` | Reducer panics, crash-recovery failures, data corruption detected |
-  | `WARN` | Tick budget exceeded, subscriber dropped, auth failures, queue full |
+  | `WARN` | Tick budget exceeded, subscriber dropped, queue full; security denials (on the `security` target, OBS-090) |
   | `INFO` | Shard startup/shutdown, snapshot written, migration applied |
   | `DEBUG` | Per-reducer call (disabled by default — enables high-verbosity tracing) |
 
@@ -254,6 +254,36 @@ of the correctness contract.
   ```json
   {"level":"warn","event":"slow_reducer","shard":"0","reducer":"purge_expired_sessions","duration_us":7200}
   ```
+
+## 9a. Security-event trail & alerting (`OBS-09x`, OWASP A09)
+
+- **OBS-090** [P1] Security-event trail. The security-relevant allow/deny moments — authentication
+  success/failure, pre-auth connection-guard rejections (SEC-03x), session-token rejections
+  (SEC-05x), and admin access-control decisions and mutations (SEC-054) — SHALL be emitted on a
+  dedicated `security` `tracing` target, so they are visible at the default log level without
+  turning on global `debug`. Denials are `WARN`, allows are `INFO`; the `security` target is
+  pinned to at least `INFO` even when the global level is quieter (an explicit `RUST_LOG` still
+  wins). Events share a uniform field schema — `event`, `outcome`, and the applicable subset of
+  `identity` / `operator` / `source_ip` / `reason` / `resource`. **No security event ever
+  contains token bytes or secret material:** identities are the public `SHA-256`-derived value.
+
+  ```json
+  {"level":"warn","target":"security","event":"auth_failure","outcome":"deny","source_ip":"203.0.113.9","reason":"bad_credential"}
+  {"level":"info","target":"security","event":"admin_mutation","outcome":"allow","source_ip":"10.0.0.2","operator":"ops-oncall","route":"/config/reload"}
+  ```
+
+- **OBS-091** [P1] Row-level visibility (SUB-030) is enforced by *filtering* non-visible rows out
+  of a scan, and column grants (CT-040) by *masking* values — neither is a discrete per-request
+  deny, so they emit no per-row security event (that would be high-frequency and low-signal); the
+  discrete auth/connection/session/admin decisions above are the trail. A reducer or query
+  rejected outright by access control surfaces through its error envelope and the reducer error
+  log (OBS-071).
+
+- **OBS-092** [P2] Reference Prometheus alerting rules for the abuse metrics
+  (`fluxum_conn_rejected_total`, `fluxum_overload_state`, `fluxum_session_rejected_total`,
+  `fluxum_admin_rejected_total`, `fluxum_subscriber_drops_total`) SHALL ship in
+  `docs/alerts/fluxum-security.rules.yml`, each with a runbook note, as a tunable starting point
+  for operators.
 
 ## 10. Configuration
 

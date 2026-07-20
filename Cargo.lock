@@ -488,6 +488,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "unicode-normalization",
  "x25519-dalek",
  "xxhash-rust",

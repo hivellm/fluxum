@@ -42,6 +42,8 @@ criterion.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
+# Captures the `security`-target trail in secevent unit tests.
+tracing-subscriber.workspace = true
 xxhash-rust.workspace = true
 
 [lints]
