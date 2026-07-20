@@ -14,10 +14,14 @@
 //! ahead of the connection as a transport-free unit. T6.2 wires it to a real socket —
 //! feed it each `InitialData`/`TxUpdate`, and ask it what to send on reconnect.
 
+pub mod cache;
+pub mod client;
 pub mod idempotency;
 pub mod protocol;
 pub mod resume;
 
+pub use cache::{RowCache, RowEvent, TableDiff, TableSchema};
+pub use client::{Connection, Error as ClientError, RowListener};
 pub use idempotency::{OfflineQueue, QueuedCall};
 pub use resume::{Reconnect, ResumeTracker};
 

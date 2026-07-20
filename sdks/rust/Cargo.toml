@@ -16,5 +16,11 @@ serde_bytes.workspace = true
 thiserror.workspace = true
 thunder-rpc.workspace = true
 
+# Test-only: the conformance runner (tests/conformance.rs) reads the shared
+# JSON corpus (tests/conformance/ at the repo root). Not a runtime dependency
+# — the published client carries none of this.
+[dev-dependencies]
+serde_json.workspace = true
+
 [lints]
 workspace = true
