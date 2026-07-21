@@ -4,11 +4,19 @@ TypeScript / JavaScript client for [Fluxum](../../README.md). Runs in Node.js (F
 `fluxum://host:15801`) and in browsers (Streamable HTTP, `http(s)://host:15800`) from the same
 package — SPEC-011 SDK-082.
 
-> **Status:** generator, transports, cache, reconnect, `FluxumClient` and packaging are in
-> place; what remains is the shared conformance corpus (its own task). `npm test` runs the suite
-> with no build step — Node strips types directly. `npm run build` emits ESM + CJS + `.d.ts`
-> and the self-contained browser bundle (`dist/fluxum.min.js`), asserting the SDK-083 50 KB
-> min+gzip budget.
+> **Status:** complete — generator, transports, cache, reconnect, `FluxumClient`, packaging,
+> and the shared conformance corpus green in **Node and headless Chromium**
+> (`tests/conformance.test.ts` / `tests/conformance.chromium.test.ts`, one shared interpreter).
+> `npm test` runs the suite with no build step — Node strips types directly. `npm run build`
+> emits ESM + CJS + `.d.ts` and the self-contained browser bundle (`dist/fluxum.min.js`),
+> asserting the SDK-083 50 KB min+gzip budget.
+
+The Chromium runner drives the real browser SDK the way a real deployment does: the page is
+served by the fluxum server itself (`server.static_dir`, same-origin with `/rpc` — which sends
+no CORS headers), and Chromium is discovered on the machine (`FLUXUM_CHROMIUM` override, a
+Playwright cache, or installed Chrome/Edge) and driven over raw CDP — no browser download, no
+new dependency. Without a server binary or a browser, those tests skip loudly instead of
+passing silently.
 
 ## Schema mismatch (SDK-043)
 

@@ -356,13 +356,27 @@ impl Session {
             .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
             .await;
         match outcome {
-            Ok(CallOutcome::Committed(receipt)) => Routed {
-                responses: vec![ServerMessage::ReducerResult(ReducerResult {
-                    id,
-                    outcome: Ok(()),
-                })],
-                commit: Some(receipt.diff),
-            },
+            Ok(CallOutcome::Committed(receipt)) => {
+                // TXN-004: the append must reach the OS before the
+                // `ReducerResult` — an acked call survives a process crash.
+                // Gated on the written watermark, not the fsync: the ~50 ms
+                // OS-crash window is the documented trade for NFR-03, and
+                // this ack never waits on the disk. (Caught by the
+                // conformance corpus: the Chromium runner's timing exposed a
+                // kill landing between the in-memory commit and the log
+                // write, losing an acknowledged row.)
+                if let Err(e) = self.engine().pipeline().log().wait_written(receipt.tx_id).await
+                {
+                    return Routed::reply(from_error(Some(id), &e));
+                }
+                Routed {
+                    responses: vec![ServerMessage::ReducerResult(ReducerResult {
+                        id,
+                        outcome: Ok(()),
+                    })],
+                    commit: Some(receipt.diff),
+                }
+            }
             // SPEC-021 CS-030: the key already applied — answer the original
             // result (a committed call's is `Ok`) and publish no diff; the
             // original commit already fanned out.

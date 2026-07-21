@@ -89,6 +89,16 @@ belong in the corpus.
 
 | SDK | Runner | Status |
 | --- | --- | --- |
-| TypeScript | `sdks/typescript/tests/conformance.test.ts` (Node; Chromium via the same interpreter is T6.2's 1.9) | reference |
-| Rust | with `phase6_rust-sdk` (T6.4) | pending |
+| TypeScript (Node) | `sdks/typescript/tests/conformance.test.ts` | reference |
+| TypeScript (Chromium) | `sdks/typescript/tests/conformance.chromium.test.ts` | green |
+| Rust | `sdks/rust/tests/conformance.rs` | green |
 | Python / Go / C# | with T7.4–T7.6 | pending |
+
+The two TypeScript runners share one interpreter (`sdks/typescript/tests/support/interpreter.ts`);
+the Chromium runner bundles it into a page served **by the fluxum server under test**
+(`server.static_dir`), because `/rpc` sends no CORS headers and a browser page must be
+same-origin with it — which is also exactly how a real browser app deploys against Fluxum.
+Node keeps only what a page cannot do (spawn/restart servers, drive the browser over CDP), so
+`restart_server` steps run in the driver and every other step runs where the SDK does. The
+browser is discovered, not downloaded: `FLUXUM_CHROMIUM`, a Playwright cache, or an installed
+Chrome/Edge/Chromium; the suite skips loudly when none is found.

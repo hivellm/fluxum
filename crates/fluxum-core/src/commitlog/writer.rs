@@ -67,6 +67,10 @@ pub struct CommitLog {
     shard_id: u32,
     sender: Option<mpsc::Sender<Cmd>>,
     durable: watch::Receiver<DurableState>,
+    /// The TXN-004 ack watermark: highest `tx_id` whose bytes reached the OS
+    /// (`write` returned; fsync may still be pending). Survives a *process*
+    /// crash; an OS crash can still lose the write-behind window (~50 ms).
+    written: watch::Receiver<DurableState>,
     /// Highest tx id accepted into the queue (0 = none yet) — enforces
     /// strictly increasing `tx_id` at the door (STG-015).
     last_appended: AtomicU64,
@@ -103,6 +107,7 @@ impl CommitLog {
 
         let (sender, receiver) = mpsc::channel(options.queue_depth);
         let (watch_tx, watch_rx) = watch::channel(DurableState::Durable(recovery.last_tx_id));
+        let (written_tx, written_rx) = watch::channel(DurableState::Durable(recovery.last_tx_id));
         let fsyncs = Arc::new(AtomicU64::new(0));
         let actor_state = Actor {
             dir: dir.to_path_buf(),
@@ -113,6 +118,7 @@ impl CommitLog {
             buf: Vec::with_capacity(options.write_buffer_bytes),
             last_written: recovery.last_tx_id,
             watch: watch_tx,
+            written_watch: written_tx,
             fsyncs: Arc::clone(&fsyncs),
         };
         let actor = std::thread::Builder::new()
@@ -125,6 +131,7 @@ impl CommitLog {
             shard_id,
             sender: Some(sender),
             durable: watch_rx,
+            written: written_rx,
             last_appended: AtomicU64::new(recovery.last_tx_id.unwrap_or(0)),
             epoch: AtomicU64::new(epoch),
             fsyncs,
@@ -264,22 +271,47 @@ impl CommitLog {
 
     /// Wait until `tx_id` is fsynced (or the writer fails).
     pub async fn wait_durable(&self, tx_id: u64) -> Result<()> {
-        let mut rx = self.durable.clone();
+        Self::wait_watermark(self.durable.clone(), tx_id, "durable").await
+    }
+
+    /// The TXN-004 ack watermark: highest `tx_id` handed to the OS (`write`
+    /// returned; fsync possibly still pending). `None` = nothing written yet.
+    pub fn written_tx_id(&self) -> Result<Option<u64>> {
+        match &*self.written.borrow() {
+            DurableState::Durable(tx) => Ok(*tx),
+            DurableState::Failed(msg) => Err(FluxumError::Storage(msg.to_string())),
+        }
+    }
+
+    /// Wait until `tx_id`'s bytes have reached the OS (or the writer fails) —
+    /// the TXN-004 gate a `ReducerResult` ack requires: past this point a
+    /// *process* crash cannot lose the transaction, while fsync stays off the
+    /// ack path (the documented ~50 ms window applies to OS crashes only).
+    pub async fn wait_written(&self, tx_id: u64) -> Result<()> {
+        Self::wait_watermark(self.written.clone(), tx_id, "written").await
+    }
+
+    /// Wait until a watermark channel reaches `tx_id` (or its writer fails).
+    async fn wait_watermark(
+        mut rx: watch::Receiver<DurableState>,
+        tx_id: u64,
+        what: &str,
+    ) -> Result<()> {
         loop {
             match &*rx.borrow_and_update() {
                 DurableState::Failed(msg) => {
                     return Err(FluxumError::Storage(msg.to_string()));
                 }
-                DurableState::Durable(Some(durable)) if *durable >= tx_id => return Ok(()),
+                DurableState::Durable(Some(mark)) if *mark >= tx_id => return Ok(()),
                 DurableState::Durable(_) => {}
             }
             if rx.changed().await.is_err() {
                 // Writer exited; one final check against its last publish.
                 return match &*rx.borrow() {
-                    DurableState::Durable(Some(durable)) if *durable >= tx_id => Ok(()),
+                    DurableState::Durable(Some(mark)) if *mark >= tx_id => Ok(()),
                     DurableState::Failed(msg) => Err(FluxumError::Storage(msg.to_string())),
                     DurableState::Durable(_) => Err(FluxumError::Storage(format!(
-                        "commit-log writer closed before tx {tx_id} became durable"
+                        "commit-log writer closed before tx {tx_id} became {what}"
                     ))),
                 };
             }
@@ -458,6 +490,9 @@ struct Actor {
     buf: Vec<u8>,
     last_written: Option<u64>,
     watch: watch::Sender<DurableState>,
+    /// The TXN-004 ack watermark: advanced the moment `write` hands the
+    /// batch to the OS, before the fsync — so acks never wait on the disk.
+    written_watch: watch::Sender<DurableState>,
     fsyncs: Arc<AtomicU64>,
 }
 
@@ -479,9 +514,9 @@ impl Actor {
                     "commit-log writer failed; log state on disk is undefined after a \
                      failed write/fsync — stopping (STG-012)"
                 );
-                let _ = self
-                    .watch
-                    .send(DurableState::Failed(Arc::from(e.to_string())));
+                let failed = DurableState::Failed(Arc::from(e.to_string()));
+                let _ = self.written_watch.send(failed.clone());
+                let _ = self.watch.send(failed);
                 rx.close();
                 return;
             }
@@ -566,6 +601,12 @@ impl Actor {
             use std::io::Write as _;
             seg.file.write_all(&self.buf)?;
             self.buf.clear();
+            // The bytes are the OS's now: a process crash can no longer lose
+            // them, so acks gated on `wait_written` (TXN-004) may proceed
+            // while the fsync below is still in flight.
+            let _ = self
+                .written_watch
+                .send(DurableState::Durable(self.last_written));
         }
         seg.file.sync_data()?;
         self.fsyncs.fetch_add(1, Ordering::SeqCst);

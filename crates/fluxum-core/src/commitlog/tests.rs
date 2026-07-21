@@ -483,6 +483,40 @@ async fn group_commit_batches_fsyncs_and_advances_the_watermark_monotonically() 
     assert_eq!(*seen.last().unwrap(), N);
 }
 
+#[tokio::test]
+async fn the_written_watermark_never_trails_the_durable_one() {
+    // TXN-004: a `ReducerResult` ack gates on `wait_written` — bytes handed
+    // to the OS — not on the fsync. The actor publishes written *before*
+    // sync_data within each batch, so at every observable instant
+    // written >= durable; anything else would let an ack outrun the bytes it
+    // promises (or wait on a disk it must not).
+    const N: u64 = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let log = CommitLog::open(dir.path(), SHARD, 1, CommitLogOptions::default()).unwrap();
+    assert_eq!(log.written_tx_id().unwrap(), None);
+
+    for tx in 1..=N {
+        log.append(rec(tx)).await.unwrap();
+        log.wait_written(tx).await.unwrap();
+        let written = log.written_tx_id().unwrap();
+        let durable = log.durable_tx_id().unwrap();
+        assert!(written >= Some(tx), "acked tx {tx} not written: {written:?}");
+        assert!(
+            written >= durable,
+            "written {written:?} trails durable {durable:?}"
+        );
+    }
+    log.wait_durable(N).await.unwrap();
+    assert_eq!(log.written_tx_id().unwrap(), Some(N));
+    log.close().unwrap();
+
+    // Recovery seeds the written watermark like the durable one.
+    let log = CommitLog::open(dir.path(), SHARD, 1, CommitLogOptions::default()).unwrap();
+    assert_eq!(log.written_tx_id().unwrap(), Some(N));
+    log.wait_written(N).await.unwrap();
+    log.close().unwrap();
+}
+
 // --- rotation + compaction (STG-013/STG-014, task 1.3) ----------------------
 
 #[tokio::test]

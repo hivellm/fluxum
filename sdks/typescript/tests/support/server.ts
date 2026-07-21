@@ -69,8 +69,19 @@ export interface RunningServer {
   restart(): Promise<void>;
 }
 
+export interface ServerOptions {
+  timeoutMs?: number;
+  /**
+   * Directory served on unmatched `GET` paths (`server.static_dir`) — how a
+   * browser page becomes same-origin with `/rpc`, which sends no CORS
+   * headers. Off by default, like the server itself.
+   */
+  staticDir?: string;
+}
+
 /** Start a server with the demo module, on fresh ports and a fresh data dir. */
-export async function startServer(label: string, timeoutMs = 20_000): Promise<RunningServer> {
+export async function startServer(label: string, options: ServerOptions = {}): Promise<RunningServer> {
+  const timeoutMs = options.timeoutMs ?? 20_000;
   const httpPort = await freePort();
   const tcpPort = await freePort();
   const dataDir = mkdtempSync(path.join(os.tmpdir(), `fluxum-${label}-`));
@@ -85,6 +96,9 @@ export async function startServer(label: string, timeoutMs = 20_000): Promise<Ru
     FLUXUM_SERVER_TCP_PORT: String(tcpPort),
     FLUXUM_STORAGE_DATA_DIR: dataDir,
     FLUXUM_STORAGE_COMMIT_LOG_DIR: path.join(dataDir, 'log'),
+    ...(options.staticDir === undefined
+      ? {}
+      : { FLUXUM_SERVER_STATIC_DIR: options.staticDir }),
   };
 
   const launch = async (): Promise<ChildProcess> => {
