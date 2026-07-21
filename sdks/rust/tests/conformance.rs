@@ -3,11 +3,10 @@
 //!
 //! Like the TypeScript runner, this is an INTERPRETER over the SAME corpus —
 //! it reads the same `corpus.json` and `scenarios/*.json` and must observe the
-//! same results, which is the whole point of a language-agnostic corpus. It
-//! runs the SUBSET the blocking client supports (SDK-050 T6.4 exit test): the
-//! `reconnect-resync` scenario needs an auto-reconnecting client, which this
-//! synchronous client does not (yet) provide, so it is skipped by name and the
-//! skip is logged, never silent.
+//! same results, which is the whole point of a language-agnostic corpus. All
+//! scenarios run (SDK-050 T6.4 exit test), including `reconnect-resync`: the
+//! blocking `Connection` auto-reconnects, resubscribes and reconciles
+//! (SDK-047), so a `restart_server` step is survivable.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
@@ -43,18 +42,14 @@ fn server_binary() -> PathBuf {
     repo_root().join("target/debug").join(name)
 }
 
-/// Scenarios this synchronous client cannot run yet, with why — skipped
-/// loudly, not silently (a silent skip reads as "covered").
-const UNSUPPORTED: &[(&str, &str)] = &[(
-    "reconnect-resync",
-    "needs an auto-reconnecting client; the blocking Connection has no reconnect loop",
-)];
-
 // --- A spawned server, one per scenario -------------------------------------
 
 struct Server {
     child: Child,
     tcp_url: String,
+    http_port: u16,
+    tcp_port: u16,
+    data_dir: PathBuf,
 }
 
 fn free_port() -> u16 {
@@ -83,22 +78,38 @@ impl Server {
         let data_dir = std::env::temp_dir().join(format!("fluxum-conf-{label}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&data_dir);
 
+        let child = Self::launch(http_port, tcp_port, &data_dir);
+        Server {
+            child,
+            tcp_url: format!("fluxum://127.0.0.1:{tcp_port}"),
+            http_port,
+            tcp_port,
+            data_dir,
+        }
+    }
+
+    fn launch(http_port: u16, tcp_port: u16, data_dir: &Path) -> Child {
         let child = Command::new(server_binary())
             .env("FLUXUM_PROFILE", "development")
             .env("FLUXUM_SERVER_HTTP_PORT", http_port.to_string())
             .env("FLUXUM_SERVER_TCP_PORT", tcp_port.to_string())
-            .env("FLUXUM_STORAGE_DATA_DIR", &data_dir)
+            .env("FLUXUM_STORAGE_DATA_DIR", data_dir)
             .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", data_dir.join("log"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn fluxum-server");
-
         wait_for_port(tcp_port, Duration::from_secs(20));
-        Server {
-            child,
-            tcp_url: format!("fluxum://127.0.0.1:{tcp_port}"),
-        }
+        child
+    }
+
+    /// Crash-and-recover: kill the process and boot a fresh one on the SAME
+    /// ports over the SAME data dir, so recovery (STG-030) replays the commit
+    /// log and reconnecting clients find the server where they left it.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::launch(self.http_port, self.tcp_port, &self.data_dir);
     }
 }
 
@@ -370,6 +381,9 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
             let name = body["client"].as_str().unwrap();
             session.clients.remove(name);
         }
+        "restart_server" => {
+            session.server.restart();
+        }
         "subscribe" => {
             let queries: Vec<&str> =
                 body["queries"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
@@ -494,7 +508,7 @@ fn assert_error(err: &fluxum_sdk::ClientError, expect: &Value) {
 }
 
 #[test]
-fn conformance_corpus_subset_is_green() {
+fn conformance_corpus_is_green() {
     let binary = server_binary();
     if !binary.exists() {
         eprintln!("skipping: no server binary at {} — run: cargo build -p fluxum-server", binary.display());
@@ -503,10 +517,6 @@ fn conformance_corpus_subset_is_green() {
     let corpus = load_corpus();
     let mut ran = 0;
     for name in &corpus.scenarios {
-        if let Some((_, why)) = UNSUPPORTED.iter().find(|(n, _)| n == name) {
-            eprintln!("skipping scenario `{name}`: {why}");
-            continue;
-        }
         let scenario: Value = serde_json::from_str(
             &std::fs::read_to_string(corpus_dir().join("scenarios").join(format!("{name}.json"))).unwrap(),
         )

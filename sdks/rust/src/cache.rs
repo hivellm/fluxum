@@ -43,6 +43,17 @@ pub struct TableDiff {
     pub deletes: Vec<Vec<u8>>,
 }
 
+/// One table's full rows from a fresh `InitialData` — the reconnect
+/// reconciliation input ([`RowCache::reconcile`]). Duplicated rows within one
+/// snapshot are the overlap between subscriptions and become the refcount.
+#[derive(Debug, Clone, Default)]
+pub struct TableSnapshot {
+    /// Table name.
+    pub table: String,
+    /// Full rows, wire bytes.
+    pub rows: Vec<Vec<u8>>,
+}
+
 /// A semantic row event. `Update` is the primary-key-coalesced pair (SDK-042).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RowEvent {
@@ -290,6 +301,111 @@ impl RowCache {
         deletes
     }
 
+    /// Forget all per-query membership without touching cached rows or their
+    /// refcounts. Used on reconnect, where [`RowCache::reconcile`] rebuilds
+    /// refcounts from the fresh snapshot and [`RowCache::track_query`] then
+    /// re-establishes which query holds what (the server reassigns query ids
+    /// on resubscribe).
+    pub fn reset_queries(&mut self) {
+        self.query_keys.clear();
+    }
+
+    /// Record that `query_id` holds these rows, by byte identity, WITHOUT
+    /// changing refcounts — the rows are already cached (post-reconcile). The
+    /// companion of [`RowCache::reset_queries`] on the reconnect path.
+    pub fn track_query(&mut self, query_id: u32, snapshots: &[TableSnapshot]) {
+        let held = self.query_keys.entry(query_id).or_default();
+        for snapshot in snapshots {
+            let keys = held.entry(snapshot.table.clone()).or_default();
+            for row in &snapshot.rows {
+                keys.insert(row.clone());
+            }
+        }
+    }
+
+    /// Rebuild from a fresh `InitialData` and return only the net difference
+    /// (SDK-047).
+    ///
+    /// The naive reconnect — clear the cache, reinsert everything — is a
+    /// callback storm that tells the application every row it already had was
+    /// deleted and recreated. What an application actually needs to know is
+    /// what *changed* while it was disconnected, which is what this computes.
+    ///
+    /// Refcounts are rebuilt from the fresh data rather than carried over
+    /// (SDK-047): the old counts describe subscriptions from a session that no
+    /// longer exists. A table with an active subscription that came back empty
+    /// sends an empty snapshot; a table absent from the snapshots entirely is
+    /// no longer subscribed, and its rows are gone rather than unmentioned.
+    pub fn reconcile(&mut self, snapshots: &[TableSnapshot]) -> Vec<RowEvent> {
+        let mut inserts = Vec::new();
+        let mut deletes = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+
+        for snapshot in snapshots {
+            let Some(state) = self.tables.get_mut(&snapshot.table) else {
+                continue;
+            };
+            seen.insert(snapshot.table.as_str());
+
+            let fresh: HashSet<&[u8]> = snapshot.rows.iter().map(Vec::as_slice).collect();
+            for (key, entry) in &state.by_key {
+                if !fresh.contains(key.as_slice()) {
+                    deletes.push(RowEvent::Delete {
+                        table: snapshot.table.clone(),
+                        row: entry.bytes.clone(),
+                    });
+                }
+            }
+
+            // Rebuild the table from the snapshot: insertion order follows the
+            // snapshot, duplicates within it become the refcount.
+            let mut by_key: HashMap<Vec<u8>, Entry> = HashMap::new();
+            let mut by_pk: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+            let mut order: Vec<Vec<u8>> = Vec::new();
+            for row in &snapshot.rows {
+                if let Some(entry) = by_key.get_mut(row.as_slice()) {
+                    entry.refs += 1;
+                    continue;
+                }
+                if !state.by_key.contains_key(row.as_slice()) {
+                    inserts.push(RowEvent::Insert {
+                        table: snapshot.table.clone(),
+                        row: row.clone(),
+                    });
+                }
+                order.push(row.clone());
+                by_pk.insert((state.schema.pk_of_row)(row), row.clone());
+                by_key.insert(
+                    row.clone(),
+                    Entry {
+                        bytes: row.clone(),
+                        refs: 1,
+                    },
+                );
+            }
+            state.by_key = by_key;
+            state.by_pk = by_pk;
+            state.order = order;
+        }
+
+        for (name, state) in &mut self.tables {
+            if seen.contains(name.as_str()) {
+                continue;
+            }
+            for entry in state.by_key.values() {
+                deletes.push(RowEvent::Delete {
+                    table: name.clone(),
+                    row: entry.bytes.clone(),
+                });
+            }
+            state.by_key = HashMap::new();
+            state.by_pk = HashMap::new();
+            state.order = Vec::new();
+        }
+
+        self.coalesce(inserts, deletes)
+    }
+
     /// Fold delete/insert pairs sharing a primary key into single `Update`
     /// events (SDK-042), then order the result: inserts, deletes, updates
     /// (SDK-045).
@@ -450,6 +566,80 @@ mod tests {
             other => panic!("expected Update, got {other:?}"),
         }
         assert_eq!(c.size(), 1);
+    }
+
+    fn snapshot(rows: Vec<Vec<u8>>) -> Vec<TableSnapshot> {
+        vec![TableSnapshot {
+            table: "Task".into(),
+            rows,
+        }]
+    }
+
+    #[test]
+    fn reconcile_reports_only_the_net_difference() {
+        // SDK-047: an unchanged row fires nothing; a row that vanished while
+        // disconnected fires one delete; a new row fires one insert; a row
+        // whose bytes changed under the same pk coalesces to one update.
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0), row(2, 0), row(3, 0)], vec![]));
+
+        let events = c.reconcile(&snapshot(vec![row(1, 0), row(3, 9), row(4, 0)]));
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert!(events.contains(&RowEvent::Insert {
+            table: "Task".into(),
+            row: row(4, 0)
+        }));
+        assert!(events.contains(&RowEvent::Delete {
+            table: "Task".into(),
+            row: row(2, 0)
+        }));
+        assert!(events.contains(&RowEvent::Update {
+            table: "Task".into(),
+            old: row(3, 0),
+            row: row(3, 9)
+        }));
+        assert_eq!(c.rows("Task"), vec![row(1, 0), row(3, 9), row(4, 0)]);
+    }
+
+    #[test]
+    fn reconcile_rebuilds_refcounts_and_track_query_reattributes() {
+        // The old session's refcounts are discarded: the duplicate row in the
+        // fresh snapshot IS the overlap between the two resubscribed queries.
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0)], vec![]));
+        c.apply_query_diff(2, &diff(vec![row(1, 0), row(2, 0)], vec![]));
+        assert_eq!(c.refcount("Task", &row(1, 0)), 2);
+
+        c.reset_queries();
+        let events = c.reconcile(&snapshot(vec![row(1, 0), row(1, 0), row(2, 0)]));
+        assert!(events.is_empty(), "nothing changed while away: {events:?}");
+        assert_eq!(c.refcount("Task", &row(1, 0)), 2);
+        assert_eq!(c.refcount("Task", &row(2, 0)), 1);
+
+        // The server reassigned ids on resubscribe: 1→7, 2→8.
+        c.track_query(7, &snapshot(vec![row(1, 0)]));
+        c.track_query(8, &snapshot(vec![row(1, 0), row(2, 0)]));
+        assert!(c.release_query(7).is_empty(), "row 1 still held by query 8");
+        let drop8 = c.release_query(8);
+        assert_eq!(drop8.len(), 2, "last holder: both rows leave");
+        assert_eq!(c.size(), 0);
+    }
+
+    #[test]
+    fn a_table_absent_from_the_snapshots_is_cleared() {
+        // Absent means "no longer subscribed", not "unmentioned" — its rows
+        // are gone and each fires a delete.
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0)], vec![]));
+        let events = c.reconcile(&[]);
+        assert_eq!(
+            events,
+            vec![RowEvent::Delete {
+                table: "Task".into(),
+                row: row(1, 0)
+            }]
+        );
+        assert_eq!(c.size(), 0);
     }
 
     #[test]
