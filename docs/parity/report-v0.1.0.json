@@ -18,158 +18,244 @@
       "version": "PostgreSQL 17.10 (Debian 17.10-1.pgdg13+1) on x86_64-pc-linux-gnu, compiled by gcc (Debian 14.2.0-19) 14.2.0, 64-bit",
       "durability": "synchronous_commit=on (WAL fsync before commit ack when on)",
       "config": "axum+sqlx app server (own process), pooled prepared statements (max_connections=16), covering indexes task(owner) and chat_message(channel,id), LISTEN/NOTIFY fan-out"
+    },
+    "spacetimedb": {
+      "version": "clockworklabs/spacetime:v2.6.1 (standalone, pinned)",
+      "durability": "reducer acked at in-memory commit, BEFORE the commit-log append: durability is a background actor batching appends and fsyncing per batch (group commit) — a process or OS crash can lose acked transactions since the last sync (spacetimedb-durability v2.6.1, imp::local). Weaker ack than Fluxum's TXN-004 (append reaches the OS pre-ack)",
+      "config": "demo module 1:1 (spacetimedb-module/, spacetimedb =2.6.1 wasm), client spacetimedb-sdk =2.6.1 over WebSocket; task visibility via RLS owner filter (:sender); btree indexes task.owner and chat_message.channel; send_chat budget table in-module (Fluxum enforces the same 20/s pre-transaction, RED-050)"
     }
   },
   "workloads": {
     "fluxum": {
       "cold": {
         "runs": 3,
-        "throughput_mean": 170.23743064313248,
-        "throughput_stddev": 37.30391233287797,
-        "p50_ns_mean": 5536800.0,
-        "p99_ns_mean": 6761133.333333333,
-        "p99_ns_stddev": 3135830.282928802,
-        "max_ns": 10343700,
+        "throughput_mean": 904.6024763329251,
+        "throughput_stddev": 89.73362783428196,
+        "p50_ns_mean": 348200.0,
+        "p99_ns_mean": 964766.6666666666,
+        "p99_ns_stddev": 124244.93282759395,
+        "max_ns": 1107000,
         "total_ops": 48
       },
       "e2e": {
         "runs": 3,
-        "throughput_mean": 496.07797557279923,
-        "throughput_stddev": 0.11416536458000313,
-        "p50_ns_mean": 479733.3333333333,
-        "p99_ns_mean": 802133.3333333334,
-        "p99_ns_stddev": 71978.63108821488,
-        "max_ns": 1121700,
+        "throughput_mean": 496.43247657269325,
+        "throughput_stddev": 0.043140819441880196,
+        "p50_ns_mean": 458266.6666666667,
+        "p99_ns_mean": 758500.0,
+        "p99_ns_stddev": 2463.736998950984,
+        "max_ns": 1000400,
         "total_ops": 15000
       },
       "hot": {
         "runs": 3,
-        "throughput_mean": 60321449.20735547,
-        "throughput_stddev": 5061860.214549657,
+        "throughput_mean": 63135731.20041442,
+        "throughput_stddev": 3013848.6355358646,
         "p50_ns_mean": 100.0,
         "p99_ns_mean": 200.0,
         "p99_ns_stddev": 0.0,
-        "max_ns": 1943500,
-        "total_ops": 904899653
+        "max_ns": 1412400,
+        "total_ops": 947125541
       },
       "mixed/e2e": {
         "runs": 3,
-        "throughput_mean": 374.98308880889346,
-        "throughput_stddev": 18.037185851616726,
-        "p50_ns_mean": 30346300.0,
-        "p99_ns_mean": 123205100.0,
-        "p99_ns_stddev": 24196214.41734223,
-        "max_ns": 138438700,
-        "total_ops": 11250
+        "throughput_mean": 494.9841242576296,
+        "throughput_stddev": 0.0059971239235848215,
+        "p50_ns_mean": 495733.3333333333,
+        "p99_ns_mean": 4455766.666666667,
+        "p99_ns_stddev": 1049359.925541915,
+        "max_ns": 5789100,
+        "total_ops": 14850
       },
       "mixed/read": {
         "runs": 3,
-        "throughput_mean": 60784949.18327371,
-        "throughput_stddev": 2870124.386482427,
+        "throughput_mean": 59435778.913511366,
+        "throughput_stddev": 4252421.441650425,
         "p50_ns_mean": 100.0,
-        "p99_ns_mean": 200.0,
-        "p99_ns_stddev": 0.0,
-        "max_ns": 13319600,
-        "total_ops": 1823631576
+        "p99_ns_mean": 300.0,
+        "p99_ns_stddev": 100.0,
+        "max_ns": 2168600,
+        "total_ops": 1783131268
       },
       "mixed/write": {
         "runs": 3,
-        "throughput_mean": 256.7558087955061,
-        "throughput_stddev": 48.56181931980237,
-        "p50_ns_mean": 28822100.0,
-        "p99_ns_mean": 77343966.66666667,
-        "p99_ns_stddev": 16944829.126412973,
-        "max_ns": 152872900,
-        "total_ops": 7703
+        "throughput_mean": 32425.20039488378,
+        "throughput_stddev": 1090.4792080474767,
+        "p50_ns_mean": 181633.33333333334,
+        "p99_ns_mean": 1839300.0,
+        "p99_ns_stddev": 49659.540875847815,
+        "max_ns": 16658200,
+        "total_ops": 972787
       },
       "write": {
         "runs": 3,
-        "throughput_mean": 941.0443428635605,
-        "throughput_stddev": 545.465090295781,
-        "p50_ns_mean": 10018366.666666666,
-        "p99_ns_mean": 17861833.333333332,
-        "p99_ns_stddev": 6010798.877298536,
-        "max_ns": 37938500,
-        "total_ops": 28232
+        "throughput_mean": 36541.121972234214,
+        "throughput_stddev": 277.75451204560466,
+        "p50_ns_mean": 161833.33333333334,
+        "p99_ns_mean": 1800066.6666666667,
+        "p99_ns_stddev": 46566.22524247948,
+        "max_ns": 8766300,
+        "total_ops": 1096277
       }
     },
     "postgres": {
       "cold": {
         "runs": 3,
-        "throughput_mean": 274.7156535025848,
-        "throughput_stddev": 206.5489205192894,
-        "p50_ns_mean": 17750900.0,
-        "p99_ns_mean": 24082233.333333332,
-        "p99_ns_stddev": 33427026.355380964,
-        "max_ns": 62680300,
+        "throughput_mean": 378.187898168678,
+        "throughput_stddev": 40.72581328835461,
+        "p50_ns_mean": 2082400.0,
+        "p99_ns_mean": 8721833.333333334,
+        "p99_ns_stddev": 705306.8575686284,
+        "max_ns": 9359400,
         "total_ops": 48
       },
       "e2e": {
         "runs": 3,
-        "throughput_mean": 484.5683708619838,
-        "throughput_stddev": 0.1301331604611909,
-        "p50_ns_mean": 2934933.3333333335,
-        "p99_ns_mean": 3904900.0,
-        "p99_ns_stddev": 309338.37459972536,
-        "max_ns": 7653200,
+        "throughput_mean": 475.1432756713702,
+        "throughput_stddev": 0.22721322736938754,
+        "p50_ns_mean": 4962433.333333333,
+        "p99_ns_mean": 6475400.0,
+        "p99_ns_stddev": 640467.4308659262,
+        "max_ns": 17068400,
         "total_ops": 15000
       },
       "hot": {
         "runs": 3,
-        "throughput_mean": 5785.599571573111,
-        "throughput_stddev": 58.00772349998476,
-        "p50_ns_mean": 1363833.3333333333,
-        "p99_ns_mean": 1893566.6666666667,
-        "p99_ns_stddev": 61602.05624273701,
-        "max_ns": 7236700,
-        "total_ops": 86792
+        "throughput_mean": 5805.4115349865,
+        "throughput_stddev": 98.77392804916346,
+        "p50_ns_mean": 1359433.3333333333,
+        "p99_ns_mean": 1884666.6666666667,
+        "p99_ns_stddev": 46279.62114509293,
+        "max_ns": 3773100,
+        "total_ops": 87091
       },
       "mixed/e2e": {
         "runs": 3,
-        "throughput_mean": 476.6435701259009,
-        "throughput_stddev": 2.87193053680529,
-        "p50_ns_mean": 4006800.0,
-        "p99_ns_mean": 7394666.666666667,
-        "p99_ns_stddev": 999389.365229255,
-        "max_ns": 8713800,
-        "total_ops": 14300
+        "throughput_mean": 464.97243374799524,
+        "throughput_stddev": 0.01698574594012108,
+        "p50_ns_mean": 7163566.666666667,
+        "p99_ns_mean": 16778100.0,
+        "p99_ns_stddev": 5092132.432488377,
+        "max_ns": 21178100,
+        "total_ops": 13950
       },
       "mixed/read": {
         "runs": 3,
-        "throughput_mean": 1557.1913955794353,
-        "throughput_stddev": 1.2525839505400411,
-        "p50_ns_mean": 4921233.333333333,
-        "p99_ns_mean": 9267533.333333334,
-        "p99_ns_stddev": 82670.20825746923,
-        "max_ns": 19354700,
-        "total_ops": 46718
+        "throughput_mean": 2068.0771155278358,
+        "throughput_stddev": 13.47080177580927,
+        "p50_ns_mean": 3747866.6666666665,
+        "p99_ns_mean": 6501000.0,
+        "p99_ns_stddev": 74822.2560472484,
+        "max_ns": 12794000,
+        "total_ops": 62046
       },
       "mixed/write": {
         "runs": 3,
-        "throughput_mean": 2305.3216656466902,
-        "throughput_stddev": 12.767565237686384,
-        "p50_ns_mean": 3288533.3333333335,
-        "p99_ns_mean": 7118800.0,
-        "p99_ns_stddev": 212048.67365772417,
-        "max_ns": 16338700,
-        "total_ops": 69163
+        "throughput_mean": 1347.1866168570348,
+        "throughput_stddev": 8.129565039054532,
+        "p50_ns_mean": 5678733.333333333,
+        "p99_ns_mean": 9480566.666666666,
+        "p99_ns_stddev": 265126.0517816635,
+        "max_ns": 23179500,
+        "total_ops": 40418
       },
       "write": {
         "runs": 3,
-        "throughput_mean": 3116.3746213064046,
-        "throughput_stddev": 12.163556511001318,
-        "p50_ns_mean": 2400000.0,
-        "p99_ns_mean": 5094933.333333333,
-        "p99_ns_stddev": 707862.5172541158,
-        "max_ns": 17588900,
-        "total_ops": 93497
+        "throughput_mean": 1424.204153320098,
+        "throughput_stddev": 4.795528177058151,
+        "p50_ns_mean": 5525400.0,
+        "p99_ns_mean": 7242866.666666667,
+        "p99_ns_stddev": 468726.2562875408,
+        "max_ns": 21192200,
+        "total_ops": 42728
+      }
+    },
+    "spacetimedb": {
+      "cold": {
+        "runs": 3,
+        "throughput_mean": 69.06025484313757,
+        "throughput_stddev": 11.389096445465348,
+        "p50_ns_mean": 9079300.0,
+        "p99_ns_mean": 11066433.333333334,
+        "p99_ns_stddev": 2023097.4082661795,
+        "max_ns": 13178100,
+        "total_ops": 48
+      },
+      "e2e": {
+        "runs": 3,
+        "throughput_mean": 460.6509962254845,
+        "throughput_stddev": 0.08599461518173272,
+        "p50_ns_mean": 7997633.333333333,
+        "p99_ns_mean": 10826766.666666666,
+        "p99_ns_stddev": 1283638.5641345205,
+        "max_ns": 13904200,
+        "total_ops": 15000
+      },
+      "hot": {
+        "runs": 3,
+        "throughput_mean": 47355628.86293421,
+        "throughput_stddev": 16068820.911806718,
+        "p50_ns_mean": 100.0,
+        "p99_ns_mean": 533.3333333333334,
+        "p99_ns_stddev": 577.3502691896257,
+        "max_ns": 1331300,
+        "total_ops": 710438241
+      },
+      "mixed/e2e": {
+        "runs": 3,
+        "throughput_mean": 449.9834874953934,
+        "throughput_stddev": 0.016212554557448428,
+        "p50_ns_mean": 10625466.666666666,
+        "p99_ns_mean": 19960933.333333332,
+        "p99_ns_stddev": 5110602.336646174,
+        "max_ns": 24156700,
+        "total_ops": 13500
+      },
+      "mixed/read": {
+        "runs": 3,
+        "throughput_mean": 49059171.7623867,
+        "throughput_stddev": 8679716.039229559,
+        "p50_ns_mean": 100.0,
+        "p99_ns_mean": 300.0,
+        "p99_ns_stddev": 173.20508075688772,
+        "max_ns": 9001000,
+        "total_ops": 1471832019
+      },
+      "mixed/write": {
+        "runs": 3,
+        "throughput_mean": 658.9760476244653,
+        "throughput_stddev": 9.75670324749849,
+        "p50_ns_mean": 11839766.666666666,
+        "p99_ns_mean": 23587466.666666668,
+        "p99_ns_stddev": 208987.30423959572,
+        "max_ns": 46285000,
+        "total_ops": 19770
+      },
+      "write": {
+        "runs": 3,
+        "throughput_mean": 615.6873636007575,
+        "throughput_stddev": 72.52288865473324,
+        "p50_ns_mean": 12294666.666666666,
+        "p99_ns_mean": 29625566.666666668,
+        "p99_ns_stddev": 16356572.04836433,
+        "max_ns": 85984500,
+        "total_ops": 18471
       }
     }
   },
   "ratios": {
-    "write_throughput": 0.3019676570428072,
-    "e2e_p99": 4.868143284574468,
-    "hot_p99": 9467.833333333334,
-    "cold_p99": 3.5618633956831696
+    "write_throughput": 25.657221885675398,
+    "e2e_p99": 8.537112722478577,
+    "hot_p99": 9423.333333333334,
+    "cold_p99": 9.040355180872751
+  },
+  "competitive": {
+    "write_throughput": 59.350124970129,
+    "e2e_p99": 14.273917820259284,
+    "hot_p99": 2.666666666666667,
+    "cold_p99": 11.470580105725046,
+    "mixed_write_throughput": 49.20543092844268,
+    "mixed_read_p99": 1.0,
+    "mixed_e2e_p99": 4.479797715320221
   }
 }

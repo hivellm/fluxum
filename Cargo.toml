@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "sdks/rust"]
+# The SpacetimeDB demo module (TST-097 competitive baseline) is a wasm
+# cdylib built with the SpacetimeDB toolchain, not a workspace member: it
+# carries third-party macro-generated code the workspace deny-lints would
+# reject, and only `spacetime publish` ever consumes its artifact.
+exclude = ["crates/fluxum-bench/spacetimedb-module"]
 
 [workspace.package]
 version = "0.1.0"
@@ -45,6 +50,11 @@ sha2 = "0.10"
 # Already in the tree via tokio; direct use is the per-socket keepalive knob
 # (SPEC-026 SEC-042).
 socket2 = "0.6"
+# The published SpacetimeDB Rust client SDK — the competitive-baseline side
+# of the parity harness (TST-097) drives a real SpacetimeDB server through
+# it, exactly as fluxum-sdk drives Fluxum. Pinned exactly: the server image
+# (clockworklabs/spacetime:v2.6.1) and the module bindings must match.
+spacetimedb-sdk = "=2.6.1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite"] }
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }

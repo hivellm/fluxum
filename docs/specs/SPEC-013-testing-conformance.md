@@ -327,6 +327,19 @@ infrastructure (not a one-off), and its comparative report is a release artifact
 - **TST-096** [P1] **Reproducibility**: the harness, both parity applications, and all tuning
   configurations **MUST** be runnable by a third party with one documented command per side
   (mitigates the "unfair to Postgres" contestation risk of PRD §11).
+- **TST-097** [P0] **SpacetimeDB competitive baseline**: the harness **MUST** also run the same
+  demo application as a SpacetimeDB module on a **pinned** SpacetimeDB server, driven over real
+  sockets through the **published** SpacetimeDB client SDK — the same side-agnostic workload
+  driver, machine, and honesty rules (TST-091) as the PostgreSQL side, with SDK/protocol
+  asymmetries and both sides' durability semantics documented in the report. The report gains a
+  **competitive-baseline ratio block** (`fluxum / spacetimedb` per TST-092 workload class,
+  oriented bigger-is-better-for-Fluxum) with target **≥ 1.0×** (parity) per class. These ratios
+  are **informational** — kept separate from the NFR-11 verdicts and never a release gate — but
+  the TST-095 guard **floors a class at 1.0** once a published report first reaches it, and every
+  class below 1.0× **MUST** have a recorded finding with the measured delta so closing the gap is
+  trackable work. (Decision 001, 2026-07-21: SpacetimeDB is the competitive baseline Fluxum must
+  reach; module + one-command setup in `crates/fluxum-bench/spacetimedb-module/` and
+  `docs/parity/spacetimedb-baseline.md`.)
 
 ## 11. SIMD scalar-parity suite (FR-112, NFR-14)
 
@@ -480,7 +493,7 @@ TST-006 unless a suite states otherwise):
 | **G3** | Rollback, tick-drift, rate-limit, migration suites green | TST-040–TST-044 |
 | **G4** | Subscription property suite + slow-consumer stress green | TST-030–TST-034 (full 10,000-mutation run per TST-034) |
 | **G5** | e2e flow (auth → subscribe → reducer → `TxUpdate`); 2-shard handoff; wire format frozen | TST-051, TST-054; SPEC-006 transport integration suites; SPEC-007 2-shard handoff test |
-| **G6** | PRD §12.1 MVP acceptance criteria all green, incl. parity report v1 — 0.1.0 | TST-052, TST-053, TST-060–TST-064, TST-070–TST-072, TST-080–TST-084, TST-090–TST-096; TST-140–TST-142 (full smoketest suite) |
+| **G6** | PRD §12.1 MVP acceptance criteria all green, incl. parity report v1 — 0.1.0 | TST-052, TST-053, TST-060–TST-064, TST-070–TST-072, TST-080–TST-084, TST-090–TST-096; TST-097 as evidence only (block present in the report; its ≥ 1.0× target is informational, never a gate); TST-140–TST-142 (full smoketest suite) |
 | **G7** | PRD §12.2 all green — 0.2.0: failover + PITR + 5 SDK conformance + 1B-row soak + parity report v2 | TST-120–TST-122; TST-112; TST-052 corpus green for the Python, Go, and C# runners (T7.4–T7.6) in addition to the G6 set; TST-094 + TST-095 (parity report v2); replication DST green per TST-134 |
 
 Completeness checks for this spec itself:

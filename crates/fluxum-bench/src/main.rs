@@ -23,6 +23,23 @@
 //!   -e POSTGRES_PASSWORD=fluxum -e POSTGRES_DB=parity -p 15432:5432 postgres:17
 //! # → --database-url postgres://fluxum:fluxum@127.0.0.1:15432/parity
 //! ```
+//!
+//! The SpacetimeDB competitive baseline (TST-097) is likewise external and
+//! pinned; the documented one-command setup (server + demo module publish +
+//! reset) lives in `docs/parity/spacetimedb-baseline.md`:
+//!
+//! ```text
+//! docker volume create fluxum-parity-stdb-data
+//! docker run -d --name fluxum-parity-stdb -p 15300:3000 \
+//!   -v fluxum-parity-stdb-data:/stdb-data \
+//!   clockworklabs/spacetime:v2.6.1 start --data-dir /stdb-data
+//! # → --stdb-url http://127.0.0.1:15300
+//! # reset (fresh data) / cold restart, passed to the harness verbatim:
+//! #   --stdb-reset-cmd "docker exec fluxum-parity-stdb spacetime publish \
+//! #     -s http://127.0.0.1:3000 --bin-path /tmp/module.wasm \
+//! #     --delete-data=always --yes fluxum-parity-demo"
+//! #   --stdb-restart-cmd "docker restart fluxum-parity-stdb"
+//! ```
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
@@ -33,6 +50,7 @@ use fluxum_bench::baseline::server::serve_blocking;
 use fluxum_bench::baseline_side::BaselineSide;
 use fluxum_bench::fluxum_side::FluxumSide;
 use fluxum_bench::measure::Summary;
+use fluxum_bench::spacetimedb_side::SpacetimeDbSide;
 use fluxum_bench::workload::{
     ColdReadConfig, E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, cold_read_workload,
     e2e_workload, hot_read_workload, mixed_workload, write_workload,
@@ -69,6 +87,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--samples" => opts.samples = parse(&value("--samples")?)?,
             "--memory-budget" => opts.memory_budget = Some(value("--memory-budget")?),
             "--cold-restart-cmd" => opts.cold_restart_cmd = Some(value("--cold-restart-cmd")?),
+            "--stdb-url" => opts.stdb_url = Some(value("--stdb-url")?),
+            "--stdb-db" => opts.stdb_db = value("--stdb-db")?,
+            "--stdb-reset-cmd" => opts.stdb_reset_cmd = Some(value("--stdb-reset-cmd")?),
+            "--stdb-restart-cmd" => opts.stdb_restart_cmd = Some(value("--stdb-restart-cmd")?),
+            "--stdb-note" => opts.stdb_note = Some(value("--stdb-note")?),
             "--subscribers" => opts.subscribers = parse(&value("--subscribers")?)?,
             "--rate" => opts.rate = parse(&value("--rate")?)?,
             "--messages" => opts.messages = parse(&value("--messages")?)?,
@@ -95,13 +118,17 @@ fn run(args: Vec<String>) -> Result<(), String> {
     // TST-095: compare a fresh report's ratios against the published one.
     if workload == "regression" {
         let current = load_report(&opts.current.ok_or("regression needs --current PATH")?)?;
-        let published =
-            load_report(&opts.published.ok_or("regression needs --published PATH")?)?;
-        let violations =
+        let published = load_report(&opts.published.ok_or("regression needs --published PATH")?)?;
+        let mut violations =
             fluxum_bench::report::regressions(&current.ratios, &published.ratios, opts.tolerance);
+        // TST-097: parity classes already reached are floored at 1.0.
+        violations.extend(fluxum_bench::report::competitive_regressions(
+            current.competitive.as_ref(),
+            published.competitive.as_ref(),
+        ));
         if violations.is_empty() {
             println!(
-                "no NFR-11 regression beyond {:.0}% tolerance",
+                "no NFR-11/TST-097 regression beyond {:.0}% tolerance",
                 opts.tolerance * 100.0
             );
             return Ok(());
@@ -109,7 +136,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         for violation in &violations {
             eprintln!("REGRESSION: {violation}");
         }
-        return Err(format!("{} NFR-11 ratio(s) regressed", violations.len()));
+        return Err(format!("{} ratio(s) regressed", violations.len()));
     }
 
     // TST-094/TST-096: the full matrix, both sides, one command → the
@@ -129,10 +156,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             runs: opts.runs,
         };
         let (name, runs) = match opts.side.as_str() {
-            "fluxum" => (
-                "fluxum",
-                cold_fluxum(opts.memory_budget.clone(), &cfg)?,
-            ),
+            "fluxum" => ("fluxum", cold_fluxum(opts.memory_budget.clone(), &cfg)?),
             "postgres" | "sqlite" => {
                 let kind: &'static str = if opts.side == "postgres" {
                     "postgres"
@@ -163,7 +187,22 @@ fn run(args: Vec<String>) -> Result<(), String> {
                     )?,
                 )
             }
-            other => return Err(format!("unknown side {other:?} (fluxum|postgres|sqlite)")),
+            "spacetimedb" => (
+                "spacetimedb",
+                cold_spacetimedb(
+                    &stdb_url(&opts)?,
+                    &opts.stdb_db,
+                    opts.stdb_restart_cmd
+                        .as_deref()
+                        .or(opts.cold_restart_cmd.as_deref()),
+                    &cfg,
+                )?,
+            ),
+            other => {
+                return Err(format!(
+                    "unknown side {other:?} (fluxum|postgres|sqlite|spacetimedb)"
+                ));
+            }
         };
         return emit(
             name,
@@ -175,44 +214,50 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
 
     // The side under measurement.
-    let (side, _server): (Box<dyn Side>, Option<Box<dyn std::any::Any>>) = match opts.side.as_str()
-    {
-        "fluxum" => match &opts.url {
-            Some(url) => (Box::new(FluxumSide::new(url.clone())), None),
-            None => {
-                let server = BenchServer::start()?;
+    let (side, _server): (Box<dyn Side>, Option<Box<dyn std::any::Any>>) =
+        match opts.side.as_str() {
+            "fluxum" => match &opts.url {
+                Some(url) => (Box::new(FluxumSide::new(url.clone())), None),
+                None => {
+                    let server = BenchServer::start()?;
+                    (
+                        Box::new(FluxumSide::new(server.url.clone())),
+                        Some(Box::new(server)),
+                    )
+                }
+            },
+            "postgres" => {
+                let url = opts.database_url.clone().ok_or(
+                    "side postgres needs --database-url (see the docker one-liner in --help)",
+                )?;
+                let server = BaselineServer::start(&url, opts.max_connections)?;
                 (
-                    Box::new(FluxumSide::new(server.url.clone())),
+                    Box::new(BaselineSide::new(server.base_url.clone(), "postgres")),
                     Some(Box::new(server)),
                 )
             }
-        },
-        "postgres" => {
-            let url = opts.database_url.clone().ok_or(
-                "side postgres needs --database-url (see the docker one-liner in --help)",
-            )?;
-            let server = BaselineServer::start(&url, opts.max_connections)?;
-            (
-                Box::new(BaselineSide::new(server.base_url.clone(), "postgres")),
-                Some(Box::new(server)),
-            )
-        }
-        "sqlite" => {
-            let url = opts.database_url.clone().unwrap_or_else(|| {
-                let path = std::env::temp_dir().join(format!(
-                    "fluxum-parity-{}.sqlite",
-                    std::process::id()
+            "sqlite" => {
+                let url = opts.database_url.clone().unwrap_or_else(|| {
+                    let path = std::env::temp_dir()
+                        .join(format!("fluxum-parity-{}.sqlite", std::process::id()));
+                    format!("sqlite://{}", path.display())
+                });
+                let server = BaselineServer::start(&url, opts.max_connections)?;
+                (
+                    Box::new(BaselineSide::new(server.base_url.clone(), "sqlite")),
+                    Some(Box::new(server)),
+                )
+            }
+            "spacetimedb" => (
+                Box::new(SpacetimeDbSide::new(stdb_url(&opts)?, opts.stdb_db.clone())),
+                None,
+            ),
+            other => {
+                return Err(format!(
+                    "unknown side {other:?} (fluxum|postgres|sqlite|spacetimedb)"
                 ));
-                format!("sqlite://{}", path.display())
-            });
-            let server = BaselineServer::start(&url, opts.max_connections)?;
-            (
-                Box::new(BaselineSide::new(server.base_url.clone(), "sqlite")),
-                Some(Box::new(server)),
-            )
-        }
-        other => return Err(format!("unknown side {other:?} (fluxum|postgres|sqlite)")),
-    };
+            }
+        };
 
     // Every workload reduces to named (class → Summary) pairs; `write`,
     // `e2e` and `hot` have one class, `mixed` has three.
@@ -270,14 +315,25 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 runs: opts.runs,
             };
             let runs = mixed_workload(side.as_ref(), &cfg)?;
-            let class = |pick: fn(&fluxum_bench::workload::MixedRun) -> &fluxum_bench::measure::RunResult| {
+            let class = |pick: fn(
+                &fluxum_bench::workload::MixedRun,
+            ) -> &fluxum_bench::measure::RunResult| {
                 runs.iter().map(pick).cloned().collect::<Vec<_>>()
             };
             (
                 vec![
-                    ("mixed/write".to_owned(), Summary::from_runs(&class(|r| &r.write))),
-                    ("mixed/read".to_owned(), Summary::from_runs(&class(|r| &r.read))),
-                    ("mixed/e2e".to_owned(), Summary::from_runs(&class(|r| &r.e2e))),
+                    (
+                        "mixed/write".to_owned(),
+                        Summary::from_runs(&class(|r| &r.write)),
+                    ),
+                    (
+                        "mixed/read".to_owned(),
+                        Summary::from_runs(&class(|r| &r.read)),
+                    ),
+                    (
+                        "mixed/e2e".to_owned(),
+                        Summary::from_runs(&class(|r| &r.e2e)),
+                    ),
                 ],
                 format!("{cfg:?}"),
             )
@@ -344,7 +400,7 @@ fn emit(
 /// Returns `Err` when an NFR-11 target is unmet, AFTER writing the files —
 /// the artifact records reality either way.
 fn run_report(opts: &Opts) -> Result<(), String> {
-    use fluxum_bench::report::{Ratios, Report, StackInfo};
+    use fluxum_bench::report::{CompetitiveRatios, Ratios, Report, StackInfo};
     use std::collections::BTreeMap;
 
     let database_url = opts.database_url.clone().ok_or(
@@ -409,14 +465,28 @@ fn run_report(opts: &Opts) -> Result<(), String> {
         );
         println!("  mixed…");
         let mixed = mixed_workload(side, &mixed_cfg)?;
-        let pick = |f: fn(&fluxum_bench::workload::MixedRun) -> &fluxum_bench::measure::RunResult| {
-            mixed.iter().map(f).cloned().collect::<Vec<_>>()
-        };
-        classes.insert("mixed/write".to_owned(), Summary::from_runs(&pick(|r| &r.write)));
-        classes.insert("mixed/read".to_owned(), Summary::from_runs(&pick(|r| &r.read)));
-        classes.insert("mixed/e2e".to_owned(), Summary::from_runs(&pick(|r| &r.e2e)));
+        let pick =
+            |f: fn(&fluxum_bench::workload::MixedRun) -> &fluxum_bench::measure::RunResult| {
+                mixed.iter().map(f).cloned().collect::<Vec<_>>()
+            };
+        classes.insert(
+            "mixed/write".to_owned(),
+            Summary::from_runs(&pick(|r| &r.write)),
+        );
+        classes.insert(
+            "mixed/read".to_owned(),
+            Summary::from_runs(&pick(|r| &r.read)),
+        );
+        classes.insert(
+            "mixed/e2e".to_owned(),
+            Summary::from_runs(&pick(|r| &r.e2e)),
+        );
         Ok(classes)
     };
+
+    // Equal data footing: the docker PostgreSQL persists across runs while
+    // every Fluxum server starts on a fresh dir — start both sides empty.
+    truncate_baseline(&database_url)?;
 
     println!("== fluxum ==");
     let mut fluxum_classes = {
@@ -437,6 +507,11 @@ fn run_report(opts: &Opts) -> Result<(), String> {
         steady(&side)?
     };
     println!("  cold…");
+    // The cold dataset is exactly users × rows_per_user on BOTH sides: the
+    // Fluxum cold server is fresh by construction, so the baseline resets
+    // too — otherwise it would carry the steady phases' rows into the
+    // measurement.
+    truncate_baseline(&database_url)?;
     baseline_classes.insert(
         "cold".to_owned(),
         Summary::from_runs(&cold_baseline(
@@ -448,13 +523,55 @@ fn run_report(opts: &Opts) -> Result<(), String> {
         )?),
     );
 
+    // The competitive baseline (TST-097): same machine, same workloads,
+    // reset to an empty database before its steady phases and again before
+    // cold (equal data footing — the standalone persists in its volume).
+    let stdb_classes = match &opts.stdb_url {
+        None => {
+            println!("== spacetimedb == skipped (no --stdb-url; report will omit TST-097)");
+            None
+        }
+        Some(url) => {
+            let reset = opts.stdb_reset_cmd.as_deref().ok_or(
+                "report with --stdb-url needs --stdb-reset-cmd (the SpacetimeDB \
+                 database persists in its volume; the documented reset republishes \
+                 the module with -c always — see docs/parity/spacetimedb-baseline.md)",
+            )?;
+            println!("== spacetimedb ==");
+            run_shell(reset)?;
+            stdb_ready(url, &opts.stdb_db)?;
+            let side = SpacetimeDbSide::new(url.clone(), opts.stdb_db.clone());
+            let mut classes = steady(&side)?;
+            println!("  cold…");
+            run_shell(reset)?;
+            stdb_ready(url, &opts.stdb_db)?;
+            classes.insert(
+                "cold".to_owned(),
+                Summary::from_runs(&cold_spacetimedb(
+                    url,
+                    &opts.stdb_db,
+                    opts.stdb_restart_cmd.as_deref(),
+                    &cold_cfg,
+                )?),
+            );
+            Some(classes)
+        }
+    };
+
     let ratios = Ratios::from_summaries(&fluxum_classes, &baseline_classes)?;
+    let competitive = stdb_classes
+        .as_ref()
+        .map(|classes| CompetitiveRatios::from_summaries(&fluxum_classes, classes))
+        .transpose()?;
     let (pg_version, synchronous_commit) = pg_info(&database_url)?;
-    let stacks: BTreeMap<String, StackInfo> = [
+    let mut stacks: BTreeMap<String, StackInfo> = [
         (
             "fluxum".to_owned(),
             StackInfo {
-                version: format!("fluxum-server {} (release)", fluxum_bench::harness_version()),
+                version: format!(
+                    "fluxum-server {} (release)",
+                    fluxum_bench::harness_version()
+                ),
                 durability: "TXN-004: ReducerResult acked after the commit-log append reaches \
                              the OS (process-crash safe); fsync is async group commit — \
                              ~50 ms OS-crash window (NFR-08)"
@@ -482,18 +599,47 @@ fn run_report(opts: &Opts) -> Result<(), String> {
         ),
     ]
     .into();
+    if stdb_classes.is_some() {
+        stacks.insert(
+            "spacetimedb".to_owned(),
+            StackInfo {
+                version: opts.stdb_note.clone().unwrap_or_else(|| {
+                    "clockworklabs/spacetime:v2.6.1 (standalone, pinned)".to_owned()
+                }),
+                durability: "reducer acked at in-memory commit, BEFORE the commit-log \
+                             append: durability is a background actor batching appends \
+                             and fsyncing per batch (group commit) — a process or OS \
+                             crash can lose acked transactions since the last sync \
+                             (spacetimedb-durability v2.6.1, imp::local). Weaker ack \
+                             than Fluxum's TXN-004 (append reaches the OS pre-ack)"
+                    .to_owned(),
+                config: "demo module 1:1 (spacetimedb-module/, spacetimedb =2.6.1 wasm), \
+                         client spacetimedb-sdk =2.6.1 over WebSocket; task visibility \
+                         via RLS owner filter (:sender); btree indexes task.owner and \
+                         chat_message.channel; send_chat budget table in-module (Fluxum \
+                         enforces the same 20/s pre-transaction, RED-050)"
+                    .to_owned(),
+            },
+        );
+    }
+
+    let mut workloads: BTreeMap<String, BTreeMap<String, Summary>> = [
+        ("fluxum".to_owned(), fluxum_classes),
+        ("postgres".to_owned(), baseline_classes),
+    ]
+    .into();
+    if let Some(classes) = stdb_classes {
+        workloads.insert("spacetimedb".to_owned(), classes);
+    }
 
     let report = Report {
         harness_version: fluxum_bench::harness_version().to_owned(),
         date: opts.date.clone().unwrap_or_else(default_date),
         hardware: hardware(opts.disk_note.as_deref()),
         stacks,
-        workloads: [
-            ("fluxum".to_owned(), fluxum_classes),
-            ("postgres".to_owned(), baseline_classes),
-        ]
-        .into(),
+        workloads,
         ratios,
+        competitive,
     };
 
     let out_dir = opts
@@ -526,11 +672,41 @@ fn run_report(opts: &Opts) -> Result<(), String> {
             if met { "OK " } else { "MISS" }
         );
     }
+    // TST-097 is informational (the parity target to REACH), never an exit
+    // code: the NFR-11 gate and the competitive baseline must not pollute
+    // each other.
+    if let Some(competitive) = &report.competitive {
+        for (name, value, reached) in competitive.verdicts() {
+            println!(
+                "  {} competitive {name}: {value:.2} (target ≥ 1.0)",
+                if reached { "OK  " } else { "GAP " }
+            );
+        }
+    }
     if unmet.is_empty() {
         Ok(())
     } else {
         Err(format!("NFR-11 targets unmet: {}", unmet.join(", ")))
     }
+}
+
+/// Empty the baseline's tables (the docker PostgreSQL persists across
+/// phases and runs; the Fluxum side gets a fresh data dir per server, so
+/// without this the two sides would measure differently-sized datasets —
+/// TST-091's equal-footing rule applied to data volume).
+fn truncate_baseline(database_url: &str) -> Result<(), String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let pool = fluxum_bench::baseline::db::connect_pg_with_retry(database_url, 1).await?;
+        sqlx::query("TRUNCATE task, chat_message RESTART IDENTITY")
+            .execute(&pool)
+            .await
+            .map_err(|e| format!("truncate baseline: {e}"))?;
+        Ok(())
+    })
 }
 
 /// The PostgreSQL server's version string and `synchronous_commit` setting,
@@ -541,8 +717,7 @@ fn pg_info(database_url: &str) -> Result<(String, String), String> {
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
-        let pool =
-            fluxum_bench::baseline::db::connect_pg_with_retry(database_url, 1).await?;
+        let pool = fluxum_bench::baseline::db::connect_pg_with_retry(database_url, 1).await?;
         let (version,): (String,) = sqlx::query_as("SELECT version()")
             .fetch_one(&pool)
             .await
@@ -574,7 +749,9 @@ fn hardware(disk_note: Option<&str>) -> fluxum_bench::report::Hardware {
             sysinfo::System::name().unwrap_or_else(|| std::env::consts::OS.to_owned()),
             sysinfo::System::os_version().unwrap_or_default()
         ),
-        disk: disk_note.unwrap_or("unstated (pass --disk-note)").to_owned(),
+        disk: disk_note
+            .unwrap_or("unstated (pass --disk-note)")
+            .to_owned(),
     }
 }
 
@@ -640,11 +817,9 @@ fn cold_baseline(
     cfg: &ColdReadConfig,
 ) -> Result<Vec<fluxum_bench::measure::RunResult>, String> {
     if kind == "postgres" && cold_restart_cmd.is_none() {
-        return Err(
-            "postgres cold reads need --cold-restart-cmd, e.g. \
+        return Err("postgres cold reads need --cold-restart-cmd, e.g. \
              --cold-restart-cmd \"docker restart fluxum-parity-pg\""
-                .to_owned(),
-        );
+            .to_owned());
     }
     let server = std::sync::Mutex::new(BaselineServer::start(database_url, max_connections)?);
     let base_url = server
@@ -663,6 +838,64 @@ fn cold_baseline(
             .restart()
     };
     cold_read_workload(&side, &restart, cfg)
+}
+
+/// The SpacetimeDB server URL: `--stdb-url` (or `--url` when driving the
+/// side directly), with the docker one-liner in the error.
+fn stdb_url(opts: &Opts) -> Result<String, String> {
+    opts.stdb_url
+        .clone()
+        .or_else(|| opts.url.clone())
+        .ok_or_else(|| {
+            "side spacetimedb needs --stdb-url, e.g. http://127.0.0.1:15300 \
+             (docker run -d --name fluxum-parity-stdb -p 15300:3000 \
+             -v fluxum-parity-stdb-data:/stdb-data \
+             clockworklabs/spacetime:v2.6.1 start --data-dir /stdb-data; \
+             see docs/parity/spacetimedb-baseline.md)"
+                .to_owned()
+        })
+}
+
+/// Cold reads on the SpacetimeDB side. The server owns its caches and its
+/// commitlog, so the caller must say how to bounce it (`docker restart …`),
+/// exactly like the PostgreSQL side; after the bounce the side is polled
+/// back to readiness (connect + subscription) before the timed loads.
+fn cold_spacetimedb(
+    url: &str,
+    db_name: &str,
+    restart_cmd: Option<&str>,
+    cfg: &ColdReadConfig,
+) -> Result<Vec<fluxum_bench::measure::RunResult>, String> {
+    let Some(cmd) = restart_cmd else {
+        return Err(
+            "spacetimedb cold reads need --stdb-restart-cmd (or --cold-restart-cmd), \
+             e.g. \"docker restart fluxum-parity-stdb\""
+                .to_owned(),
+        );
+    };
+    let side = SpacetimeDbSide::new(url, db_name);
+    let restart = || {
+        run_shell(cmd)?;
+        stdb_ready(url, db_name)
+    };
+    cold_read_workload(&side, &restart, cfg)
+}
+
+/// Poll the SpacetimeDB side back to readiness after a restart or reset.
+/// Readiness = a full client session works again (connect + subscription),
+/// not just an open port: the standalone accepts sockets before the module
+/// is warm.
+fn stdb_ready(url: &str, db_name: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match fluxum_bench::spacetimedb_side::probe(url, db_name) {
+            Ok(()) => return Ok(()),
+            Err(e) if Instant::now() >= deadline => {
+                return Err(format!("spacetimedb not ready within 60 s: {e}"));
+            }
+            Err(_) => std::thread::sleep(Duration::from_millis(250)),
+        }
+    }
 }
 
 /// Run a caller-supplied shell command (the PostgreSQL cold-restart hook).
@@ -695,6 +928,11 @@ struct Opts {
     samples: u32,
     memory_budget: Option<String>,
     cold_restart_cmd: Option<String>,
+    stdb_url: Option<String>,
+    stdb_db: String,
+    stdb_reset_cmd: Option<String>,
+    stdb_restart_cmd: Option<String>,
+    stdb_note: Option<String>,
     subscribers: usize,
     rate: u32,
     messages: u32,
@@ -724,6 +962,11 @@ impl Default for Opts {
             samples: 16,
             memory_budget: None,
             cold_restart_cmd: None,
+            stdb_url: None,
+            stdb_db: "fluxum-parity-demo".to_owned(),
+            stdb_reset_cmd: None,
+            stdb_restart_cmd: None,
+            stdb_note: None,
             subscribers: 50,
             rate: 10,
             messages: 100,
@@ -745,11 +988,14 @@ fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
 }
 
 fn usage() -> String {
-    "usage: fluxum-bench <write|e2e|hot|cold|mixed> [--side fluxum|postgres|sqlite] [--url URL] \
+    "usage: fluxum-bench <write|e2e|hot|cold|mixed> [--side fluxum|postgres|sqlite|spacetimedb] \
+     [--url URL] \
      [--database-url URL] [--clients N] [--warmup-secs N] [--measure-secs N] [--runs N] \
      [--rows N] [--users N] [--samples N] [--memory-budget SIZE] [--cold-restart-cmd CMD] \
+     [--stdb-url URL] [--stdb-db NAME] \
      [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
-     \x20      fluxum-bench report --database-url URL --cold-restart-cmd CMD [--out DIR] \
+     \x20      fluxum-bench report --database-url URL --cold-restart-cmd CMD \
+     [--stdb-url URL --stdb-reset-cmd CMD [--stdb-db NAME] [--stdb-note TEXT]] [--out DIR] \
      [--date YYYY-MM-DD] [--disk-note TEXT] [workload knobs]\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
@@ -859,7 +1105,14 @@ impl BenchServer {
 
         let http_port = free_port()?;
         let tcp_port = free_port()?;
-        let data_dir = std::env::temp_dir().join(format!("fluxum-bench-{}", std::process::id()));
+        // Unique per INSTANCE, not per process: the report spawns several
+        // servers in one run, and a shared dir would hand a later phase the
+        // earlier phases' committed data through recovery — the cold phase
+        // would then measure loads over a dataset nobody configured.
+        static INSTANCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let instance = INSTANCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let data_dir =
+            std::env::temp_dir().join(format!("fluxum-bench-{}-{instance}", std::process::id()));
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
         let child = launch_fluxum(

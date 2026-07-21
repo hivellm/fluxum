@@ -33,7 +33,12 @@ impl Ratios {
     #[must_use]
     pub fn verdicts(&self) -> Vec<(&'static str, f64, f64, bool)> {
         vec![
-            ("write_throughput", self.write_throughput, 10.0, self.write_throughput >= 10.0),
+            (
+                "write_throughput",
+                self.write_throughput,
+                10.0,
+                self.write_throughput >= 10.0,
+            ),
             ("e2e_p99", self.e2e_p99, 10.0, self.e2e_p99 >= 10.0),
             ("hot_p99", self.hot_p99, 50.0, self.hot_p99 >= 50.0),
             ("cold_p99", self.cold_p99, 0.5, self.cold_p99 >= 0.5),
@@ -81,6 +86,95 @@ impl Ratios {
     }
 }
 
+/// The competitive-baseline ratios (TST-097): Fluxum vs SpacetimeDB, one
+/// per workload class, oriented so **bigger is better for Fluxum** —
+/// throughputs are `fluxum / spacetimedb`, latencies `spacetimedb / fluxum`.
+///
+/// The target for every class is ≥ 1.0 (parity with the baseline Fluxum
+/// must reach). Unlike the NFR-11 ratios these are *informational* until a
+/// class first reaches 1.0; from then on [`competitive_regressions`] floors
+/// it (a class that reached parity may never silently fall back below).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CompetitiveRatios {
+    /// Write throughput, `fluxum / spacetimedb`.
+    pub write_throughput: f64,
+    /// End-to-end change→subscriber p99, `spacetimedb / fluxum`.
+    pub e2e_p99: f64,
+    /// Hot read p99, `spacetimedb / fluxum`.
+    pub hot_p99: f64,
+    /// Cold (page-in) load p99, `spacetimedb / fluxum`.
+    pub cold_p99: f64,
+    /// Write throughput under contention, `fluxum / spacetimedb`.
+    pub mixed_write_throughput: f64,
+    /// Hot read p99 under contention, `spacetimedb / fluxum`.
+    pub mixed_read_p99: f64,
+    /// Delivery p99 under contention, `spacetimedb / fluxum`.
+    pub mixed_e2e_p99: f64,
+}
+
+impl CompetitiveRatios {
+    /// `(name, value, reached-parity?)` per class, in report order.
+    #[must_use]
+    pub fn verdicts(&self) -> Vec<(&'static str, f64, bool)> {
+        [
+            ("write_throughput", self.write_throughput),
+            ("e2e_p99", self.e2e_p99),
+            ("hot_p99", self.hot_p99),
+            ("cold_p99", self.cold_p99),
+            ("mixed_write_throughput", self.mixed_write_throughput),
+            ("mixed_read_p99", self.mixed_read_p99),
+            ("mixed_e2e_p99", self.mixed_e2e_p99),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name, value, value >= 1.0))
+        .collect()
+    }
+
+    /// Compute the ratios from both sides' per-class summaries.
+    pub fn from_summaries(
+        fluxum: &BTreeMap<String, Summary>,
+        spacetimedb: &BTreeMap<String, Summary>,
+    ) -> Result<CompetitiveRatios, String> {
+        let get = |map: &BTreeMap<String, Summary>, side: &str, class: &str| {
+            map.get(class)
+                .cloned()
+                .ok_or_else(|| format!("{side} has no {class:?} summary"))
+        };
+        let ratio = |num: f64, den: f64, what: &str| {
+            if den <= 0.0 {
+                return Err(format!("{what}: denominator is {den}"));
+            }
+            Ok(num / den)
+        };
+        let throughput = |class: &str, what: &str| {
+            ratio(
+                get(fluxum, "fluxum", class)?.throughput_mean,
+                get(spacetimedb, "spacetimedb", class)?.throughput_mean,
+                what,
+            )
+        };
+        let p99 = |class: &str, what: &str| {
+            ratio(
+                get(spacetimedb, "spacetimedb", class)?.p99_ns_mean,
+                get(fluxum, "fluxum", class)?.p99_ns_mean,
+                what,
+            )
+        };
+        Ok(CompetitiveRatios {
+            write_throughput: throughput("write", "competitive write_throughput")?,
+            e2e_p99: p99("e2e", "competitive e2e_p99")?,
+            hot_p99: p99("hot", "competitive hot_p99")?,
+            cold_p99: p99("cold", "competitive cold_p99")?,
+            mixed_write_throughput: throughput(
+                "mixed/write",
+                "competitive mixed_write_throughput",
+            )?,
+            mixed_read_p99: p99("mixed/read", "competitive mixed_read_p99")?,
+            mixed_e2e_p99: p99("mixed/e2e", "competitive mixed_e2e_p99")?,
+        })
+    }
+}
+
 /// One side's recorded identity and configuration (TST-094).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct StackInfo {
@@ -122,6 +216,11 @@ pub struct Report {
     pub workloads: BTreeMap<String, BTreeMap<String, Summary>>,
     /// The NFR-11 ratios, Fluxum vs the PostgreSQL baseline.
     pub ratios: Ratios,
+    /// The TST-097 competitive ratios, Fluxum vs SpacetimeDB. `None` when
+    /// the run had no spacetimedb side (kept optional so older published
+    /// reports still parse); the release report always carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub competitive: Option<CompetitiveRatios>,
 }
 
 impl Report {
@@ -131,13 +230,21 @@ impl Report {
         use std::fmt::Write as _;
         let mut out = String::new();
         let ms = |ns: f64| ns / 1_000_000.0;
-        let _ = writeln!(out, "# Fluxum parity report (harness {})", self.harness_version);
+        let _ = writeln!(
+            out,
+            "# Fluxum parity report (harness {})",
+            self.harness_version
+        );
         let _ = writeln!(out, "\nDate: {}", self.date);
         let _ = writeln!(out, "\n## Hardware (both sides, same machine — TST-091)\n");
         let _ = writeln!(
             out,
             "- CPU: {} ({} logical cores)\n- RAM: {:.1} GiB\n- OS: {}\n- Disk: {}",
-            self.hardware.cpu, self.hardware.cores, self.hardware.ram_gib, self.hardware.os, self.hardware.disk
+            self.hardware.cpu,
+            self.hardware.cores,
+            self.hardware.ram_gib,
+            self.hardware.os,
+            self.hardware.disk
         );
         let _ = writeln!(out, "\n## Stacks\n");
         for (name, stack) in &self.stacks {
@@ -151,7 +258,11 @@ impl Report {
         let _ = writeln!(out, "| ratio | value | target | met |");
         let _ = writeln!(out, "| --- | --- | --- | --- |");
         for (name, value, target, met) in self.ratios.verdicts() {
-            let op = if name == "cold_p99" { "≥ 0.5 (within 2×)" } else { "≥" };
+            let op = if name == "cold_p99" {
+                "≥ 0.5 (within 2×)"
+            } else {
+                "≥"
+            };
             let target_text = if name == "cold_p99" {
                 op.to_owned()
             } else {
@@ -163,9 +274,36 @@ impl Report {
                 if met { "✅" } else { "❌" }
             );
         }
-        let _ = writeln!(out, "\n## Raw measurements (mean ± stddev across runs — TST-091)\n");
-        let _ = writeln!(out, "| side | class | ops/s | p50 ms | p99 ms | p99 σ ms | max ms | ops | runs |");
-        let _ = writeln!(out, "| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+        if let Some(competitive) = &self.competitive {
+            let _ = writeln!(out, "\n## Competitive baseline vs SpacetimeDB (TST-097)\n");
+            let _ = writeln!(
+                out,
+                "Ratios oriented bigger-is-better-for-Fluxum; ≥ 1.00 = parity with \
+                 SpacetimeDB reached for that class. Informational until reached, \
+                 floored by the regression guard afterwards.\n"
+            );
+            let _ = writeln!(out, "| ratio | value | target | reached |");
+            let _ = writeln!(out, "| --- | --- | --- | --- |");
+            for (name, value, reached) in competitive.verdicts() {
+                let _ = writeln!(
+                    out,
+                    "| {name} | {value:.2} | ≥ 1.0 | {} |",
+                    if reached { "✅" } else { "⏳" }
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\n## Raw measurements (mean ± stddev across runs — TST-091)\n"
+        );
+        let _ = writeln!(
+            out,
+            "| side | class | ops/s | p50 ms | p99 ms | p99 σ ms | max ms | ops | runs |"
+        );
+        let _ = writeln!(
+            out,
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+        );
         for (side, classes) in &self.workloads {
             for (class, s) in classes {
                 let _ = writeln!(
@@ -210,11 +348,55 @@ pub fn regressions(current: &Ratios, published: &Ratios, tolerance: f64) -> Vec<
             ));
         }
     };
-    check("write_throughput", current.write_throughput, published.write_throughput);
+    check(
+        "write_throughput",
+        current.write_throughput,
+        published.write_throughput,
+    );
     check("e2e_p99", current.e2e_p99, published.e2e_p99);
     check("hot_p99", current.hot_p99, published.hot_p99);
     check("cold_p99", current.cold_p99, published.cold_p99);
     violations
+}
+
+/// TST-097 guard: the competitive ratios are informational while a class is
+/// below parity, but once the published report shows a class at ≥ 1.0 that
+/// class is **floored at 1.0** — reaching SpacetimeDB and silently falling
+/// back would un-earn the product claim. Also fires when the published
+/// report carries the block and the current run dropped it entirely.
+#[must_use]
+pub fn competitive_regressions(
+    current: Option<&CompetitiveRatios>,
+    published: Option<&CompetitiveRatios>,
+) -> Vec<String> {
+    let Some(published) = published else {
+        return Vec::new(); // nothing earned yet, nothing to floor
+    };
+    let Some(current) = current else {
+        return vec![
+            "competitive: published report has the SpacetimeDB block; current run has none"
+                .to_owned(),
+        ];
+    };
+    let published: BTreeMap<&str, f64> = published
+        .verdicts()
+        .into_iter()
+        .map(|(name, value, _)| (name, value))
+        .collect();
+    current
+        .verdicts()
+        .into_iter()
+        .filter_map(|(name, value, _)| {
+            let earned = published.get(name).copied().unwrap_or(0.0) >= 1.0;
+            (earned && value < 1.0).then(|| {
+                format!(
+                    "competitive {name}: {value:.2} fell below the 1.0 parity floor \
+                     (published {:.2} had reached it)",
+                    published[name]
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -299,6 +481,72 @@ mod tests {
         assert!(violations[0].contains("write_throughput"), "{violations:?}");
     }
 
+    /// A spacetimedb side whose classes make every competitive ratio land
+    /// on an easily-asserted value against [`sides`]'s fluxum numbers.
+    fn spacetimedb_classes() -> BTreeMap<String, Summary> {
+        [
+            ("write".to_owned(), summary(25_000.0, 1_000_000.0)),
+            ("e2e".to_owned(), summary(100.0, 1_000_000.0)),
+            ("hot".to_owned(), summary(500_000.0, 2_000.0)),
+            ("cold".to_owned(), summary(50.0, 4_000_000.0)),
+            ("mixed/write".to_owned(), summary(80_000.0, 1_000_000.0)),
+            ("mixed/read".to_owned(), summary(500_000.0, 500.0)),
+            ("mixed/e2e".to_owned(), summary(100.0, 250_000.0)),
+        ]
+        .into()
+    }
+
+    /// Fluxum mixed classes to pair with [`spacetimedb_classes`].
+    fn fluxum_mixed() -> [(String, Summary); 3] {
+        [
+            ("mixed/write".to_owned(), summary(40_000.0, 900_000.0)),
+            ("mixed/read".to_owned(), summary(800_000.0, 1_000.0)),
+            ("mixed/e2e".to_owned(), summary(100.0, 500_000.0)),
+        ]
+    }
+
+    #[test]
+    fn competitive_ratios_orient_bigger_as_better_for_fluxum() {
+        let (mut fluxum, _) = sides();
+        fluxum.extend(fluxum_mixed());
+        let competitive =
+            CompetitiveRatios::from_summaries(&fluxum, &spacetimedb_classes()).unwrap();
+        assert!((competitive.write_throughput - 2.0).abs() < 1e-9); // 50k/25k
+        assert!((competitive.e2e_p99 - 2.0).abs() < 1e-9); // 1ms/0.5ms
+        assert!((competitive.hot_p99 - 2.0).abs() < 1e-9); // 2µs/1µs
+        assert!((competitive.cold_p99 - 0.5).abs() < 1e-9); // 4ms/8ms
+        assert!((competitive.mixed_write_throughput - 0.5).abs() < 1e-9); // 40k/80k
+        assert!((competitive.mixed_read_p99 - 0.5).abs() < 1e-9); // 0.5µs/1µs
+        assert!((competitive.mixed_e2e_p99 - 0.5).abs() < 1e-9); // 0.25ms/0.5ms
+        // Parity verdicts follow the 1.0 target per class.
+        let verdicts = competitive.verdicts();
+        let reached: Vec<bool> = verdicts.iter().map(|(_, _, reached)| *reached).collect();
+        assert_eq!(reached, [true, true, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn competitive_guard_floors_only_classes_that_reached_parity() {
+        let (mut fluxum, _) = sides();
+        fluxum.extend(fluxum_mixed());
+        let published = CompetitiveRatios::from_summaries(&fluxum, &spacetimedb_classes()).unwrap();
+        // Identical current: nothing fires (below-parity classes stay
+        // informational, reached classes are at their floor).
+        assert!(competitive_regressions(Some(&published), Some(&published)).is_empty());
+        // A reached class falling under 1.0 fires; a never-reached class
+        // sinking further does not.
+        let mut current = published.clone();
+        current.write_throughput = 0.9; // was ≥ 1.0 in published
+        current.cold_p99 = 0.1; // was < 1.0 in published
+        let violations = competitive_regressions(Some(&current), Some(&published));
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("write_throughput"), "{violations:?}");
+        // Dropping the whole block after publishing it is itself a
+        // regression; never having published one is not.
+        assert_eq!(competitive_regressions(None, Some(&published)).len(), 1);
+        assert!(competitive_regressions(Some(&current), None).is_empty());
+        assert!(competitive_regressions(None, None).is_empty());
+    }
+
     #[test]
     fn markdown_renders_from_the_json_source_of_truth() {
         let (fluxum, baseline) = sides();
@@ -322,16 +570,41 @@ mod tests {
                 },
             )]
             .into(),
-            workloads: [("fluxum".to_owned(), fluxum), ("postgres".to_owned(), baseline)].into(),
+            workloads: [
+                ("fluxum".to_owned(), fluxum),
+                ("postgres".to_owned(), baseline),
+            ]
+            .into(),
             ratios,
+            competitive: None,
         };
         let md = report.markdown();
         assert!(md.contains("# Fluxum parity report"));
         assert!(md.contains("write_throughput"));
         assert!(md.contains("PostgreSQL 17"));
         assert!(md.contains("✅"));
-        // The JSON round-trips — the guard reads what the release publishes.
+        // Without a spacetimedb side there is no TST-097 section — and the
+        // JSON omits the key entirely, which is also the old-schema shape,
+        // so pre-TST-097 published reports keep loading (guard inputs).
+        assert!(!md.contains("Competitive baseline"));
         let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("competitive"));
+        let back: Report = serde_json::from_str(&json).unwrap();
+        assert!(back.competitive.is_none());
+        assert_eq!(back.markdown(), md);
+
+        // With the block: section renders, verdict icons split at 1.0, and
+        // the JSON round-trips.
+        let mut with_stdb = report;
+        let (mut fluxum, _) = sides();
+        fluxum.extend(fluxum_mixed());
+        with_stdb.competitive =
+            Some(CompetitiveRatios::from_summaries(&fluxum, &spacetimedb_classes()).unwrap());
+        let md = with_stdb.markdown();
+        assert!(md.contains("Competitive baseline vs SpacetimeDB (TST-097)"));
+        assert!(md.contains("mixed_e2e_p99"));
+        assert!(md.contains("⏳"));
+        let json = serde_json::to_string(&with_stdb).unwrap();
         let back: Report = serde_json::from_str(&json).unwrap();
         assert_eq!(back.markdown(), md);
     }

@@ -15,6 +15,10 @@ axum.workspace = true
 fluxum-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# The competitive-baseline side (TST-097) drives a pinned SpacetimeDB
+# server through its published client SDK; `spacetimedb_bindings/` is the
+# `spacetime generate` output for the demo module in `spacetimedb-module/`.
+spacetimedb-sdk.workspace = true
 sqlx.workspace = true
 sysinfo.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }

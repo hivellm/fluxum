@@ -1,0 +1,11 @@
+{
+  "id": 1,
+  "slug": "spacetimedb-is-the-competitive-baseline-real-head-to-head-side-in-the-parity-harness",
+  "title": "SpacetimeDB is the competitive baseline — real head-to-head side in the parity harness",
+  "status": "proposed",
+  "date": "2026-07-21",
+  "relatedTasks": [
+    "phase0_parity-spacetimedb-baseline"
+  ],
+  "supersededBy": null
+}

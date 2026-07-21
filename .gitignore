@@ -1,5 +1,7 @@
 # Rust
 /target/
+# The SpacetimeDB demo module builds outside the workspace (own target dir).
+crates/fluxum-bench/spacetimedb-module/target/
 **/*.rs.bk
 *.pdb
 

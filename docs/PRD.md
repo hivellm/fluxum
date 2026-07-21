@@ -371,11 +371,15 @@ SPEC-021–027. Priority tags: **P1** competitive-launch candidate, **P2** post-
 | NFR-09 | Quality | `cargo fmt --check`, `clippy -D warnings` (incl. `unwrap_used`/`expect_used` deny), nextest green on Linux/macOS/Windows | every PR |
 | NFR-10 | Correctness | Subscription diff accuracy under property testing | 100% |
 | NFR-11 | **Comparative baseline** | Measured by the `fluxum-bench` parity harness — the same application on app-server + PostgreSQL, equal hardware, honest durability settings on both sides — published every release: write throughput ≥ 10×; end-to-end change→subscriber p99 latency ≥ 10× lower (vs `LISTEN/NOTIFY` fan-out); hot reads ≥ 50× lower latency (in-process vs SQL round trip); cold (page-in) reads within 2× of PostgreSQL | every release |
+| NFR-11b | **Competitive baseline (SpacetimeDB)** | Measured by the same parity harness (SPEC-013 TST-097): the same demo application as a SpacetimeDB module on a **pinned** SpacetimeDB server, driven over real sockets through the **published** SpacetimeDB client SDK, same machine and honesty rules; the report publishes `fluxum / spacetimedb` ratios per workload class. Informational (never a release gate, kept separate from the NFR-11 verdicts); once a class first reaches ≥ 1.0× in a published report, the regression guard floors it there; classes below 1.0× carry recorded findings with measured deltas | ≥ 1.0× per class (the parity to reach), tracked every release |
 | NFR-12 | Memory envelope | Fully functional on 1 vCPU / 512 MB with a dataset ≥ 10× RAM (tiered storage); idle baseline RSS < 100 MB | validated in CI profile |
 | NFR-13 | Capacity | ≥ 1 billion rows per deployment (sharded + tiered), sustained by a soak test | 0.2.0 gate |
 | NFR-14 | SIMD parity | SIMD kernels bit-identical to scalar reference on every supported ISA | CI matrix |
 
-Reference baseline: SpacetimeDB in production — 150,000 tx/s, single binary.
+Reference baseline: SpacetimeDB in production — 150,000 tx/s, single binary. Since 2026-07-21
+(decision 001) that claim is **measured, not framed**: NFR-11b's head-to-head runs in every
+release report. Notably, SpacetimeDB's own published benchmarks are in-process vs SQLite;
+Fluxum's harness compares both products over real sockets through their published SDKs.
 
 ## 8. Non-goals (contract)
 

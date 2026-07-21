@@ -1,0 +1,27 @@
+# The parity demo app as a SpacetimeDB module (TST-097): the same
+# application `crates/fluxum-demo` implements on Fluxum, built for the
+# competitive-baseline side of the harness. Mirrors the official
+# `templates/basic-rs` layout at the pinned version — edition 2024, default
+# release profile — so SpacetimeDB runs exactly what its own tooling ships.
+#
+# NOT a workspace member (see the root Cargo.toml `exclude`): built to
+# wasm32-unknown-unknown and consumed only by `spacetime publish`.
+#
+# Version pin: `=2.6.1` must match the server image
+# (clockworklabs/spacetime:v2.6.1) and the `spacetimedb-sdk` client pin in
+# the workspace Cargo.toml.
+
+[package]
+name = "fluxum-parity-demo"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# `unstable` is required by `client_visibility_filter` — the row-level
+# security rule that mirrors Fluxum's `owner_only` (DM-060) server-side.
+spacetimedb = { version = "=2.6.1", features = ["unstable"] }
