@@ -62,11 +62,7 @@ impl Db {
     /// `sqlite://<path>` (`sqlite::memory:` for a throwaway).
     pub async fn connect(url: &str, max_connections: u32) -> Result<Db, String> {
         if url.starts_with("postgres") {
-            let pool = PgPoolOptions::new()
-                .max_connections(max_connections)
-                .connect(url)
-                .await
-                .map_err(|e| format!("postgres connect {url}: {e}"))?;
+            let pool = connect_pg_with_retry(url, max_connections).await?;
             for statement in split_ddl(PG_SCHEMA) {
                 sqlx::query(&statement)
                     .execute(&pool)
@@ -211,6 +207,46 @@ impl Db {
             }
         }
     }
+}
+
+/// Connect to PostgreSQL, retrying for up to ~30 s. The retry is not a
+/// benchmark kindness — it is what any competent incumbent deployment does,
+/// and the cold-read workload restarts the database out from under the app
+/// server, exactly the window where a first attempt lands on a PostgreSQL
+/// that is listening (Docker's proxy accepts early) but not yet ready.
+pub async fn connect_pg_with_retry(url: &str, max_connections: u32) -> Result<PgPool, String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match PgPoolOptions::new()
+            .max_connections(max_connections)
+            // The pool hands out connections lazily; a health check here
+            // makes "connected" mean "the server answers queries".
+            .test_before_acquire(true)
+            .connect(url)
+            .await
+        {
+            Ok(pool) => match sqlx::query("SELECT 1").execute(&pool).await {
+                Ok(_) => return Ok(pool),
+                Err(e) if std::time::Instant::now() < deadline => {
+                    drop(pool);
+                    tracing_note(&e);
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(format!("postgres probe {url}: {e}")),
+            },
+            Err(e) if std::time::Instant::now() < deadline => {
+                tracing_note(&e);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => return Err(format!("postgres connect {url}: {e}")),
+        }
+    }
+}
+
+/// Startup retries are normal during a cold restart; keep them visible
+/// without failing anything.
+fn tracing_note(error: &sqlx::Error) {
+    eprintln!("baseline: postgres not ready yet ({error}); retrying");
 }
 
 /// Split a DDL blob into statements (sqlx prepared queries are one statement

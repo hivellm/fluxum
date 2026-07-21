@@ -369,6 +369,9 @@ impl Connection {
         let read_half = match target {
             Target::Tcp(_) => {
                 let stream = TcpStream::connect(&shared.addr)?;
+                // Reducer calls are small request/response frames; Nagle
+                // would hold each one behind the previous frame's ACK.
+                let _ = stream.set_nodelay(true);
                 shared.set_push_socket(Some(stream.try_clone()?));
                 shared.set_writer(Some(WriteHalf::Tcp(stream.try_clone()?)));
                 // Authenticate before returning: connecting means "session
@@ -1028,6 +1031,7 @@ fn sleep_unless_closed(shared: &Shared, delay: Duration) -> bool {
 /// attempt; the loop backs off and tries again.
 fn try_tcp_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
     let stream = TcpStream::connect(&shared.addr)?;
+    let _ = stream.set_nodelay(true);
     // A half-dead handshake must not wedge `Drop`: bound reads until the
     // session is live, then go back to blocking indefinitely.
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;

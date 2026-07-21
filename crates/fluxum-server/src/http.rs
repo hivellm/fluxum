@@ -325,6 +325,9 @@ pub async fn serve_tls(
                 _ = accept_shutdown.notified() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else { continue };
+                    // Realtime wire: push-stream frames are small and must
+                    // leave immediately — Nagle would batch them (NFR-04).
+                    let _ = stream.set_nodelay(true);
                     // SEC-042: keepalive so dead peers stop holding slots.
                     crate::sock::apply_keepalive(&stream, state.options.socket.tcp_keepalive);
                     // SEC-030/031: gate the pre-auth surface per peer IP, the

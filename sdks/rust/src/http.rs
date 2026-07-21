@@ -46,6 +46,7 @@ impl HttpEndpoint {
     /// I/O timeout, never a hung caller.
     pub fn post(&self, session: Option<&str>, body: &[u8]) -> std::io::Result<PostResponse> {
         let mut stream = TcpStream::connect(&self.addr)?;
+        let _ = stream.set_nodelay(true);
         stream.set_read_timeout(Some(Duration::from_secs(30)))?;
 
         let mut request = format!(
@@ -93,6 +94,7 @@ impl HttpEndpoint {
     /// server still counts the previous stream (retry shortly).
     pub fn open_stream(&self, session: &str) -> std::io::Result<(u16, Option<ChunkedStream>)> {
         let mut stream = TcpStream::connect(&self.addr)?;
+        let _ = stream.set_nodelay(true);
         // Bounded while we wait for the response head; cleared once live —
         // the stream then idles between keep-alives and must block freely.
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;

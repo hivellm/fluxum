@@ -541,11 +541,8 @@ fn pg_info(database_url: &str) -> Result<(String, String), String> {
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(1)
-            .connect(database_url)
-            .await
-            .map_err(|e| format!("postgres connect for version info: {e}"))?;
+        let pool =
+            fluxum_bench::baseline::db::connect_pg_with_retry(database_url, 1).await?;
         let (version,): (String,) = sqlx::query_as("SELECT version()")
             .fetch_one(&pool)
             .await

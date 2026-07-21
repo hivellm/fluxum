@@ -109,6 +109,28 @@ impl CommitLog {
         let (watch_tx, watch_rx) = watch::channel(DurableState::Durable(recovery.last_tx_id));
         let (written_tx, written_rx) = watch::channel(DurableState::Durable(recovery.last_tx_id));
         let fsyncs = Arc::new(AtomicU64::new(0));
+        let sync_handle = match &tail {
+            Some(seg) => Some(Arc::new(seg.file.try_clone().map_err(FluxumError::Io)?)),
+            None => None,
+        };
+        let sync = Arc::new(SyncShared {
+            watch: watch_tx,
+            cursor: std::sync::Mutex::new(SyncCursor {
+                handle: sync_handle.clone(),
+                written: recovery.last_tx_id,
+                synced: recovery.last_tx_id,
+                shutdown: false,
+            }),
+            cv: std::sync::Condvar::new(),
+            fsyncs: Arc::clone(&fsyncs),
+        });
+        let syncer = {
+            let sync = Arc::clone(&sync);
+            std::thread::Builder::new()
+                .name(format!("fluxum-commitlog-sync-{shard_id}"))
+                .spawn(move || sync.run())
+                .map_err(FluxumError::Io)?
+        };
         let actor_state = Actor {
             dir: dir.to_path_buf(),
             shard_id,
@@ -117,9 +139,10 @@ impl CommitLog {
             current: tail,
             buf: Vec::with_capacity(options.write_buffer_bytes),
             last_written: recovery.last_tx_id,
-            watch: watch_tx,
             written_watch: written_tx,
-            fsyncs: Arc::clone(&fsyncs),
+            sync,
+            sync_handle,
+            syncer: Some(syncer),
         };
         let actor = std::thread::Builder::new()
             .name(format!("fluxum-commitlog-{shard_id}"))
@@ -476,10 +499,112 @@ fn notify_quarantine(q: &QuarantineReport, last_recovered_tx: Option<u64>) {
     );
 }
 
-/// The dedicated fsync/flush actor (STG-012). Runs on its own OS thread so
-/// blocking file I/O and `fsync` never touch an async runtime; commands
-/// arrive over the bounded queue, and each drained batch gets exactly one
-/// fsync before the durable offset advances.
+/// Writer↔syncer shared state: the durable watch channel and the cursor
+/// naming what is written vs what is fsynced.
+struct SyncShared {
+    /// Durability watermark channel (STG-012). Advanced monotonically by
+    /// whichever thread finished an fsync last; `Failed` sticks.
+    watch: watch::Sender<DurableState>,
+    cursor: std::sync::Mutex<SyncCursor>,
+    cv: std::sync::Condvar,
+    fsyncs: Arc<AtomicU64>,
+}
+
+struct SyncCursor {
+    /// The active segment's handle as of the last written batch — what an
+    /// fsync targets. Entries in earlier segments were sealed durably at
+    /// rotation, so syncing the active segment is always sufficient.
+    handle: Option<Arc<std::fs::File>>,
+    /// Highest tx id whose bytes reached the OS (the sync target).
+    written: Option<u64>,
+    /// Highest tx id known fsynced.
+    synced: Option<u64>,
+    /// The writer is done (or failed); finish and exit.
+    shutdown: bool,
+}
+
+impl SyncShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, SyncCursor> {
+        self.cursor
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Advance the durable watermark; never regress, and `Failed` sticks.
+    fn publish_durable(&self, mark: Option<u64>) {
+        self.watch.send_modify(|state| {
+            if let DurableState::Durable(current) = state
+                && mark > *current
+            {
+                *state = DurableState::Durable(mark);
+            }
+        });
+    }
+
+    fn fail(&self, message: String) {
+        let _ = self.watch.send(DurableState::Failed(Arc::from(message)));
+    }
+
+    /// The syncer thread: fsync behind the writer, group-commit style — one
+    /// fsync covers every batch that landed while the previous one ran.
+    fn run(self: &Arc<Self>) {
+        loop {
+            let (handle, target) = {
+                let mut cursor = self.lock();
+                loop {
+                    if cursor.written > cursor.synced
+                        && let Some(handle) = cursor.handle.as_ref()
+                    {
+                        break (Arc::clone(handle), cursor.written);
+                    }
+                    if cursor.shutdown {
+                        return;
+                    }
+                    cursor = self
+                        .cv
+                        .wait(cursor)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                }
+            };
+            match handle.sync_data() {
+                Ok(()) => {
+                    self.fsyncs.fetch_add(1, Ordering::SeqCst);
+                    {
+                        let mut cursor = self.lock();
+                        if target > cursor.synced {
+                            cursor.synced = target;
+                        }
+                    }
+                    self.publish_durable(target);
+                }
+                Err(e) => {
+                    // A failed fsync leaves the on-disk state undefined —
+                    // no retry (STG-012). The writer sees Failed on the
+                    // watch and stops accepting.
+                    self.fail(format!("commit-log fsync failed: {e}"));
+                    self.lock().shutdown = true;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// The flush actor (STG-012), two OS threads so blocking file I/O never
+/// touches an async runtime:
+/// - the **writer** (`run`): drains the command queue, appends frames with
+///   `write`, and publishes the TXN-004 `written` watermark the moment the
+///   OS holds the bytes — the reducer-ack path gates here and never waits
+///   for a disk flush;
+/// - the **syncer** ([`SyncShared::run`]): fsyncs the active segment behind
+///   the writer and publishes the durable watermark. Group commit falls out
+///   naturally: every batch written while one fsync runs is covered by the
+///   next, so fsync count stays far below tx count (STG-012) *and* the
+///   writer never stalls behind the disk.
+///
+/// Rotation, epoch bumps, and shutdown still sync inline on the writer:
+/// they are rare, and their correctness depends on "old bytes durable
+/// before new bytes exist".
 struct Actor {
     dir: PathBuf,
     shard_id: u32,
@@ -489,17 +614,27 @@ struct Actor {
     /// Write buffer: frames accumulate here and hit the file at flush time.
     buf: Vec<u8>,
     last_written: Option<u64>,
-    watch: watch::Sender<DurableState>,
     /// The TXN-004 ack watermark: advanced the moment `write` hands the
     /// batch to the OS, before the fsync — so acks never wait on the disk.
     written_watch: watch::Sender<DurableState>,
-    fsyncs: Arc<AtomicU64>,
+    /// Shared with the syncer thread.
+    sync: Arc<SyncShared>,
+    /// Clone of the active segment's handle, refreshed on rotation.
+    sync_handle: Option<Arc<std::fs::File>>,
+    /// The syncer thread, joined before the writer exits so `close()`
+    /// joining the writer means both are done.
+    syncer: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Actor {
     fn run(mut self, mut rx: mpsc::Receiver<Cmd>) {
         let mut batch = Vec::new();
         while let Some(first) = rx.blocking_recv() {
+            // A dead syncer (failed fsync) poisons the log: stop accepting.
+            if matches!(&*self.sync.watch.borrow(), DurableState::Failed(_)) {
+                rx.close();
+                break;
+            }
             batch.push(first);
             while batch.len() < self.options.max_batch {
                 match rx.try_recv() {
@@ -514,18 +649,36 @@ impl Actor {
                     "commit-log writer failed; log state on disk is undefined after a \
                      failed write/fsync — stopping (STG-012)"
                 );
-                let failed = DurableState::Failed(Arc::from(e.to_string()));
-                let _ = self.written_watch.send(failed.clone());
-                let _ = self.watch.send(failed);
+                let message = e.to_string();
+                let _ = self
+                    .written_watch
+                    .send(DurableState::Failed(Arc::from(message.clone())));
+                self.sync.fail(message);
                 rx.close();
-                return;
+                break;
             }
         }
-        // Queue closed: everything received was processed and fsynced.
+        // Queue closed: everything received is written AND fsynced before
+        // the writer retires (close() joins this thread and relies on it).
+        if let Err(e) = self.flush_sync() {
+            let message = e.to_string();
+            let _ = self
+                .written_watch
+                .send(DurableState::Failed(Arc::from(message.clone())));
+            self.sync.fail(message);
+        }
+        {
+            let mut cursor = self.sync.lock();
+            cursor.shutdown = true;
+        }
+        self.sync.cv.notify_one();
+        if let Some(syncer) = self.syncer.take() {
+            let _ = syncer.join();
+        }
     }
 
-    /// Append every command in the batch, then flush + fsync once and
-    /// publish the new durable offset (group commit, STG-012).
+    /// Append every command in the batch, write the frames to the OS,
+    /// publish the `written` watermark, and hand the fsync to the syncer.
     fn process(&mut self, batch: &mut Vec<Cmd>) -> Result<()> {
         let mut wrote = false;
         for cmd in batch.drain(..) {
@@ -535,11 +688,10 @@ impl Actor {
                     wrote = true;
                 }
                 Cmd::SetEpoch { epoch, ack } => {
-                    // Flush pending data under the old epoch first.
+                    // Flush pending data durably under the old epoch first.
                     if wrote {
                         self.flush_sync()?;
                         wrote = false;
-                        self.publish();
                     }
                     let result = if epoch < self.epoch {
                         Err(FluxumError::Storage(format!(
@@ -555,8 +707,14 @@ impl Actor {
             }
         }
         if wrote {
-            self.flush_sync()?;
-            self.publish();
+            self.flush_written()?;
+            // Hand the batch to the syncer and keep draining.
+            {
+                let mut cursor = self.sync.lock();
+                cursor.handle = self.sync_handle.clone();
+                cursor.written = self.last_written;
+            }
+            self.sync.cv.notify_one();
         }
         Ok(())
     }
@@ -574,12 +732,9 @@ impl Actor {
             if self.current.is_some() {
                 self.flush_sync()?;
             }
-            self.current = Some(create_segment(
-                &self.dir,
-                self.shard_id,
-                record.tx_id,
-                self.epoch,
-            )?);
+            let seg = create_segment(&self.dir, self.shard_id, record.tx_id, self.epoch)?;
+            self.sync_handle = Some(Arc::new(seg.file.try_clone().map_err(FluxumError::Io)?));
+            self.current = Some(seg);
         }
         let Some(seg) = self.current.as_mut() else {
             return Err(FluxumError::Storage(
@@ -592,8 +747,9 @@ impl Actor {
         Ok(())
     }
 
-    /// Write buffered frames to the active segment and fsync it.
-    fn flush_sync(&mut self) -> Result<()> {
+    /// Write buffered frames to the active segment and publish the TXN-004
+    /// `written` watermark — no fsync here; that is the syncer's job.
+    fn flush_written(&mut self) -> Result<()> {
         let Some(seg) = self.current.as_mut() else {
             return Ok(());
         };
@@ -601,19 +757,32 @@ impl Actor {
             use std::io::Write as _;
             seg.file.write_all(&self.buf)?;
             self.buf.clear();
-            // The bytes are the OS's now: a process crash can no longer lose
-            // them, so acks gated on `wait_written` (TXN-004) may proceed
-            // while the fsync below is still in flight.
+            // The bytes are the OS's now: a process crash can no longer
+            // lose them, so acks gated on `wait_written` may proceed while
+            // the fsync happens behind this thread.
             let _ = self
                 .written_watch
                 .send(DurableState::Durable(self.last_written));
         }
-        seg.file.sync_data()?;
-        self.fsyncs.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
-    fn publish(&self) {
-        let _ = self.watch.send(DurableState::Durable(self.last_written));
+    /// Write AND fsync inline — the rotation/epoch/shutdown path, where the
+    /// caller needs "durable now" before proceeding.
+    fn flush_sync(&mut self) -> Result<()> {
+        self.flush_written()?;
+        let Some(seg) = self.current.as_mut() else {
+            return Ok(());
+        };
+        seg.file.sync_data()?;
+        self.sync.fsyncs.fetch_add(1, Ordering::SeqCst);
+        {
+            let mut cursor = self.sync.lock();
+            if self.last_written > cursor.synced {
+                cursor.synced = self.last_written;
+            }
+        }
+        self.sync.publish_durable(self.last_written);
+        Ok(())
     }
 }

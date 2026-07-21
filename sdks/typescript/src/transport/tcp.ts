@@ -75,6 +75,9 @@ export class TcpTransport implements Transport {
 
     return new Promise<TcpTransport>((resolve, reject) => {
       const socket = net.createConnection({ host, port });
+      // Reducer calls are small request/response frames; Nagle would hold
+      // each one behind the previous frame's ACK.
+      socket.setNoDelay(true);
       // `error` before `connect` means the connection never came up: reject
       // rather than resolve a transport that is already dead. Handlers are
       // swapped for the instance's own in the constructor path below.
@@ -128,6 +131,7 @@ interface NetModule {
   createConnection(options: { host: string; port: number }): {
     once(event: string, listener: (...args: never[]) => void): unknown;
     removeListener(event: string, listener: (...args: never[]) => void): unknown;
+    setNoDelay(noDelay: boolean): unknown;
   };
 }
 

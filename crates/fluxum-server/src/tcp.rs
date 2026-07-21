@@ -139,6 +139,11 @@ pub async fn serve_tls(
                             drop(stream);
                         }
                         Ok((stream, peer)) => {
+                            // Realtime wire: a TxUpdate or ReducerResult is a
+                            // small frame that must leave NOW — Nagle would
+                            // batch it behind an unacked predecessor and turn
+                            // sub-ms fan-out into multi-ms (NFR-04/NFR-05).
+                            let _ = stream.set_nodelay(true);
                             // SEC-042: keepalive so dead peers stop holding
                             // connection slots.
                             crate::sock::apply_keepalive(&stream, options.socket.tcp_keepalive);

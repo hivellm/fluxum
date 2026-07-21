@@ -141,6 +141,32 @@ async fn pump(mut socket: WebSocket, mut receiver: broadcast::Receiver<ChatPush>
     }
 }
 
+/// A TCP listener whose accepted sockets have Nagle disabled — small push
+/// frames must leave immediately, same as the Fluxum server's sockets.
+fn listener_with_nodelay(listener: tokio::net::TcpListener) -> NoDelayListener {
+    NoDelayListener(listener)
+}
+
+struct NoDelayListener(tokio::net::TcpListener);
+
+impl axum::serve::Listener for NoDelayListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = std::net::SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            if let Ok((stream, addr)) = self.0.accept().await {
+                let _ = stream.set_nodelay(true);
+                return (stream, addr);
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 /// On PostgreSQL: hold the `LISTEN chat` connection and feed the fan-out.
 async fn listen_task(pool: sqlx::PgPool, fanout: broadcast::Sender<ChatPush>) {
     let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
@@ -193,7 +219,9 @@ pub fn serve_blocking(database_url: &str, port: u16, max_connections: u32) -> Re
         let addr = listener.local_addr().map_err(|e| e.to_string())?;
         // The parent process watches for this line to know the server is up.
         println!("baseline-server listening on {addr}");
-        axum::serve(listener, router(state))
+        // Same Nagle treatment as the Fluxum server (TST-091: the incumbent
+        // is tuned like a competent deployment, not handicapped).
+        axum::serve(listener_with_nodelay(listener), router(state))
             .await
             .map_err(|e| e.to_string())
     })
