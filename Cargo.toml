@@ -23,6 +23,7 @@ fluxum-core = { path = "crates/fluxum-core" }
 fluxum-demo = { path = "crates/fluxum-demo" }
 fluxum-macros = { path = "crates/fluxum-macros" }
 fluxum-protocol = { path = "crates/fluxum-protocol" }
+fluxum-sdk = { path = "sdks/rust" }
 fluxum-testmod = { path = "crates/fluxum-testmod" }
 hmac = "0.12"
 inventory = "0.3"

@@ -1,14 +1,25 @@
-//! # fluxum-bench — comparative parity harness (home crate)
+//! # fluxum-bench — comparative parity harness (T6.3)
 //!
-//! Permanent home of the PostgreSQL/SQLite parity harness mandated by PRD NFR-11 and
-//! SPEC-013 §15 (TST-090..): the *same* application implemented on Fluxum and on an
-//! app-server + PostgreSQL stack, run on equal hardware with honest durability settings
-//! on both sides, producing the comparative report published with every release.
+//! Permanent home of the PostgreSQL/SQLite parity harness mandated by PRD
+//! NFR-11 and SPEC-013 §10 (TST-090..TST-096): the *same* application
+//! implemented on Fluxum and on an app-server + database stack, run on equal
+//! hardware with honest durability settings on both sides, producing the
+//! comparative report published with every release.
 //!
-//! The workload drivers, incumbent-stack implementations, and report generator land with
-//! DAG task **T6.3** (gate G6). Until then this crate only pins the workspace slot so the
-//! quality gate (fmt, clippy `-D warnings`, tests on 3 OSes) covers it from day one
-//! (DAG T0.1, NFR-09).
+//! Layout:
+//! - [`workload`] — the demo-app workloads (TST-092), written once against
+//!   the [`workload::Side`] trait so every side runs identical client
+//!   behavior;
+//! - [`measure`] — latency/throughput reduction with multi-run variance
+//!   (TST-091);
+//! - [`fluxum_side`] — the Fluxum side, driven through the published Rust
+//!   SDK against a real `fluxum-server`;
+//! - the baseline (app-server + PostgreSQL, SQLite variant) and the report
+//!   generator land with the remaining T6.3 items.
+
+pub mod fluxum_side;
+pub mod measure;
+pub mod workload;
 
 /// Version of the parity harness, tied to the workspace version so reports can name the
 /// exact Fluxum release they were produced for.
