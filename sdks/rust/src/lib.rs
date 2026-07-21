@@ -16,6 +16,7 @@
 
 pub mod cache;
 pub mod client;
+mod http;
 pub mod idempotency;
 pub mod protocol;
 pub mod resume;

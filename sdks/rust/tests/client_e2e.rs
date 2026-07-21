@@ -28,6 +28,7 @@ fn server_binary() -> PathBuf {
 struct Server {
     child: Child,
     tcp_url: String,
+    http_url: String,
 }
 
 fn free_port() -> u16 {
@@ -51,13 +52,16 @@ impl Server {
             .spawn()
             .expect("spawn fluxum-server");
         let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", tcp)).is_err() {
+        while TcpStream::connect(("127.0.0.1", tcp)).is_err()
+            || TcpStream::connect(("127.0.0.1", http)).is_err()
+        {
             assert!(Instant::now() < deadline, "server did not bind");
             std::thread::sleep(Duration::from_millis(100));
         }
         Server {
             child,
             tcp_url: format!("fluxum://127.0.0.1:{tcp}"),
+            http_url: format!("http://127.0.0.1:{http}"),
         }
     }
 }
@@ -123,6 +127,56 @@ fn the_client_drives_a_real_session_end_to_end() {
     }
     assert_eq!(db.cache_size(), 1, "the row reached the local cache");
     assert_eq!(*seen.lock().unwrap(), vec!["hello".to_owned()], "the callback fired");
+}
+
+#[test]
+fn the_client_drives_a_real_session_over_streamable_http() {
+    // The SAME client surface over `http://` (RPC-004..007): auth via POST,
+    // replies in POST response bodies, TxUpdates on the GET push stream.
+    if skip() {
+        return;
+    }
+    let server = Server::start("http-drive");
+    let db = Connection::connect(&server.http_url, b"", [chat_schema()]).expect("connect");
+    assert_ne!(db.identity(), [0u8; 32], "the server derived an identity");
+
+    db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    db.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("over http".into())])
+        .expect("send_chat");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.cache_size() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db.cache_size(), 1, "the TxUpdate arrived on the push stream");
+}
+
+#[test]
+fn an_http_stream_blip_recovers_without_losing_updates() {
+    // SPEC-021 CS-021: the push stream dies but the session survives; the
+    // client reattaches (resuming from its applied offsets) and a row
+    // committed around the outage still reaches the cache.
+    if skip() {
+        return;
+    }
+    let server = Server::start("http-blip");
+    let alice = Connection::connect(&server.http_url, b"alice", [chat_schema()]).expect("alice");
+    alice.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+
+    // Kill the read side as a network outage would — the Connection itself
+    // stays open and must recover on its own.
+    alice.simulate_stream_loss();
+
+    // A second session commits while (or right after) alice's stream is down.
+    let bob = Connection::connect(&server.http_url, b"bob", [chat_schema()]).expect("bob");
+    bob.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("missed?".into())])
+        .expect("send_chat");
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alice.cache_size() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(alice.cache_size(), 1, "the update survived the stream blip");
 }
 
 #[test]

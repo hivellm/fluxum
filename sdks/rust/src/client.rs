@@ -1,4 +1,4 @@
-//! A blocking FluxRPC client over TCP (SPEC-006 §4/§5).
+//! A blocking FluxRPC client (SPEC-006 §4/§5) over TCP or Streamable HTTP.
 //!
 //! This is the object an application holds: it authenticates, calls reducers,
 //! registers subscriptions with typed row callbacks, and keeps a local
@@ -7,25 +7,41 @@
 //! are services and tools that want a plain blocking client, and because it
 //! keeps the crate's dependency surface to the vendored wire layer alone.
 //!
-//! One background thread owns the read half of the session: it decodes frames,
-//! routes id-correlated replies (RPC-002) to the waiting caller, and applies
-//! server-initiated `TxUpdate`s to the cache. The write half is shared behind
-//! a mutex so any thread can send.
+//! Two transports behind one URL scheme (`Connection::connect` picks by
+//! prefix):
+//!
+//! - `fluxum://host:port` — raw TCP (:15801). One socket; a background thread
+//!   owns the read half, decodes frames, routes id-correlated replies
+//!   (RPC-002) to the waiting caller, and applies server-initiated
+//!   `TxUpdate`s. The write half is shared behind a mutex.
+//! - `http://host:port` — Streamable HTTP (:15800, RPC-004..007). Requests go
+//!   as `POST /rpc` (the response body carries that request's replies); the
+//!   background thread reads the `GET /rpc` chunked push stream. The
+//!   `Fluxum-Session` token binds the two.
 //!
 //! # Automatic reconnect (SPEC-011 SDK-047)
 //!
-//! When the connection drops, the same background thread becomes the
-//! reconnect loop: connect, authenticate, resubscribe, reconcile — in that
-//! order, with exponential backoff and jitter between attempts. The order
-//! matters: reconciling before resubscribing would compare the cache against
-//! an `InitialData` that does not yet cover the queries the application
-//! registered, and dutifully delete every row it could not see. A TCP
-//! reconnect is a NEW session whose query ids the server does not recognise,
-//! so the client resubscribes and reconciles (the net-difference pass in
-//! [`RowCache::reconcile`]) rather than sending `Resume` — the
-//! session-preserving resume (CS-021) belongs to the HTTP stream transport.
-//! The ids handed out by [`Connection::subscribe`] are stable application
-//! handles; the client re-points them at the server's fresh ids internally.
+//! When the connection drops, the background thread becomes the reconnect
+//! loop, with exponential backoff and jitter between attempts.
+//!
+//! Over TCP a reconnect is a NEW session whose query ids the server does not
+//! recognise, so the sequence is fixed: connect, authenticate, resubscribe,
+//! reconcile — in that order (reconciling before resubscribing would compare
+//! the cache against an `InitialData` that does not yet cover the registered
+//! queries, and dutifully delete every row it could not see). The reconcile
+//! is the net-difference pass in [`RowCache::reconcile`].
+//!
+//! Over HTTP a dropped push stream is first treated as a BLIP (SPEC-021
+//! CS-021): the session may have survived, so the client reattaches the GET
+//! stream and sends `Resume` from each subscription's highest applied offset
+//! ([`ResumeTracker`]) — the server replays only the missed deltas, or
+//! answers a `cache_reset` snapshot (CS-022) if it compacted past us. Only
+//! when the session is truly gone (404) does the client fall back to the
+//! full TCP-style re-establishment.
+//!
+//! Either way, the ids handed out by [`Connection::subscribe`] are stable
+//! application handles; the client re-points them at the server's fresh ids
+//! internally.
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -37,8 +53,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::cache::{RowCache, RowEvent, TableDiff, TableSchema, TableSnapshot};
+use crate::http::{ChunkedStream, HttpEndpoint};
 use crate::protocol::{
-    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall,
+    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall, Resume,
     ServerMessage, Subscribe, TableUpdate, TxUpdate, Unsubscribe,
 };
 use crate::resume::ResumeTracker;
@@ -46,7 +63,7 @@ use crate::resume::ResumeTracker;
 /// A client error.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// The URL was not `fluxum://host:port`.
+    /// The URL was not `fluxum://host:port` or `http://host:port`.
     #[error("invalid Fluxum URL: {0}")]
     Url(String),
     /// A socket or I/O failure.
@@ -78,6 +95,11 @@ pub enum Error {
         /// Human-readable message.
         message: String,
     },
+    /// The HTTP transport got a status it has no better mapping for
+    /// (RPC-004..007) — e.g. `415` from something that is not a Fluxum
+    /// server, or `409` racing a still-registered push stream.
+    #[error("unexpected HTTP status {0}")]
+    Http(u16),
     /// The connection closed while a request was in flight.
     #[error("connection closed")]
     Disconnected,
@@ -168,9 +190,48 @@ struct SubEntry {
     server_id: u32,
 }
 
+/// Where the parsed URL points.
+enum Target {
+    Tcp(String),
+    Http(String),
+}
+
+/// The write half of the current session.
+enum WriteHalf {
+    /// The TCP socket's write side.
+    Tcp(TcpStream),
+    /// Streamable HTTP: each send is a `POST /rpc` bound by this session.
+    Http {
+        /// The `Fluxum-Session` token (RPC-007).
+        session: String,
+    },
+}
+
+/// The read half of the current session, owned by the background thread.
+enum ReadHalf {
+    Tcp(MessageStream),
+    Http(ChunkedStream),
+}
+
+impl ReadHalf {
+    fn next(&mut self) -> Option<ServerMessage> {
+        match self {
+            ReadHalf::Tcp(stream) => stream.next(),
+            ReadHalf::Http(stream) => stream.next(),
+        }
+    }
+
+    fn is_http(&self) -> bool {
+        matches!(self, ReadHalf::Http(_))
+    }
+}
+
 struct Shared {
-    /// `host:port`, kept for reconnecting.
+    /// `host:port` of the TCP endpoint, kept for reconnecting. Unused (empty)
+    /// on the HTTP transport.
     addr: String,
+    /// The `/rpc` endpoint when the transport is Streamable HTTP.
+    http: Option<HttpEndpoint>,
     /// The auth token, replayed on every re-authentication (SPEC-009).
     token: Vec<u8>,
     policy: ReconnectPolicy,
@@ -181,16 +242,20 @@ struct Shared {
     /// `"<Table>:<insert|delete|update>"` → listeners.
     listeners: Mutex<HashMap<String, Vec<RowListener>>>,
     /// The highest applied `tx_offset` per subscription (SPEC-021 CS-020),
-    /// fed by every `InitialData`/`TxUpdate` this connection applies. Rebuilt
-    /// on reconnect: a new session's offsets restart with its snapshot.
+    /// fed by every `InitialData`/`TxUpdate` this connection applies. It
+    /// drives the HTTP blip `Resume` (CS-021) and is rebuilt on a full
+    /// re-establishment: a new session's offsets restart with its snapshot.
     resume: Mutex<ResumeTracker>,
     /// Live subscriptions, in registration order — the reconnect replay set.
     subs: Mutex<Vec<SubEntry>>,
     /// The 32-byte identity the server derived for this session (SPEC-009).
     identity: Mutex<[u8; 32]>,
-    /// The write half of the current socket. `None` while disconnected, so
+    /// The write half of the current session. `None` while disconnected, so
     /// sends fail fast instead of writing into a dead session.
-    writer: Mutex<Option<TcpStream>>,
+    writer: Mutex<Option<WriteHalf>>,
+    /// The socket the background thread is currently reading (the TCP socket,
+    /// or the HTTP push stream). `Drop` shuts it down to unblock the reader.
+    push_socket: Mutex<Option<TcpStream>>,
     /// Monotonic request-id allocator, shared with the reconnect handshake.
     next_id: AtomicU32,
     /// Set by `Drop`; the reconnect loop checks it and stops.
@@ -206,6 +271,46 @@ impl Shared {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    fn alloc_id(&self) -> u32 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn set_push_socket(&self, socket: Option<TcpStream>) {
+        *self
+            .push_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = socket;
+    }
+
+    fn set_writer(&self, half: Option<WriteHalf>) {
+        *self
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = half;
+    }
+
+    fn authenticate_message(&self) -> (u32, ClientMessage) {
+        let id = self.alloc_id();
+        let auth = crate::protocol::Authenticate {
+            id,
+            token: self.token.clone(),
+            compression: None,
+            tx_updates: None,
+            namespace: None,
+        };
+        (id, ClientMessage::Authenticate(auth))
+    }
+
+    /// The active SQL replay set, in registration order.
+    fn replay_sqls(&self) -> Vec<String> {
+        self.subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|e| e.sql.clone())
+            .collect()
+    }
 }
 
 /// A connected Fluxum client.
@@ -215,12 +320,13 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// Connect over TCP, authenticate, and return a live client with the
-    /// default [`ReconnectPolicy`].
+    /// Connect, authenticate, and return a live client with the default
+    /// [`ReconnectPolicy`].
     ///
-    /// `url` is `fluxum://host:port`; `token` is the auth token (empty under
-    /// the dev `none` provider); `schemas` are the per-table primary-key
-    /// projections the cache needs (SDK-040).
+    /// `url` picks the transport: `fluxum://host:port` for raw TCP,
+    /// `http://host:port` for Streamable HTTP. `token` is the auth token
+    /// (empty under the dev `none` provider); `schemas` are the per-table
+    /// primary-key projections the cache needs (SDK-040).
     pub fn connect(
         url: &str,
         token: &[u8],
@@ -236,12 +342,15 @@ impl Connection {
         schemas: impl IntoIterator<Item = TableSchema>,
         policy: ReconnectPolicy,
     ) -> Result<Self, Error> {
-        let addr = parse_fluxum_url(url)?;
-        let stream = TcpStream::connect(&addr)?;
-        let writer = stream.try_clone()?;
+        let target = parse_url(url)?;
+        let (addr, http) = match &target {
+            Target::Tcp(addr) => (addr.clone(), None),
+            Target::Http(addr) => (String::new(), Some(HttpEndpoint { addr: addr.clone() })),
+        };
 
         let shared = Arc::new(Shared {
             addr,
+            http,
             token: token.to_vec(),
             policy,
             pending: Mutex::new(HashMap::new()),
@@ -250,25 +359,37 @@ impl Connection {
             resume: Mutex::new(ResumeTracker::new()),
             subs: Mutex::new(Vec::new()),
             identity: Mutex::new([0u8; 32]),
-            writer: Mutex::new(Some(writer)),
+            writer: Mutex::new(None),
+            push_socket: Mutex::new(None),
             next_id: AtomicU32::new(1),
             closed: Mutex::new(false),
             wake: Condvar::new(),
         });
 
-        // Authenticate before returning: connecting means "session ready",
-        // not "socket open" (RPC-020). The reader thread does not exist yet,
-        // so the handshake reads the stream inline.
-        let mut messages = MessageStream::new(stream);
-        let identity = authenticate(&shared, &mut messages)?;
-        *shared
-            .identity
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+        let read_half = match target {
+            Target::Tcp(_) => {
+                let stream = TcpStream::connect(&shared.addr)?;
+                shared.set_push_socket(Some(stream.try_clone()?));
+                shared.set_writer(Some(WriteHalf::Tcp(stream.try_clone()?)));
+                // Authenticate before returning: connecting means "session
+                // ready", not "socket open" (RPC-020). The reader thread does
+                // not exist yet, so the handshake reads the stream inline.
+                let mut messages = MessageStream::new(stream);
+                let identity = tcp_authenticate(&shared, &mut messages)?;
+                *shared
+                    .identity
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+                ReadHalf::Tcp(messages)
+            }
+            // The first HTTP session IS a full establishment with an empty
+            // replay set: authenticate, (no queries yet), open the stream.
+            Target::Http(_) => try_http_session(&shared)?,
+        };
 
         let reader = {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || supervise(messages, &shared))
+            std::thread::spawn(move || supervise(read_half, &shared))
         };
 
         Ok(Connection {
@@ -324,7 +445,7 @@ impl Connection {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let id = self.alloc_id();
+        let id = self.shared.alloc_id();
         let sub = Subscribe {
             id,
             queries: queries.iter().map(|q| (*q).to_owned()).collect(),
@@ -403,7 +524,7 @@ impl Connection {
         // Fire-and-forget: the server sends NO reply to Unsubscribe — delivery
         // simply stops (RPC-024). The message still carries an id for framing
         // symmetry.
-        let id = self.alloc_id();
+        let id = self.shared.alloc_id();
         self.send(ClientMessage::Unsubscribe(Unsubscribe {
             id,
             query_ids: server_ids.clone(),
@@ -436,7 +557,7 @@ impl Connection {
     /// Call a reducer and await its outcome. Resolves when the reducer
     /// committed — the resulting `TxUpdate` may arrive before or after.
     pub fn call_reducer(&self, name: &str, args: Vec<FluxValue>) -> Result<(), Error> {
-        let id = self.alloc_id();
+        let id = self.shared.alloc_id();
         let call = ReducerCall {
             id,
             reducer: name.to_owned(),
@@ -458,11 +579,24 @@ impl Connection {
         }
     }
 
-    // --- Internals -----------------------------------------------------------
-
-    fn alloc_id(&self) -> u32 {
-        self.shared.next_id.fetch_add(1, Ordering::Relaxed)
+    /// Test hook: kill the socket the background thread is reading, as an
+    /// outage would, WITHOUT closing the client — the reconnect machinery
+    /// must bring the session back. Hidden because applications have no
+    /// business calling it.
+    #[doc(hidden)]
+    pub fn simulate_stream_loss(&self) {
+        if let Some(socket) = self
+            .shared
+            .push_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
     }
+
+    // --- Internals -----------------------------------------------------------
 
     /// The current session's server id behind an application handle.
     fn server_id(&self, app_id: u32) -> u32 {
@@ -522,18 +656,7 @@ impl Connection {
     }
 
     fn send(&self, message: ClientMessage) -> Result<(), Error> {
-        let framed = encode_framed(&message)?;
-        let mut guard = self
-            .shared
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // `None` means the connection dropped and the reconnect loop has not
-        // re-established it yet: fail fast rather than write into the void.
-        let writer = guard.as_mut().ok_or(Error::Disconnected)?;
-        writer.write_all(&framed)?;
-        writer.flush()?;
-        Ok(())
+        send_message(&self.shared, &message)
     }
 
     fn dispatch(&self, events: Vec<RowEvent>) {
@@ -550,19 +673,51 @@ impl Drop for Connection {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         // Wake a reconnect loop out of its backoff sleep so it can stop.
         self.shared.wake.notify_all();
-        // Closing the socket unblocks the reader thread's `read`.
-        if let Some(writer) = self
-            .shared
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .as_ref()
-        {
-            let _ = writer.shutdown(std::net::Shutdown::Both);
-        }
+        // Closing the read-side socket unblocks the background thread.
+        self.simulate_stream_loss();
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
+    }
+}
+
+/// Send one message over whichever write half is live. On HTTP the POST
+/// response carries this request's replies — they are routed exactly as the
+/// push stream's frames are, into the pending map the caller is waiting on.
+fn send_message(shared: &Shared, message: &ClientMessage) -> Result<(), Error> {
+    let framed = encode_framed(message)?;
+    let session = {
+        let mut guard = shared
+            .writer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match guard.as_mut() {
+            // `None` means the connection dropped and the reconnect loop has
+            // not re-established it yet: fail fast, not into the void.
+            None => return Err(Error::Disconnected),
+            Some(WriteHalf::Tcp(stream)) => {
+                stream.write_all(&framed)?;
+                stream.flush()?;
+                return Ok(());
+            }
+            Some(WriteHalf::Http { session }) => session.clone(),
+        }
+        // The lock is released here: an HTTP round-trip must not serialize
+        // every other sender behind it.
+    };
+    let endpoint = shared.http.as_ref().ok_or(Error::Disconnected)?;
+    let response = endpoint.post(Some(&session), &framed).map_err(Error::Io)?;
+    match response.status {
+        200 => {
+            for message in response.messages {
+                route(shared, message);
+            }
+            Ok(())
+        }
+        // RPC-007: an unknown/expired session is a 404; the push-stream loop
+        // notices the same death and re-establishes.
+        404 => Err(Error::Disconnected),
+        status => Err(Error::Http(status)),
     }
 }
 
@@ -670,10 +825,10 @@ fn dispatch_shared(shared: &Shared, events: Vec<RowEvent>) {
 
 // --- The session stream ------------------------------------------------------
 
-/// A blocking, buffered decoder of server messages off one socket. Owned by
-/// whichever code is currently reading — the handshake reads it inline, then
-/// hands it (buffer and all) to the read loop, so no bytes are lost at the
-/// transition.
+/// A blocking, buffered decoder of server messages off one TCP socket. Owned
+/// by whichever code is currently reading — the handshake reads it inline,
+/// then hands it (buffer and all) to the read loop, so no bytes are lost at
+/// the transition.
 struct MessageStream {
     stream: TcpStream,
     codec: FrameCodec,
@@ -719,35 +874,49 @@ impl MessageStream {
 }
 
 /// The background thread: read the session until it drops, then — policy
-/// permitting — reconnect and carry on, forever, until the `Connection` is
-/// dropped.
-fn supervise(mut messages: MessageStream, shared: &Arc<Shared>) {
+/// permitting — bring it back and carry on, forever, until the `Connection`
+/// is dropped.
+fn supervise(mut messages: ReadHalf, shared: &Arc<Shared>) {
     loop {
         while let Some(message) = messages.next() {
             route(shared, message);
         }
+        let was_http = messages.is_http();
 
-        // Disconnected: new sends fail fast, in-flight callers unblock.
-        *shared
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        fail_all(shared);
+        // Over TCP the session died with the socket: fail senders fast and
+        // unblock in-flight callers. Over HTTP only the PUSH STREAM died —
+        // the session may be fine and POSTs keep working, so nothing is
+        // failed unless recovery below gives up.
+        if !was_http {
+            shared.set_writer(None);
+            fail_all(shared);
+        }
 
         if shared.is_closed() || !shared.policy.enabled {
+            shared.set_writer(None);
+            fail_all(shared);
             return;
         }
-        match reestablish(shared) {
-            Some(next) => messages = next,
-            None => return,
+        let next = if was_http {
+            recover_http(shared)
+        } else {
+            reestablish_tcp(shared)
+        };
+        match next {
+            Some(live) => messages = live,
+            None => {
+                shared.set_writer(None);
+                fail_all(shared);
+                return;
+            }
         }
     }
 }
 
-/// The reconnect loop: connect, authenticate, resubscribe, reconcile — with
-/// exponential backoff between attempts (SDK-047). `None` when the client was
-/// closed or the policy's attempt budget ran out.
-fn reestablish(shared: &Arc<Shared>) -> Option<MessageStream> {
+/// The TCP reconnect loop: connect, authenticate, resubscribe, reconcile —
+/// with exponential backoff between attempts (SDK-047). `None` when the
+/// client was closed or the policy's attempt budget ran out.
+fn reestablish_tcp(shared: &Arc<Shared>) -> Option<ReadHalf> {
     let mut attempt: u32 = 0;
     loop {
         if let Some(max) = shared.policy.max_attempts
@@ -763,7 +932,70 @@ fn reestablish(shared: &Arc<Shared>) -> Option<MessageStream> {
         if !sleep_unless_closed(shared, delay) {
             return None;
         }
-        match try_session(shared) {
+        match try_tcp_session(shared) {
+            Ok(messages) => return Some(messages),
+            Err(_) => attempt += 1,
+        }
+    }
+}
+
+/// The HTTP push-stream recovery loop. Each attempt first tries the BLIP
+/// path — reattach the GET stream under the surviving session and `Resume`
+/// each subscription from its applied offset (SPEC-021 CS-021) — and falls
+/// back to a full re-establishment (new session, resubscribe, reconcile)
+/// when the session is gone.
+fn recover_http(shared: &Arc<Shared>) -> Option<ReadHalf> {
+    let mut attempt: u32 = 0;
+    loop {
+        if let Some(max) = shared.policy.max_attempts
+            && attempt >= max
+        {
+            return None;
+        }
+        let delay = if attempt == 0 {
+            Duration::ZERO
+        } else {
+            backoff_delay(attempt - 1, &shared.policy)
+        };
+        if !sleep_unless_closed(shared, delay) {
+            return None;
+        }
+
+        let endpoint = shared.http.as_ref()?;
+        let session = {
+            let guard = shared
+                .writer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.as_ref() {
+                Some(WriteHalf::Http { session }) => Some(session.clone()),
+                _ => None,
+            }
+        };
+
+        if let Some(session) = session {
+            match endpoint.open_stream(&session) {
+                Ok((200, Some(stream))) => {
+                    shared.set_push_socket(stream.socket().ok());
+                    if resume_subscriptions(shared, &session).is_ok() {
+                        return Some(ReadHalf::Http(stream));
+                    }
+                    // The session survived but a subscription did not
+                    // (SUB unknown query) — rebuild from scratch below.
+                }
+                // The server still counts the previous stream (409) or is not
+                // reachable: back off and retry the blip before giving the
+                // session up for dead.
+                Ok((409, _)) | Err(_) => {
+                    attempt += 1;
+                    continue;
+                }
+                // 404: the session is gone — full re-establishment.
+                Ok((_, _)) => {}
+            }
+        }
+
+        match try_http_session(shared) {
             Ok(messages) => return Some(messages),
             Err(_) => attempt += 1,
         }
@@ -792,9 +1024,9 @@ fn sleep_unless_closed(shared: &Shared, delay: Duration) -> bool {
     false
 }
 
-/// One reconnect attempt: a full session bring-up. Any failure aborts the
+/// One TCP reconnect attempt: a full session bring-up. Any failure aborts the
 /// attempt; the loop backs off and tries again.
-fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
+fn try_tcp_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
     let stream = TcpStream::connect(&shared.addr)?;
     // A half-dead handshake must not wedge `Drop`: bound reads until the
     // session is live, then go back to blocking indefinitely.
@@ -803,15 +1035,8 @@ fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
     let mut messages = MessageStream::new(stream);
 
     // 1. Authenticate (the shared writer is still None — send directly).
-    let auth_id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-    let auth = crate::protocol::Authenticate {
-        id: auth_id,
-        token: shared.token.clone(),
-        compression: None,
-        tx_updates: None,
-        namespace: None,
-    };
-    writer.write_all(&encode_framed(&ClientMessage::Authenticate(auth))?)?;
+    let (auth_id, auth) = shared.authenticate_message();
+    writer.write_all(&encode_framed(&auth)?)?;
     writer.flush()?;
     let identity = loop {
         match messages.next() {
@@ -822,23 +1047,17 @@ fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
             Some(ServerMessage::Error(err)) if err.id == Some(auth_id) => {
                 return Err(err.into());
             }
-            Some(_) => {} // nothing else belongs to this young session
+            Some(_) => {} // nothing else belongs to a session this young
         }
     };
 
     // 2. Resubscribe every active query, in registration order — always
     // BEFORE reconcile: InitialData must cover every active query, or
     // reconciliation reads the gap as rows having been deleted.
-    let sqls: Vec<String> = shared
-        .subs
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .map(|e| e.sql.clone())
-        .collect();
+    let sqls = shared.replay_sqls();
     let mut initials: Vec<InitialData> = Vec::new();
     if !sqls.is_empty() {
-        let sub_id = shared.next_id.fetch_add(1, Ordering::Relaxed);
+        let sub_id = shared.alloc_id();
         let subscribe = Subscribe {
             id: sub_id,
             queries: sqls.clone(),
@@ -859,12 +1078,156 @@ fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
         }
     }
 
+    // 3. Reconcile under the new session's ids.
+    let events = adopt_session(shared, &initials, sqls.len(), identity)?;
+
+    // Session live: back to blocking reads, reopen the shared writer, and only
+    // then tell the application what changed while it was away.
+    messages.stream.set_read_timeout(None)?;
+    shared.set_push_socket(messages.stream.try_clone().ok());
+    shared.set_writer(Some(WriteHalf::Tcp(writer)));
+    dispatch_shared(shared, events);
+    Ok(ReadHalf::Tcp(messages))
+}
+
+/// One full HTTP session bring-up: authenticate a fresh session over POST,
+/// resubscribe over POST, reconcile, then open the push stream. Also the
+/// FIRST session's path, where the replay set is simply empty.
+fn try_http_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
+    let endpoint = shared.http.as_ref().ok_or(Error::Disconnected)?;
+
+    // 1. Authenticate: the response carries the AuthResult and mints the
+    // session token (RPC-007).
+    let (_, auth) = shared.authenticate_message();
+    let response = endpoint.post(None, &encode_framed(&auth)?).map_err(Error::Io)?;
+    if response.status != 200 {
+        return Err(Error::Http(response.status));
+    }
+    let session = response.session.clone();
+    let mut identity: Option<[u8; 32]> = None;
+    for message in response.messages {
+        match message {
+            ServerMessage::AuthResult(result) => identity = Some(result.identity),
+            ServerMessage::Error(err) => return Err(err.into()),
+            _ => {}
+        }
+    }
+    let identity = identity.ok_or(Error::Disconnected)?;
+    let session = session.ok_or(Error::Disconnected)?;
+
+    // 2. Resubscribe the replay set in one POST; its response body carries
+    // every InitialData.
+    let sqls = shared.replay_sqls();
+    let mut initials: Vec<InitialData> = Vec::new();
+    if !sqls.is_empty() {
+        let sub_id = shared.alloc_id();
+        let subscribe = ClientMessage::Subscribe(Subscribe {
+            id: sub_id,
+            queries: sqls.clone(),
+        });
+        let response = endpoint
+            .post(Some(&session), &encode_framed(&subscribe)?)
+            .map_err(Error::Io)?;
+        if response.status != 200 {
+            return Err(Error::Http(response.status));
+        }
+        for message in response.messages {
+            match message {
+                ServerMessage::InitialData(initial) if initial.id == sub_id => {
+                    initials.push(initial);
+                }
+                ServerMessage::Error(err) if err.id == Some(sub_id) => {
+                    return Err(err.into());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 3. Reconcile under the new session's ids.
+    let events = adopt_session(shared, &initials, sqls.len(), identity)?;
+
+    // 4. Open the push stream; anything committed between the subscribe POST
+    // and here sits in the session's outbound queue and arrives on attach.
+    let (status, stream) = endpoint.open_stream(&session).map_err(Error::Io)?;
+    let Some(stream) = stream else {
+        return Err(Error::Http(status));
+    };
+    shared.set_push_socket(stream.socket().ok());
+    shared.set_writer(Some(WriteHalf::Http { session }));
+    dispatch_shared(shared, events);
+    Ok(ReadHalf::Http(stream))
+}
+
+/// The HTTP blip path (SPEC-021 CS-021): the session survived a dropped push
+/// stream, so ask the server to replay what each subscription missed, from
+/// its highest APPLIED offset. Deltas come back as `TxUpdate`s and apply on
+/// the normal path; a compacted-away offset comes back as a `cache_reset`
+/// snapshot (CS-022) which `apply_initial` already honours. Any error —
+/// typically SUB unknown query, a session that did not really survive —
+/// tells the caller to rebuild from scratch.
+fn resume_subscriptions(shared: &Arc<Shared>, session: &str) -> Result<(), Error> {
+    let endpoint = shared.http.as_ref().ok_or(Error::Disconnected)?;
+    let targets: Vec<(u32, Option<u64>)> = {
+        let subs = shared
+            .subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let resume = shared
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        subs.iter()
+            .map(|e| (e.server_id, resume.applied_offset(e.server_id)))
+            .collect()
+    };
+    for (server_id, offset) in targets {
+        // Nothing applied yet — nothing to resume; the stream reattach alone
+        // covers it.
+        let Some(from_offset) = offset else { continue };
+        let id = shared.alloc_id();
+        let resume = ClientMessage::Resume(Resume {
+            id,
+            query_id: server_id,
+            from_offset,
+        });
+        let response = endpoint
+            .post(Some(session), &encode_framed(&resume)?)
+            .map_err(Error::Io)?;
+        if response.status != 200 {
+            return Err(Error::Http(response.status));
+        }
+        for message in response.messages {
+            match message {
+                ServerMessage::InitialData(initial) => {
+                    let events = apply_initial(shared, &initial);
+                    dispatch_shared(shared, events);
+                }
+                ServerMessage::Error(_) => return Err(Error::Disconnected),
+                other => route(shared, other),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Adopt a fresh session's `InitialData` set: rebuild the resume tracker,
+/// reconcile the cache to the net difference (SDK-047), re-attribute rows to
+/// the NEW query ids, re-point the application handles, and store the
+/// re-derived identity. Returns the events to dispatch once the writer is
+/// live.
+fn adopt_session(
+    shared: &Shared,
+    initials: &[InitialData],
+    expected_queries: usize,
+    identity: [u8; 32],
+) -> Result<Vec<RowEvent>, Error> {
     // The fresh server-assigned ids, in reply order — one per query, matching
     // the registry's order because the Subscribe listed them in that order.
     let mut new_ids: Vec<u32> = Vec::new();
     let mut per_query: Vec<(u32, Vec<TableSnapshot>)> = Vec::new();
     let mut merged: Vec<TableSnapshot> = Vec::new();
-    for initial in &initials {
+    for initial in initials {
         for table in &initial.tables {
             let rows: Vec<Vec<u8>> = table.inserts.iter().map(<[u8]>::to_vec).collect();
             let snapshot = TableSnapshot {
@@ -887,21 +1250,19 @@ fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
             }
         }
     }
-    if new_ids.len() != sqls.len() {
+    if new_ids.len() != expected_queries {
         // The reply shape does not match the replay set; treat the attempt as
         // failed rather than mis-binding handles.
         return Err(Error::Disconnected);
     }
 
-    // 3. Reconcile: net-difference against the fresh snapshot (SDK-047), then
-    // re-establish which query holds what under the NEW ids.
     {
         let mut resume = shared
             .resume
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         *resume = ResumeTracker::new();
-        for initial in &initials {
+        for initial in initials {
             let _ = resume.apply_initial(initial);
         }
     }
@@ -930,16 +1291,7 @@ fn try_session(shared: &Arc<Shared>) -> Result<MessageStream, Error> {
         .identity
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
-
-    // Session live: back to blocking reads, reopen the shared writer, and only
-    // then tell the application what changed while it was away.
-    messages.stream.set_read_timeout(None)?;
-    *shared
-        .writer
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(writer);
-    dispatch_shared(shared, events);
-    Ok(messages)
+    Ok(events)
 }
 
 fn route(shared: &Shared, message: ServerMessage) {
@@ -985,27 +1337,11 @@ fn reply_id(message: &ServerMessage) -> Option<u32> {
     }
 }
 
-/// Authenticate a brand-new first session, reading the stream inline (the
+/// Authenticate a brand-new first TCP session, reading the stream inline (the
 /// reader thread does not exist yet).
-fn authenticate(shared: &Shared, messages: &mut MessageStream) -> Result<[u8; 32], Error> {
-    let auth_id = shared.next_id.fetch_add(1, Ordering::Relaxed);
-    let auth = crate::protocol::Authenticate {
-        id: auth_id,
-        token: shared.token.clone(),
-        compression: None,
-        tx_updates: None,
-        namespace: None,
-    };
-    let framed = encode_framed(&ClientMessage::Authenticate(auth))?;
-    {
-        let mut guard = shared
-            .writer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let writer = guard.as_mut().ok_or(Error::Disconnected)?;
-        writer.write_all(&framed)?;
-        writer.flush()?;
-    }
+fn tcp_authenticate(shared: &Shared, messages: &mut MessageStream) -> Result<[u8; 32], Error> {
+    let (auth_id, auth) = shared.authenticate_message();
+    send_message(shared, &auth)?;
     loop {
         match messages.next() {
             None => return Err(Error::Disconnected),
@@ -1033,13 +1369,25 @@ fn fail_all(shared: &Shared) {
         .clear();
 }
 
-/// Parse `fluxum://host:port` into a socket address string.
-fn parse_fluxum_url(url: &str) -> Result<String, Error> {
-    let rest = url
-        .strip_prefix("fluxum://")
-        .ok_or_else(|| Error::Url(format!("expected fluxum://host:port, got {url}")))?;
-    if !rest.contains(':') {
+/// Parse a client URL: `fluxum://host:port` (TCP) or `http://host:port`
+/// (Streamable HTTP), both with an explicit port.
+fn parse_url(url: &str) -> Result<Target, Error> {
+    let (rest, is_http) = if let Some(rest) = url.strip_prefix("fluxum://") {
+        (rest, false)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (rest, true)
+    } else {
+        return Err(Error::Url(format!(
+            "expected fluxum://host:port or http://host:port, got {url}"
+        )));
+    };
+    let addr = rest.trim_end_matches('/');
+    if !addr.contains(':') {
         return Err(Error::Url(format!("missing port in {url}")));
     }
-    Ok(rest.trim_end_matches('/').to_owned())
+    Ok(if is_http {
+        Target::Http(addr.to_owned())
+    } else {
+        Target::Tcp(addr.to_owned())
+    })
 }

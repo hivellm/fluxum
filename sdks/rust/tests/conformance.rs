@@ -47,6 +47,7 @@ fn server_binary() -> PathBuf {
 struct Server {
     child: Child,
     tcp_url: String,
+    http_url: String,
     http_port: u16,
     tcp_port: u16,
     data_dir: PathBuf,
@@ -82,6 +83,7 @@ impl Server {
         Server {
             child,
             tcp_url: format!("fluxum://127.0.0.1:{tcp_port}"),
+            http_url: format!("http://127.0.0.1:{http_port}"),
             http_port,
             tcp_port,
             data_dir,
@@ -100,6 +102,7 @@ impl Server {
             .spawn()
             .expect("spawn fluxum-server");
         wait_for_port(tcp_port, Duration::from_secs(20));
+        wait_for_port(http_port, Duration::from_secs(20));
         child
     }
 
@@ -292,8 +295,34 @@ fn skip_value(reader: &mut FluxBinReader<'_>, ty: &str) {
 struct Session<'a> {
     corpus: &'a Corpus,
     server: Server,
+    /// Which transport this run connects through: the TCP or the HTTP URL.
+    transport: Transport,
     clients: HashMap<String, Connection>,
     handles: HashMap<String, Vec<u32>>,
+}
+
+/// The corpus runs once per transport (SPEC-006 acceptance 6: the SAME
+/// scenarios must observe the SAME results over TCP and Streamable HTTP).
+#[derive(Clone, Copy)]
+enum Transport {
+    Tcp,
+    Http,
+}
+
+impl Transport {
+    fn name(self) -> &'static str {
+        match self {
+            Transport::Tcp => "tcp",
+            Transport::Http => "http",
+        }
+    }
+
+    fn url(self, server: &Server) -> String {
+        match self {
+            Transport::Tcp => server.tcp_url.clone(),
+            Transport::Http => server.http_url.clone(),
+        }
+    }
 }
 
 impl<'a> Session<'a> {
@@ -373,8 +402,8 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
                 .map(|t| t.as_bytes().to_vec())
                 .unwrap_or_default();
             let schemas = session.schemas();
-            let conn = Connection::connect(&session.server.tcp_url, &token, schemas)
-                .expect("connect");
+            let url = session.transport.url(&session.server);
+            let conn = Connection::connect(&url, &token, schemas).expect("connect");
             session.clients.insert(name, conn);
         }
         "close" => {
@@ -516,24 +545,30 @@ fn conformance_corpus_is_green() {
     }
     let corpus = load_corpus();
     let mut ran = 0;
-    for name in &corpus.scenarios {
-        let scenario: Value = serde_json::from_str(
-            &std::fs::read_to_string(corpus_dir().join("scenarios").join(format!("{name}.json"))).unwrap(),
-        )
-        .unwrap();
+    for transport in [Transport::Tcp, Transport::Http] {
+        for name in &corpus.scenarios {
+            let scenario: Value = serde_json::from_str(
+                &std::fs::read_to_string(corpus_dir().join("scenarios").join(format!("{name}.json"))).unwrap(),
+            )
+            .unwrap();
 
-        let server = Server::start(name);
-        let mut session = Session {
-            corpus: &corpus,
-            server,
-            clients: HashMap::new(),
-            handles: HashMap::new(),
-        };
-        for step in scenario["steps"].as_array().unwrap() {
-            run_step(&mut session, step);
+            // The label keys the data dir; the transport must be part of it,
+            // or the second transport's server RECOVERS the first run's
+            // commit log (STG-030) and starts with its rows.
+            let server = Server::start(&format!("{}-{name}", transport.name()));
+            let mut session = Session {
+                corpus: &corpus,
+                server,
+                transport,
+                clients: HashMap::new(),
+                handles: HashMap::new(),
+            };
+            for step in scenario["steps"].as_array().unwrap() {
+                run_step(&mut session, step);
+            }
+            ran += 1;
+            eprintln!("conformance[{}]: {name} ok", transport.name());
         }
-        ran += 1;
-        eprintln!("conformance: {name} ok");
     }
     assert!(ran > 0, "no scenarios ran");
 }
