@@ -33,7 +33,10 @@ use fluxum_bench::baseline::server::serve_blocking;
 use fluxum_bench::baseline_side::BaselineSide;
 use fluxum_bench::fluxum_side::FluxumSide;
 use fluxum_bench::measure::Summary;
-use fluxum_bench::workload::{E2eConfig, RunConfig, Side, e2e_workload, write_workload};
+use fluxum_bench::workload::{
+    E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, e2e_workload, hot_read_workload,
+    mixed_workload, write_workload,
+};
 
 fn main() {
     if let Err(e) = run(std::env::args().skip(1).collect()) {
@@ -61,6 +64,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--warmup-secs" => opts.warmup_secs = parse(&value("--warmup-secs")?)?,
             "--measure-secs" => opts.measure_secs = parse(&value("--measure-secs")?)?,
             "--runs" => opts.runs = parse(&value("--runs")?)?,
+            "--rows" => opts.rows = parse(&value("--rows")?)?,
             "--subscribers" => opts.subscribers = parse(&value("--subscribers")?)?,
             "--rate" => opts.rate = parse(&value("--rate")?)?,
             "--messages" => opts.messages = parse(&value("--messages")?)?,
@@ -118,7 +122,9 @@ fn run(args: Vec<String>) -> Result<(), String> {
         other => return Err(format!("unknown side {other:?} (fluxum|postgres|sqlite)")),
     };
 
-    let (runs, config_json) = match workload.as_str() {
+    // Every workload reduces to named (class → Summary) pairs; `write`,
+    // `e2e` and `hot` have one class, `mixed` has three.
+    let (summaries, config_json): (Vec<(String, Summary)>, String) = match workload.as_str() {
         "write" => {
             let cfg = RunConfig {
                 clients: opts.clients,
@@ -127,7 +133,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 runs: opts.runs,
             };
             let runs = write_workload(side.as_ref(), &cfg)?;
-            (runs, format!("{cfg:?}"))
+            (
+                vec![("write".to_owned(), Summary::from_runs(&runs))],
+                format!("{cfg:?}"),
+            )
         }
         "e2e" => {
             let cfg = E2eConfig {
@@ -138,25 +147,67 @@ fn run(args: Vec<String>) -> Result<(), String> {
                 runs: opts.runs,
             };
             let runs = e2e_workload(side.as_ref(), &cfg)?;
-            (runs, format!("{cfg:?}"))
+            (
+                vec![("e2e".to_owned(), Summary::from_runs(&runs))],
+                format!("{cfg:?}"),
+            )
+        }
+        "hot" => {
+            let cfg = HotReadConfig {
+                clients: opts.clients,
+                rows_per_client: opts.rows,
+                warmup: Duration::from_secs(opts.warmup_secs),
+                measure: Duration::from_secs(opts.measure_secs),
+                runs: opts.runs,
+            };
+            let runs = hot_read_workload(side.as_ref(), &cfg)?;
+            (
+                vec![("hot".to_owned(), Summary::from_runs(&runs))],
+                format!("{cfg:?}"),
+            )
+        }
+        "mixed" => {
+            let cfg = MixedConfig {
+                writers: opts.clients,
+                readers: opts.clients,
+                rows_per_reader: opts.rows,
+                subscribers: opts.subscribers,
+                rate_per_sec: opts.rate,
+                warmup: Duration::from_secs(opts.warmup_secs),
+                measure: Duration::from_secs(opts.measure_secs),
+                runs: opts.runs,
+            };
+            let runs = mixed_workload(side.as_ref(), &cfg)?;
+            let class = |pick: fn(&fluxum_bench::workload::MixedRun) -> &fluxum_bench::measure::RunResult| {
+                runs.iter().map(pick).cloned().collect::<Vec<_>>()
+            };
+            (
+                vec![
+                    ("mixed/write".to_owned(), Summary::from_runs(&class(|r| &r.write))),
+                    ("mixed/read".to_owned(), Summary::from_runs(&class(|r| &r.read))),
+                    ("mixed/e2e".to_owned(), Summary::from_runs(&class(|r| &r.e2e))),
+                ],
+                format!("{cfg:?}"),
+            )
         }
         other => return Err(format!("unknown workload {other:?}\n{}", usage())),
     };
 
-    let summary = Summary::from_runs(&runs);
     let ms = |ns: f64| ns / 1_000_000.0;
-    println!(
-        "{} / {workload}: {:.0} ops/s (±{:.0}) | p50 {:.3} ms | p99 {:.3} ms (±{:.3}) | max {:.3} ms | {} ops over {} runs",
-        side.name(),
-        summary.throughput_mean,
-        summary.throughput_stddev,
-        ms(summary.p50_ns_mean),
-        ms(summary.p99_ns_mean),
-        ms(summary.p99_ns_stddev),
-        ms(summary.max_ns as f64),
-        summary.total_ops,
-        summary.runs,
-    );
+    for (class, summary) in &summaries {
+        println!(
+            "{} / {class}: {:.0} ops/s (±{:.0}) | p50 {:.4} ms | p99 {:.4} ms (±{:.4}) | max {:.3} ms | {} ops over {} runs",
+            side.name(),
+            summary.throughput_mean,
+            summary.throughput_stddev,
+            ms(summary.p50_ns_mean),
+            ms(summary.p99_ns_mean),
+            ms(summary.p99_ns_stddev),
+            ms(summary.max_ns as f64),
+            summary.total_ops,
+            summary.runs,
+        );
+    }
 
     if let Some(path) = &opts.json {
         let doc = serde_json::json!({
@@ -164,7 +215,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "side": side.name(),
             "workload": workload,
             "config": config_json,
-            "summary": summary,
+            "summaries": summaries
+                .iter()
+                .map(|(class, s)| (class.clone(), s.clone()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
         });
         std::fs::write(
             path,
@@ -187,6 +241,7 @@ struct Opts {
     warmup_secs: u64,
     measure_secs: u64,
     runs: usize,
+    rows: u32,
     subscribers: usize,
     rate: u32,
     messages: u32,
@@ -205,6 +260,7 @@ impl Default for Opts {
             warmup_secs: 2,
             measure_secs: 10,
             runs: 3,
+            rows: 100,
             subscribers: 50,
             rate: 10,
             messages: 100,
@@ -220,9 +276,9 @@ fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
 }
 
 fn usage() -> String {
-    "usage: fluxum-bench <write|e2e> [--side fluxum|postgres|sqlite] [--url URL] \
+    "usage: fluxum-bench <write|e2e|hot|mixed> [--side fluxum|postgres|sqlite] [--url URL] \
      [--database-url URL] [--clients N] [--warmup-secs N] [--measure-secs N] [--runs N] \
-     [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
+     [--rows N] [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()
 }

@@ -130,6 +130,30 @@ impl BenchClient for BaselineClient {
         self.sockets.push((stream, closing));
         Ok(())
     }
+
+    fn prepare_reads(&mut self, rows: u32) -> Result<(), String> {
+        // The SQL side needs the rows to exist; the "view" is the database.
+        for i in 0..rows {
+            self.add_task(&format!("seed {i}"))?;
+        }
+        Ok(())
+    }
+
+    fn hot_read(&mut self) -> Result<String, String> {
+        let response = self
+            .agent
+            .get(&format!("{}/task", self.base_url))
+            .query("user", &self.user)
+            .call()
+            .map_err(|e| format!("GET /task: {e}"))?;
+        let body: serde_json::Value = response
+            .into_json()
+            .map_err(|e| format!("GET /task body: {e}"))?;
+        body.get("title")
+            .and_then(|t| t.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| "GET /task: no title in response".to_owned())
+    }
 }
 
 impl Drop for BaselineClient {

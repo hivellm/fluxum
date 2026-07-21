@@ -11,3 +11,25 @@
 - [ ] 2.1 Update or create documentation covering the implementation
 - [ ] 2.2 Write tests covering the new behavior
 - [ ] 2.3 Run tests and confirm they pass
+
+## Progress log
+
+Delivered in complete units (driver → baseline → matrix → report), one commit each:
+
+- **Unit 1 (done, committed)** — 1.1: measurement core + `Side`/`BenchClient` traits + write and
+  e2e workloads + the Fluxum side + CLI. See 1.1's checked text.
+- **Unit 2 (done, committed)** — 1.2: the axum+sqlx baseline (OQ-9 decided), Postgres
+  LISTEN/NOTIFY fan-out + SQLite variant, own-process app server, ureq+tungstenite client.
+  See 1.2's checked text.
+- **Unit 3 (done, committed)** — TST-092 (c) and (e): **hot read** — `prepare_reads` seeds and
+  (on Fluxum) materializes the app-side live view fed by row listeners, then `hot_read` is an
+  in-process map lookup on Fluxum vs an indexed single-row `SELECT` over HTTP on the baseline
+  (`GET /task`), exactly the "in-process vs SQL round trip" comparison NFR-11 names; both
+  return the title read so neither side can dead-code the lookup (`black_box` on the driver
+  side). **mixed** — writers + hot-readers + chat sender + subscribers over one measured
+  window, reported per class (`mixed/write`, `mixed/read`, `mixed/e2e`) so the report shows
+  what contention does to each. CLI grew `hot` and `mixed` (+`--rows`); JSON output is now
+  (class → Summary). Smokes: Fluxum hot-read (asserts in-process p99 < 1 ms), Fluxum mixed
+  (all three classes nonzero), SQLite baseline all-workloads. Remaining for the matrix:
+  **cold read** (TST-092 d) — needs a small-memory-budget Fluxum config so the seed overflows
+  to the cold tier, and cache-cleared restarts on both sides; then the report generator.

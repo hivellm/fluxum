@@ -33,9 +33,29 @@ struct AppState {
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/tasks", post(add_task))
+        .route("/task", get(task_title))
         .route("/chat", post(send_chat))
         .route("/subscribe", get(subscribe))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct TaskParams {
+    user: String,
+}
+
+/// The hot single-row read (TST-092 c): indexed point SELECT, JSON out.
+async fn task_title(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TaskParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let title = state
+        .db
+        .task_title(&params.user)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no tasks for that user".to_owned()))?;
+    Ok(Json(serde_json::json!({ "title": title })))
 }
 
 async fn add_task(

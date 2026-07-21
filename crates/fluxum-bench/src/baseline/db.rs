@@ -129,6 +129,32 @@ impl Db {
         }
     }
 
+    /// One hot single-row read: the newest task for `owner`, over the
+    /// `task_owner` index — the incumbent's indexed point SELECT on a
+    /// cached page (TST-092 c).
+    pub async fn task_title(&self, owner: &str) -> Result<Option<String>, String> {
+        use sqlx::Row as _;
+        let row = match self {
+            Db::Postgres(pool) => {
+                sqlx::query("SELECT title FROM task WHERE owner = $1 ORDER BY id DESC LIMIT 1")
+                    .bind(owner)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("task_title: {e}"))?
+                    .map(|r| r.get::<String, _>(0))
+            }
+            Db::Sqlite(pool) => {
+                sqlx::query("SELECT title FROM task WHERE owner = ?1 ORDER BY id DESC LIMIT 1")
+                    .bind(owner)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("task_title: {e}"))?
+                    .map(|r| r.get::<String, _>(0))
+            }
+        };
+        Ok(row)
+    }
+
     /// `INSERT` one chat message, committed before returning. On PostgreSQL
     /// the same statement issues the `NOTIFY` (`pg_notify`) **inside the
     /// insert's transaction** — delivery is tied to the commit exactly like

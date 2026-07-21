@@ -11,7 +11,10 @@ use std::time::{Duration, Instant};
 use fluxum_bench::baseline_side::BaselineSide;
 use fluxum_bench::fluxum_side::FluxumSide;
 use fluxum_bench::measure::Summary;
-use fluxum_bench::workload::{E2eConfig, RunConfig, Side, e2e_workload, write_workload};
+use fluxum_bench::workload::{
+    E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, e2e_workload, hot_read_workload,
+    mixed_workload, write_workload,
+};
 
 fn server_binary() -> PathBuf {
     let name = if cfg!(windows) {
@@ -157,7 +160,7 @@ impl Drop for SqliteBaseline {
 }
 
 #[test]
-fn baseline_sqlite_runs_both_workloads() {
+fn baseline_sqlite_runs_all_workloads() {
     let server = SqliteBaseline::start("smoke");
     let side = BaselineSide::new(server.base_url.clone(), "sqlite");
     assert_eq!(side.name(), "sqlite");
@@ -180,6 +183,59 @@ fn baseline_sqlite_runs_both_workloads() {
     };
     let runs = e2e_workload(&side, &e2e_cfg).expect("baseline e2e workload");
     assert_eq!(runs[0].ops, 10 * 3, "every message reaches every subscriber");
+
+    let hot_cfg = HotReadConfig {
+        clients: 2,
+        rows_per_client: 10,
+        warmup: Duration::from_millis(200),
+        measure: Duration::from_secs(1),
+        runs: 1,
+    };
+    let runs = hot_read_workload(&side, &hot_cfg).expect("baseline hot-read workload");
+    assert!(runs[0].ops > 0, "no baseline hot reads measured");
+}
+
+#[test]
+fn hot_read_workload_reads_the_live_view() {
+    let server = Server::start("hot");
+    let side = FluxumSide::new(server.tcp_url.clone());
+    let cfg = HotReadConfig {
+        clients: 2,
+        rows_per_client: 10,
+        warmup: Duration::from_millis(200),
+        measure: Duration::from_secs(1),
+        runs: 1,
+    };
+    let runs = hot_read_workload(&side, &cfg).expect("hot-read workload");
+    assert!(runs[0].ops > 0, "no hot reads measured");
+    let summary = Summary::from_runs(&runs);
+    // In-process lookups: the p99 must sit far under any network round trip.
+    assert!(
+        summary.p99_ns_mean < 1_000_000.0,
+        "in-process hot read p99 {} ns is suspiciously slow",
+        summary.p99_ns_mean
+    );
+}
+
+#[test]
+fn mixed_workload_reports_every_class() {
+    let server = Server::start("mixed");
+    let side = FluxumSide::new(server.tcp_url.clone());
+    let cfg = MixedConfig {
+        writers: 2,
+        readers: 2,
+        rows_per_reader: 10,
+        subscribers: 3,
+        rate_per_sec: 15,
+        warmup: Duration::from_millis(300),
+        measure: Duration::from_secs(2),
+        runs: 1,
+    };
+    let runs = mixed_workload(&side, &cfg).expect("mixed workload");
+    assert_eq!(runs.len(), 1);
+    assert!(runs[0].write.ops > 0, "mixed run acked no writes");
+    assert!(runs[0].read.ops > 0, "mixed run measured no reads");
+    assert!(runs[0].e2e.ops > 0, "mixed run delivered no messages");
 }
 
 #[test]

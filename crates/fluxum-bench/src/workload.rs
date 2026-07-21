@@ -38,6 +38,16 @@ pub trait BenchClient: Send {
         channel: u32,
         on_message: Box<dyn Fn(&str) + Send + Sync>,
     ) -> Result<(), String>;
+    /// Seed `rows` tasks for this user and make them readable: on Fluxum the
+    /// client subscribes and materializes its live view (the app-side map a
+    /// real app keeps); on the SQL side the rows just need to exist. Called
+    /// once before a read loop; not measured.
+    fn prepare_reads(&mut self, rows: u32) -> Result<(), String>;
+    /// One hot single-row read of this user's data — the NFR-11 comparison
+    /// as the PRD states it: **in-process** (Fluxum: local live-view lookup)
+    /// vs **SQL round trip** (baseline: indexed single-row SELECT over
+    /// HTTP). Returns the title read, so neither side can skip the work.
+    fn hot_read(&mut self) -> Result<String, String>;
 }
 
 /// Shared knobs for a workload run (TST-091 warmup + multi-run).
@@ -185,6 +195,367 @@ pub fn e2e_workload(side: &dyn Side, cfg: &E2eConfig) -> Result<Vec<RunResult>, 
         results.push(e2e_run(side, cfg, run as u64)?);
     }
     Ok(results)
+}
+
+/// Knobs for the hot-read workload.
+#[derive(Debug, Clone)]
+pub struct HotReadConfig {
+    /// Concurrent reader sessions.
+    pub clients: usize,
+    /// Tasks seeded per reader before measurement.
+    pub rows_per_client: u32,
+    /// Unmeasured warmup preceding the window.
+    pub warmup: Duration,
+    /// The measured window.
+    pub measure: Duration,
+    /// Independent repetitions.
+    pub runs: usize,
+}
+
+impl Default for HotReadConfig {
+    fn default() -> Self {
+        HotReadConfig {
+            clients: 4,
+            rows_per_client: 100,
+            warmup: Duration::from_secs(1),
+            measure: Duration::from_secs(5),
+            runs: 3,
+        }
+    }
+}
+
+/// TST-092 (c): hot read latency — each client loops single-row reads of its
+/// own seeded data. Seeding and (on Fluxum) subscription materialization
+/// happen before the clock starts.
+pub fn hot_read_workload(side: &dyn Side, cfg: &HotReadConfig) -> Result<Vec<RunResult>, String> {
+    let mut results = Vec::with_capacity(cfg.runs);
+    for run in 0..cfg.runs {
+        results.push(hot_read_run(side, cfg, run as u64)?);
+    }
+    Ok(results)
+}
+
+fn hot_read_run(side: &dyn Side, cfg: &HotReadConfig, run: u64) -> Result<RunResult, String> {
+    let mut clients = Vec::with_capacity(cfg.clients);
+    for c in 0..cfg.clients {
+        let mut client = side.client(run * 10_000 + 500 + c as u64)?;
+        client.prepare_reads(cfg.rows_per_client)?;
+        clients.push(client);
+    }
+
+    let start_gate = Arc::new(Barrier::new(cfg.clients + 1));
+    let measuring = Arc::new(AtomicBool::new(false));
+    let stop = Arc::new(AtomicBool::new(false));
+    let failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let handles: Vec<_> = clients
+        .into_iter()
+        .map(|mut client| {
+            let start_gate = Arc::clone(&start_gate);
+            let measuring = Arc::clone(&measuring);
+            let stop = Arc::clone(&stop);
+            let failed = Arc::clone(&failed);
+            std::thread::spawn(move || -> Vec<u64> {
+                let mut latencies = Vec::new();
+                start_gate.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    let began = Instant::now();
+                    match client.hot_read() {
+                        Ok(title) => {
+                            let elapsed = began.elapsed().as_nanos() as u64;
+                            // The read's result flows into a hint the
+                            // optimizer cannot see through, so the lookup
+                            // is never dead code on either side.
+                            std::hint::black_box(&title);
+                            if measuring.load(Ordering::Relaxed) {
+                                latencies.push(elapsed);
+                            }
+                        }
+                        Err(e) => {
+                            *failed
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                            stop.store(true, Ordering::Relaxed);
+                            break;
+                        }
+                    }
+                }
+                latencies
+            })
+        })
+        .collect();
+
+    start_gate.wait();
+    std::thread::sleep(cfg.warmup);
+    measuring.store(true, Ordering::Relaxed);
+    let window_start = Instant::now();
+    std::thread::sleep(cfg.measure);
+    measuring.store(false, Ordering::Relaxed);
+    let wall = window_start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+
+    let mut latencies_ns = Vec::new();
+    for handle in handles {
+        latencies_ns.extend(
+            handle
+                .join()
+                .map_err(|_| "reader thread panicked".to_owned())?,
+        );
+    }
+    if let Some(e) = failed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(format!("hot-read workload client failed: {e}"));
+    }
+    Ok(RunResult {
+        ops: latencies_ns.len() as u64,
+        wall,
+        latencies_ns,
+    })
+}
+
+/// Knobs for the mixed workload (TST-092 e): writes, reads, and live
+/// subscribers at the same time — the shape of a real deployment, where
+/// each class contends with the others.
+#[derive(Debug, Clone)]
+pub struct MixedConfig {
+    /// Clients looping the acked small write.
+    pub writers: usize,
+    /// Clients looping the hot single-row read.
+    pub readers: usize,
+    /// Tasks seeded per reader before measurement.
+    pub rows_per_reader: u32,
+    /// Live subscribers to the chat channel.
+    pub subscribers: usize,
+    /// Chat sender rate, messages/second (under the 20/s limit).
+    pub rate_per_sec: u32,
+    /// Unmeasured warmup preceding the window.
+    pub warmup: Duration,
+    /// The measured window.
+    pub measure: Duration,
+    /// Independent repetitions.
+    pub runs: usize,
+}
+
+impl Default for MixedConfig {
+    fn default() -> Self {
+        MixedConfig {
+            writers: 4,
+            readers: 4,
+            rows_per_reader: 100,
+            subscribers: 20,
+            rate_per_sec: 10,
+            warmup: Duration::from_secs(2),
+            measure: Duration::from_secs(10),
+            runs: 3,
+        }
+    }
+}
+
+/// One mixed run's results, per operation class.
+#[derive(Debug, Clone)]
+pub struct MixedRun {
+    /// Acked small writes under contention.
+    pub write: RunResult,
+    /// Hot reads under contention.
+    pub read: RunResult,
+    /// Change→subscriber deliveries under contention.
+    pub e2e: RunResult,
+}
+
+/// TST-092 (e): the mixed workload. Every class runs concurrently over the
+/// same measured window; results come back per class so the report can show
+/// what contention does to each.
+pub fn mixed_workload(side: &dyn Side, cfg: &MixedConfig) -> Result<Vec<MixedRun>, String> {
+    let mut results = Vec::with_capacity(cfg.runs);
+    for run in 0..cfg.runs {
+        results.push(mixed_run(side, cfg, run as u64)?);
+    }
+    Ok(results)
+}
+
+fn mixed_run(side: &dyn Side, cfg: &MixedConfig, run: u64) -> Result<MixedRun, String> {
+    let epoch = Instant::now();
+    let channel = 8000 + run as u32;
+
+    // Sessions first; none of this is measured.
+    let mut writers = Vec::with_capacity(cfg.writers);
+    for c in 0..cfg.writers {
+        writers.push(side.client(run * 10_000 + 1000 + c as u64)?);
+    }
+    let mut readers = Vec::with_capacity(cfg.readers);
+    for c in 0..cfg.readers {
+        let mut client = side.client(run * 10_000 + 2000 + c as u64)?;
+        client.prepare_reads(cfg.rows_per_reader)?;
+        readers.push(client);
+    }
+    let measuring = Arc::new(AtomicBool::new(false));
+    let e2e_latencies: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut subscribers = Vec::with_capacity(cfg.subscribers);
+    for s in 0..cfg.subscribers {
+        let mut client = side.client(run * 10_000 + 3000 + s as u64)?;
+        let measuring = Arc::clone(&measuring);
+        let e2e_latencies = Arc::clone(&e2e_latencies);
+        client.subscribe_chat(
+            channel,
+            Box::new(move |content| {
+                let now_ns = epoch.elapsed().as_nanos() as u64;
+                let Some(sent_ns) = content
+                    .split(' ')
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                else {
+                    return;
+                };
+                if measuring.load(Ordering::Relaxed) {
+                    e2e_latencies
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(now_ns.saturating_sub(sent_ns));
+                }
+            }),
+        )?;
+        subscribers.push(client);
+    }
+    let mut chat_sender = side.client(run * 10_000 + 999)?;
+
+    let participants = cfg.writers + cfg.readers + 1; // + the chat sender
+    let start_gate = Arc::new(Barrier::new(participants + 1));
+    let stop = Arc::new(AtomicBool::new(false));
+    let failed: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    let fail = |failed: &Arc<Mutex<Option<String>>>, stop: &Arc<AtomicBool>, e: String| {
+        *failed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+        stop.store(true, Ordering::Relaxed);
+    };
+
+    let mut write_handles = Vec::new();
+    for (idx, mut client) in writers.into_iter().enumerate() {
+        let (start_gate, measuring, stop, failed) = (
+            Arc::clone(&start_gate),
+            Arc::clone(&measuring),
+            Arc::clone(&stop),
+            Arc::clone(&failed),
+        );
+        write_handles.push(std::thread::spawn(move || -> Vec<u64> {
+            let mut latencies = Vec::new();
+            let mut i = 0u64;
+            start_gate.wait();
+            while !stop.load(Ordering::Relaxed) {
+                let title = format!("mixed task {idx}-{i}");
+                i += 1;
+                let began = Instant::now();
+                if let Err(e) = client.add_task(&title) {
+                    fail(&failed, &stop, e);
+                    break;
+                }
+                if measuring.load(Ordering::Relaxed) {
+                    latencies.push(began.elapsed().as_nanos() as u64);
+                }
+            }
+            latencies
+        }));
+    }
+
+    let mut read_handles = Vec::new();
+    for mut client in readers {
+        let (start_gate, measuring, stop, failed) = (
+            Arc::clone(&start_gate),
+            Arc::clone(&measuring),
+            Arc::clone(&stop),
+            Arc::clone(&failed),
+        );
+        read_handles.push(std::thread::spawn(move || -> Vec<u64> {
+            let mut latencies = Vec::new();
+            start_gate.wait();
+            while !stop.load(Ordering::Relaxed) {
+                let began = Instant::now();
+                match client.hot_read() {
+                    Ok(title) => {
+                        let elapsed = began.elapsed().as_nanos() as u64;
+                        std::hint::black_box(&title);
+                        if measuring.load(Ordering::Relaxed) {
+                            latencies.push(elapsed);
+                        }
+                    }
+                    Err(e) => {
+                        fail(&failed, &stop, e);
+                        break;
+                    }
+                }
+            }
+            latencies
+        }));
+    }
+
+    let sender_handle = {
+        let (start_gate, stop, failed) = (
+            Arc::clone(&start_gate),
+            Arc::clone(&stop),
+            Arc::clone(&failed),
+        );
+        let gap = Duration::from_secs_f64(1.0 / f64::from(cfg.rate_per_sec.max(1)));
+        std::thread::spawn(move || {
+            start_gate.wait();
+            let mut n = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let body = format!("{} mixed{n}", epoch.elapsed().as_nanos());
+                n += 1;
+                if let Err(e) = chat_sender.send_chat(channel, &body) {
+                    fail(&failed, &stop, e);
+                    break;
+                }
+                std::thread::sleep(gap);
+            }
+        })
+    };
+
+    start_gate.wait();
+    std::thread::sleep(cfg.warmup);
+    measuring.store(true, Ordering::Relaxed);
+    let window_start = Instant::now();
+    std::thread::sleep(cfg.measure);
+    measuring.store(false, Ordering::Relaxed);
+    let wall = window_start.elapsed();
+    stop.store(true, Ordering::Relaxed);
+
+    let mut write_ns = Vec::new();
+    for handle in write_handles {
+        write_ns.extend(handle.join().map_err(|_| "writer thread panicked".to_owned())?);
+    }
+    let mut read_ns = Vec::new();
+    for handle in read_handles {
+        read_ns.extend(handle.join().map_err(|_| "reader thread panicked".to_owned())?);
+    }
+    sender_handle
+        .join()
+        .map_err(|_| "chat sender thread panicked".to_owned())?;
+    if let Some(e) = failed
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+    {
+        return Err(format!("mixed workload client failed: {e}"));
+    }
+    let e2e_ns = std::mem::take(
+        &mut *e2e_latencies
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let result = |ns: Vec<u64>| RunResult {
+        ops: ns.len() as u64,
+        wall,
+        latencies_ns: ns,
+    };
+    Ok(MixedRun {
+        write: result(write_ns),
+        read: result(read_ns),
+        e2e: result(e2e_ns),
+    })
 }
 
 fn e2e_run(side: &dyn Side, cfg: &E2eConfig, run: u64) -> Result<RunResult, String> {
