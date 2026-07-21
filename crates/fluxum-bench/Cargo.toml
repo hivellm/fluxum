@@ -16,6 +16,7 @@ fluxum-sdk.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
+sysinfo.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "time", "sync", "macros"] }
 tungstenite.workspace = true
 ureq.workspace = true

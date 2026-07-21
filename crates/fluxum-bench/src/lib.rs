@@ -23,6 +23,7 @@ pub mod baseline;
 pub mod baseline_side;
 pub mod fluxum_side;
 pub mod measure;
+pub mod report;
 pub mod workload;
 
 /// Version of the parity harness, tied to the workspace version so reports can name the
