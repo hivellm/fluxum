@@ -34,8 +34,8 @@ use fluxum_bench::baseline_side::BaselineSide;
 use fluxum_bench::fluxum_side::FluxumSide;
 use fluxum_bench::measure::Summary;
 use fluxum_bench::workload::{
-    E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, e2e_workload, hot_read_workload,
-    mixed_workload, write_workload,
+    ColdReadConfig, E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, cold_read_workload,
+    e2e_workload, hot_read_workload, mixed_workload, write_workload,
 };
 
 fn main() {
@@ -65,6 +65,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--measure-secs" => opts.measure_secs = parse(&value("--measure-secs")?)?,
             "--runs" => opts.runs = parse(&value("--runs")?)?,
             "--rows" => opts.rows = parse(&value("--rows")?)?,
+            "--users" => opts.users = parse(&value("--users")?)?,
+            "--samples" => opts.samples = parse(&value("--samples")?)?,
+            "--memory-budget" => opts.memory_budget = Some(value("--memory-budget")?),
+            "--cold-restart-cmd" => opts.cold_restart_cmd = Some(value("--cold-restart-cmd")?),
             "--subscribers" => opts.subscribers = parse(&value("--subscribers")?)?,
             "--rate" => opts.rate = parse(&value("--rate")?)?,
             "--messages" => opts.messages = parse(&value("--messages")?)?,
@@ -80,6 +84,99 @@ fn run(args: Vec<String>) -> Result<(), String> {
             .database_url
             .ok_or("baseline-server needs --database-url")?;
         return serve_blocking(&url, opts.port, opts.max_connections);
+    }
+
+    // Cold reads own their server lifecycle (seed → restart → measure), so
+    // they take a different construction path from the steady-state
+    // workloads below.
+    if workload == "cold" {
+        let cfg = ColdReadConfig {
+            users: opts.users,
+            rows_per_user: opts.rows,
+            sample_users: opts.samples,
+            runs: opts.runs,
+        };
+        let (name, runs) = match opts.side.as_str() {
+            "fluxum" => {
+                let server =
+                    std::sync::Mutex::new(BenchServer::start_with(opts.memory_budget.clone())?);
+                let url = server
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .url
+                    .clone();
+                let side = FluxumSide::new(url);
+                let restart = || {
+                    server
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .restart()
+                };
+                ("fluxum", cold_read_workload(&side, &restart, &cfg)?)
+            }
+            "postgres" | "sqlite" => {
+                let kind: &'static str = if opts.side == "postgres" {
+                    "postgres"
+                } else {
+                    "sqlite"
+                };
+                let url = match (kind, opts.database_url.clone()) {
+                    ("postgres", Some(url)) => url,
+                    ("postgres", None) => {
+                        return Err("side postgres needs --database-url".to_owned());
+                    }
+                    (_, Some(url)) => url,
+                    (_, None) => format!(
+                        "sqlite://{}",
+                        std::env::temp_dir()
+                            .join(format!("fluxum-parity-cold-{}.sqlite", std::process::id()))
+                            .display()
+                    ),
+                };
+                // PostgreSQL's caches live in its own process: restarting
+                // only the app server would measure a warm database. The
+                // caller says how to bounce it (docker restart …).
+                if kind == "postgres" && opts.cold_restart_cmd.is_none() {
+                    return Err(
+                        "side postgres cold reads need --cold-restart-cmd, e.g. \
+                         --cold-restart-cmd \"docker restart fluxum-parity-pg\""
+                            .to_owned(),
+                    );
+                }
+                let server = std::sync::Mutex::new(BaselineServer::start(
+                    &url,
+                    opts.max_connections,
+                )?);
+                let base_url = server
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .base_url
+                    .clone();
+                let side = BaselineSide::new(base_url, kind);
+                let cmd = opts.cold_restart_cmd.clone();
+                let restart = || {
+                    if let Some(cmd) = &cmd {
+                        run_shell(cmd)?;
+                    }
+                    // The app server restarts too — symmetric with the
+                    // Fluxum side, and (for SQLite) it IS the database's
+                    // page cache.
+                    server
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .restart()
+                };
+                (kind, cold_read_workload(&side, &restart, &cfg)?)
+            }
+            other => return Err(format!("unknown side {other:?} (fluxum|postgres|sqlite)")),
+        };
+        return emit(
+            name,
+            &workload,
+            &[("cold".to_owned(), Summary::from_runs(&runs))],
+            &format!("{cfg:?}"),
+            opts.json.as_deref(),
+        );
     }
 
     // The side under measurement.
@@ -193,11 +290,28 @@ fn run(args: Vec<String>) -> Result<(), String> {
         other => return Err(format!("unknown workload {other:?}\n{}", usage())),
     };
 
+    emit(
+        side.name(),
+        &workload,
+        &summaries,
+        &config_json,
+        opts.json.as_deref(),
+    )
+}
+
+/// Print the per-class summaries and (optionally) write the JSON artifact
+/// the report generator consumes.
+fn emit(
+    side_name: &str,
+    workload: &str,
+    summaries: &[(String, Summary)],
+    config_json: &str,
+    json: Option<&std::path::Path>,
+) -> Result<(), String> {
     let ms = |ns: f64| ns / 1_000_000.0;
-    for (class, summary) in &summaries {
+    for (class, summary) in summaries {
         println!(
-            "{} / {class}: {:.0} ops/s (±{:.0}) | p50 {:.4} ms | p99 {:.4} ms (±{:.4}) | max {:.3} ms | {} ops over {} runs",
-            side.name(),
+            "{side_name} / {class}: {:.0} ops/s (±{:.0}) | p50 {:.4} ms | p99 {:.4} ms (±{:.4}) | max {:.3} ms | {} ops over {} runs",
             summary.throughput_mean,
             summary.throughput_stddev,
             ms(summary.p50_ns_mean),
@@ -209,10 +323,10 @@ fn run(args: Vec<String>) -> Result<(), String> {
         );
     }
 
-    if let Some(path) = &opts.json {
+    if let Some(path) = json {
         let doc = serde_json::json!({
             "harness_version": fluxum_bench::harness_version(),
-            "side": side.name(),
+            "side": side_name,
             "workload": workload,
             "config": config_json,
             "summaries": summaries
@@ -230,6 +344,20 @@ fn run(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// Run a caller-supplied shell command (the PostgreSQL cold-restart hook).
+fn run_shell(command: &str) -> Result<(), String> {
+    let status = if cfg!(windows) {
+        Command::new("cmd").args(["/C", command]).status()
+    } else {
+        Command::new("sh").args(["-c", command]).status()
+    }
+    .map_err(|e| format!("{command}: {e}"))?;
+    if !status.success() {
+        return Err(format!("{command}: exit {status}"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct Opts {
     side: String,
@@ -242,6 +370,10 @@ struct Opts {
     measure_secs: u64,
     runs: usize,
     rows: u32,
+    users: u32,
+    samples: u32,
+    memory_budget: Option<String>,
+    cold_restart_cmd: Option<String>,
     subscribers: usize,
     rate: u32,
     messages: u32,
@@ -261,6 +393,10 @@ impl Default for Opts {
             measure_secs: 10,
             runs: 3,
             rows: 100,
+            users: 64,
+            samples: 16,
+            memory_budget: None,
+            cold_restart_cmd: None,
             subscribers: 50,
             rate: 10,
             messages: 100,
@@ -276,9 +412,10 @@ fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
 }
 
 fn usage() -> String {
-    "usage: fluxum-bench <write|e2e|hot|mixed> [--side fluxum|postgres|sqlite] [--url URL] \
+    "usage: fluxum-bench <write|e2e|hot|cold|mixed> [--side fluxum|postgres|sqlite] [--url URL] \
      [--database-url URL] [--clients N] [--warmup-secs N] [--measure-secs N] [--runs N] \
-     [--rows N] [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
+     [--rows N] [--users N] [--samples N] [--memory-budget SIZE] [--cold-restart-cmd CMD] \
+     [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()
 }
@@ -288,6 +425,9 @@ fn usage() -> String {
 struct BaselineServer {
     base_url: String,
     child: Child,
+    database_url: String,
+    max_connections: u32,
+    port: u16,
 }
 
 impl BaselineServer {
@@ -296,6 +436,17 @@ impl BaselineServer {
     /// process, and an in-process one would share the driver's CPU.
     fn start(database_url: &str, max_connections: u32) -> Result<Self, String> {
         let port = free_port()?;
+        let child = Self::launch(database_url, max_connections, port)?;
+        Ok(BaselineServer {
+            base_url: format!("http://127.0.0.1:{port}"),
+            child,
+            database_url: database_url.to_owned(),
+            max_connections,
+            port,
+        })
+    }
+
+    fn launch(database_url: &str, max_connections: u32, port: u16) -> Result<Child, String> {
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
         let child = Command::new(exe)
             .args([
@@ -312,10 +463,15 @@ impl BaselineServer {
             .spawn()
             .map_err(|e| format!("spawn baseline-server: {e}"))?;
         wait_for_port(port, Duration::from_secs(20))?;
-        Ok(BaselineServer {
-            base_url: format!("http://127.0.0.1:{port}"),
-            child,
-        })
+        Ok(child)
+    }
+
+    /// Kill and relaunch on the same port over the same database.
+    fn restart(&mut self) -> Result<(), String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::launch(&self.database_url, self.max_connections, self.port)?;
+        Ok(())
     }
 }
 
@@ -331,10 +487,21 @@ impl Drop for BaselineServer {
 struct BenchServer {
     url: String,
     child: Child,
+    binary: PathBuf,
+    http_port: u16,
+    tcp_port: u16,
+    data_dir: PathBuf,
+    memory_budget: Option<String>,
 }
 
 impl BenchServer {
     fn start() -> Result<Self, String> {
+        Self::start_with(None)
+    }
+
+    /// Start with an explicit `memory.budget` (the cold-read knob: a budget
+    /// smaller than the seeded dataset forces the cold tier into play).
+    fn start_with(memory_budget: Option<String>) -> Result<Self, String> {
         let name = if cfg!(windows) {
             "fluxum-server.exe"
         } else {
@@ -359,23 +526,64 @@ impl BenchServer {
         let data_dir = std::env::temp_dir().join(format!("fluxum-bench-{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
-        let child = Command::new(&binary)
-            .env("FLUXUM_PROFILE", "development")
-            .env("FLUXUM_SERVER_HTTP_PORT", http_port.to_string())
-            .env("FLUXUM_SERVER_TCP_PORT", tcp_port.to_string())
-            .env("FLUXUM_STORAGE_DATA_DIR", &data_dir)
-            .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", data_dir.join("log"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|e| format!("spawn {}: {e}", binary.display()))?;
-        wait_for_port(tcp_port, Duration::from_secs(20))?;
-
+        let child = launch_fluxum(
+            &binary,
+            http_port,
+            tcp_port,
+            &data_dir,
+            memory_budget.as_deref(),
+        )?;
         Ok(BenchServer {
             url: format!("fluxum://127.0.0.1:{tcp_port}"),
             child,
+            binary,
+            http_port,
+            tcp_port,
+            data_dir,
+            memory_budget,
         })
     }
+
+    /// Kill and relaunch on the same ports over the same data dir: recovery
+    /// replays the seed, and every cache starts empty (the cold restart).
+    fn restart(&mut self) -> Result<(), String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = launch_fluxum(
+            &self.binary,
+            self.http_port,
+            self.tcp_port,
+            &self.data_dir,
+            self.memory_budget.as_deref(),
+        )?;
+        Ok(())
+    }
+}
+
+fn launch_fluxum(
+    binary: &std::path::Path,
+    http_port: u16,
+    tcp_port: u16,
+    data_dir: &std::path::Path,
+    memory_budget: Option<&str>,
+) -> Result<Child, String> {
+    let mut command = Command::new(binary);
+    command
+        .env("FLUXUM_PROFILE", "development")
+        .env("FLUXUM_SERVER_HTTP_PORT", http_port.to_string())
+        .env("FLUXUM_SERVER_TCP_PORT", tcp_port.to_string())
+        .env("FLUXUM_STORAGE_DATA_DIR", data_dir)
+        .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", data_dir.join("log"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(budget) = memory_budget {
+        command.env("FLUXUM_MEMORY_BUDGET", budget);
+    }
+    let child = command
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", binary.display()))?;
+    wait_for_port(tcp_port, Duration::from_secs(20))?;
+    Ok(child)
 }
 
 impl Drop for BenchServer {

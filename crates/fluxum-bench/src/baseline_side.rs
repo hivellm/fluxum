@@ -154,6 +154,21 @@ impl BenchClient for BaselineClient {
             .map(str::to_owned)
             .ok_or_else(|| "GET /task: no title in response".to_owned())
     }
+
+    fn load_my_data(&mut self) -> Result<u32, String> {
+        let response = self
+            .agent
+            .get(&format!("{}/tasks", self.base_url))
+            .query("user", &self.user)
+            .call()
+            .map_err(|e| format!("GET /tasks: {e}"))?;
+        let body: serde_json::Value = response
+            .into_json()
+            .map_err(|e| format!("GET /tasks body: {e}"))?;
+        body.as_array()
+            .map(|rows| rows.len() as u32)
+            .ok_or_else(|| "GET /tasks: response is not an array".to_owned())
+    }
 }
 
 impl Drop for BaselineClient {

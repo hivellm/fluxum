@@ -195,6 +195,15 @@ impl BenchClient for FluxumClient {
             .cloned()
             .ok_or_else(|| format!("task {key} vanished from the live view"))
     }
+
+    fn load_my_data(&mut self) -> Result<u32, String> {
+        // `subscribe` returns once `InitialData` is applied to the local
+        // cache — the whole "open the app" operation, timed by the caller.
+        self.connection
+            .subscribe(&["SELECT * FROM Task"])
+            .map_err(|e| format!("subscribe Task: {e}"))?;
+        Ok(self.connection.rows("Task").len() as u32)
+    }
 }
 
 /// Decode `content` out of a `ChatMessage` row (id, sender, channel,

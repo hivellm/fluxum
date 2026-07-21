@@ -155,6 +155,30 @@ impl Db {
         Ok(row)
     }
 
+    /// Every task for `owner` (id, title, done) — the "load my data" read
+    /// (TST-092 d), over the `task_owner` index.
+    pub async fn tasks_for(&self, owner: &str) -> Result<Vec<(i64, String, bool)>, String> {
+        use sqlx::Row as _;
+        match self {
+            Db::Postgres(pool) => sqlx::query("SELECT id, title, done FROM task WHERE owner = $1")
+                .bind(owner)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("tasks_for: {e}"))?
+                .iter()
+                .map(|r| Ok((r.get(0), r.get(1), r.get(2))))
+                .collect(),
+            Db::Sqlite(pool) => sqlx::query("SELECT id, title, done FROM task WHERE owner = ?1")
+                .bind(owner)
+                .fetch_all(pool)
+                .await
+                .map_err(|e| format!("tasks_for: {e}"))?
+                .iter()
+                .map(|r| Ok((r.get(0), r.get(1), r.get::<i64, _>(2) != 0)))
+                .collect(),
+        }
+    }
+
     /// `INSERT` one chat message, committed before returning. On PostgreSQL
     /// the same statement issues the `NOTIFY` (`pg_notify`) **inside the
     /// insert's transaction** — delivery is tied to the commit exactly like

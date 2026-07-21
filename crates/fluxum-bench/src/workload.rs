@@ -48,6 +48,11 @@ pub trait BenchClient: Send {
     /// vs **SQL round trip** (baseline: indexed single-row SELECT over
     /// HTTP). Returns the title read, so neither side can skip the work.
     fn hot_read(&mut self) -> Result<String, String>;
+    /// Load ALL of this user's tasks in one operation — "open the app after
+    /// a cold start". Fluxum: a fresh subscription's `InitialData`, applied;
+    /// baseline: the indexed `SELECT` of every row over HTTP. Returns the
+    /// row count so the driver can assert both sides read the same data.
+    fn load_my_data(&mut self) -> Result<u32, String>;
 }
 
 /// Shared knobs for a workload run (TST-091 warmup + multi-run).
@@ -314,6 +319,88 @@ fn hot_read_run(side: &dyn Side, cfg: &HotReadConfig, run: u64) -> Result<RunRes
         wall,
         latencies_ns,
     })
+}
+
+/// Knobs for the cold-read workload.
+#[derive(Debug, Clone)]
+pub struct ColdReadConfig {
+    /// Users whose data is seeded. Sized (with `rows_per_user`) so the
+    /// dataset overflows the Fluxum side's configured memory budget — that
+    /// is what makes the post-restart reads page-in from the cold tier.
+    pub users: u32,
+    /// Tasks seeded per user.
+    pub rows_per_user: u32,
+    /// Users sampled for the measured cold loads (each on a fresh session).
+    pub sample_users: u32,
+    /// Independent repetitions. Every run re-restarts the servers; the seed
+    /// is shared (seeding is idempotent enough for reads — rows only grow).
+    pub runs: usize,
+}
+
+impl Default for ColdReadConfig {
+    fn default() -> Self {
+        ColdReadConfig {
+            users: 64,
+            rows_per_user: 500,
+            sample_users: 16,
+            runs: 3,
+        }
+    }
+}
+
+/// TST-092 (d): cold (page-in) reads. Seeds `users × rows_per_user` tasks,
+/// then for each run: `restart` both server-side caches away, and measure
+/// "load my data" for `sample_users` fresh sessions — first touch of each
+/// user's pages. `restart` is environment-provided (kill/relaunch a spawned
+/// server, `docker restart` for PostgreSQL): the workload cannot know how
+/// its servers were started.
+///
+/// Honesty note for the report: a restart empties the *database's* caches
+/// (Fluxum buffer pool / PG shared_buffers) on both sides symmetrically;
+/// the OS page cache is not dropped on either side, so this measures
+/// database-level page-in, not platter latency.
+pub fn cold_read_workload(
+    side: &dyn Side,
+    restart: &dyn Fn() -> Result<(), String>,
+    cfg: &ColdReadConfig,
+) -> Result<Vec<RunResult>, String> {
+    // Seed once: rows_per_user tasks under each user's identity.
+    for user in 0..cfg.users {
+        let mut client = side.client(u64::from(user))?;
+        for i in 0..cfg.rows_per_user {
+            client.add_task(&format!("cold seed {i}"))?;
+        }
+    }
+
+    let mut results = Vec::with_capacity(cfg.runs);
+    for run in 0..cfg.runs {
+        restart()?;
+        let mut latencies_ns = Vec::with_capacity(cfg.sample_users as usize);
+        let window_start = Instant::now();
+        for s in 0..cfg.sample_users {
+            // Sample users rotate across runs so a run never re-reads pages
+            // the previous run's samples just heated.
+            let user = (run as u32 * cfg.sample_users + s) % cfg.users;
+            // The session is opened OUTSIDE the timed op: connection setup
+            // is not a page-in.
+            let mut client = side.client(u64::from(user))?;
+            let began = Instant::now();
+            let rows = client.load_my_data()?;
+            latencies_ns.push(began.elapsed().as_nanos() as u64);
+            if rows < cfg.rows_per_user {
+                return Err(format!(
+                    "cold load for user {user} returned {rows} rows, seeded {}",
+                    cfg.rows_per_user
+                ));
+            }
+        }
+        results.push(RunResult {
+            ops: u64::from(cfg.sample_users),
+            wall: window_start.elapsed(),
+            latencies_ns,
+        });
+    }
+    Ok(results)
 }
 
 /// Knobs for the mixed workload (TST-092 e): writes, reads, and live

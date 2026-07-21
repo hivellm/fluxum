@@ -32,7 +32,7 @@ struct AppState {
 /// Build the router over an already-connected database.
 fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/tasks", post(add_task))
+        .route("/tasks", post(add_task).get(list_tasks))
         .route("/task", get(task_title))
         .route("/chat", post(send_chat))
         .route("/subscribe", get(subscribe))
@@ -42,6 +42,23 @@ fn router(state: Arc<AppState>) -> Router {
 #[derive(serde::Deserialize)]
 struct TaskParams {
     user: String,
+}
+
+/// The "load my data" read (TST-092 d): every task for one user, JSON out.
+async fn list_tasks(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TaskParams>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let rows = state
+        .db
+        .tasks_for(&params.user)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let body: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(id, title, done)| serde_json::json!({ "id": id, "title": title, "done": done }))
+        .collect();
+    Ok(Json(serde_json::Value::Array(body)))
 }
 
 /// The hot single-row read (TST-092 c): indexed point SELECT, JSON out.

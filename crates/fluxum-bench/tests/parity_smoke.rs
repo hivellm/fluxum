@@ -12,8 +12,8 @@ use fluxum_bench::baseline_side::BaselineSide;
 use fluxum_bench::fluxum_side::FluxumSide;
 use fluxum_bench::measure::Summary;
 use fluxum_bench::workload::{
-    E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, e2e_workload, hot_read_workload,
-    mixed_workload, write_workload,
+    ColdReadConfig, E2eConfig, HotReadConfig, MixedConfig, RunConfig, Side, cold_read_workload,
+    e2e_workload, hot_read_workload, mixed_workload, write_workload,
 };
 
 fn server_binary() -> PathBuf {
@@ -30,6 +30,17 @@ fn server_binary() -> PathBuf {
 struct Server {
     child: Child,
     tcp_url: String,
+    http_port: u16,
+    tcp_port: u16,
+    data_dir: PathBuf,
+}
+
+fn wait_port(port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "server did not bind {port}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 impl Server {
@@ -52,26 +63,36 @@ impl Server {
             std::env::temp_dir().join(format!("fluxum-bench-{label}-{}", std::process::id()));
         std::fs::create_dir_all(&data_dir).unwrap();
 
-        let child = Command::new(&binary)
+        let child = Self::launch(http_port, tcp_port, &data_dir);
+        Server {
+            child,
+            tcp_url: format!("fluxum://127.0.0.1:{tcp_port}"),
+            http_port,
+            tcp_port,
+            data_dir,
+        }
+    }
+
+    fn launch(http_port: u16, tcp_port: u16, data_dir: &Path) -> Child {
+        let child = Command::new(server_binary())
             .env("FLUXUM_PROFILE", "development")
             .env("FLUXUM_SERVER_HTTP_PORT", http_port.to_string())
             .env("FLUXUM_SERVER_TCP_PORT", tcp_port.to_string())
-            .env("FLUXUM_STORAGE_DATA_DIR", &data_dir)
+            .env("FLUXUM_STORAGE_DATA_DIR", data_dir)
             .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", data_dir.join("log"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn fluxum-server");
+        wait_port(tcp_port);
+        child
+    }
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", tcp_port)).is_err() {
-            assert!(Instant::now() < deadline, "server did not bind {tcp_port}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        Server {
-            child,
-            tcp_url: format!("fluxum://127.0.0.1:{tcp_port}"),
-        }
+    /// Crash-and-recover on the same ports and data dir.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::launch(self.http_port, self.tcp_port, &self.data_dir);
     }
 }
 
@@ -112,6 +133,8 @@ fn write_workload_measures_acked_small_writes() {
 struct SqliteBaseline {
     child: Child,
     base_url: String,
+    port: u16,
+    database_url: String,
 }
 
 impl SqliteBaseline {
@@ -128,11 +151,22 @@ impl SqliteBaseline {
             "fluxum-parity-{label}-{}.sqlite",
             std::process::id()
         ));
+        let database_url = format!("sqlite://{}", db.display());
+        let child = Self::launch(&database_url, port);
+        SqliteBaseline {
+            child,
+            base_url: format!("http://127.0.0.1:{port}"),
+            port,
+            database_url,
+        }
+    }
+
+    fn launch(database_url: &str, port: u16) -> Child {
         let child = Command::new(env!("CARGO_BIN_EXE_fluxum-bench"))
             .args([
                 "baseline-server",
                 "--database-url",
-                &format!("sqlite://{}", db.display()),
+                database_url,
                 "--port",
                 &port.to_string(),
             ])
@@ -140,15 +174,15 @@ impl SqliteBaseline {
             .stderr(Stdio::inherit())
             .spawn()
             .expect("spawn baseline-server");
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(Instant::now() < deadline, "baseline-server did not bind {port}");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        SqliteBaseline {
-            child,
-            base_url: format!("http://127.0.0.1:{port}"),
-        }
+        wait_port(port);
+        child
+    }
+
+    /// Restart the app server over the same database file.
+    fn restart(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.child = Self::launch(&self.database_url, self.port);
     }
 }
 
@@ -215,6 +249,48 @@ fn hot_read_workload_reads_the_live_view() {
         "in-process hot read p99 {} ns is suspiciously slow",
         summary.p99_ns_mean
     );
+}
+
+#[test]
+fn cold_read_workload_survives_a_restart_on_both_sides() {
+    // Plumbing assertion, not a cold-tier measurement: the dataset is tiny
+    // and fits any budget. What must hold: the seed survives the restart
+    // (recovery), fresh sessions read ALL their rows, and per-load
+    // latencies are recorded. The real page-in numbers come from the
+    // release harness run with --memory-budget below the dataset size.
+    let cfg = ColdReadConfig {
+        users: 4,
+        rows_per_user: 5,
+        sample_users: 4,
+        runs: 2,
+    };
+
+    let mut server = Server::start("cold-fluxum");
+    let side = FluxumSide::new(server.tcp_url.clone());
+    let restart = {
+        let server = std::cell::RefCell::new(&mut server);
+        move || -> Result<(), String> {
+            server.borrow_mut().restart();
+            Ok(())
+        }
+    };
+    let runs = cold_read_workload(&side, &restart, &cfg).expect("fluxum cold workload");
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].ops, 4);
+    assert_eq!(runs[0].latencies_ns.len(), 4);
+    drop(restart);
+
+    let mut baseline = SqliteBaseline::start("cold");
+    let side = BaselineSide::new(baseline.base_url.clone(), "sqlite");
+    let restart = {
+        let baseline = std::cell::RefCell::new(&mut baseline);
+        move || -> Result<(), String> {
+            baseline.borrow_mut().restart();
+            Ok(())
+        }
+    };
+    let runs = cold_read_workload(&side, &restart, &cfg).expect("sqlite cold workload");
+    assert_eq!(runs[0].ops, 4);
 }
 
 #[test]
