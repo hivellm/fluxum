@@ -142,6 +142,7 @@ pub fn generate(schema: &Value) -> Result<BTreeMap<String, String>, String> {
     files.insert("client.ts".to_owned(), client_ts(&banner));
     files.insert("types.ts".to_owned(), types_ts(&banner, tables)?);
     files.insert("decoders.ts".to_owned(), decoders_ts(&banner, tables)?);
+    files.insert("schemas.ts".to_owned(), schemas_ts(&banner, tables)?);
     files.insert(
         "reducers.ts".to_owned(),
         reducers_ts(&banner, reducers, schema_version)?,
@@ -195,7 +196,7 @@ fn decoders_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
     if !names.is_empty() {
-        out.push_str(&format!("import type {{ {} }} from './types';\n", names.join(", ")));
+        out.push_str(&format!("import type {{ {} }} from './types.ts';\n", names.join(", ")));
     }
     out.push('\n');
 
@@ -253,6 +254,136 @@ fn decoders_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
     Ok(out)
 }
 
+/// Emit the SDK cache hooks (`tableSchema<Name>()` → `TableSchema`) — the
+/// primary-key projections `FluxumClient.connect({ tables })` needs (SDK-040).
+/// The Rust generator's `table_schema()` twin. Like `decoders.ts` this is a
+/// *with-runtime* file (it reads rows through the SDK's `RowReader`), so it
+/// stays out of the `tsc`-alone binding set.
+///
+/// Two layouts per table, because the wire has two (SPEC-006): a full row for
+/// `pkOfRow` — read the leading columns up to the last key column, keep the
+/// key values — and primary-key fields alone for `pkOfDelete`. A table with
+/// no declared primary key keys on every column: each row is its own key,
+/// which is the only stable meaning "no pk" has.
+fn schemas_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
+    let mut out = String::from(banner);
+    out.push_str(
+        "import { RowReader } from '@hivehub/fluxum';\n\
+         import type { FluxType, TableSchema } from '@hivehub/fluxum';\n\n\
+         /** Read `plan` in wire order, keeping the values marked as key parts. */\n\
+         function projectKey(bytes: Uint8Array, plan: ReadonlyArray<readonly [FluxType, boolean]>): string {\n\
+         \x20 const reader = new RowReader(bytes);\n\
+         \x20 const parts: string[] = [];\n\
+         \x20 for (const [type, isKey] of plan) {\n\
+         \x20   const value = reader.read(type);\n\
+         \x20   if (isKey) parts.push(String(value));\n\
+         \x20 }\n\
+         \x20 return parts.join('|');\n\
+         }\n\n",
+    );
+
+    let mut names = Vec::new();
+    for table in tables {
+        let name = table
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("table has no name")?;
+        let columns = table
+            .get("columns")
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("table `{name}` has no columns"))?;
+        let pk_ordinals: Vec<usize> = table
+            .get("primary_key")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|n| n as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let column_types: Vec<&str> = columns
+            .iter()
+            .map(|c| {
+                c.get("type")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("table `{name}` has an untyped column"))
+            })
+            .collect::<Result<_, _>>()?;
+        for (i, ty) in column_types.iter().enumerate() {
+            if !is_decodable(ty) {
+                return Err(format!(
+                    "table `{name}` column {i} has unmodelled type `{ty}`: the key \
+                     projection cannot read it. Model the type or remove the column."
+                ));
+            }
+        }
+
+        // No declared pk → every column is the key (each row keys on itself).
+        let key_ordinals: Vec<usize> = if pk_ordinals.is_empty() {
+            (0..column_types.len()).collect()
+        } else {
+            pk_ordinals
+        };
+        let pk_end = key_ordinals.iter().copied().max().map_or(0, |m| m + 1);
+        let row_plan: Vec<String> = (0..pk_end)
+            .map(|i| {
+                format!(
+                    "['{}', {}]",
+                    column_types[i],
+                    key_ordinals.contains(&i)
+                )
+            })
+            .collect();
+        // A delete entry carries the key columns alone, in declaration order.
+        let delete_plan: Vec<String> = key_ordinals
+            .iter()
+            .map(|i| format!("['{}', true]", column_types[*i]))
+            .collect();
+
+        out.push_str(&doc_comment(
+            &[
+                format!("The SDK cache hooks for `{name}` (SDK-040): stable primary-key"),
+                "projections over the full-row and delete-entry wire layouts.".to_owned(),
+            ],
+            "",
+        ));
+        out.push_str(&format!(
+            "export function tableSchema{name}(): TableSchema {{\n\
+             \x20 const rowPlan = [{row}] as ReadonlyArray<readonly [FluxType, boolean]>;\n\
+             \x20 const deletePlan = [{delete}] as ReadonlyArray<readonly [FluxType, boolean]>;\n\
+             \x20 return {{\n\
+             \x20   name: '{name}',\n\
+             \x20   pkOfRow: (row) => projectKey(row, rowPlan),\n\
+             \x20   pkOfDelete: (entry) => projectKey(entry, deletePlan),\n\
+             \x20 }};\n\
+             }}\n\n",
+            row = row_plan.join(", "),
+            delete = delete_plan.join(", "),
+        ));
+        names.push(name);
+    }
+
+    out.push_str(&doc_comment(
+        &[
+            "Every table's cache hooks, in schema order — ready to pass as the".to_owned(),
+            "`tables` option of `FluxumClient.connect`.".to_owned(),
+        ],
+        "",
+    ));
+    let calls: Vec<String> = names
+        .iter()
+        .map(|n| format!("tableSchema{n}()"))
+        .collect();
+    out.push_str(&format!(
+        "export function allTableSchemas(): TableSchema[] {{\n\
+         \x20 return [{}];\n\
+         }}\n",
+        calls.join(", ")
+    ));
+    Ok(out)
+}
+
 /// The interface the generated wrappers call through, plus the branded
 /// scalar aliases the row types use.
 fn client_ts(banner: &str) -> String {
@@ -282,7 +413,7 @@ export interface ReducerCaller {{\n\
 
 fn types_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
     let mut out = String::from(banner);
-    out.push_str("import type { ConnectionId, Identity, Timestamp } from './client';\n\n");
+    out.push_str("import type { ConnectionId, Identity, Timestamp } from './client.ts';\n\n");
     // Re-export so a consumer importing only `types` still gets the scalars.
     out.push_str("export type { ConnectionId, Identity, Timestamp };\n\n");
 
@@ -395,7 +526,7 @@ fn reducers_ts(banner: &str, reducers: &[Value], schema_version: u64) -> Result<
 
     let mut out = String::from(banner);
     out.push_str(&format!(
-        "import type {{ {} }} from './client';\n\n",
+        "import type {{ {} }} from './client.ts';\n\n",
         used.join(", ")
     ));
     out.push_str(&format!(
@@ -411,7 +542,13 @@ fn reducers_ts(banner: &str, reducers: &[Value], schema_version: u64) -> Result<
          * them.\n\
          */\n\
          export class Reducers {\n\
-         \x20 constructor(private readonly client: ReducerCaller) {}\n",
+         \x20 // A real private field, not a TS parameter property: the emitted\n\
+         \x20 // code must be type-ERASABLE so Node's strip-only TypeScript mode\n\
+         \x20 // can load it directly.\n\
+         \x20 readonly #client: ReducerCaller;\n\n\
+         \x20 constructor(client: ReducerCaller) {\n\
+         \x20   this.#client = client;\n\
+         \x20 }\n",
     );
 
     for reducer in reducers {
@@ -457,7 +594,7 @@ fn reducers_ts(banner: &str, reducers: &[Value], schema_version: u64) -> Result<
         out.push('\n');
         out.push_str(&doc_comment(&doc, "  "));
         out.push_str(&format!(
-            "  {}({}): Promise<void> {{\n    return this.client.callReducer('{name}', [{}]);\n  }}\n",
+            "  {}({}): Promise<void> {{\n    return this.#client.callReducer('{name}', [{}]);\n  }}\n",
             method_name(name),
             signature.join(", "),
             argument_names.join(", "),
@@ -470,10 +607,11 @@ fn reducers_ts(banner: &str, reducers: &[Value], schema_version: u64) -> Result<
 fn index_ts(banner: &str) -> String {
     format!(
         "{banner}\
-export * from './client';\n\
-export * from './types';\n\
-export * from './decoders';\n\
-export * from './reducers';\n"
+export * from './client.ts';\n\
+export * from './types.ts';\n\
+export * from './decoders.ts';\n\
+export * from './schemas.ts';\n\
+export * from './reducers.ts';\n"
     )
 }
 
@@ -585,7 +723,7 @@ mod tests {
             "{reducers}"
         );
         assert!(
-            reducers.contains("this.client.callReducer('complete_task', [task_id])"),
+            reducers.contains("this.#client.callReducer('complete_task', [task_id])"),
             "{reducers}"
         );
         // A schedule-only reducer answers clients 403 — emitting a method for
@@ -603,7 +741,7 @@ mod tests {
         let files = generate(&schema()).unwrap();
         let reducers = &files["reducers.ts"];
         assert!(
-            reducers.contains("import type { ReducerCaller } from './client';"),
+            reducers.contains("import type { ReducerCaller } from './client.ts';"),
             "{reducers}"
         );
 
@@ -615,10 +753,40 @@ mod tests {
         let files = generate(&with_identity).unwrap();
         let reducers = &files["reducers.ts"];
         assert!(
-            reducers.contains("import type { Identity, ReducerCaller } from './client';"),
+            reducers.contains("import type { Identity, ReducerCaller } from './client.ts';"),
             "{reducers}"
         );
         assert!(reducers.contains("who: Identity"), "{reducers}");
+    }
+
+    #[test]
+    fn a_table_gets_its_cache_hooks() {
+        // The Rust generator's `table_schema()` twin: `FluxumClient.connect`
+        // takes these as its `tables` option, closing the "hand-written pk
+        // projections" gap the same way the decoders closed the decode one.
+        let files = generate(&schema()).unwrap();
+        let schemas = &files["schemas.ts"];
+        assert!(
+            schemas.contains("export function tableSchemaTask(): TableSchema"),
+            "{schemas}"
+        );
+        // Task's pk is column 0 (U64): the row plan reads it as the key...
+        assert!(
+            schemas.contains("const rowPlan = [['U64', true]]"),
+            "{schemas}"
+        );
+        // ...and the delete plan reads the pk-only layout (SPEC-006).
+        assert!(
+            schemas.contains("const deletePlan = [['U64', true]]"),
+            "{schemas}"
+        );
+        assert!(
+            schemas.contains("export function allTableSchemas(): TableSchema[]"),
+            "{schemas}"
+        );
+        assert!(schemas.contains("return [tableSchemaTask()];"), "{schemas}");
+        // Re-exported like every sibling.
+        assert!(files["index.ts"].contains("export * from './schemas.ts';"));
     }
 
     #[test]
@@ -637,7 +805,7 @@ mod tests {
         let files = generate(&schema()).unwrap();
         let decoders = &files["decoders.ts"];
         assert!(decoders.contains("import { decodeRow } from '@hivehub/fluxum';"), "{decoders}");
-        assert!(decoders.contains("import type { Task } from './types';"), "{decoders}");
+        assert!(decoders.contains("import type { Task } from './types.ts';"), "{decoders}");
         assert!(
             decoders.contains("{ name: 'id', type: 'U64' as FluxType }"),
             "{decoders}"

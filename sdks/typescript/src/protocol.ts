@@ -113,7 +113,12 @@ export class FluxumFrameReader {
  * older frames.
  */
 export function encodeMessage(tag: string, payload: unknown[]): Uint8Array {
-  return encodeFrame(encodeMsg([tag, payload]));
+  // `useBigInt64`: a 64-bit reducer argument arrives as a `bigint` (the
+  // generated signatures type u64/i64 that way on purpose — `number` would
+  // silently lose precision past 2^53), and the default encoder REJECTS
+  // BigInt outright. Encode-only: decoding stays as-is, so ids and other
+  // small integers keep arriving as plain numbers.
+  return encodeFrame(encodeMsg([tag, payload], { useBigInt64: true }));
 }
 
 /** A decoded server message: its tag and positional payload. */

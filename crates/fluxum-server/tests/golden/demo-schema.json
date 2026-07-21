@@ -1,0 +1,161 @@
+{
+  "document_version": 1,
+  "procedures": [],
+  "query": {
+    "match": "col MATCH 'term \"a phrase\" prefix*' [ORDER BY SCORE DESC] [SELECT *, SCORE]",
+    "operators": [
+      "=",
+      "IN",
+      "BETWEEN",
+      "<",
+      ">",
+      "<=",
+      ">=",
+      "MATCH"
+    ],
+    "pagination": "keyset: ORDER BY <indexed col> [, <pk>] LIMIT n AFTER (value, pk)"
+  },
+  "reducers": [
+    {
+      "client_callable": true,
+      "max_rate_per_sec": 0,
+      "name": "add_task",
+      "params": [
+        {
+          "name": "title",
+          "type": "String"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    },
+    {
+      "client_callable": true,
+      "max_rate_per_sec": 0,
+      "name": "complete_task",
+      "params": [
+        {
+          "name": "id",
+          "type": "u64"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    },
+    {
+      "client_callable": true,
+      "max_rate_per_sec": 20,
+      "name": "send_chat",
+      "params": [
+        {
+          "name": "channel",
+          "type": "u32"
+        },
+        {
+          "name": "content",
+          "type": "String"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    }
+  ],
+  "schema_version": 1,
+  "tables": [
+    {
+      "access": "Public",
+      "auto_inc": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "U64"
+        },
+        {
+          "name": "sender",
+          "type": "Identity"
+        },
+        {
+          "name": "channel",
+          "type": "U32"
+        },
+        {
+          "name": "content",
+          "type": "Str"
+        },
+        {
+          "name": "sent_at",
+          "type": "Timestamp"
+        }
+      ],
+      "indexes": [],
+      "name": "ChatMessage",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
+    },
+    {
+      "access": "Ephemeral",
+      "auto_inc": null,
+      "columns": [
+        {
+          "name": "connection",
+          "type": "ConnectionId"
+        },
+        {
+          "name": "identity",
+          "type": "Identity"
+        },
+        {
+          "name": "connected_at",
+          "type": "Timestamp"
+        }
+      ],
+      "indexes": [],
+      "name": "OnlineUser",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
+    },
+    {
+      "access": "Public",
+      "auto_inc": "id",
+      "columns": [
+        {
+          "name": "id",
+          "type": "U64"
+        },
+        {
+          "name": "owner",
+          "type": "Identity"
+        },
+        {
+          "name": "title",
+          "type": "Str"
+        },
+        {
+          "name": "done",
+          "type": "Bool"
+        }
+      ],
+      "indexes": [],
+      "name": "Task",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [],
+      "visibility": {
+        "column": "owner",
+        "kind": "owner_only"
+      }
+    }
+  ],
+  "views": []
+}

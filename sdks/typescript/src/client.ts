@@ -316,7 +316,7 @@ export class FluxumClient {
    * push stream and may land before or after this resolves, so an application
    * that needs the row should watch the callback rather than assume.
    */
-  async callReducer(name: string, args: unknown[] = []): Promise<void> {
+  async callReducer(name: string, args: readonly unknown[] = []): Promise<void> {
     const message = await this.#request('ReducerCall', (id) => [id, name, null, args, null]);
     const outcome = message.payload[1];
     if (!Array.isArray(outcome) || outcome[0] === 'Ok') return;
