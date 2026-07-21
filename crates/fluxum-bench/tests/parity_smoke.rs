@@ -278,7 +278,6 @@ fn cold_read_workload_survives_a_restart_on_both_sides() {
     assert_eq!(runs.len(), 2);
     assert_eq!(runs[0].ops, 4);
     assert_eq!(runs[0].latencies_ns.len(), 4);
-    drop(restart);
 
     let mut baseline = SqliteBaseline::start("cold");
     let side = BaselineSide::new(baseline.base_url.clone(), "sqlite");
