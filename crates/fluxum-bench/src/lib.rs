@@ -14,9 +14,13 @@
 //!   (TST-091);
 //! - [`fluxum_side`] — the Fluxum side, driven through the published Rust
 //!   SDK against a real `fluxum-server`;
-//! - the baseline (app-server + PostgreSQL, SQLite variant) and the report
-//!   generator land with the remaining T6.3 items.
+//! - [`baseline`] — the incumbent side: the same app on axum + sqlx over
+//!   PostgreSQL (LISTEN/NOTIFY fan-out) or SQLite, served by its own
+//!   process; [`baseline_side`] is the driver's HTTP/WS client for it;
+//! - the report generator lands with the remaining T6.3 items.
 
+pub mod baseline;
+pub mod baseline_side;
 pub mod fluxum_side;
 pub mod measure;
 pub mod workload;

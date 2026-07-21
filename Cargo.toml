@@ -12,6 +12,10 @@ repository = "https://github.com/hivellm/fluxum"
 # Kept minimal for T0.1; external deps land here as phases need them.
 [workspace.dependencies]
 arc-swap = "1"
+# Parity-baseline stack (T6.3, TST-090): the representative incumbent
+# app-server the comparison runs against, plus the blocking clients the
+# workload driver uses. Confined to `fluxum-bench` (publish = false).
+axum = { version = "0.8", features = ["ws"] }
 crc = "3"
 crc32c = "0.6"
 criterion = "0.5"
@@ -41,6 +45,7 @@ sha2 = "0.10"
 # Already in the tree via tokio; direct use is the per-socket keepalive knob
 # (SPEC-026 SEC-042).
 socket2 = "0.6"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "postgres", "sqlite"] }
 chacha20poly1305 = "0.10"
 zeroize = { version = "1", features = ["derive"] }
 x25519-dalek = { version = "2", features = ["static_secrets"] }
@@ -62,7 +67,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 trybuild = "1"
+tungstenite = "0.27"
 unicode-normalization = "0.1"
+ureq = { version = "2", features = ["json"] }
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 zstd = "0.13"
 
