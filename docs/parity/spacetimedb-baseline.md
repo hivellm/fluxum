@@ -140,4 +140,33 @@ Recorded observations (honesty notes, not gaps):
    in-process number; the two are different measurements and the report never mixes them.
 3. **Container hop**: the SpacetimeDB server runs in a Linux container (Docker Desktop NAT)
    while `fluxum-server` is native — sub-ms of the socket-class deltas is environment, not
-   product; at the measured multiples (≥ 2.7×) it changes no verdict.
+   product; at the measured multiples (≥ 2.7×) it changes no verdict. Bounded by measurement
+   below.
+
+## Symmetric-environment check (2026-07-21): both servers in Docker
+
+To bound observation 3, `fluxum-server` was built for Linux (`rustlang/rust:nightly`,
+workspace release profile) and run in a container on the same Docker Desktop VM as the pinned
+SpacetimeDB, driver on the host in both cases. Because the development profile refuses a
+non-loopback bind with `auth: none` (AUTH-040 — by design), the container exposes the
+loopback-bound server through an in-container **nginx stream relay** (single-process epoll) —
+an extra hop only Fluxum pays, so these ratios are a **lower bound**. (A first attempt with a
+fork-per-connection `socat` relay was discarded: the relay itself became the bottleneck —
+e.g. steady e2e p99 15.4 ms vs 2.9 ms through nginx — a lesson in relay choice, not a product
+number.) Steady classes only; cold was not run (the harness's Fluxum cold path is
+self-boot-only today).
+
+| ratio | docker-vs-docker (nginx relay) | native-fluxum report |
+|---|---|---|
+| write_throughput | **13.70** | 59.35 |
+| e2e_p99 | **4.08** | 14.27 |
+| hot_p99 | 5.00 (structural) | 2.67 |
+| mixed_write_throughput | **15.75** | 49.21 |
+| mixed_read_p99 | 1.50 (structural) | 1.00 |
+| mixed_e2e_p99 | **23.34** | 4.48 |
+
+**Every class stays ≥ 1× with the environment symmetric** — the verdicts of the committed
+report survive containerization; what shrinks is Fluxum's own absolute numbers (write
+36.5k → 8.7k ops/s, e2e p99 0.76 → 2.88 ms), i.e. the container/NAT/relay tax on Fluxum's
+fast path, which SpacetimeDB's numbers already included. The honest product gap lies between
+the two columns.
