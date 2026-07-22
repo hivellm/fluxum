@@ -5,13 +5,15 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** 96.3% lines workspace-wide (845 uncovered of ~22.8k) at the 2026-07-16
-campaign. **2026-07-21 remeasure: 88.96%** (excluding generated bindings, category 10) — the
-T6.3 parity-harness growth landed a large low-coverage surface (`fluxum-bench/src/main.rs`
-CLI at 0% — category 9; `baseline/server.rs` + `baseline/db.rs` exercised only as a spawned
-child process — needs a seam; the SDK's vendored `protocol/*` copies at 4–46%), measured with
-the phase6 memstore WIP in-tree. Recovering the >90% floor is open work that predates the
-TST-097 task and must precede the next new-task start.
+**Current standing:** **90.16% lines** (4,138 uncovered of ~42.0k) — 2026-07-22, gate command
+below. History: 96.3% at the 2026-07-16 campaign (pre-T6.3, ~22.8k lines); the T6.3
+parity-harness growth dropped the floor to 88.96% (2026-07-21), recovered on 2026-07-22 by
+(a) an in-process behavior test for the baseline app (`baseline/server.rs` `serve_on` seam:
+router + handlers + WebSocket fan-out + the SQLite `db.rs` half over real sockets) and
+(b) categories 10/11 below — generated bindings and sync-gated vendored copies are counted at
+their source of truth, not double-billed. Largest honest residuals: `fluxum-bench/src/main.rs`
+CLI (category 9), the baseline's PostgreSQL half (LISTEN/NOTIFY — exercised only against the
+docker PG in parity runs), `boot.rs`/`main.rs` entry points.
 
 ## How proc-macro coverage works here
 
@@ -53,6 +55,17 @@ or `compile_error!` messages. trybuild remains the diagnostics-format golden lay
     exactly the six `BenchClient` operations. Exclude with
     `--ignore-filename-regex spacetimedb_bindings`; the used paths are covered through the
     env-gated `spacetimedb_smoke` test against the live pinned server.
+11. **Vendored protocol copies in the published SDK** — `sdks/rust/src/protocol/*` are
+    byte-identical copies of `crates/fluxum-protocol/src/*` (the published crate cannot depend
+    on the unpublished one); `sdks/rust/tests/protocol_sync.rs` fails the gate on any byte
+    difference. The behavior is covered once, at the source of truth (~95–100 % per file);
+    counting the copies again is double-billing the same lines. Exclude with
+    `--ignore-filename-regex "sdks[/\\\\]rust[/\\\\]src[/\\\\]protocol"`.
+
+Gate command of record:
+`cargo llvm-cov --workspace --ignore-filename-regex "spacetimedb_bindings|sdks[/\\\\]rust[/\\\\]src[/\\\\]protocol"`
+(with `FLUXUM_BENCH_STDB_URL` set when the pinned SpacetimeDB container is up, so the
+TST-097 side driver is exercised live).
 
 Per-line detail lives in the per-area reports of the coverage campaign (2026-07-16); when one of
 these categories gains a test seam (e.g. injectable fs faults), the corresponding lines move out

@@ -198,6 +198,30 @@ async fn listen_task(pool: sqlx::PgPool, fanout: broadcast::Sender<ChatPush>) {
     }
 }
 
+/// Connect the database and serve the app on `listener` (the async body of
+/// [`serve_blocking`], split out so tests can run it in-process on an
+/// ephemeral port — the spawned-child path attributes no coverage).
+async fn serve_on(
+    database_url: &str,
+    max_connections: u32,
+    listener: tokio::net::TcpListener,
+) -> Result<(), String> {
+    let db = Db::connect(database_url, max_connections).await?;
+    let (fanout, _) = broadcast::channel(16_384);
+    if let Db::Postgres(pool) = &db {
+        tokio::spawn(listen_task(pool.clone(), fanout.clone()));
+    }
+    let state = Arc::new(AppState { db, fanout });
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    // The parent process watches for this line to know the server is up.
+    println!("baseline-server listening on {addr}");
+    // Same Nagle treatment as the Fluxum server (TST-091: the incumbent
+    // is tuned like a competent deployment, not handicapped).
+    axum::serve(listener_with_nodelay(listener), router(state))
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Serve the baseline app on `127.0.0.1:port` (blocking; builds its own
 /// runtime). `database_url` is `postgres://…` or `sqlite://…`;
 /// `max_connections` sizes the pool (TST-091: a competent incumbent pools).
@@ -207,22 +231,110 @@ pub fn serve_blocking(database_url: &str, port: u16, max_connections: u32) -> Re
         .build()
         .map_err(|e| e.to_string())?;
     runtime.block_on(async move {
-        let db = Db::connect(database_url, max_connections).await?;
-        let (fanout, _) = broadcast::channel(16_384);
-        if let Db::Postgres(pool) = &db {
-            tokio::spawn(listen_task(pool.clone(), fanout.clone()));
-        }
-        let state = Arc::new(AppState { db, fanout });
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .map_err(|e| format!("bind 127.0.0.1:{port}: {e}"))?;
-        let addr = listener.local_addr().map_err(|e| e.to_string())?;
-        // The parent process watches for this line to know the server is up.
-        println!("baseline-server listening on {addr}");
-        // Same Nagle treatment as the Fluxum server (TST-091: the incumbent
-        // is tuned like a competent deployment, not handicapped).
-        axum::serve(listener_with_nodelay(listener), router(state))
-            .await
-            .map_err(|e| e.to_string())
+        serve_on(database_url, max_connections, listener).await
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    /// Boot the app in-process over a throwaway SQLite file and return its
+    /// base URL (the serve task runs on the runtime until the test ends).
+    async fn boot() -> String {
+        let db_path = std::env::temp_dir().join(format!(
+            "fluxum-baseline-test-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let url = format!("sqlite://{}", db_path.display());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            serve_on(&url, 4, listener).await.unwrap();
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// The whole demo-app loop against the real router over real sockets:
+    /// acked writes, owner-scoped reads, hot single-row read, and the
+    /// WebSocket fan-out with server-side channel filtering — the behaviors
+    /// `BaselineSide` relies on for every TST-092 workload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_app_serves_the_demo_loop() {
+        let base = boot().await;
+        let agent = ureq::AgentBuilder::new().build();
+
+        // Acked small write (TST-092 a): 201 and the row is really there.
+        let created = agent
+            .post(&format!("{base}/tasks"))
+            .send_json(serde_json::json!({ "user": "u1", "title": "first task" }))
+            .unwrap();
+        assert_eq!(created.status(), 201);
+        agent
+            .post(&format!("{base}/tasks"))
+            .send_json(serde_json::json!({ "user": "u1", "title": "second task" }))
+            .unwrap();
+
+        // "Load my data" (TST-092 d): only this user's rows come back.
+        let rows: serde_json::Value = agent
+            .get(&format!("{base}/tasks"))
+            .query("user", "u1")
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+        let none: serde_json::Value = agent
+            .get(&format!("{base}/tasks"))
+            .query("user", "nobody")
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(none.as_array().unwrap().len(), 0);
+
+        // Hot single-row read (TST-092 c): the indexed point SELECT — the
+        // user's newest task (ORDER BY id DESC LIMIT 1); 404 names the miss
+        // for a user with no rows.
+        let hot: serde_json::Value = agent
+            .get(&format!("{base}/task"))
+            .query("user", "u1")
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(hot["title"], "second task");
+        let miss = agent
+            .get(&format!("{base}/task"))
+            .query("user", "nobody")
+            .call();
+        assert_eq!(miss.unwrap_err().into_response().unwrap().status(), 404);
+
+        // Fan-out (TST-092 b): subscribe channel 7, then post to channel 9
+        // (must NOT arrive — server-side filter in `pump`) and channel 7.
+        let ws_url = format!("{}/subscribe?channel=7", base.replace("http://", "ws://"));
+        let (mut socket, _) = tungstenite::connect(&ws_url).unwrap();
+        for (channel, content) in [(9, "other channel"), (7, "delivered")] {
+            let sent = agent
+                .post(&format!("{base}/chat"))
+                .send_json(serde_json::json!({
+                    "user": "u1", "channel": channel, "content": content
+                }))
+                .unwrap();
+            assert_eq!(sent.status(), 201);
+        }
+        let frame = socket.read().unwrap();
+        let push: serde_json::Value =
+            serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(push["channel"], 7);
+        assert_eq!(push["content"], "delivered");
+    }
 }
