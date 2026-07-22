@@ -251,7 +251,7 @@ impl MemStore {
                 id,
                 Arc::new(TableState {
                     schema: table,
-                    rows: BTreeMap::new(),
+                    rows: imbl::OrdMap::new(),
                     indexes: build_btree_indexes(table)?,
                     spatial: build_spatial_index(table, &options)?,
                     fulltext: build_fulltext_indexes(table),

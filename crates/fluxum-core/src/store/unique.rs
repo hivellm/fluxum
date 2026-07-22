@@ -15,8 +15,6 @@
 //! is all a constraint needs, and the transform already gives every value —
 //! including `NaN` and `None` — one deterministic, prefix-free encoding.
 
-use std::collections::BTreeMap;
-
 use crate::error::{FluxumError, Result};
 use crate::index::btree;
 use crate::schema::TableSchema;
@@ -28,7 +26,9 @@ use crate::store::row::{PkBytes, Row, RowValue};
 pub(crate) struct UniqueIndex {
     /// Constraint column ordinals in declared order (DM-006).
     columns: &'static [u16],
-    map: BTreeMap<Vec<u8>, PkBytes>,
+    /// Persistent map: O(1) clone under the commit merge's copy-on-write
+    /// (phase6_memstore-structural-sharing).
+    map: imbl::OrdMap<Vec<u8>, PkBytes>,
 }
 
 impl UniqueIndex {
@@ -37,7 +37,7 @@ impl UniqueIndex {
     pub(crate) fn new(columns: &'static [u16]) -> Self {
         Self {
             columns,
-            map: BTreeMap::new(),
+            map: imbl::OrdMap::new(),
         }
     }
 

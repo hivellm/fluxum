@@ -15,6 +15,7 @@ arc-swap.workspace = true
 crc32c.workspace = true
 fluxum-protocol.workspace = true
 hmac.workspace = true
+imbl.workspace = true
 inventory.workspace = true
 jsonwebtoken.workspace = true
 lz4.workspace = true
@@ -67,4 +68,8 @@ harness = false
 
 [[bench]]
 name = "txn_commit"
+harness = false
+
+[[bench]]
+name = "table_clone"
 harness = false

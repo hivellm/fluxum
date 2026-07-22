@@ -15,17 +15,23 @@ use crate::store::unique::UniqueIndex;
 
 /// One table's committed contents (STG-002).
 ///
-/// `rows` is the logical primary map (BTreeMap for O(log n) point lookup and
-/// deterministic iteration); `indexes` the secondary B-tree indexes (T2.4)
-/// and `spatial` the SPEC-008 spatial index (T2.5), all maintained together
-/// with `rows` inside the commit merge so a published snapshot's rows and
-/// indexes are always mutually consistent.
+/// `rows` is the logical primary map — a **persistent** ordered map
+/// (`imbl::OrdMap`: O(log n) point lookup, deterministic key-order
+/// iteration, and O(1) clone via structurally-shared Arc'd chunks). The
+/// commit merge clones the map handle, path-copies only the chunks its k
+/// touched rows live in (O(k·log n)), and swaps — never an O(n) table
+/// clone, which is what made commit cost grow with table size
+/// (phase6_memstore-structural-sharing; decision bench
+/// `benches/table_clone.rs`). `indexes` are the secondary B-tree indexes
+/// (T2.4) and `spatial` the SPEC-008 spatial index (T2.5), all maintained
+/// together with `rows` inside the commit merge so a published snapshot's
+/// rows and indexes are always mutually consistent.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
     pub(crate) schema: &'static TableSchema,
     /// Primary row map, keyed by FluxBIN-encoded PK.
-    pub(crate) rows: BTreeMap<PkBytes, Row>,
+    pub(crate) rows: imbl::OrdMap<PkBytes, Row>,
     /// Secondary B-tree indexes by stable id (STG-051), one per
     /// `#[index(btree(...))]` declaration (DM-030/DM-031).
     pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
@@ -553,7 +559,7 @@ mod tests {
 
     /// A hand-built table state (the corruption seam for invariant tests).
     fn state_with_rows() -> TableState {
-        let mut rows = BTreeMap::new();
+        let mut rows = imbl::OrdMap::new();
         rows.insert(pk(1), row(1, 1.0, 2.0));
         TableState {
             schema: &COV,

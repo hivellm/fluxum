@@ -37,7 +37,6 @@
 //! open/closed/half-open range, prefix scan — to a single contiguous
 //! `[start, end)` byte range over the index map.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 use crate::error::{FluxumError, Result};
@@ -55,7 +54,10 @@ pub struct BTreeIndex {
     columns: &'static [u16],
     /// Memcomparable key → PKs of the rows with that key. PKs within one
     /// key are in encoded-PK byte order (deterministic, not numeric).
-    map: BTreeMap<Vec<u8>, BTreeSet<PkBytes>>,
+    /// Persistent maps/sets so the commit merge's copy-on-write clones the
+    /// handle in O(1) and path-copies only what a write touches
+    /// (phase6_memstore-structural-sharing).
+    map: imbl::OrdMap<Vec<u8>, imbl::OrdSet<PkBytes>>,
 }
 
 impl BTreeIndex {
@@ -63,7 +65,7 @@ impl BTreeIndex {
     pub(crate) fn new(columns: &'static [u16]) -> Self {
         Self {
             columns,
-            map: BTreeMap::new(),
+            map: imbl::OrdMap::new(),
         }
     }
 
@@ -91,7 +93,11 @@ impl BTreeIndex {
     /// Add `row`'s index entry (commit merge, insert side).
     pub(crate) fn insert(&mut self, row: &Row, pk: PkBytes) -> Result<()> {
         let key = self.key_of(row)?;
-        self.map.entry(key).or_default().insert(pk);
+        // Clone-modify-reinsert: the set handle clone is O(1) (persistent
+        // set), and the map insert path-copies O(log n).
+        let mut pks = self.map.get(&key).cloned().unwrap_or_default();
+        pks.insert(pk);
+        self.map.insert(key, pks);
         Ok(())
     }
 
@@ -99,10 +105,13 @@ impl BTreeIndex {
     /// slots are dropped so the map stays bit-identical to a fresh rebuild.
     pub(crate) fn remove(&mut self, row: &Row, pk: &PkBytes) -> Result<()> {
         let key = self.key_of(row)?;
-        if let Some(pks) = self.map.get_mut(&key) {
+        if let Some(existing) = self.map.get(&key) {
+            let mut pks = existing.clone();
             pks.remove(pk);
             if pks.is_empty() {
                 self.map.remove(&key);
+            } else {
+                self.map.insert(key, pks);
             }
         }
         Ok(())

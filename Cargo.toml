@@ -35,6 +35,12 @@ fluxum-protocol = { path = "crates/fluxum-protocol" }
 fluxum-sdk = { path = "sdks/rust" }
 fluxum-testmod = { path = "crates/fluxum-testmod" }
 hmac = "0.12"
+# Persistent (structurally-shared) collections for MemStore's committed
+# state: table clones become O(1) Arc bumps and a commit touching k rows
+# costs O(k·log n) path copies instead of an O(n) table clone
+# (phase6_memstore-structural-sharing; decision bench: benches/table_clone.rs).
+# MPL-2.0 (file-level copyleft): linked unmodified, compatible with Apache-2.0.
+imbl = "7"
 inventory = "0.3"
 jsonwebtoken = "9"
 lz4 = "1"

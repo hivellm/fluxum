@@ -4,9 +4,16 @@
 //! group-commit flush actor and never waits for fsync).
 //!
 //! The measured path is the full pipeline cycle: submit → begin → upsert →
-//! commit merge (copy-on-write of the touched table) → commit-log enqueue →
-//! respond. A p50/p99/max summary over individual commits is printed before
-//! the criterion run, since criterion reports mean/median only.
+//! commit merge → commit-log enqueue → respond. A p50/p99/max summary over
+//! individual commits is printed before the criterion run, since criterion
+//! reports mean/median only.
+//!
+//! Runs at TWO table sizes — 1k and 1M committed rows — asserting the p99
+//! target at both: since phase6_memstore-structural-sharing the commit
+//! merge path-copies only what a write touches (O(k·log n)), so commit
+//! latency must not grow with table size. (Before that change the merge
+//! deep-cloned the touched table, and this bench's 1k-row case was the
+//! only reason NFR-03 appeared to hold.)
 #![allow(clippy::unwrap_used)]
 
 use std::hint::black_box;
@@ -48,11 +55,7 @@ static READING: TableSchema = TableSchema {
     visibility: VisibilityRule::PublicAll,
 };
 
-/// Committed rows in the touched table. The T2.1 commit merge deep-clones
-/// the touched table's key map (the documented Phase-2 copy-on-write
-/// trade-off), so this sizes the per-commit merge cost.
-const ROWS: u64 = 1_000;
-/// Individual samples for the p99 summary.
+/// Individual samples for each p99 summary.
 const SAMPLES: usize = 2_000;
 
 fn reading(sensor_id: u64, value: f64) -> Vec<RowValue> {
@@ -63,11 +66,10 @@ fn reading(sensor_id: u64, value: f64) -> Vec<RowValue> {
     ]
 }
 
-fn txn_commit(c: &mut Criterion) {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .build()
-        .unwrap();
+/// One measured configuration: a fresh store/pipeline with `rows` committed
+/// rows, `SAMPLES` individual `update_reading` commits, p99 asserted < 1 ms.
+/// Returns the p99 for the size-independence check.
+fn measure_at(c: &mut Criterion, rt: &tokio::runtime::Runtime, rows: u64) -> Duration {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemStore::new(&Schema::from_tables([&READING]).unwrap()).unwrap());
     let log = Arc::new(CommitLog::open(dir.path(), 0, 1, CommitLogOptions::default()).unwrap());
@@ -76,20 +78,27 @@ fn txn_commit(c: &mut Criterion) {
     let _worker = rt.spawn(worker.run());
     let rid = store.table_id("Reading").unwrap();
 
-    // Prepopulate the sensor rows.
-    rt.block_on(pipeline.call(Box::new(move |tx| {
-        for id in 0..ROWS {
-            tx.insert(rid, reading(id, 20.0))?;
-        }
-        Ok(())
-    })))
-    .unwrap();
+    // Prepopulate the sensor rows in batches (one giant transaction would
+    // hold the writer for the whole seed).
+    let mut seeded = 0u64;
+    while seeded < rows {
+        let batch_end = (seeded + 100_000).min(rows);
+        let range = seeded..batch_end;
+        rt.block_on(pipeline.call(Box::new(move |tx| {
+            for id in range {
+                tx.insert(rid, reading(id, 20.0))?;
+            }
+            Ok(())
+        })))
+        .unwrap();
+        seeded = batch_end;
+    }
 
     // `update_reading`: the canonical small-write reducer — one committed
     // row replaced by primary key.
     let commit_once = |i: u64| {
         rt.block_on(pipeline.call(Box::new(move |tx| {
-            tx.upsert(rid, reading(i % ROWS, 20.0 + (i % 80) as f64 / 8.0))?;
+            tx.upsert(rid, reading(i % rows, 20.0 + (i % 80) as f64 / 8.0))?;
             Ok(())
         })))
         .unwrap()
@@ -109,21 +118,43 @@ fn txn_commit(c: &mut Criterion) {
     let max = latencies[latencies.len() - 1];
     println!(
         "NFR-03 update_reading commit latency over {SAMPLES} commits \
-         ({ROWS}-row table, async log writes): p50={p50:?} p99={p99:?} max={max:?} \
+         ({rows}-row table, async log writes): p50={p50:?} p99={p99:?} max={max:?} \
          — target p99 < 1 ms"
     );
     assert!(
         p99 < Duration::from_millis(1),
-        "NFR-03 violated: commit p99 {p99:?} >= 1 ms"
+        "NFR-03 violated at {rows} rows: commit p99 {p99:?} >= 1 ms"
     );
 
     let mut i = SAMPLES as u64;
-    c.bench_function("txn_commit_update_reading_1k", |b| {
+    c.bench_function(&format!("txn_commit_update_reading_{rows}"), |b| {
         b.iter(|| {
             i += 1;
             black_box(commit_once(i))
         });
     });
+    p99
+}
+
+fn txn_commit(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .build()
+        .unwrap();
+
+    let p99_small = measure_at(c, &rt, 1_000);
+    let p99_large = measure_at(c, &rt, 1_000_000);
+
+    // Size independence: the structural-sharing commit merge must not let a
+    // 1000× larger table cost more than a small multiple (allowing for
+    // deeper tree paths and cache effects — NOT the ~1000× a table clone
+    // would show).
+    let ratio = p99_large.as_secs_f64() / p99_small.as_secs_f64().max(1e-9);
+    println!("NFR-03 size check: p99(1M) / p99(1k) = {ratio:.2}");
+    assert!(
+        ratio < 10.0,
+        "commit p99 grew {ratio:.1}× from 1k to 1M rows — the merge is scaling with table size"
+    );
 }
 
 criterion_group!(benches, txn_commit);

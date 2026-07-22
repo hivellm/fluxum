@@ -1,0 +1,11 @@
+{
+  "id": 2,
+  "slug": "imbl-persistent-maps-for-memstore-structural-sharing",
+  "title": "imbl persistent maps for MemStore structural sharing",
+  "status": "accepted",
+  "date": "2026-07-22",
+  "relatedTasks": [
+    "phase6_memstore-structural-sharing"
+  ],
+  "supersededBy": null
+}

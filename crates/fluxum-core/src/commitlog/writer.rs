@@ -126,9 +126,10 @@ impl CommitLog {
         });
         let syncer = {
             let sync = Arc::clone(&sync);
+            let interval = options.sync_interval;
             std::thread::Builder::new()
                 .name(format!("fluxum-commitlog-sync-{shard_id}"))
-                .spawn(move || sync.run())
+                .spawn(move || sync.run(interval))
                 .map_err(FluxumError::Io)?
         };
         let actor_state = Actor {
@@ -546,16 +547,22 @@ impl SyncShared {
     }
 
     /// The syncer thread: fsync behind the writer, group-commit style — one
-    /// fsync covers every batch that landed while the previous one ran.
-    fn run(self: &Arc<Self>) {
+    /// fsync covers every batch that landed since the previous one.
+    ///
+    /// Fsyncs are **spaced** by `interval` rather than issued back-to-back:
+    /// the OS serializes a file's writes against an in-flight flush of the
+    /// same file, so continuous fsyncs would make the writer's `write_all`
+    /// (and with it the TXN-004 ack watermark) wait out the disk on nearly
+    /// every batch. During the pause the writer keeps appending freely and
+    /// the next fsync covers everything it wrote.
+    fn run(self: &Arc<Self>, interval: std::time::Duration) {
+        let mut last_sync: Option<std::time::Instant> = None;
         loop {
             let (handle, target) = {
                 let mut cursor = self.lock();
                 loop {
-                    if cursor.written > cursor.synced
-                        && let Some(handle) = cursor.handle.as_ref()
-                    {
-                        break (Arc::clone(handle), cursor.written);
+                    if cursor.written > cursor.synced && cursor.handle.is_some() {
+                        break;
                     }
                     if cursor.shutdown {
                         return;
@@ -565,9 +572,29 @@ impl SyncShared {
                         .wait(cursor)
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                 }
+                // Pace: coalesce further batches until the interval elapses.
+                // A shutdown ends the pause early — the writer's inline
+                // final flush has already made everything durable.
+                while !cursor.shutdown {
+                    let since = last_sync.map_or(interval, |at| at.elapsed());
+                    let Some(remaining) = interval.checked_sub(since).filter(|d| !d.is_zero())
+                    else {
+                        break;
+                    };
+                    let (paused, _timeout) = self
+                        .cv
+                        .wait_timeout(cursor, remaining)
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    cursor = paused;
+                }
+                let Some(handle) = cursor.handle.as_ref().map(Arc::clone) else {
+                    continue;
+                };
+                (handle, cursor.written)
             };
             match handle.sync_data() {
                 Ok(()) => {
+                    last_sync = Some(std::time::Instant::now());
                     self.fsyncs.fetch_add(1, Ordering::SeqCst);
                     {
                         let mut cursor = self.lock();

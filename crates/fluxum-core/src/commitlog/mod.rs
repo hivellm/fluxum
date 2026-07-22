@@ -85,6 +85,19 @@ pub struct CommitLogOptions {
     pub max_batch: usize,
     /// Initial capacity of the actor's write buffer (default 128 KiB).
     pub write_buffer_bytes: usize,
+    /// Minimum spacing between group-commit fsyncs (default 5 ms;
+    /// `Duration::ZERO` = fsync after every written batch).
+    ///
+    /// Why spacing exists: the OS serializes a file's writes against an
+    /// in-flight flush of the same file, so a back-to-back fsync loop makes
+    /// every append (and with it the TXN-004 `written` ack watermark) wait
+    /// out the previous fsync — acks degrade to disk speed. Spaced fsyncs
+    /// leave the writer unblocked for the whole interval and coalesce more
+    /// batches per flush. The durable watermark lags by at most this
+    /// interval + one fsync, well inside the NFR-08 ~50 ms crash-loss
+    /// budget — and acked (`written`) data still survives a process crash
+    /// regardless.
+    pub sync_interval: std::time::Duration,
 }
 
 impl Default for CommitLogOptions {
@@ -94,6 +107,7 @@ impl Default for CommitLogOptions {
             queue_depth: 4096,
             max_batch: 4096,
             write_buffer_bytes: 128 * 1024,
+            sync_interval: std::time::Duration::from_millis(5),
         }
     }
 }

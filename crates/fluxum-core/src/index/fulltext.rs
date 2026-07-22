@@ -417,10 +417,12 @@ pub struct FullTextIndexState {
     /// The deterministic analyzer (FTS-010).
     analyzer: Analyzer,
     /// Positional posting lists: `term → { pk → positions }` (FTS-020).
-    /// A `BTreeMap` so term-prefix scans are range iteration.
-    postings: BTreeMap<String, BTreeMap<PkBytes, Posting>>,
+    /// Ordered maps so term-prefix scans are range iteration; persistent
+    /// (imbl) so the commit merge's copy-on-write clones handles in O(1)
+    /// instead of the whole corpus (phase6_memstore-structural-sharing).
+    postings: imbl::OrdMap<String, imbl::OrdMap<PkBytes, Posting>>,
     /// Per-document length (kept-term count) for BM25 (FTS-020).
-    doc_len: BTreeMap<PkBytes, u32>,
+    doc_len: imbl::OrdMap<PkBytes, u32>,
     /// Sum of `doc_len` over all documents — the BM25 `avgdl` numerator.
     total_len: u64,
     /// FTS-022 gate: `false` while the index awaits its post-recovery
@@ -435,8 +437,8 @@ impl FullTextIndexState {
         Self {
             column,
             analyzer,
-            postings: BTreeMap::new(),
-            doc_len: BTreeMap::new(),
+            postings: imbl::OrdMap::new(),
+            doc_len: imbl::OrdMap::new(),
             total_len: 0,
             ready: true,
         }
@@ -539,10 +541,11 @@ impl FullTextIndexState {
             per_term.entry(term).or_default().push(pos);
         }
         for (term, positions) in per_term {
-            self.postings
-                .entry(term)
-                .or_default()
-                .insert(pk.clone(), Posting { positions });
+            // Clone-modify-reinsert: the inner map handle clone is O(1)
+            // (persistent map), and the outer insert path-copies O(log n).
+            let mut docs = self.postings.get(&term).cloned().unwrap_or_default();
+            docs.insert(pk.clone(), Posting { positions });
+            self.postings.insert(term, docs);
         }
         self.doc_len.insert(pk, doc_len);
         self.total_len += u64::from(doc_len);
@@ -558,10 +561,13 @@ impl FullTextIndexState {
         }
         if let Some(text) = self.document_text(row)? {
             for (term, _) in self.analyzer.analyze(&text) {
-                if let Some(docs) = self.postings.get_mut(&term) {
+                if let Some(existing) = self.postings.get(&term) {
+                    let mut docs = existing.clone();
                     docs.remove(pk);
                     if docs.is_empty() {
                         self.postings.remove(&term);
+                    } else {
+                        self.postings.insert(term, docs);
                     }
                 }
             }
@@ -598,10 +604,7 @@ impl FullTextIndexState {
                     let mut union: HashMap<PkBytes, u32> = HashMap::new();
                     for (_, docs) in self
                         .postings
-                        .range::<String, _>((
-                            std::ops::Bound::Included(prefix.clone()),
-                            std::ops::Bound::Unbounded,
-                        ))
+                        .range(prefix.clone()..)
                         .take_while(|(term, _)| term.starts_with(prefix.as_str()))
                     {
                         for (pk, posting) in docs {
@@ -719,7 +722,7 @@ impl FullTextIndexState {
 
     /// Document frequency of `term`: how many documents contain it.
     pub fn doc_freq(&self, term: &str) -> usize {
-        self.postings.get(term).map_or(0, BTreeMap::len)
+        self.postings.get(term).map_or(0, |docs| docs.len())
     }
 
     /// The length of document `pk`, if indexed.
@@ -733,7 +736,7 @@ impl FullTextIndexState {
     }
 
     /// The posting list for `term`: every document that contains it.
-    pub fn postings_for(&self, term: &str) -> Option<&BTreeMap<PkBytes, Posting>> {
+    pub fn postings_for(&self, term: &str) -> Option<&imbl::OrdMap<PkBytes, Posting>> {
         self.postings.get(term)
     }
 }

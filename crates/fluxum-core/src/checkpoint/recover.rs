@@ -143,7 +143,7 @@ pub fn recover(
     let mut tables = HashMap::with_capacity(working.len());
     for (id, table) in working {
         let empty = base.state.table(id)?;
-        let mut rows: BTreeMap<_, Row> = BTreeMap::new();
+        let mut rows: imbl::OrdMap<_, Row> = imbl::OrdMap::new();
         let mut indexes = empty.indexes.clone();
         let mut spatial = empty.spatial.clone();
         let mut fulltext = empty.fulltext.clone();
