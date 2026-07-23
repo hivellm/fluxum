@@ -20,7 +20,10 @@
 //! runtime dependencies — a full HTTP stack would be a large dependency for
 //! one request.
 
+pub mod dev;
 pub mod generate;
+pub mod init;
+pub mod logs;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -63,34 +66,81 @@ fn host_port(server: &str) -> &str {
         .trim_end_matches('/')
 }
 
-/// Fetch the schema document from `server` (`host:port`, optionally
-/// `http://`-prefixed) and return it as canonical pretty JSON with a
-/// trailing newline — exactly what [`export_schema`] writes.
-pub fn fetch_schema(server: &str) -> Result<String, CliError> {
+/// One `GET` against a running server, returning the raw response body.
+/// The one-request-per-connection shape every subcommand shares — see the
+/// module docs for why HTTP is hand-rolled here.
+///
+/// The body is read to `Content-Length` when the server states one (a real
+/// server keeps the connection alive whatever `Connection: close` asked
+/// for), falling back to read-until-EOF for servers that do close.
+pub fn fetch_path(server: &str, path: &str) -> Result<String, CliError> {
     let addr = host_port(server);
     let mut stream =
         TcpStream::connect(addr).map_err(|e| CliError::Connect(format!("{addr}: {e}")))?;
+    // A stuck server must fail the command, not hang it.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
     let request = format!(
-        "GET /schema HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
          Connection: close\r\n\r\n"
     );
     stream.write_all(request.as_bytes())?;
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw)?;
 
-    let text = String::from_utf8_lossy(&raw);
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| CliError::Response("no header/body separator".into()))?;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let (head_len, body_start) = loop {
+        let n = stream.read(&mut chunk)?;
+        if n == 0 {
+            return Err(CliError::Response("connection closed before headers".into()));
+        }
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break (split, split + 4);
+        }
+    };
+    let head = String::from_utf8_lossy(&raw[..head_len]).into_owned();
     let status = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .ok_or_else(|| CliError::Response("no status line".into()))?;
+        .ok_or_else(|| CliError::Response("no status line".into()))?
+        .to_owned();
+    let content_length: Option<usize> = head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    });
+    match content_length {
+        Some(length) => {
+            while raw.len() < body_start + length {
+                let n = stream.read(&mut chunk)?;
+                if n == 0 {
+                    break; // truncated — surface what arrived
+                }
+                raw.extend_from_slice(&chunk[..n]);
+            }
+        }
+        None => {
+            // No stated length: the server closes when done.
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                }
+            }
+        }
+    }
     if status != "200" {
         return Err(CliError::Response(format!("server answered {status}")));
     }
-    canonical_schema(body)
+    Ok(String::from_utf8_lossy(&raw[body_start..]).into_owned())
+}
+
+/// Fetch the schema document from `server` (`host:port`, optionally
+/// `http://`-prefixed) and return it as canonical pretty JSON with a
+/// trailing newline — exactly what [`export_schema`] writes.
+pub fn fetch_schema(server: &str) -> Result<String, CliError> {
+    canonical_schema(&fetch_path(server, "/schema")?)
 }
 
 /// Unwrap the RPC-052 admin envelope and re-serialize the payload
@@ -134,10 +184,28 @@ pub const USAGE: &str = "\
 fluxum — Fluxum command-line tool
 
 USAGE:
+    fluxum init <dir> [--name <crate>] [--template notes] [--fluxum-path <checkout>]
+    fluxum dev [--path <dir>] [--http <host:port>] [--bindings <dir>] [--lang <lang>]
+    fluxum logs --server <host:port> [-f] [--level <level>] [--format json|pretty]
     fluxum schema export --server <host:port> [--out <file>]
     fluxum generate --lang <lang> --schema <url_or_file> --out <dir>
 
 COMMANDS:
+    init             Scaffold a runnable Fluxum application (schema +
+                     reducers + config + client instructions) that boots
+                     with `cargo run` (SPEC-024 DEV-011). --fluxum-path
+                     points the dependencies at a Fluxum checkout.
+
+    dev              The edit-save-see loop (DEV-010): watch the module
+                     crate, rebuild on save, restart the server with data
+                     intact (snapshot + commit-log replay), regenerate
+                     bindings into --bindings, and stream the merged logs.
+                     A failed build keeps the previous server running.
+
+    logs             Stream the server's structured logs from GET /logs
+                     (DEV-012). -f follows; --level warn narrows;
+                     --format pretty renders one-liners (default: json).
+
     schema export    Fetch GET /schema from a running server and write the
                      module contract (SPEC-011). Prints to stdout without
                      --out. The output is canonical, so committing it gives
@@ -165,6 +233,98 @@ where
         .collect::<Vec<_>>()
         .as_slice()
     {
+        ["init", rest @ ..] => {
+            let Some(dir) = rest.first().filter(|a| !a.starts_with("--")) else {
+                eprintln!("init: a target directory is required\n\n{USAGE}");
+                return 2;
+            };
+            let options = init::InitOptions {
+                name: flag(rest, "--name"),
+                fluxum_path: flag(rest, "--fluxum-path"),
+                template: flag(rest, "--template").unwrap_or_else(|| "notes".to_owned()),
+            };
+            let dir = std::path::PathBuf::from(dir);
+            match init::scaffold(&dir, &options) {
+                Ok(written) => {
+                    for rel in written {
+                        println!("{}", dir.join(rel).display());
+                    }
+                    println!("\nscaffolded — next: cd {} && cargo run", dir.display());
+                    0
+                }
+                Err(e) => {
+                    eprintln!("init failed: {e}");
+                    1
+                }
+            }
+        }
+        ["dev", rest @ ..] => {
+            let lang = match flag(rest, "--lang") {
+                None => generate::Lang::Rust,
+                Some(text) => match generate::Lang::parse(&text) {
+                    Some(lang) => lang,
+                    None => {
+                        eprintln!("dev: unknown --lang `{text}` (supported: typescript, rust)");
+                        return 2;
+                    }
+                },
+            };
+            let options = dev::DevOptions {
+                path: flag(rest, "--path").map_or_else(|| ".".into(), Into::into),
+                http: flag(rest, "--http").unwrap_or_else(|| "127.0.0.1:15800".to_owned()),
+                bindings: flag(rest, "--bindings").map(Into::into),
+                lang,
+                ..dev::DevOptions::default()
+            };
+            match dev::dev_loop(&options) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("dev failed: {e}");
+                    1
+                }
+            }
+        }
+        ["logs", rest @ ..] => {
+            let Some(server) = flag(rest, "--server") else {
+                eprintln!("logs: --server <host:port> is required\n\n{USAGE}");
+                return 2;
+            };
+            let level = match flag(rest, "--level") {
+                None => None,
+                Some(text) => match logs::Level::parse(&text) {
+                    Some(level) => Some(level),
+                    None => {
+                        eprintln!(
+                            "logs: unknown --level `{text}` (trace|debug|info|warn|error)"
+                        );
+                        return 2;
+                    }
+                },
+            };
+            let format = match flag(rest, "--format") {
+                None => logs::Format::Json,
+                Some(text) => match logs::Format::parse(&text) {
+                    Some(format) => format,
+                    None => {
+                        eprintln!("logs: unknown --format `{text}` (json|pretty)");
+                        return 2;
+                    }
+                },
+            };
+            let options = logs::LogsOptions {
+                server,
+                follow: rest.contains(&"-f") || rest.contains(&"--follow"),
+                level,
+                format,
+            };
+            match logs::stream(&options, &mut std::io::stdout()) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("logs failed: {e}");
+                    1
+                }
+            }
+        }
         ["schema", "export", rest @ ..] => {
             let Some(server) = flag(rest, "--server") else {
                 eprintln!("schema export: --server <host:port> is required\n\n{USAGE}");

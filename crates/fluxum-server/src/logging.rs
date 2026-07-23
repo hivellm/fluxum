@@ -23,6 +23,9 @@
 //! holds both and publishes them together, which keeps the OPS-040 promise
 //! that one reload applies the whole pair.
 
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use fluxum_core::config::{LogFormat, LoggingConfig};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{EnvFilter, Layer, Registry, reload};
@@ -68,6 +71,117 @@ fn layer_for(config: &LoggingConfig) -> BoxedLayer {
             .with_span_list(false)
             .boxed(),
         LogFormat::Pretty => tracing_subscriber::fmt::layer().pretty().boxed(),
+    }
+}
+
+/// The in-process log tap feeding `GET /logs` (SPEC-024 DEV-012): a ring of
+/// the most recent JSON lines (catch-up for a fresh `fluxum logs`) plus a
+/// live broadcast (`-f` follows). Filled by a second, always-JSON fmt layer
+/// riding the same global level filter as the console — what the operator
+/// quieted stays quiet here too. The console's format stays free to be
+/// `pretty`; the tap is machine-shaped by design (the CLI renders).
+pub struct LogTap {
+    ring: Mutex<VecDeque<Arc<str>>>,
+    live: tokio::sync::broadcast::Sender<Arc<str>>,
+}
+
+/// One process-wide tap, installed by [`init`] alongside the subscriber.
+static TAP: OnceLock<Arc<LogTap>> = OnceLock::new();
+
+/// What [`LogTap::subscribe`] hands a follower: the catch-up snapshot and
+/// the live line feed.
+pub type LogFeed = (Vec<Arc<str>>, tokio::sync::broadcast::Receiver<Arc<str>>);
+
+impl LogTap {
+    /// Lines retained for catch-up.
+    const RING: usize = 256;
+    /// Broadcast depth: a slow follower lags (drops) rather than blocks.
+    const LIVE: usize = 1024;
+
+    fn install() -> Arc<LogTap> {
+        Arc::clone(TAP.get_or_init(|| {
+            let (live, _) = tokio::sync::broadcast::channel(Self::LIVE);
+            Arc::new(LogTap {
+                ring: Mutex::new(VecDeque::with_capacity(Self::RING)),
+                live,
+            })
+        }))
+    }
+
+    fn push(&self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        let line: Arc<str> = Arc::from(line);
+        {
+            let mut ring = self
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if ring.len() == Self::RING {
+                ring.pop_front();
+            }
+            ring.push_back(Arc::clone(&line));
+        }
+        // No receiver is fine — the ring alone serves the next catch-up.
+        let _ = self.live.send(line);
+    }
+
+    /// The recent-lines snapshot plus a live receiver — what `GET /logs`
+    /// serves. `None` until [`init`] has installed the subscriber.
+    pub fn subscribe() -> Option<LogFeed> {
+        TAP.get().map(|tap| {
+            let ring = tap
+                .ring
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .cloned()
+                .collect();
+            (ring, tap.live.subscribe())
+        })
+    }
+}
+
+/// Per-event writer handed out by the tap's fmt layer: buffers one event's
+/// bytes and pushes the completed line on drop (fmt makes a writer per
+/// event, so drop marks the event's end).
+struct TapWriter {
+    tap: Arc<LogTap>,
+    buf: Vec<u8>,
+}
+
+impl std::io::Write for TapWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buf.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TapWriter {
+    fn drop(&mut self) {
+        self.tap.push(&String::from_utf8_lossy(&self.buf));
+    }
+}
+
+/// `MakeWriter` for the tap layer.
+struct TapMakeWriter {
+    tap: Arc<LogTap>,
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TapMakeWriter {
+    type Writer = TapWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        TapWriter {
+            tap: Arc::clone(&self.tap),
+            buf: Vec::with_capacity(256),
+        }
     }
 }
 
@@ -120,9 +234,21 @@ impl LogReloadHandle {
 pub fn init(config: &LoggingConfig) -> Result<LogReloadHandle, String> {
     let (filter_layer, filter) = reload::Layer::new(env_filter(&config.level));
     let (fmt_layer, fmt) = reload::Layer::new(layer_for(config));
+    // The DEV-012 tap: a second, always-JSON writer under the same global
+    // level filter, feeding the ring + broadcast `GET /logs` serves. Not
+    // reloadable — its format is part of the endpoint's contract.
+    let tap_layer = tracing_subscriber::fmt::layer()
+        .json()
+        .with_current_span(true)
+        .with_span_list(false)
+        .with_ansi(false)
+        .with_writer(TapMakeWriter {
+            tap: LogTap::install(),
+        });
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(fmt_layer)
+        .with(tap_layer)
         .try_init()
         .map_err(|e| e.to_string())?;
     Ok(LogReloadHandle { fmt, filter })

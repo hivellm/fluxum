@@ -532,6 +532,12 @@ async fn serve_connection(
                 handle_blob_download(&state.ctx, &mut stream, &hash).await?;
                 true
             }
+            // SPEC-024 DEV-012: the structured-log stream. Owns the
+            // connection while following, like `GET /rpc`.
+            ("GET", path) if path == "/logs" || path.starts_with("/logs?") => {
+                handle_logs(&state.ctx, stream, &request, ip, &server_shutdown).await?;
+                return Ok(());
+            }
             // The HTTP/JSON admin surface (RPC-050) shares this port.
             (method, path) if crate::admin::is_admin_path(path) => {
                 handle_admin(
@@ -619,6 +625,94 @@ async fn handle_blob_download(
         Ok(None) => write_simple(stream, 404, "Not Found").await,
         Err(_) => write_simple(stream, 500, "Internal Server Error").await,
     }
+}
+
+/// `GET /logs[?follow=1]` (SPEC-024 DEV-012): the server's recent structured
+/// log lines as NDJSON chunks, then — with `follow` — the connection stays
+/// open and new lines stream as they are emitted (blank-line keep-alives in
+/// the gaps). Rides the SEC-054 admin guard: loopback free, a remote needs
+/// trust + credential. Lines are always JSON (the tap's contract) whatever
+/// the console format; the emitted set is already governed by the
+/// subscriber's global level filter, finer filtering is the client's job
+/// (`fluxum logs --level`).
+async fn handle_logs(
+    ctx: &Arc<ShardContext>,
+    mut stream: MaybeTls,
+    request: &Request,
+    client_ip: std::net::IpAddr,
+    server_shutdown: &Arc<Notify>,
+) -> io::Result<()> {
+    let operator_token = request.header("fluxum-operator");
+    let admin_req = crate::admin::AdminRequest {
+        method: "GET",
+        path: &request.path,
+        body: &[],
+        client_ip,
+        operator_token: operator_token.as_deref(),
+    };
+    if let Err(deny) = crate::admin::check_access(ctx, &admin_req) {
+        let bytes = serde_json::to_vec(&deny.body).unwrap_or_default();
+        return write_json(&mut stream, deny.status, "application/json", &bytes).await;
+    }
+    let Some((ring, mut live)) = crate::logging::LogTap::subscribe() else {
+        // An embedded assembly that never called `logging::init` has no tap.
+        return write_simple(&mut stream, 503, "Service Unavailable").await;
+    };
+    let follow = request
+        .path
+        .split_once('?')
+        .is_some_and(|(_, query)| {
+            query
+                .split('&')
+                .any(|p| matches!(p, "follow" | "follow=1" | "follow=true"))
+        });
+
+    const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                        Transfer-Encoding: chunked\r\n\
+                        X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\r\n";
+    stream.write_all(HEAD.as_bytes()).await?;
+    stream.flush().await?;
+    for line in ring {
+        if write_chunk(&mut stream, format!("{line}\n").as_bytes())
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+    if !follow {
+        return write_last_chunk(&mut stream).await;
+    }
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // arm: the first tick fires immediately
+    loop {
+        tokio::select! {
+            _ = server_shutdown.notified() => break,
+            line = live.recv() => match line {
+                Ok(line) => {
+                    if write_chunk(&mut stream, format!("{line}\n").as_bytes()).await.is_err() {
+                        return Ok(()); // follower went away — not an error
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Honest gap marker: the follower was slower than the
+                    // log volume; n lines are not in this stream.
+                    let marker = format!("{{\"fluxum_logs_dropped\":{n}}}\n");
+                    if write_chunk(&mut stream, marker.as_bytes()).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = keepalive.tick() => {
+                if write_chunk(&mut stream, b"\n").await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    write_last_chunk(&mut stream).await
 }
 
 async fn handle_admin(

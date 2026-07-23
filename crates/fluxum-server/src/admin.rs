@@ -175,6 +175,19 @@ fn admin_guard(ctx: &Arc<ShardContext>, req: &AdminRequest) -> Guard {
     Guard::Allow
 }
 
+/// The SEC-054 access check for streaming routes that live OUTSIDE
+/// [`dispatch`] (`GET /logs` owns its connection instead of returning one
+/// response): `Err` carries the refusal to serve.
+pub(crate) fn check_access(
+    ctx: &Arc<ShardContext>,
+    req: &AdminRequest<'_>,
+) -> Result<(), AdminResponse> {
+    match admin_guard(ctx, req) {
+        Guard::Allow => Ok(()),
+        Guard::Deny(response) => Err(response),
+    }
+}
+
 /// Whether a route changes state (as opposed to a read) — the routes whose
 /// success emits a SEC-054 `admin_mutation` audit event.
 fn is_mutating_route(method: &str, path: &str) -> bool {
