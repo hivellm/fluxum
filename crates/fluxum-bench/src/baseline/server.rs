@@ -337,4 +337,84 @@ mod tests {
         assert_eq!(push["channel"], 7);
         assert_eq!(push["content"], "delivered");
     }
+
+    /// The same loop over **PostgreSQL** — the `Db::Postgres` arms and the
+    /// REAL LISTEN/NOTIFY hop (`listen_task`): `pg_notify` fires inside the
+    /// INSERT statement, crosses the database on the dedicated LISTEN
+    /// connection, and lands on the WebSocket. Gated on the operator's
+    /// docker PG (like the SpacetimeDB smoke) and run in-process because the
+    /// spawned-child path attributes no coverage. The shared database
+    /// persists across runs, so a unique user + channel isolate this one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn baseline_app_serves_the_demo_loop_over_postgres() {
+        let Ok(url) = std::env::var("FLUXUM_BENCH_PG_URL") else {
+            eprintln!(
+                "skipping: set FLUXUM_BENCH_PG_URL=postgres://fluxum:fluxum@127.0.0.1:15432/parity \
+                 (docker fluxum-parity-pg) to run the PG in-process loop"
+            );
+            return;
+        };
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            serve_on(&url, 4, listener).await.unwrap();
+        });
+        let base = format!("http://127.0.0.1:{port}");
+        let agent = ureq::AgentBuilder::new().build();
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let user = format!("cov-{nonce}");
+        #[allow(clippy::cast_possible_truncation)]
+        let channel = 100_000 + (nonce % 50_000) as u32;
+
+        // Acked small writes against the real pool.
+        for title in ["first task", "second task"] {
+            let created = agent
+                .post(&format!("{base}/tasks"))
+                .send_json(serde_json::json!({ "user": user, "title": title }))
+                .unwrap();
+            assert_eq!(created.status(), 201);
+        }
+
+        // Owner-scoped load: exactly this run's rows.
+        let rows: serde_json::Value = agent
+            .get(&format!("{base}/tasks"))
+            .query("user", &user)
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 2);
+
+        // Hot indexed point read: the user's newest row.
+        let hot: serde_json::Value = agent
+            .get(&format!("{base}/task"))
+            .query("user", &user)
+            .call()
+            .unwrap()
+            .into_json()
+            .unwrap();
+        assert_eq!(hot["title"], "second task");
+
+        // The LISTEN/NOTIFY fan-out: channel-filtered, cross-database.
+        let ws_url =
+            format!("{}/subscribe?channel={channel}", base.replace("http://", "ws://"));
+        let (mut socket, _) = tungstenite::connect(&ws_url).unwrap();
+        for (target, content) in [(channel + 1, "other channel"), (channel, "delivered")] {
+            let sent = agent
+                .post(&format!("{base}/chat"))
+                .send_json(serde_json::json!({
+                    "user": user, "channel": target, "content": content
+                }))
+                .unwrap();
+            assert_eq!(sent.status(), 201);
+        }
+        let frame = socket.read().unwrap();
+        let push: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        assert_eq!(push["channel"], channel);
+        assert_eq!(push["content"], "delivered");
+    }
 }
