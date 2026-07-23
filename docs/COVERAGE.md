@@ -5,8 +5,9 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** see the gate log — 2026-07-23, gate command below, after the P0 parity
-campaign (OBS-023 stage histogram, commit hook, SDK write pipelining). The P0-B growth briefly
+**Current standing:** **90.12% lines** (4,203 uncovered of ~42.6k) — 2026-07-23, gate command
+below, after the P0 parity campaign (OBS-023 stage histogram, commit hook, SDK write
+pipelining). The P0-B growth briefly
 dipped the floor to 89.96%; recovered by covering the pipelining trait defaults +
 `ratio_interval` arms and by the **PG-gated baseline smoke** (`baseline_postgres_runs_all_workloads`,
 `FLUXUM_BENCH_PG_URL` — the `Db::Pg` half and the real LISTEN/NOTIFY hop, formerly a named
