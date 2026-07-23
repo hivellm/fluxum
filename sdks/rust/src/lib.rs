@@ -22,7 +22,7 @@ pub mod protocol;
 pub mod resume;
 
 pub use cache::{RowCache, RowEvent, TableDiff, TableSchema, TableSnapshot};
-pub use client::{Connection, Error as ClientError, ReconnectPolicy, RowListener};
+pub use client::{Connection, Error as ClientError, PendingReducer, ReconnectPolicy, RowListener};
 pub use idempotency::{OfflineQueue, QueuedCall};
 pub use resume::{Reconnect, ResumeTracker};
 

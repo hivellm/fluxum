@@ -109,6 +109,7 @@ fn write_workload_measures_acked_small_writes() {
     let side = FluxumSide::new(server.tcp_url.clone());
     let cfg = RunConfig {
         clients: 4,
+        pipeline: 1,
         warmup: Duration::from_millis(300),
         measure: Duration::from_secs(2),
         runs: 2,
@@ -122,6 +123,30 @@ fn write_workload_measures_acked_small_writes() {
         summary.throughput_mean
     );
     // Ack latency is a real, positive duration on every op.
+    assert!(summary.p99_ns_mean > 0.0);
+    assert!(summary.total_ops > 0);
+}
+
+#[test]
+fn pipelined_write_workload_keeps_a_window_in_flight_and_acks_everything() {
+    let server = Server::start("write-pipelined");
+    let side = FluxumSide::new(server.tcp_url.clone());
+    let cfg = RunConfig {
+        clients: 2,
+        pipeline: 8,
+        warmup: Duration::from_millis(300),
+        measure: Duration::from_secs(2),
+        runs: 1,
+    };
+    let runs = write_workload(&side, &cfg).expect("pipelined write workload");
+    let summary = Summary::from_runs(&runs);
+    assert!(
+        summary.throughput_mean > 10.0,
+        "pipelined writes should ack continuously: {}",
+        summary.throughput_mean
+    );
+    // Every recorded op resolved to a real ack with a positive latency
+    // (which includes the window queueing — the mode's documented caveat).
     assert!(summary.p99_ns_mean > 0.0);
     assert!(summary.total_ops > 0);
 }
@@ -201,6 +226,7 @@ fn baseline_sqlite_runs_all_workloads() {
 
     let write_cfg = RunConfig {
         clients: 2,
+        pipeline: 1,
         warmup: Duration::from_millis(200),
         measure: Duration::from_secs(1),
         runs: 1,

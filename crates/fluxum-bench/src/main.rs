@@ -79,6 +79,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--port" => opts.port = parse(&value("--port")?)?,
             "--max-connections" => opts.max_connections = parse(&value("--max-connections")?)?,
             "--clients" => opts.clients = parse(&value("--clients")?)?,
+            "--pipeline" => opts.pipeline = parse(&value("--pipeline")?)?,
             "--warmup-secs" => opts.warmup_secs = parse(&value("--warmup-secs")?)?,
             "--measure-secs" => opts.measure_secs = parse(&value("--measure-secs")?)?,
             "--runs" => opts.runs = parse(&value("--runs")?)?,
@@ -128,8 +129,13 @@ fn run(args: Vec<String>) -> Result<(), String> {
     if workload == "regression" {
         let current = load_report(&opts.current.ok_or("regression needs --current PATH")?)?;
         let published = load_report(&opts.published.ok_or("regression needs --published PATH")?)?;
-        let mut violations =
-            fluxum_bench::report::regressions(&current.ratios, &published.ratios, opts.tolerance);
+        // Noise-aware (F-011): a relative drop only counts when the two
+        // runs' ratio-uncertainty bands are disjoint — see report.rs.
+        let mut violations = fluxum_bench::report::regressions_with_uncertainty(
+            &current,
+            &published,
+            opts.tolerance,
+        );
         // TST-097: parity classes already reached are floored (tolerance-
         // aware — a noise-dominated ratio at the boundary must not flap).
         violations.extend(fluxum_bench::report::competitive_regressions(
@@ -276,13 +282,21 @@ fn run(args: Vec<String>) -> Result<(), String> {
         "write" => {
             let cfg = RunConfig {
                 clients: opts.clients,
+                pipeline: opts.pipeline,
                 warmup: Duration::from_secs(opts.warmup_secs),
                 measure: Duration::from_secs(opts.measure_secs),
                 runs: opts.runs,
             };
             let runs = write_workload(side.as_ref(), &cfg)?;
+            // F-007 honesty: a pipelined run is a different measurement
+            // class than the acked-serial write — never the same label.
+            let class = if cfg.pipeline > 1 {
+                format!("write/pipelined({})", cfg.pipeline)
+            } else {
+                "write".to_owned()
+            };
             (
-                vec![("write".to_owned(), Summary::from_runs(&runs))],
+                vec![(class, Summary::from_runs(&runs))],
                 format!("{cfg:?}"),
             )
         }
@@ -406,6 +420,11 @@ fn emit(
     Ok(())
 }
 
+/// The in-flight window of the report's fluxum-only pipelined-write row
+/// (F-007/NFR-01): picked from the P0-B sweep — past this window the
+/// throughput curve is flat, so a larger one only inflates queueing latency.
+const REPORT_PIPELINE_WINDOW: usize = 32;
+
 /// TST-094/TST-096: run the full TST-092 matrix on both sides with one
 /// command and write the versioned report artifact (JSON + Markdown).
 /// Returns `Err` when an NFR-11 target is unmet, AFTER writing the files —
@@ -425,6 +444,7 @@ fn run_report(opts: &Opts) -> Result<(), String> {
     let runs = opts.runs.max(5);
     let write_cfg = RunConfig {
         clients: opts.clients,
+        pipeline: 1,
         warmup: Duration::from_secs(opts.warmup_secs),
         measure: Duration::from_secs(opts.measure_secs),
         runs,
@@ -507,7 +527,23 @@ fn run_report(opts: &Opts) -> Result<(), String> {
     let mut fluxum_classes = {
         let server = BenchServer::start()?;
         let side = FluxumSide::new(server.url.clone());
-        steady(&side)?
+        let mut classes = steady(&side)?;
+        // F-007 / NFR-01 evidence row, fluxum-only: the same acked write
+        // with a window of calls in flight per connection. The incumbent's
+        // request/response app-server protocol has no in-connection
+        // pipeline — its concurrency lever (connection count) is already
+        // the write row — so this class deliberately has no baseline
+        // counterpart and feeds NO ratio.
+        println!("  write/pipelined…");
+        let pipelined_cfg = RunConfig {
+            pipeline: REPORT_PIPELINE_WINDOW,
+            ..write_cfg.clone()
+        };
+        classes.insert(
+            format!("write/pipelined({REPORT_PIPELINE_WINDOW})"),
+            Summary::from_runs(&write_workload(&side, &pipelined_cfg)?),
+        );
+        classes
     };
     println!("  cold…");
     fluxum_classes.insert(
@@ -1022,6 +1058,7 @@ struct Opts {
     stdb_restart_cmd: Option<String>,
     stdb_note: Option<String>,
     pin: Option<String>,
+    pipeline: usize,
     subscribers: usize,
     rate: u32,
     messages: u32,
@@ -1057,6 +1094,7 @@ impl Default for Opts {
             stdb_restart_cmd: None,
             stdb_note: None,
             pin: None,
+            pipeline: 1,
             subscribers: 50,
             rate: 10,
             messages: 100,
@@ -1082,7 +1120,7 @@ fn usage() -> String {
      [--url URL] \
      [--database-url URL] [--clients N] [--warmup-secs N] [--measure-secs N] [--runs N] \
      [--rows N] [--users N] [--samples N] [--memory-budget SIZE] [--cold-restart-cmd CMD] \
-     [--stdb-url URL] [--stdb-db NAME] \
+     [--stdb-url URL] [--stdb-db NAME] [--pipeline N (write: acked calls in flight/conn)] \
      [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
      \x20      fluxum-bench report --database-url URL --cold-restart-cmd CMD \
      [--stdb-url URL --stdb-reset-cmd CMD [--stdb-db NAME] [--stdb-note TEXT]] \

@@ -313,6 +313,21 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   so a stale SDK never silently invokes a newer, signature-incompatible reducer revision
   (reducer versioning: SPEC-004).
 
+- **SDK-032** [P1] **Pipelined reducer calls.** An SDK connection SHALL allow multiple reducer
+  calls in flight concurrently — the wire protocol already correlates replies by request id
+  (SPEC-006 RPC-002), so this is a client-concurrency contract, not a wire change. The
+  contract: a non-blocking call variant returns a per-call pending handle resolved by its OWN
+  ack or error (attribution is exact — a rejected call among successes fails alone, never
+  first-reply-wins); same-connection calls are sent in invocation order and execute in arrival
+  order, so pipelined writes commit in submission order; the client imposes no in-flight cap —
+  backpressure is the transport's send buffer plus server admission (TXN-011 "shard busy",
+  resolving exactly the refused calls); a disconnect resolves every in-flight handle with the
+  connection error, and delivery of un-acked calls is unknown — exactly-once callers use
+  idempotency keys (SPEC-021 CS-030). Reference: `fluxum-sdk`'s `Connection::call_reducer_async`
+  → `PendingReducer::wait`. Rationale: a strictly acked-serial connection caps write throughput
+  at 1/RTT regardless of engine speed (F-007); the NFR-01 measurement methodology (SPEC-013
+  TST-060) uses the pipelined path.
+
 ## 6. Generated client runtime (local cache, events, schema check)
 
 - **SDK-040** [P0] The generated `FluxumClient` SHALL maintain a local cache of all subscribed

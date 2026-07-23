@@ -32,6 +32,11 @@ cargo build --release -p fluxum-server -p fluxum-bench
 ./target/release/fluxum-bench write --side postgres \
   --database-url postgres://fluxum:fluxum@127.0.0.1:15432/parity
 
+# Pipelined writes (SDK-032, NFR-01 methodology): N acked calls in flight
+# per connection — a separate measurement class, never conflated with the
+# acked-serial write row (throughput is its meaningful column):
+./target/release/fluxum-bench write --side fluxum --pipeline 32
+
 # The full matrix on both sides → docs/parity/report-v<version>.{json,md} (TST-094):
 ./target/release/fluxum-bench report \
   --database-url postgres://fluxum:fluxum@127.0.0.1:15432/parity \
@@ -48,7 +53,11 @@ distinguishable from noise — raw rows carry a 95% Student-t confidence half-wi
 single-workload invocations keep the CLI default. The regression guard's `--tolerance`
 (default 20%) applies to the NFR-11 ratios AND to the TST-097 parity floor, so a
 noise-dominated competitive ratio sitting at the boundary (two sub-µs in-process reads) cannot
-flap a release.
+flap a release. The NFR-11 check is additionally **noise-aware**: a relative drop only counts
+as a regression when the two runs' ratio-uncertainty bands (95% Student-t, propagated from
+each side's summaries by interval arithmetic) are disjoint — a four-orders-of-magnitude ratio
+whose denominator sits at timer resolution (the in-process hot read) swings ±50% run to run,
+while a real fall (that read becoming a socket round trip) lands far outside any band.
 
 Without `--url`, the harness boots the **release** `fluxum-server` found beside its own binary
 and refuses to fall back to a debug build — the no-argument path cannot produce dishonest

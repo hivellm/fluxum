@@ -28,6 +28,20 @@ pub trait BenchClient: Send {
     /// The small-write operation: create a task, awaited until acknowledged
     /// (Fluxum: reducer ack; SQL side: INSERT committed and HTTP 2xx).
     fn add_task(&mut self, title: &str) -> Result<(), String>;
+    /// Start the acked small write WITHOUT waiting for its ack — write
+    /// pipelining (NFR-01 methodology, F-007). Returns an opaque token that
+    /// [`Self::finish_task`] resolves. Default: unsupported — a side whose
+    /// protocol is strictly request/response has no in-connection pipeline;
+    /// its concurrency lever is connection count, which `--clients` already
+    /// measures.
+    fn start_task(&mut self, _title: &str) -> Result<u64, String> {
+        Err("write pipelining is not supported on this side".to_owned())
+    }
+    /// Await the ack of a [`Self::start_task`] token (exact attribution:
+    /// the token's own ack or error, never a neighbor's).
+    fn finish_task(&mut self, _token: u64) -> Result<(), String> {
+        Err("write pipelining is not supported on this side".to_owned())
+    }
     /// Post a chat message to a channel, awaited like [`Self::add_task`].
     fn send_chat(&mut self, channel: u32, content: &str) -> Result<(), String>;
     /// Subscribe to a channel's messages; `on_message` fires once per
@@ -60,6 +74,13 @@ pub trait BenchClient: Send {
 pub struct RunConfig {
     /// Concurrent client sessions.
     pub clients: usize,
+    /// Acked writes each client keeps in flight (write workload only).
+    /// `1` = the acked-serial default: one op outstanding, latency is the
+    /// honest round trip. `> 1` = pipelined mode (F-007/NFR-01): the client
+    /// holds a window of N un-acked calls, so per-op latency includes the
+    /// deliberate window queueing and THROUGHPUT is the meaningful number.
+    /// The two must never be conflated in a report row.
+    pub pipeline: usize,
     /// Unmeasured warmup preceding every measured window.
     pub warmup: Duration,
     /// The measured window.
@@ -72,6 +93,7 @@ impl Default for RunConfig {
     fn default() -> Self {
         RunConfig {
             clients: 8,
+            pipeline: 1,
             warmup: Duration::from_secs(2),
             measure: Duration::from_secs(10),
             runs: 3,
@@ -111,22 +133,62 @@ fn write_run(side: &dyn Side, cfg: &RunConfig, run: u64) -> Result<RunResult, St
             let measuring = Arc::clone(&measuring);
             let stop = Arc::clone(&stop);
             let failed = Arc::clone(&failed);
+            let window = cfg.pipeline.max(1);
             std::thread::spawn(move || -> Vec<u64> {
                 let mut latencies = Vec::new();
                 let mut i = 0u64;
+                let fail = |failed: &Arc<Mutex<Option<String>>>, stop: &Arc<AtomicBool>, e| {
+                    *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    stop.store(true, Ordering::Relaxed);
+                };
                 start_gate.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    let title = format!("bench task {idx}-{i}");
-                    i += 1;
-                    let began = Instant::now();
-                    if let Err(e) = client.add_task(&title) {
-                        *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(e);
-                        stop.store(true, Ordering::Relaxed);
-                        break;
+                if window == 1 {
+                    // Acked-serial: one op in flight, latency = round trip.
+                    while !stop.load(Ordering::Relaxed) {
+                        let title = format!("bench task {idx}-{i}");
+                        i += 1;
+                        let began = Instant::now();
+                        if let Err(e) = client.add_task(&title) {
+                            fail(&failed, &stop, e);
+                            break;
+                        }
+                        if measuring.load(Ordering::Relaxed) {
+                            latencies.push(began.elapsed().as_nanos() as u64);
+                        }
                     }
-                    if measuring.load(Ordering::Relaxed) {
-                        latencies.push(began.elapsed().as_nanos() as u64);
+                } else {
+                    // Pipelined (F-007): keep `window` acked writes in
+                    // flight; an op completes when ITS ack resolves, so
+                    // recorded latency includes the window queueing (the
+                    // throughput row's honest caveat).
+                    let mut inflight: std::collections::VecDeque<(u64, Instant)> =
+                        std::collections::VecDeque::with_capacity(window);
+                    'outer: while !stop.load(Ordering::Relaxed) {
+                        while inflight.len() < window {
+                            let title = format!("bench task {idx}-{i}");
+                            i += 1;
+                            match client.start_task(&title) {
+                                Ok(token) => inflight.push_back((token, Instant::now())),
+                                Err(e) => {
+                                    fail(&failed, &stop, e);
+                                    break 'outer;
+                                }
+                            }
+                        }
+                        let Some((token, began)) = inflight.pop_front() else {
+                            break;
+                        };
+                        if let Err(e) = client.finish_task(token) {
+                            fail(&failed, &stop, e);
+                            break;
+                        }
+                        if measuring.load(Ordering::Relaxed) {
+                            latencies.push(began.elapsed().as_nanos() as u64);
+                        }
+                    }
+                    // Drain the window so no ack is left dangling.
+                    while let Some((token, _)) = inflight.pop_front() {
+                        let _ = client.finish_task(token);
                     }
                 }
                 latencies

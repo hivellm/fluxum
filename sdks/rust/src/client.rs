@@ -560,6 +560,44 @@ impl Connection {
     /// Call a reducer and await its outcome. Resolves when the reducer
     /// committed — the resulting `TxUpdate` may arrive before or after.
     pub fn call_reducer(&self, name: &str, args: Vec<FluxValue>) -> Result<(), Error> {
+        self.call_reducer_async(name, args)?.wait()
+    }
+
+    /// Start a reducer call WITHOUT waiting for its ack — **write
+    /// pipelining** (SDK-032): any number of calls may be in flight on one
+    /// connection, each resolved by awaiting its [`PendingReducer`].
+    ///
+    /// # Concurrency contract
+    ///
+    /// - **Attribution is exact**: every ack/error frame carries the request
+    ///   id (RPC-002); a reply resolves precisely the `PendingReducer` it
+    ///   belongs to, never a neighbor — a rejected call among successes
+    ///   surfaces on its own handle.
+    /// - **Ordering**: same-connection calls are sent in `call_reducer_async`
+    ///   invocation order (sends serialize on the write half) and the server
+    ///   executes a connection's calls in arrival order, so pipelined writes
+    ///   commit in submission order. Ordering ACROSS connections is decided
+    ///   by the shard's single-writer queue, as always.
+    /// - **In-flight window / backpressure**: the client imposes no cap —
+    ///   backpressure is the transport's send buffer plus the server's
+    ///   admission control: an overloaded shard answers
+    ///   `CLUSTER_SHARD_UNAVAILABLE` ("shard busy", TXN-011), which resolves
+    ///   exactly the calls it refused. Callers wanting a bounded window hold
+    ///   at most N handles and await the oldest before issuing the next.
+    /// - **Disconnects** fail every in-flight handle with
+    ///   [`Error::Disconnected`]; delivery of an un-acked call is unknown
+    ///   (the classic pipelining trade — use idempotency keys where that
+    ///   matters, SPEC-021 CS-030).
+    /// - **Transports**: over TCP the calls genuinely share the socket. Over
+    ///   Streamable HTTP each send is its own `POST /rpc` whose response
+    ///   already carries the ack, so the send itself round-trips —
+    ///   pipelining does not overlap requests there; concurrency over HTTP
+    ///   comes from concurrent callers instead.
+    pub fn call_reducer_async(
+        &self,
+        name: &str,
+        args: Vec<FluxValue>,
+    ) -> Result<PendingReducer, Error> {
         let id = self.shared.alloc_id();
         let call = ReducerCall {
             id,
@@ -568,18 +606,25 @@ impl Connection {
             args,
             idempotency_key: None,
         };
-        let reply = self.request(ClientMessage::ReducerCall(call), id, 1)?;
-        match reply.into_iter().next() {
-            Some(ServerMessage::ReducerResult(result)) => match result.outcome {
-                Ok(()) => Ok(()),
-                Err(e) => Err(Error::Reducer {
-                    code: e.code,
-                    app_code: e.app_code,
-                    message: e.message,
-                }),
-            },
-            _ => Ok(()),
+        let (tx, rx): (Sender<Routed>, Receiver<Routed>) = mpsc::channel();
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(id, tx);
+        if let Err(e) = self.send(ClientMessage::ReducerCall(call)) {
+            self.shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&id);
+            return Err(e);
         }
+        Ok(PendingReducer {
+            shared: Arc::clone(&self.shared),
+            rx,
+            id,
+        })
     }
 
     /// Test hook: kill the socket the background thread is reading, as an
@@ -664,6 +709,55 @@ impl Connection {
 
     fn dispatch(&self, events: Vec<RowEvent>) {
         dispatch_shared(&self.shared, events);
+    }
+}
+
+/// A reducer call in flight ([`Connection::call_reducer_async`]): resolve it
+/// with [`PendingReducer::wait`]. Dropping it without waiting abandons the
+/// call — the ack is discarded on arrival (the call itself is NOT cancelled;
+/// it was already on the wire).
+pub struct PendingReducer {
+    shared: Arc<Shared>,
+    rx: Receiver<Routed>,
+    id: u32,
+}
+
+impl PendingReducer {
+    /// Await this call's own ack: `Ok` when the reducer committed, the
+    /// call's exact error otherwise (RPC-031 reducer rejection, an `Error`
+    /// frame, or [`Error::Disconnected`] when the session died with the
+    /// call in flight).
+    pub fn wait(self) -> Result<(), Error> {
+        match self.rx.recv() {
+            Ok(Ok(ServerMessage::ReducerResult(result))) => match result.outcome {
+                Ok(()) => Ok(()),
+                Err(e) => Err(Error::Reducer {
+                    code: e.code,
+                    app_code: e.app_code,
+                    message: e.message,
+                }),
+            },
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(err)) => Err(Error::from(err)),
+            Err(_) => Err(Error::Disconnected),
+        }
+    }
+
+    /// The request id this call went out under (RPC-002 correlation).
+    #[must_use]
+    pub fn id(&self) -> u32 {
+        self.id
+    }
+}
+
+impl Drop for PendingReducer {
+    fn drop(&mut self) {
+        // Idempotent: `wait` consumed the reply, or the entry is stale.
+        self.shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
     }
 }
 

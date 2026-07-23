@@ -76,6 +76,8 @@ impl Side for FluxumSide {
             tasks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             read_keys: Vec::new(),
             read_cursor: 0,
+            pending_writes: std::collections::HashMap::new(),
+            next_token: 0,
         }))
     }
 }
@@ -89,6 +91,10 @@ struct FluxumClient {
     /// Round-robin cursor + key snapshot for the read loop.
     read_keys: Vec<u64>,
     read_cursor: usize,
+    /// In-flight pipelined writes: token → the SDK's pending ack handle.
+    pending_writes: std::collections::HashMap<u64, fluxum_sdk::PendingReducer>,
+    /// Monotonic token allocator for [`BenchClient::start_task`].
+    next_token: u64,
 }
 
 impl BenchClient for FluxumClient {
@@ -96,6 +102,25 @@ impl BenchClient for FluxumClient {
         self.connection
             .call_reducer("add_task", vec![FluxValue::Str(title.to_owned())])
             .map_err(|e| format!("add_task: {e}"))
+    }
+
+    fn start_task(&mut self, title: &str) -> Result<u64, String> {
+        let pending = self
+            .connection
+            .call_reducer_async("add_task", vec![FluxValue::Str(title.to_owned())])
+            .map_err(|e| format!("add_task (pipelined send): {e}"))?;
+        let token = self.next_token;
+        self.next_token += 1;
+        self.pending_writes.insert(token, pending);
+        Ok(token)
+    }
+
+    fn finish_task(&mut self, token: u64) -> Result<(), String> {
+        self.pending_writes
+            .remove(&token)
+            .ok_or_else(|| format!("unknown pipelined write token {token}"))?
+            .wait()
+            .map_err(|e| format!("add_task (pipelined ack): {e}"))
     }
 
     fn send_chat(&mut self, channel: u32, content: &str) -> Result<(), String> {

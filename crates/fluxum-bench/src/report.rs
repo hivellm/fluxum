@@ -368,6 +368,23 @@ impl Report {
              is that cap times the subscriber count on every side — a harness constant, \
              not a throughput result. Only their latency columns are measurements.*"
         );
+        if self
+            .workloads
+            .values()
+            .any(|classes| classes.keys().any(|c| c.starts_with("write/pipelined")))
+        {
+            let _ = writeln!(
+                out,
+                "\n*write/pipelined(N) is a **fluxum-only NFR-01 evidence row**: the same \
+                 acked reducer write with N calls held in flight per connection (Rust SDK \
+                 `call_reducer_async`). Its latency columns include the deliberate \
+                 client-held window queueing — **throughput is the meaningful column** — \
+                 and it feeds no ratio: the incumbent's app-server protocol is strictly \
+                 request/response, so its concurrency lever (connection count) is already \
+                 the `write` row. The acked-serial `write` row above remains the honest \
+                 latency number.*"
+            );
+        }
         let _ = writeln!(
             out,
             "\n*Cold-read honesty note: restarts clear database-level caches (Fluxum buffer \
@@ -427,6 +444,76 @@ pub fn regressions(current: &Ratios, published: &Ratios, tolerance: f64) -> Vec<
     check("hot_p99", current.hot_p99, published.hot_p99);
     check("cold_p99", current.cold_p99, published.cold_p99);
     violations
+}
+
+/// TST-095, noise-aware (F-011 applied to the guard itself): a ratio has
+/// regressed only when BOTH (a) its point estimate dropped more than
+/// `tolerance` below the published one — exactly [`regressions`] — AND
+/// (b) the two runs' ratio-uncertainty intervals do not overlap. A ratio
+/// whose denominator is a sub-µs in-process read sits at timer resolution:
+/// its point estimate swings ±50% run to run, and a relative-only guard
+/// flaps on pure noise, while a REAL fall (the read becoming a socket
+/// round-trip) lands orders of magnitude outside any band. Intervals are
+/// 95% Student-t bands on each side's underlying metric (throughput for
+/// the write ratio, p99 for the latency ratios), combined by interval
+/// arithmetic over positive quantities. When either report lacks the
+/// summaries to build a band (foreign artifact), the ratio falls back to
+/// the pure relative check.
+#[must_use]
+pub fn regressions_with_uncertainty(
+    current: &Report,
+    published: &Report,
+    tolerance: f64,
+) -> Vec<String> {
+    let plain = regressions(&current.ratios, &published.ratios, tolerance);
+    if plain.is_empty() {
+        return plain;
+    }
+    plain
+        .into_iter()
+        .filter(|violation| {
+            let name = violation.split(':').next().unwrap_or_default();
+            match (ratio_interval(current, name), ratio_interval(published, name)) {
+                // Distinguishable from noise only when the current band sits
+                // entirely below the published one.
+                (Some((_, cur_hi)), Some((pub_lo, _))) => cur_hi < pub_lo,
+                // No bands to compare — keep the conservative verdict.
+                _ => true,
+            }
+        })
+        .collect()
+}
+
+/// The 95% band of one NFR-11 ratio, from the report's own summaries:
+/// `[num_lo/den_hi, num_hi/den_lo]`. `None` when the report does not carry
+/// the classes (e.g. a hand-built ratios-only artifact).
+fn ratio_interval(report: &Report, ratio: &str) -> Option<(f64, f64)> {
+    let side = |name: &str, class: &str| report.workloads.get(name)?.get(class).cloned();
+    let band = |mean: f64, stddev: f64, runs: usize| -> (f64, f64) {
+        let half = ci95_half_width_ns(stddev, runs).unwrap_or(0.0);
+        // A positive floor keeps the interval division meaningful even when
+        // the band spans zero (a denominator cannot be ≤ 0).
+        ((mean - half).max(mean * 1e-3), mean + half)
+    };
+    let p99_band = |name: &str, class: &str| -> Option<(f64, f64)> {
+        let s = side(name, class)?;
+        Some(band(s.p99_ns_mean, s.p99_ns_stddev, s.runs))
+    };
+    let (num, den) = match ratio {
+        "write_throughput" => {
+            let f = side("fluxum", "write")?;
+            let b = side("postgres", "write")?;
+            (
+                band(f.throughput_mean, f.throughput_stddev, f.runs),
+                band(b.throughput_mean, b.throughput_stddev, b.runs),
+            )
+        }
+        "e2e_p99" => (p99_band("postgres", "e2e")?, p99_band("fluxum", "e2e")?),
+        "hot_p99" => (p99_band("postgres", "hot")?, p99_band("fluxum", "hot")?),
+        "cold_p99" => (p99_band("postgres", "cold")?, p99_band("fluxum", "cold")?),
+        _ => return None,
+    };
+    (den.0 > 0.0).then_some((num.0 / den.1, num.1 / den.0))
 }
 
 /// TST-097 guard: the competitive ratios are informational while a class is
@@ -556,6 +643,67 @@ mod tests {
         let violations = regressions(&bad, &published, 0.2);
         assert_eq!(violations.len(), 1);
         assert!(violations[0].contains("write_throughput"), "{violations:?}");
+    }
+
+    /// A minimal report over `sides`-shaped workloads with a chosen fluxum
+    /// hot p99 (mean, stddev) — the noise-aware guard's test subject.
+    fn report_with_hot(fluxum_hot_p99: f64, fluxum_hot_stddev: f64) -> Report {
+        let (mut fluxum, baseline) = sides();
+        let hot = fluxum.get_mut("hot").unwrap();
+        hot.p99_ns_mean = fluxum_hot_p99;
+        hot.p99_ns_stddev = fluxum_hot_stddev;
+        hot.runs = 5;
+        let ratios = Ratios::from_summaries(&fluxum, &baseline).unwrap();
+        Report {
+            harness_version: "0.1.0".to_owned(),
+            date: "2026-07-23".to_owned(),
+            hardware: Hardware {
+                cpu: "Test CPU".to_owned(),
+                cores: 8,
+                ram_gib: 32.0,
+                os: "Test OS".to_owned(),
+                disk: "NVMe".to_owned(),
+            },
+            stacks: BTreeMap::new(),
+            workloads: [
+                ("fluxum".to_owned(), fluxum),
+                ("postgres".to_owned(), baseline),
+            ]
+            .into(),
+            ratios,
+            competitive: None,
+        }
+    }
+
+    #[test]
+    fn the_noise_aware_guard_ignores_within_band_drops_and_catches_real_falls() {
+        // Published: fluxum in-process hot p99 120 ns ± 45 (timer-resolution
+        // noise) → a huge, noisy ratio. Current: 180 ns ± 45 — a >30% point
+        // drop that is pure noise (the 95% bands overlap).
+        let published = report_with_hot(120.0, 45.0);
+        let noisy = report_with_hot(180.0, 45.0);
+        assert!(
+            !regressions(&noisy.ratios, &published.ratios, 0.2).is_empty(),
+            "the relative-only check DOES flag it (that is the flaw)"
+        );
+        assert!(
+            regressions_with_uncertainty(&noisy, &published, 0.2).is_empty(),
+            "the bands overlap — noise, not a regression"
+        );
+        // A real fall: the in-process read became a socket round trip
+        // (100 µs). Far outside any band → fires.
+        let real = report_with_hot(100_000.0, 1_000.0);
+        let violations = regressions_with_uncertainty(&real, &published, 0.2);
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert!(violations[0].contains("hot_p99"), "{violations:?}");
+        // A report without workload summaries (foreign artifact) falls back
+        // to the conservative relative check.
+        let mut bare = noisy.clone();
+        bare.workloads.clear();
+        assert!(
+            !regressions_with_uncertainty(&bare, &published, 0.2).is_empty(),
+            "no bands to compare — keep the relative verdict"
+        );
     }
 
     /// A spacetimedb side whose classes make every competitive ratio land
@@ -697,6 +845,8 @@ mod tests {
         assert!(!md.contains("| e2e | 100 ±0 |"), "e2e ops/s must not render");
         // F-011: the p99 CI95 column renders from stddev and runs.
         assert!(md.contains("p99 CI95 ± ms"));
+        // F-007: no pipelined class → no pipelined footnote.
+        assert!(!md.contains("write/pipelined"));
         // Without a spacetimedb side there is no TST-097 section — and the
         // JSON omits the key entirely, which is also the old-schema shape,
         // so pre-TST-097 published reports keep loading (guard inputs).
@@ -721,5 +871,19 @@ mod tests {
         let json = serde_json::to_string(&with_stdb).unwrap();
         let back: Report = serde_json::from_str(&json).unwrap();
         assert_eq!(back.markdown(), md);
+
+        // F-007: a fluxum-only pipelined-write class renders with its
+        // honesty footnote (throughput row, latency includes queueing,
+        // feeds no ratio) and never invents a ratio.
+        let mut with_pipelined = with_stdb;
+        with_pipelined
+            .workloads
+            .get_mut("fluxum")
+            .unwrap()
+            .insert("write/pipelined(32)".to_owned(), summary(120_000.0, 2_000_000.0));
+        let md = with_pipelined.markdown();
+        assert!(md.contains("| fluxum | write/pipelined(32) | 120000"));
+        assert!(md.contains("fluxum-only NFR-01 evidence row"));
+        assert!(md.contains("feeds no ratio"));
     }
 }

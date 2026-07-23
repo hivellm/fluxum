@@ -222,9 +222,15 @@ hardware (CPU model, RAM, OS) in the committed report.
 
 - **TST-060** [P0] **Load test**: ≥ **100,000 reducer calls/s sustained on one shard** for at
   least 60 s (NFR-01), using the high-frequency small-write reducer (`update_reading`) driven
-  over loopback FluxRPC by concurrent trusted-peer connections. Throughput **MUST** be measured
-  via the `fluxum_reducer_calls_total` delta, with zero errored calls. The load report is a G6
-  deliverable.
+  over loopback FluxRPC by concurrent trusted-peer connections. Connections **SHALL pipeline**
+  their calls (SDK-032; the harness's `--pipeline N`) — an acked-serial connection measures
+  round-trip latency, not engine throughput (F-007), and the report records the window and
+  connection count alongside the result. Throughput **MUST** be measured via the
+  `fluxum_reducer_calls_total` delta, with zero errored calls. The load report is a G6
+  deliverable. Measured ceiling on the reference box (2026-07-23, P0-B): the shard's
+  single-writer commit loop sustains ~64k calls/s (~15.6 µs/commit — invariant to connection
+  count 8→24 and window 8→128; queue never full; engine-only microbench 22.4 µs serial
+  round-trip), so the remaining NFR-01 gap is in-engine, not in the protocol.
 - **TST-061** [P0] **Fan-out latency**: with 1,000 concurrent subscribers holding overlapping
   subscriptions, `TxUpdate` delivery p99 (commit time to client receipt) **MUST** be **< 5 ms**
   (NFR-04).

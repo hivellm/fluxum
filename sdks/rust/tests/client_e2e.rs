@@ -259,3 +259,72 @@ fn concurrent_reducer_calls_are_correlated_by_id() {
     assert!(results[1].is_err(), "the empty one, and only it, failed");
     assert!(results[2].is_ok(), "third");
 }
+
+/// Task row: (id: U64, owner: Identity, title: Str, …) — leading U64 pk.
+fn task_schema() -> TableSchema {
+    TableSchema {
+        name: "Task".into(),
+        pk_of_row: Box::new(|row| row[..8].to_vec()),
+        pk_of_delete: Box::new(|entry| entry[..8].to_vec()),
+    }
+}
+
+#[test]
+fn pipelined_calls_resolve_by_id_and_commit_in_submission_order() {
+    // SDK-032 (write pipelining, F-007): a window of un-acked calls shares
+    // one connection; each `PendingReducer` resolves exactly its own outcome
+    // — a failing call in the middle of the window fails alone — and
+    // same-connection commits land in submission order.
+    if skip() {
+        return;
+    }
+    let server = Server::start("pipeline");
+    let db = Connection::connect(&server.tcp_url, b"", [task_schema()]).expect("connect");
+
+    let titles: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&titles);
+    db.on(
+        "Task:insert",
+        Box::new(move |row, _old| {
+            let mut reader = FluxBinReader::new(row);
+            reader.read_u64().unwrap(); // id
+            reader.read_identity().unwrap(); // owner
+            sink.lock().unwrap().push(reader.read_str().unwrap().to_owned());
+        }),
+    );
+    db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
+
+    // Eight adds in flight with a doomed call planted mid-window.
+    let mut pending = Vec::new();
+    for i in 0..4 {
+        pending.push(
+            db.call_reducer_async("add_task", vec![FluxValue::Str(format!("t{i}"))])
+                .expect("pipelined send"),
+        );
+    }
+    let doomed = db
+        .call_reducer_async("no_such_reducer", vec![])
+        .expect("pipelined send");
+    for i in 4..8 {
+        pending.push(
+            db.call_reducer_async("add_task", vec![FluxValue::Str(format!("t{i}"))])
+                .expect("pipelined send"),
+        );
+    }
+
+    for p in pending {
+        p.wait().expect("every valid call acks Ok");
+    }
+    assert!(
+        doomed.wait().is_err(),
+        "the unknown reducer fails exactly its own handle"
+    );
+
+    // Same-connection commits deliver in submission order.
+    let expected: Vec<String> = (0..8).map(|i| format!("t{i}")).collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while titles.lock().unwrap().len() < expected.len() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(*titles.lock().unwrap(), expected);
+}
