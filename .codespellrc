@@ -13,5 +13,6 @@ skip = *.lock,*.json,*.map,*.yaml,*.yml,*.csv,*.bib,*.min.js,target,node_modules
 #     keep-alives (valid plural, RPC-001), unparseable (valid variant),
 #     lits (SQL AST literals), caf (from the "Café" Unicode-normalization test),
 #     runn (Porter-stemmer output for "running", not a typo),
-#     atLeast (camelCase identifier in the conformance interpreter).
-ignore-words-list = crate,ser,deser,upToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,statics,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack,keep-alives,unparseable,lits,caf,runn,atLeast
+#     atLeast (camelCase identifier in the conformance interpreter),
+#     UpToDate (the PlanVerdict enum variant).
+ignore-words-list = crate,ser,deser,upToDate,UpToDate,optIn,shouldBe,Bloc,UE,ue,Dota,dota,retuned,implementors,statics,FluxBIN,fluxbin,BSATN,bsatn,SATS,sats,UzDB,uzdb,msgpack,keep-alives,unparseable,lits,caf,runn,atLeast

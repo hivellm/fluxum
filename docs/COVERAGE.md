@@ -5,17 +5,18 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.23% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
-drivers live), after phase6_reducer-test-simulation-kit (`fluxum-testkit` lands ~96%-covered
-by its own author-facing suite). **The floor is recovered** from the ~89.8% breach the T6.6
-leva recorded and has grown three levas straight: 90.02% (optimistic mutations) → 90.09%
-(offline persistence) → 90.23% (testkit). The **standing debt items below remain open**
-(they are why the margin is not wider, category 9 aside): (a) the `fluxum dev`
-watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the `fluxum-bench
-load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the short-window
-smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered). **The next task
-touching fluxum-cli or fluxum-bench should still factor those into pure functions and cover
-them.** Prior standings: 90.09%, 90.02%, ~89.8% (T6.6), 89.93% (T6 inner-loop), 90.12%
+**Current standing:** **90.08% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
+drivers live), after phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the
+seed path are covered by their suites; the dip from 90.23% is the new CLI glue —
+`migrate.rs`'s cargo-spawn wrapper and the `run()` dispatch arms — the same category-9
+shape as the standing debt). **The floor holds**, recovered from the ~89.8% T6.6 breach:
+90.02% → 90.09% → 90.23% → 90.08%. The **standing debt items below remain open**: (a) the
+`fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
+`fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
+short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);
+(c) now also the `fluxum migrate --plan` cargo-spawn wrapper. **The next task touching
+fluxum-cli or fluxum-bench should factor those into pure functions and cover them.** Prior
+standings: 90.23% (testkit), 90.09%, 90.02%, ~89.8% (T6.6), 89.93% (T6 inner-loop), 90.12%
 (P0 parity campaign). The P0-B growth briefly
 dipped the floor to 89.96%; recovered by covering the pipelining trait defaults +
 `ratio_interval` arms and by the **PG-gated baseline smoke** (`baseline_postgres_runs_all_workloads`,

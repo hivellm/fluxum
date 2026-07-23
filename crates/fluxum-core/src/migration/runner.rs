@@ -45,6 +45,249 @@ pub struct MigrationReport {
     pub auto_applied: Vec<SchemaChange>,
 }
 
+/// What a [`MigrationPlan`] says the next real boot would do (SPEC-024
+/// DEV-041): the auto-apply decision, per MIG-021/022/023.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// No stored metadata: the first boot adopts the compiled schema
+    /// verbatim (MIG-002).
+    FirstBoot,
+    /// Stored and compiled schemas already match; nothing to do.
+    UpToDate,
+    /// Every detected change is safe (MIG-021): the next boot auto-applies
+    /// them and serves.
+    AutoApplies,
+    /// The schema changed but `SCHEMA_VERSION` did not: the next boot
+    /// refuses to start (MIG-023).
+    NeedsVersionBump,
+    /// Incompatible changes with no pending migration step: the next boot
+    /// refuses to start, stored data untouched (MIG-022).
+    RequiresMigration,
+    /// Pending `#[fluxum::migration]` steps will run first; the diff below
+    /// is against the CURRENT stored catalog, so entries a step resolves
+    /// will not abort the real boot.
+    RunsMigrations,
+}
+
+/// A read-only preview of what [`MigrationRunner::run`] would do at the
+/// next boot (SPEC-024 DEV-041): the computed schema diff, the pending
+/// migration steps, and the auto-apply verdict — computed from snapshot
+/// reads alone, mutating nothing.
+///
+/// The preview is honest about its limits: pending steps cannot be executed
+/// read-only, so the diff is against the catalog as currently stored. A
+/// step failure or a CT-060 transform divergence surfaces only at the real
+/// boot.
+#[derive(Debug)]
+pub struct MigrationPlan {
+    /// `schema_version` currently stored (equals `code_version` when the
+    /// store has never booted).
+    pub stored_version: u32,
+    /// The compiled binary's `fluxum::schema_version!`.
+    pub code_version: u32,
+    /// `#[fluxum::migration]` steps the next boot would run, ascending.
+    pub pending: Vec<AppliedMigration>,
+    /// The MIG-020 diff of the CURRENT stored catalog vs the compiled
+    /// schema. Empty on first boot.
+    pub changes: Vec<SchemaChange>,
+    /// The auto-apply decision.
+    pub verdict: PlanVerdict,
+}
+
+impl MigrationPlan {
+    /// Whether the next real boot definitely refuses to start (MIG-022 /
+    /// MIG-023). `false` means it boots — or, with pending steps, depends
+    /// on those steps succeeding.
+    pub fn refuses(&self) -> bool {
+        matches!(
+            self.verdict,
+            PlanVerdict::NeedsVersionBump | PlanVerdict::RequiresMigration
+        )
+    }
+
+    /// The human-readable plan, one entry per line with its MIG-020
+    /// required action and the `[auto]` / `[BLOCKS]` classification.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str("schema migration plan (read-only preview, SPEC-024 DEV-041)\n");
+        out.push_str(&format!(
+            "  stored schema_version:   {}\n  compiled schema_version: {}\n",
+            self.stored_version, self.code_version
+        ));
+        if !self.pending.is_empty() {
+            out.push_str("  pending #[fluxum::migration] steps (run first, in order):\n");
+            for step in &self.pending {
+                out.push_str(&format!("    - v{} `{}`\n", step.version, step.name));
+            }
+        }
+        if self.changes.is_empty() {
+            out.push_str("  schema diff: none\n");
+        } else {
+            out.push_str("  schema diff vs the CURRENT stored catalog:\n");
+            for change in &self.changes {
+                let tag = if change.is_safe() {
+                    "[auto]"
+                } else {
+                    "[BLOCKS]"
+                };
+                out.push_str(&format!(
+                    "    {tag} {change} — {}\n",
+                    change.required_action()
+                ));
+            }
+        }
+        let verdict = match self.verdict {
+            PlanVerdict::FirstBoot => {
+                "first boot: the compiled schema is adopted verbatim (MIG-002)"
+            }
+            PlanVerdict::UpToDate => "up to date: nothing to migrate",
+            PlanVerdict::AutoApplies => {
+                "boots: every change is safe and auto-applies at startup (MIG-021)"
+            }
+            PlanVerdict::NeedsVersionBump => {
+                "REFUSES to boot: schema changed without a SCHEMA_VERSION bump (MIG-023)"
+            }
+            PlanVerdict::RequiresMigration => {
+                "REFUSES to boot: incompatible changes need an explicit \
+                 #[fluxum::migration] (MIG-022)"
+            }
+            PlanVerdict::RunsMigrations => {
+                "runs the pending migration steps first; diff entries a step \
+                 resolves will not abort the real boot"
+            }
+        };
+        out.push_str(&format!("  verdict: {verdict}\n"));
+        out
+    }
+}
+
+/// Compute the read-only migration plan (SPEC-024 DEV-041) from this
+/// binary's link-time registrations — the preview twin of
+/// [`MigrationRunner::run`]. Snapshot reads only; guaranteed side-effect
+/// free (it does not even need the commit log).
+pub fn plan(store: &MemStore, schema: &Schema) -> Result<MigrationPlan> {
+    let code_version = declared_schema_version()?;
+    let migrations: Vec<&MigrationDef> = registered_migrations().collect();
+    plan_inner(
+        store,
+        schema,
+        code_version,
+        &migrations,
+        &MetaIndex::collect(),
+    )
+}
+
+/// [`plan`] with explicit inputs instead of the link-time registries — the
+/// seam tests and embedders use to simulate binaries at different schema
+/// versions (the twin of [`MigrationRunner::run_with`]).
+pub fn plan_with(
+    store: &MemStore,
+    schema: &Schema,
+    code_version: u32,
+    migrations: &[&MigrationDef],
+    column_meta: &[&TableColumnMeta],
+) -> Result<MigrationPlan> {
+    plan_inner(
+        store,
+        schema,
+        code_version,
+        migrations,
+        &MetaIndex::new(column_meta),
+    )
+}
+
+fn plan_inner(
+    store: &MemStore,
+    schema: &Schema,
+    code_version: u32,
+    migrations: &[&MigrationDef],
+    meta: &MetaIndex<'_>,
+) -> Result<MigrationPlan> {
+    if code_version == 0 {
+        return Err(FluxumError::Schema(
+            "SCHEMA_VERSION 0 is invalid: versions start at 1 (MIG-001)".into(),
+        ));
+    }
+    let meta_id = store.table_id(META_TABLE).ok_or_else(|| {
+        FluxumError::Schema(format!(
+            "the store was assembled without `{META_TABLE}` (MIG-002)"
+        ))
+    })?;
+    let sorted = validate_migrations(migrations, code_version)?;
+
+    let Some(version_bytes) = read_meta_value(store, meta_id, META_KEY_VERSION)? else {
+        return Ok(MigrationPlan {
+            stored_version: code_version,
+            code_version,
+            pending: Vec::new(),
+            changes: Vec::new(),
+            verdict: PlanVerdict::FirstBoot,
+        });
+    };
+    let stored_version = decode_version(&version_bytes)?;
+    // MIG-003 parity: a downgrade refuses at the door — the plan says so
+    // the same way the real boot would.
+    if code_version < stored_version {
+        return Err(FluxumError::Schema(format!(
+            "FATAL: schema downgrade detected (code={code_version} < \
+             stored={stored_version}). Aborting."
+        )));
+    }
+    let catalog_bytes = read_meta_value(store, meta_id, META_KEY_CATALOG)?.ok_or_else(|| {
+        FluxumError::Storage(format!(
+            "__schema_meta__.{META_KEY_VERSION} is present but \
+             __schema_meta__.{META_KEY_CATALOG} is missing — the schema metadata is corrupt"
+        ))
+    })?;
+    let stored_catalog = StoredCatalog::decode(&catalog_bytes)?;
+    let compiled = StoredCatalog::from_schema(schema);
+
+    let pending: Vec<AppliedMigration> = sorted
+        .iter()
+        .filter(|def| def.version > stored_version && def.version <= code_version)
+        .map(|def| AppliedMigration {
+            version: def.version,
+            name: def.name,
+        })
+        .collect();
+    let changes = diff_catalogs_with(&stored_catalog, &compiled, meta);
+
+    let verdict = if !pending.is_empty() {
+        PlanVerdict::RunsMigrations
+    } else if changes.is_empty() {
+        PlanVerdict::UpToDate
+    } else if code_version == stored_version {
+        PlanVerdict::NeedsVersionBump
+    } else if changes.iter().all(SchemaChange::is_safe) {
+        PlanVerdict::AutoApplies
+    } else {
+        PlanVerdict::RequiresMigration
+    };
+    Ok(MigrationPlan {
+        stored_version,
+        code_version,
+        pending,
+        changes,
+        verdict,
+    })
+}
+
+/// Read a `__schema_meta__` value from the committed state (shared by the
+/// runner and the read-only [`plan`] path).
+fn read_meta_value(store: &MemStore, meta_id: TableId, key: &str) -> Result<Option<Vec<u8>>> {
+    let snapshot = store.snapshot();
+    let Some(row) = snapshot.query_pk(meta_id, &[RowValue::Str(key.to_owned())])? else {
+        return Ok(None);
+    };
+    match row.value(1) {
+        Some(RowValue::Bytes(bytes)) => Ok(Some(bytes.clone())),
+        other => Err(FluxumError::Storage(format!(
+            "__schema_meta__.{key} holds {other:?} instead of Bytes — the schema \
+             metadata is corrupt"
+        ))),
+    }
+}
+
 /// The startup migration runner (SPEC-010).
 ///
 /// Runs after recovery ([`crate::checkpoint::recover`]) and **before** the
@@ -347,17 +590,7 @@ impl<'a> MigrationRunner<'a> {
 
     /// Read a `__schema_meta__` value from the committed state.
     fn read_meta(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        let snapshot = self.store.snapshot();
-        let Some(row) = snapshot.query_pk(self.meta_id, &[RowValue::Str(key.to_owned())])? else {
-            return Ok(None);
-        };
-        match row.value(1) {
-            Some(RowValue::Bytes(bytes)) => Ok(Some(bytes.clone())),
-            other => Err(FluxumError::Storage(format!(
-                "__schema_meta__.{key} holds {other:?} instead of Bytes — the schema \
-                 metadata is corrupt"
-            ))),
-        }
+        read_meta_value(self.store, self.meta_id, key)
     }
 
     /// Upsert a `__schema_meta__` key inside `tx`.

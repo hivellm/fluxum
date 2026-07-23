@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | DEV-01x (dev inner loop) shipped with T6/FR-135; DEV-02x (reducer test kit) shipped as [`fluxum-testkit`](../../crates/fluxum-testkit/) — seeded clock/RNG fixture, row/diff assertions, deterministic record/replay, crash-fault recovery. DEV-03x/DEV-04x remain open. |
+| **Status** | DEV-01x (dev inner loop) shipped with T6/FR-135; DEV-02x (reducer test kit) shipped as [`fluxum-testkit`](../../crates/fluxum-testkit/); DEV-04x shipped — `fluxum seed` (ordered reducer-call fixtures over the admin surface) and `fluxum migrate --plan` (read-only diff + auto-apply verdict via `fluxum_core::migration::plan`, reached through `FLUXUM_MIGRATE_PLAN=1` / `fluxum-server --migrate-plan`). DEV-03x (admin console) remains open. |
 | **Phase / tasks** | Phase 6 (CLI, console, test kit, seeding) ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-04, FR-81, FR-82 (extends); new: FR-135 (dev inner-loop CLI), FR-136 (reducer test kit), FR-137 (admin web console), FR-138 (seeding & migrate dry-run) |
 | **Requirement prefix** | `DEV-` |

@@ -36,6 +36,31 @@ fn main() -> ExitCode {
             println!("fluxum-server {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Ok(Some(Args::MigratePlan(path))) => {
+            // SPEC-024 DEV-041: print the read-only plan and stop — the
+            // same seam FLUXUM_MIGRATE_PLAN=1 reaches through boot::serve.
+            let config = match Config::load(path.as_deref()) {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("configuration error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return match boot::migration_plan(&config) {
+                Ok(plan) => {
+                    print!("{}", plan.render());
+                    if plan.refuses() {
+                        ExitCode::from(3)
+                    } else {
+                        ExitCode::SUCCESS
+                    }
+                }
+                Err(err) => {
+                    eprintln!("migrate --plan failed: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(Some(Args::Config(path))) => Some(path),
         Ok(None) => None,
         Err(message) => {
@@ -79,10 +104,14 @@ const USAGE: &str = "\
 fluxum-server — the Fluxum reference server
 
 USAGE:
-    fluxum-server [--config <path>]
+    fluxum-server [--config <path>] [--migrate-plan]
 
 OPTIONS:
     -c, --config <path>    Configuration file (YAML). Defaults apply if omitted.
+        --migrate-plan     Print the read-only schema migration plan for this
+                           binary against the configured data directory and
+                           exit — 0 when the next boot proceeds, 3 when it
+                           would refuse (SPEC-024 DEV-041). Nothing is mutated.
     -h, --help             Print this message.
     -V, --version          Print the version.
 
@@ -93,6 +122,7 @@ enum Args {
     Help,
     Version,
     Config(std::path::PathBuf),
+    MigratePlan(Option<std::path::PathBuf>),
 }
 
 /// Parse the command line, which is deliberately one option wide.
@@ -107,8 +137,20 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
     match first.as_str() {
         "-h" | "--help" => Ok(Some(Args::Help)),
         "-V" | "--version" => Ok(Some(Args::Version)),
+        "--migrate-plan" => match args.get(1).map(String::as_str) {
+            None => Ok(Some(Args::MigratePlan(None))),
+            Some("-c" | "--config") => match args.get(2) {
+                Some(path) => Ok(Some(Args::MigratePlan(Some(path.into())))),
+                None => Err("--config needs a path".into()),
+            },
+            Some(other) => Err(format!("unrecognised argument: {other}")),
+        },
         "-c" | "--config" => match args.get(1) {
-            Some(path) => Ok(Some(Args::Config(path.into()))),
+            Some(path) => match args.get(2).map(String::as_str) {
+                None => Ok(Some(Args::Config(path.into()))),
+                Some("--migrate-plan") => Ok(Some(Args::MigratePlan(Some(path.into())))),
+                Some(other) => Err(format!("unrecognised argument: {other}")),
+            },
             None => Err(format!("{first} needs a path")),
         },
         other => Err(format!("unrecognised argument: {other}")),

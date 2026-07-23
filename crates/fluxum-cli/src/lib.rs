@@ -24,6 +24,8 @@ pub mod dev;
 pub mod generate;
 pub mod init;
 pub mod logs;
+pub mod migrate;
+pub mod seed;
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -74,15 +76,58 @@ fn host_port(server: &str) -> &str {
 /// server keeps the connection alive whatever `Connection: close` asked
 /// for), falling back to read-until-EOF for servers that do close.
 pub fn fetch_path(server: &str, path: &str) -> Result<String, CliError> {
+    let (status, body) = http_request(server, "GET", path, None)?;
+    if status != "200" {
+        return Err(CliError::Response(format!("server answered {status}")));
+    }
+    Ok(body)
+}
+
+/// One JSON `POST` against a running server (the `fluxum seed` transport,
+/// RPC-051). A non-200 answer surfaces the admin envelope's own `error`
+/// message when the body carries one — "quota exceeded" beats
+/// "server answered 400".
+pub fn post_path(server: &str, path: &str, json_body: &str) -> Result<String, CliError> {
+    let (status, body) = http_request(server, "POST", path, Some(json_body))?;
+    if status != "200" {
+        let message = serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| {
+                v.get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| format!("server answered {status}"));
+        return Err(CliError::Response(message));
+    }
+    Ok(body)
+}
+
+/// The shared one-request HTTP exchange: send, split headers, honor
+/// `Content-Length`, return `(status, body)`.
+fn http_request(
+    server: &str,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+) -> Result<(String, String), CliError> {
     let addr = host_port(server);
     let mut stream =
         TcpStream::connect(addr).map_err(|e| CliError::Connect(format!("{addr}: {e}")))?;
     // A stuck server must fail the command, not hang it.
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
-    let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
-         Connection: close\r\n\r\n"
-    );
+    let request = match body {
+        None => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
+             Connection: close\r\n\r\n"
+        ),
+        Some(payload) => format!(
+            "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/json\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        ),
+    };
     stream.write_all(request.as_bytes())?;
 
     let mut raw = Vec::new();
@@ -132,10 +177,10 @@ pub fn fetch_path(server: &str, path: &str) -> Result<String, CliError> {
             }
         }
     }
-    if status != "200" {
-        return Err(CliError::Response(format!("server answered {status}")));
-    }
-    Ok(String::from_utf8_lossy(&raw[body_start..]).into_owned())
+    Ok((
+        status,
+        String::from_utf8_lossy(&raw[body_start..]).into_owned(),
+    ))
 }
 
 /// Fetch the schema document from `server` (`host:port`, optionally
@@ -191,6 +236,8 @@ USAGE:
     fluxum logs --server <host:port> [-f] [--level <level>] [--format json|pretty]
     fluxum schema export --server <host:port> [--out <file>]
     fluxum generate --lang <lang> --schema <url_or_file> --out <dir>
+    fluxum seed <file> --server <host:port>
+    fluxum migrate --plan [--path <dir>]
 
 COMMANDS:
     init             Scaffold a runnable Fluxum application (schema +
@@ -219,6 +266,18 @@ COMMANDS:
                      committed and diffed in review.
 
                      --lang    typescript | ts | rust | rs
+
+    seed             Apply a JSON fixture to a running instance (DEV-040):
+                     an ordered list of reducer calls, each POSTed through
+                     the admin surface so the full production admission
+                     path runs. Stops at the first failing call.
+
+    migrate --plan   Preview the schema migration the next boot would run
+                     (DEV-041): builds the module at --path (default .) and
+                     prints the diff with each entry's decision — [auto]
+                     safe/additive vs [BLOCKS] requires an explicit
+                     #[fluxum::migration] — changing nothing. Exit 0 when
+                     the boot proceeds, 3 when it would refuse.
 ";
 
 /// Run the CLI over `args` (without the program name). Returns the process
@@ -369,6 +428,43 @@ where
                 }
                 Err(e) => {
                     eprintln!("generate failed: {e}");
+                    1
+                }
+            }
+        }
+        ["seed", rest @ ..] => {
+            let Some(file) = rest.first().filter(|a| !a.starts_with("--")) else {
+                eprintln!("seed: a fixture file is required\n\n{USAGE}");
+                return 2;
+            };
+            let Some(server) = flag(rest, "--server") else {
+                eprintln!("seed: --server <host:port> is required\n\n{USAGE}");
+                return 2;
+            };
+            match seed::run_seed(&server, std::path::Path::new(file)) {
+                Ok(report) => {
+                    println!("seeded {} call(s) from {file}", report.applied);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("seed failed: {e}");
+                    1
+                }
+            }
+        }
+        ["migrate", rest @ ..] => {
+            if !rest.contains(&"--plan") {
+                eprintln!(
+                    "migrate: only --plan exists — migrations APPLY at server boot \
+                     (SPEC-010); the CLI's job is the read-only preview\n\n{USAGE}"
+                );
+                return 2;
+            }
+            let dir = flag(rest, "--path").map_or_else(|| ".".into(), std::path::PathBuf::from);
+            match migrate::migrate_plan(&dir) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("migrate --plan failed: {e}");
                     1
                 }
             }

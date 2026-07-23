@@ -160,12 +160,60 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
 /// each transport. Two knobs for one queue would only let them disagree.
 const COMMIT_BROADCAST_CAPACITY: usize = 256;
 
+/// Compute the read-only migration plan for this binary against the data
+/// directories in `config` (SPEC-024 DEV-041): recover the stored state
+/// into a fresh in-memory store (disk is only READ — the commit log is not
+/// opened for writing, no checkpoint is taken, `__schema_meta__` is not
+/// touched) and preview what the next real boot's migration run would do.
+///
+/// A data directory that does not exist yet is a first boot: the plan says
+/// so without creating anything.
+pub fn migration_plan(config: &Config) -> Result<fluxum_core::migration::MigrationPlan, BootError> {
+    if fluxum_core::schema::registered_tables().next().is_none() {
+        return Err(BootError::NoTables);
+    }
+    // The module's registry plus the runtime-owned `__schema_meta__` (the
+    // migration runner's MIG-002 requirement — the plan reads it).
+    let schema = Schema::from_tables(
+        fluxum_core::schema::registered_tables()
+            .chain(std::iter::once(&fluxum_core::migration::SCHEMA_META)),
+    )?;
+    let store = MemStore::new(&schema)?;
+    if config.storage.commit_log_dir.is_dir() {
+        let repo = fluxum_core::checkpoint::CheckpointRepo::open(&config.storage.checkpoint_dir)?;
+        fluxum_core::checkpoint::recover(&store, &repo, &config.storage.commit_log_dir, 0)?;
+    }
+    Ok(fluxum_core::migration::plan(&store, &schema)?)
+}
+
 /// Assemble and bind both listeners.
 ///
 /// Both are bound before either is reported as up: a server answering TCP
 /// while its HTTP port is still unbound looks healthy to a supervisor and is
 /// unreachable to a browser.
+///
+/// # `FLUXUM_MIGRATE_PLAN`
+///
+/// When the environment variable `FLUXUM_MIGRATE_PLAN=1` is set, `serve`
+/// does not serve: it prints the read-only [`migration_plan`] to stdout and
+/// **exits the process** — 0 when the next boot proceeds, 3 when it would
+/// refuse (MIG-022/MIG-023). This is the seam `fluxum migrate --plan`
+/// drives, and because it lives here every embedder — the reference binary,
+/// `fluxum init` scaffolds, custom mains — gets the plan mode without code
+/// changes.
 pub async fn serve(config: Config) -> Result<Server, BootError> {
+    if std::env::var("FLUXUM_MIGRATE_PLAN").is_ok_and(|v| v == "1") {
+        match migration_plan(&config) {
+            Ok(plan) => {
+                print!("{}", plan.render());
+                std::process::exit(i32::from(plan.refuses()) * 3);
+            }
+            Err(e) => {
+                eprintln!("migrate --plan failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let ctx = assemble(&config)?;
 
     let idle = match config.server.idle_timeout_secs {

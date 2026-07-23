@@ -53,7 +53,9 @@ pub mod runner;
 pub use catalog::{StoredCatalog, StoredColumn, StoredTable, StoredType};
 pub use context::MigrationContext;
 pub use diff::{SchemaChange, diff_catalogs};
-pub use runner::{AppliedMigration, MigrationReport, MigrationRunner};
+pub use runner::{
+    AppliedMigration, MigrationPlan, MigrationReport, MigrationRunner, PlanVerdict, plan, plan_with,
+};
 
 use crate::error::{FluxumError, Result};
 use crate::schema::{ColumnSchema, FluxType, TableAccess, TableSchema, VisibilityRule};

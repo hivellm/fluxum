@@ -1085,3 +1085,111 @@ async fn missing_catalog_with_a_version_is_reported_as_corruption() {
         assert!(err.contains("corrupt"), "{err}");
     }
 }
+
+// --- SPEC-024 DEV-041: the read-only plan ------------------------------------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_plan_previews_every_verdict_without_mutating_anything() {
+    use fluxum_core::migration::{PlanVerdict, plan_with};
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // A store that never booted: the plan says first boot — and writes
+    // nothing, so a second plan says exactly the same.
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        let plan = plan_with(&shard.store, &shard.schema, 1, &[], &[]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::FirstBoot);
+        assert!(!plan.refuses());
+        let again = plan_with(&shard.store, &shard.schema, 1, &[], &[]).unwrap();
+        assert_eq!(
+            again.verdict,
+            PlanVerdict::FirstBoot,
+            "read-only: no adoption"
+        );
+
+        // Now really boot and write a row, so later plans have stored state.
+        shard.migrate(1, &[], &[]).await.unwrap();
+        let task_id = shard.store.table_id("Task").unwrap();
+        shard
+            .commit(|tx| {
+                tx.insert(task_id, task(1, "a", false)).unwrap();
+            })
+            .await;
+    }
+
+    // Same binary again: up to date.
+    {
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        let plan = plan_with(&shard.store, &shard.schema, 1, &[], &[]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::UpToDate);
+        assert!(plan.changes.is_empty());
+        assert!(plan.pending.is_empty());
+    }
+
+    // v2 with a defaulted new column + a new table: auto-applies; the plan
+    // lists both changes as safe and STILL mutates nothing.
+    {
+        let shard = boot(dir.path(), &[&TASK_V2, &AUDIT]);
+        let before_version = shard.meta_version();
+        let plan = plan_with(&shard.store, &shard.schema, 2, &[], &[&TASK_META]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::AutoApplies);
+        assert_eq!(plan.changes.len(), 2);
+        assert!(plan.changes.iter().all(SchemaChange::is_safe));
+        assert!(!plan.refuses());
+        assert_eq!(plan.stored_version, 1);
+        assert_eq!(plan.code_version, 2);
+        let rendered = plan.render();
+        assert!(rendered.contains("[auto]"), "{rendered}");
+        assert!(rendered.contains("auto-applies"), "{rendered}");
+        assert_eq!(shard.meta_version(), before_version, "plan wrote nothing");
+        assert_eq!(shard.meta_catalog().tables.len(), 1, "catalog untouched");
+    }
+
+    // The same v2 diff WITHOUT a version bump: MIG-023, refuses.
+    {
+        let shard = boot(dir.path(), &[&TASK_V2, &AUDIT]);
+        let plan = plan_with(&shard.store, &shard.schema, 1, &[], &[&TASK_META]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::NeedsVersionBump);
+        assert!(plan.refuses());
+        assert!(plan.render().contains("MIG-023"));
+    }
+
+    // A dropped column with no migration step: MIG-022, refuses, and the
+    // render marks the blocking entry.
+    {
+        let shard = boot(dir.path(), &[&TASK_DROPPED]);
+        let plan = plan_with(&shard.store, &shard.schema, 2, &[], &[]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::RequiresMigration);
+        assert!(plan.refuses());
+        let rendered = plan.render();
+        assert!(rendered.contains("[BLOCKS]"), "{rendered}");
+        assert!(rendered.contains("REFUSES"), "{rendered}");
+    }
+
+    // With a pending #[fluxum::migration] step the verdict defers to it —
+    // the step runs first at the real boot.
+    {
+        let shard = boot(dir.path(), &[&TASK_V2]);
+        let plan = plan_with(&shard.store, &shard.schema, 2, &[&ADD_PRIORITY_V2], &[]).unwrap();
+        assert_eq!(plan.verdict, PlanVerdict::RunsMigrations);
+        assert_eq!(plan.pending.len(), 1);
+        assert_eq!(plan.pending[0].version, 2);
+        assert!(!plan.refuses());
+        assert!(plan.render().contains("run first"));
+    }
+
+    // MIG-003 parity: a downgrade plan refuses at the door. First move the
+    // store to v2 for real, then plan as a v1 binary.
+    {
+        boot(dir.path(), &[&TASK_V2, &AUDIT])
+            .migrate(2, &[], &[&TASK_META])
+            .await
+            .unwrap();
+        let shard = boot(dir.path(), &[&TASK_V1]);
+        let err = plan_with(&shard.store, &shard.schema, 1, &[], &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("downgrade"), "{err}");
+    }
+}

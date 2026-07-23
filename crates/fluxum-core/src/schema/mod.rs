@@ -17,7 +17,7 @@
 
 pub mod registry;
 
-pub use registry::{Schema, TableDef, spatial_stream_advisory};
+pub use registry::{Schema, TableDef, registered_tables, spatial_stream_advisory};
 
 use crate::error::Result;
 use crate::store::RowValue;
