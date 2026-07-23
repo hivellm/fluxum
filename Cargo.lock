@@ -1119,6 +1119,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fluxum-testkit"
+version = "0.1.0"
+dependencies = [
+ "fluxum-core",
+ "fluxum-demo",
+ "fluxum-dst",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "fluxum-testmod"
 version = "0.1.0"
 dependencies = [

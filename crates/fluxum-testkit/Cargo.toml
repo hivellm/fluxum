@@ -1,0 +1,25 @@
+[package]
+name = "fluxum-testkit"
+description = "Deterministic reducer test & simulation kit for Fluxum module authors (SPEC-024 DEV-020/DEV-021)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# Internal to the workspace: never goes to crates.io. Only `fluxum-sdk` is
+# published (SPEC-011 SDK-071); module authors consume this from the repo.
+publish = false
+
+[dependencies]
+fluxum-core.workspace = true
+fluxum-dst = { path = "../fluxum-dst" }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+# The canonical demo module doubles as the author-facing example: the kit's
+# integration tests drive `complete_task` & friends exactly as a module
+# author would drive their own crate.
+fluxum-demo.workspace = true
+
+[lints]
+workspace = true
