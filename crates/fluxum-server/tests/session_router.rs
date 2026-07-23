@@ -303,7 +303,6 @@ async fn an_unknown_reducer_maps_to_an_error_frame() {
         }
         other => panic!("expected Error, got {other:?}"),
     }
-    assert!(routed.commit.is_none(), "nothing committed");
 }
 
 #[tokio::test(flavor = "multi_thread")]

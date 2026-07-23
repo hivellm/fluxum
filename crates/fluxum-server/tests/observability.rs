@@ -250,13 +250,12 @@ async fn metrics_catalogue_is_complete_with_outcomes_and_histogram_buckets() {
 #[tokio::test]
 async fn health_reports_ready_then_degrades_on_recovery() {
     let ctx = build_ctx();
-    let receipt = ctx
-        .engine
+    // The commit hook publishes from the single writer (P0-A 1.3), which
+    // advances the lock-free health tx_id.
+    ctx.engine
         .call(caller(), "add_note", vec![FluxValue::Str("x".into())])
         .await
         .unwrap();
-    // Publish like the transport would, so the lock-free health tx_id advances.
-    ctx.publish_commit(receipt.diff);
     let server = http::serve(Arc::clone(&ctx), "127.0.0.1:0", HttpOptions::default())
         .await
         .unwrap();

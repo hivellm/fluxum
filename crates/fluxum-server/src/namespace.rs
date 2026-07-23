@@ -95,14 +95,26 @@ impl Namespace {
         quotas: crate::quota::TenantQuotas,
     ) -> Arc<Self> {
         let (commit_tx, _) = broadcast::channel(commit_capacity.max(1));
-        Arc::new(Self {
+        let ns = Arc::new(Self {
             name: name.into(),
             engine,
             subscriptions: Mutex::new(subscriptions),
             commit_tx,
             last_tx_id: AtomicU64::new(0),
             quotas: crate::quota::QuotaState::new(quotas),
-        })
+        });
+        // P0-A 1.3 (TXN-021 steps 9/10): this database's single writer
+        // publishes every commit to *its own* fan-out at commit visibility —
+        // tenant isolation is preserved because each namespace owns its
+        // engine, pipeline, and broadcast. Weak breaks the ns → engine →
+        // pipeline → hook → ns cycle.
+        let hook_ns = Arc::downgrade(&ns);
+        ns.engine.pipeline().set_commit_hook(Box::new(move |diff| {
+            if let Some(ns) = hook_ns.upgrade() {
+                ns.publish_commit(diff.clone());
+            }
+        }));
+        ns
     }
 
     /// This tenant's quota ceilings and live state (OPS-060/061).

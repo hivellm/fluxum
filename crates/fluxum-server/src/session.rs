@@ -26,27 +26,25 @@ use fluxum_protocol::{
 
 use crate::ShardContext;
 
-/// The result of routing one message: the responses to send, plus any diff
-/// to publish to the commit fan-out (a committed reducer call).
+/// The result of routing one message: the responses to send. A committed
+/// reducer call's diff is NOT here — the single writer publishes it to the
+/// fan-out at commit visibility (TXN-021 steps 9/10, the P0-A 1.3 commit
+/// hook), so delivery never waits for this connection's response hop.
 pub struct Routed {
     /// Responses to write back, in order (each echoes the request id).
     pub responses: Vec<ServerMessage>,
-    /// A committed transaction to broadcast to subscribers (SUB-021).
-    pub commit: Option<fluxum_core::store::TxDiff>,
 }
 
 impl Routed {
     fn reply(message: ServerMessage) -> Self {
         Self {
             responses: vec![message],
-            commit: None,
         }
     }
 
     fn none() -> Self {
         Self {
             responses: Vec::new(),
-            commit: None,
         }
     }
 }
@@ -130,8 +128,7 @@ impl Session {
     }
 
     /// The namespace this session is bound to (`None` = the default
-    /// database), so the transport can persist/resume the binding and
-    /// publish commits to the right fan-out.
+    /// database), so the transport can persist/resume the binding.
     pub fn namespace(&self) -> Option<&Arc<crate::namespace::Namespace>> {
         self.namespace.as_ref()
     }
@@ -160,15 +157,6 @@ impl Session {
         match &self.namespace {
             Some(ns) => ns.store(),
             None => self.ctx.store(),
-        }
-    }
-
-    /// Publish a committed diff to *this session's* namespace fan-out, so a
-    /// tenant's commit never reaches another tenant's subscribers.
-    pub fn publish_commit(&self, diff: fluxum_core::store::TxDiff) {
-        match &self.namespace {
-            Some(ns) => ns.publish_commit(diff),
-            None => self.ctx.publish_commit(diff),
         }
     }
 
@@ -369,13 +357,12 @@ impl Session {
                 {
                     return Routed::reply(from_error(Some(id), &e));
                 }
-                Routed {
-                    responses: vec![ServerMessage::ReducerResult(ReducerResult {
-                        id,
-                        outcome: Ok(()),
-                    })],
-                    commit: Some(receipt.diff),
-                }
+                // The single writer already published the diff at commit
+                // visibility (P0-A 1.3) — this ack only reports the outcome.
+                Routed::reply(ServerMessage::ReducerResult(ReducerResult {
+                    id,
+                    outcome: Ok(()),
+                }))
             }
             // SPEC-021 CS-030: the key already applied — answer the original
             // result (a committed call's is `Ok`) and publish no diff; the
@@ -446,7 +433,6 @@ impl Session {
                         })
                     })
                     .collect(),
-                commit: None,
             },
             Ok(Some(Resumed::Reset(initial))) => {
                 let mut initial = *initial;
@@ -496,10 +482,7 @@ impl Session {
                 }
             }
         }
-        Routed {
-            responses,
-            commit: None,
-        }
+        Routed { responses }
     }
 
     /// RPC-024: drop each `query_id`. No response (delivery simply stops).

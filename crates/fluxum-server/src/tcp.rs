@@ -470,16 +470,13 @@ async fn drive_connection(
         ctx.metrics().note_disconnect(); // OBS-040
         ctx.connections.remove(conn_id).await;
         session.subscriptions().lock().await.disconnect(conn_id);
-        // RED-012: run the `on_disconnect` hooks and publish their diff to the
-        // remaining subscribers (a presence cleanup must reach them).
-        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
-            match session.engine().client_disconnected(identity, cid).await {
-                Ok(Some(receipt)) => session.publish_commit(receipt.diff),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
-                }
-            }
+        // RED-012: run the `on_disconnect` hooks; their diff reaches the
+        // remaining subscribers via the commit hook (P0-A 1.3), like any
+        // commit.
+        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id))
+            && let Err(e) = session.engine().client_disconnected(identity, cid).await
+        {
+            tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
         }
     }
     drop(out_tx);
@@ -556,16 +553,12 @@ async fn route_frame(
                 },
             )
             .await;
-        // RED-011: run the `on_connect` hooks and publish their diff to the
-        // shard fan-out (a presence insert must reach subscribers).
-        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id)) {
-            match session.engine().client_connected(identity, cid).await {
-                Ok(Some(receipt)) => session.publish_commit(receipt.diff),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
-                }
-            }
+        // RED-011: run the `on_connect` hooks; their diff reaches
+        // subscribers via the commit hook (P0-A 1.3), like any commit.
+        if let Some((identity, cid)) = session.caller().map(|c| (c.identity, c.connection_id))
+            && let Err(e) = session.engine().client_connected(identity, cid).await
+        {
+            tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
         }
     }
 
@@ -576,10 +569,6 @@ async fn route_frame(
         if out_tx.send(frame).await.is_err() {
             return false;
         }
-    }
-    // Publish a committed reducer diff to the shard fan-out (SUB-021).
-    if let Some(diff) = routed.commit {
-        session.publish_commit(diff);
     }
     true
 }

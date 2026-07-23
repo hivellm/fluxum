@@ -419,7 +419,7 @@ impl ShardContext {
         let mut subscriptions = subscriptions;
         subscriptions.set_query_bounds(Arc::clone(&query_bounds));
         subscriptions.set_metrics(Arc::clone(engine.metrics()));
-        Arc::new(Self {
+        let ctx = Arc::new(Self {
             engine,
             subscriptions: Mutex::new(subscriptions),
             authenticator,
@@ -453,7 +453,19 @@ impl ShardContext {
             ),
             query_bounds,
             query_limiter,
-        })
+        });
+        // P0-A 1.3 (TXN-021 steps 9/10): the single writer publishes every
+        // commit to this shard's fan-out at commit visibility — delivery
+        // never waits for the log handoff, the written watermark, or the
+        // caller's response hop. Weak, or the pipeline's hook would cycle
+        // back to the context that owns the pipeline.
+        let hook_ctx = Arc::downgrade(&ctx);
+        ctx.engine.pipeline().set_commit_hook(Box::new(move |diff| {
+            if let Some(ctx) = hook_ctx.upgrade() {
+                ctx.publish_commit(diff.clone());
+            }
+        }));
+        ctx
     }
 
     /// The SEC-045 query-bounds handle (shared with every hosted manager).
@@ -881,17 +893,14 @@ impl ShardContext {
         ) else {
             return;
         };
-        let ctx = Arc::clone(self);
         tokio::spawn(async move {
             let cadence = sweeper.cadence();
             loop {
                 tokio::time::sleep(cadence).await;
-                match sweeper.sweep_once().await {
-                    Ok(Some(receipt)) => ctx.publish_commit(receipt.diff),
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(target: "fluxum::server", error = %e, "ephemeral sweep failed");
-                    }
+                // The P0-A 1.3 commit hook publishes the sweep's diff from
+                // the single writer, like any commit.
+                if let Err(e) = sweeper.sweep_once().await {
+                    tracing::warn!(target: "fluxum::server", error = %e, "ephemeral sweep failed");
                 }
             }
         });
@@ -914,18 +923,15 @@ impl ShardContext {
         else {
             return;
         };
-        let ctx = Arc::clone(self);
         tokio::spawn(async move {
             let cadence = sweeper.cadence();
             loop {
                 tokio::time::sleep(cadence).await;
                 // Drain the backlog: keep sweeping while a pass hits the cap.
+                // The P0-A 1.3 commit hook publishes each pass's delete diff.
                 loop {
                     match sweeper.sweep_once().await {
-                        Ok((receipt, more)) => {
-                            if let Some(receipt) = receipt {
-                                ctx.publish_commit(receipt.diff);
-                            }
+                        Ok((_receipt, more)) => {
                             if !more {
                                 break;
                             }

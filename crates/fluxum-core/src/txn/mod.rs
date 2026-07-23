@@ -64,6 +64,16 @@ use crate::types::Timestamp;
 /// of these; T3.1 tests and internal callers hand closures in directly.
 pub type ReducerFn = Box<dyn for<'a, 'b> FnOnce(&'a mut Tx<'b>) -> Result<()> + Send + 'static>;
 
+/// The fan-out seam (TXN-021 steps 9/10): called by the shard's single
+/// writer the moment a commit becomes visible — after the atomic merge,
+/// before the commit-log handoff — so subscription delivery starts without
+/// waiting for the durability enqueue, the written watermark, or the
+/// caller's response hop. The *ack* still gates on
+/// [`CommitLog::wait_written`] (TXN-004): a subscriber may see a commit that
+/// a crash inside the documented ~50 ms window erases, which the SPEC-021
+/// reconnect resync heals — the same trade respond-after-merge already made.
+pub type CommitHook = Box<dyn Fn(&TxDiff) + Send + Sync + 'static>;
+
 /// Tuning knobs for a [`TxPipeline`] (SPEC-003 §3; wired into `config.yml`
 /// with the server assembly).
 #[derive(Debug, Clone, Copy)]
@@ -132,11 +142,22 @@ struct Job {
 /// funnel through [`TxPipeline::submit`] / [`TxPipeline::call`]; reads go
 /// straight to [`MemStore::snapshot`] via [`TxPipeline::store`] and never
 /// queue.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TxPipeline {
     sender: mpsc::Sender<Job>,
     store: Arc<MemStore>,
     log: Arc<CommitLog>,
+    /// Shared with the worker; installed once by the assembly that owns the
+    /// shard's fan-out (see [`TxPipeline::set_commit_hook`]).
+    commit_hook: Arc<std::sync::OnceLock<CommitHook>>,
+}
+
+impl std::fmt::Debug for TxPipeline {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxPipeline")
+            .field("commit_hook", &self.commit_hook.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TxPipeline {
@@ -161,17 +182,31 @@ impl TxPipeline {
             ));
         }
         let (sender, receiver) = mpsc::channel(options.queue_capacity);
+        let commit_hook = Arc::new(std::sync::OnceLock::new());
         let pipeline = Self {
             sender,
             store: Arc::clone(&store),
             log: Arc::clone(&log),
+            commit_hook: Arc::clone(&commit_hook),
         };
         let worker = TxPipelineWorker {
             receiver,
             store,
             log,
+            commit_hook,
         };
         Ok((pipeline, worker))
+    }
+
+    /// Install the commit-visibility fan-out hook (TXN-021 steps 9/10) —
+    /// the single writer calls it with every committed diff, in `tx_id`
+    /// order, before the commit-log handoff. First install wins (`false`
+    /// reports a hook was already there); the server assembly binds it to
+    /// the shard's commit broadcast when the owning context is created, so
+    /// a pipeline without an assembly simply commits without fan-out,
+    /// exactly as before.
+    pub fn set_commit_hook(&self, hook: CommitHook) -> bool {
+        self.commit_hook.set(hook).is_ok()
     }
 
     /// Enqueue a reducer job (TXN-010: processed in arrival order by the
@@ -247,11 +282,19 @@ impl TxPipeline {
 
 /// The shard's single writer (TXN-010): drains the reducer queue in arrival
 /// order, one transaction at a time.
-#[derive(Debug)]
 pub struct TxPipelineWorker {
     receiver: mpsc::Receiver<Job>,
     store: Arc<MemStore>,
     log: Arc<CommitLog>,
+    commit_hook: Arc<std::sync::OnceLock<CommitHook>>,
+}
+
+impl std::fmt::Debug for TxPipelineWorker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TxPipelineWorker")
+            .field("commit_hook", &self.commit_hook.get().is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl TxPipelineWorker {
@@ -274,6 +317,14 @@ impl TxPipelineWorker {
     async fn process(&self, reducer: ReducerFn, meta: &CommitMeta) -> Result<CommitReceipt> {
         let timestamp = Timestamp::now();
         let diff = execute(&self.store, reducer)?;
+        // TXN-021 steps 9/10 are concurrent: fan-out starts at commit
+        // visibility, in tx_id order by construction (this loop is the only
+        // caller). The append below is the durability handoff, not a
+        // delivery gate — the ack's TXN-004 written-watermark wait stays
+        // with the caller (P0-A 1.3, F-006).
+        if let Some(hook) = self.commit_hook.get() {
+            hook(&diff);
+        }
         let tx_id = diff.tx_id;
         // TXN-021 step 9 / TXN-004: enqueue on the commit-log writer before
         // responding. `append` waits for queue acceptance (STG-012

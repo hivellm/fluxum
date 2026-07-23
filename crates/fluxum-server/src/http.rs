@@ -785,9 +785,9 @@ async fn handle_post(
     let was_authed = matches!(router_state, SessionState::Authenticated { .. });
 
     // Route every frame through the transport-independent session core, in
-    // the session's database.
+    // the session's database. Committed diffs fan out from the single
+    // writer at commit visibility (P0-A 1.3) — nothing to publish here.
     let mut responses: Vec<ServerMessage> = Vec::new();
-    let mut commits = Vec::new();
     {
         let mut session = Session::with_state_in(
             Arc::clone(&state.ctx),
@@ -800,9 +800,6 @@ async fn handle_post(
         for message in messages {
             let routed = session.handle(message).await;
             responses.extend(routed.responses);
-            if let Some(diff) = routed.commit {
-                commits.push(diff);
-            }
         }
         // An `Authenticate` in this batch may have bound the namespace.
         namespace = session.namespace().cloned();
@@ -875,21 +872,17 @@ async fn handle_post(
         );
         issued_token = Some(minted.raw);
         // RED-011: run the `on_connect` hooks for the fresh session, in its
-        // own database; their diff is published with this request's commits.
+        // own database; their diff fans out via the commit hook (P0-A 1.3).
         if let SessionState::Authenticated { caller, .. } = &router_state {
             let engine = match &namespace {
                 Some(ns) => ns.engine(),
                 None => &state.ctx.engine,
             };
-            match engine
+            if let Err(e) = engine
                 .client_connected(caller.identity, caller.connection_id)
                 .await
             {
-                Ok(Some(receipt)) => commits.push(receipt.diff),
-                Ok(None) => {}
-                Err(e) => {
-                    tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
-                }
+                tracing::warn!(target: "fluxum::server", error = %e, "on_connect hook failed");
             }
         }
     } else if let Some(id) = &resolved_id {
@@ -926,15 +919,6 @@ async fn handle_post(
         }
     }
     let _ = connection_id;
-
-    // Publish committed diffs to this session's namespace fan-out (SUB-021),
-    // never to another tenant's.
-    for diff in commits {
-        match &namespace {
-            Some(ns) => ns.publish_commit(diff),
-            None => state.ctx.publish_commit(diff),
-        }
-    }
 
     // Encode the response frames into the body.
     let mut body = Vec::new();
@@ -1124,18 +1108,12 @@ async fn evict_session(state: &Arc<HttpState>, token: &str, connection_id: u128)
             Some(ns) => ns.engine(),
             None => &state.ctx.engine,
         };
-        match engine
+        // The commit hook (P0-A 1.3) fans the hook's diff out.
+        if let Err(e) = engine
             .client_disconnected(caller.identity, caller.connection_id)
             .await
         {
-            Ok(Some(receipt)) => match &namespace {
-                Some(ns) => ns.publish_commit(receipt.diff),
-                None => state.ctx.publish_commit(receipt.diff),
-            },
-            Ok(None) => {}
-            Err(e) => {
-                tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
-            }
+            tracing::warn!(target: "fluxum::server", error = %e, "on_disconnect hook failed");
         }
     }
 }

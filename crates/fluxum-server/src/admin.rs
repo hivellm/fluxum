@@ -1082,10 +1082,8 @@ async fn reducer_call(ctx: &Arc<ShardContext>, name: &str, body: &[u8]) -> Admin
         shard_id: ctx.shard_id,
     };
     match ctx.engine.call(caller, name, args).await {
-        Ok(receipt) => {
-            ctx.publish_commit(receipt.diff);
-            AdminResponse::ok(request_id.as_deref(), json!({ "committed": true }))
-        }
+        // The commit hook (P0-A 1.3) already fanned the diff out.
+        Ok(_receipt) => AdminResponse::ok(request_id.as_deref(), json!({ "committed": true })),
         Err(FluxumError::Reducer(message)) => {
             // A business error (RED-060) is a well-formed failure envelope.
             AdminResponse::err(400, request_id.as_deref(), message)
