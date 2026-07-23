@@ -5,13 +5,16 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **89.93% lines** (4,370 uncovered of ~43.4k) — 2026-07-23, gate command
-below, after the T6 dev-inner-loop CLI (init/dev/logs + the log tap). **The floor is
-breached by 0.07pp** — archived that way by operator instruction, recorded as debt: the
-residual is the `fluxum dev` watch/restart loop body and parts of the `logs` network glue
-(extractable into pure step functions for coverage); the next fluxum-cli leva recovers it.
-Previous standing: 90.12% after the P0 parity campaign (OBS-023 stage histogram, commit
-hook, SDK write pipelining). The P0-B growth briefly
+**Current standing:** **~89.8% lines** — 2026-07-23, gate command below, after T6.6 (load +
+fan-out drivers, security-audit report, Grafana dashboard). **The floor is breached (~0.2pp)
+and the debt has grown across two consecutive levas** — both archived below the floor by
+operator instruction, recorded here as **required-recovery debt**: (a) the `fluxum dev`
+watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the `fluxum-bench
+load`/`fanout` command handlers in `main.rs` (CLI residual, category 9) + `load.rs` sustained
+paths the short-window smokes don't reach. The `load.rs` `/metrics`-scrape and counter
+parsing ARE covered (unit + smoke). **The next task touching fluxum-cli or fluxum-bench must
+recover the floor** — factor the dev-loop step and the load-command glue into pure functions
+and cover them. Prior standings: 89.93% (T6 inner-loop), 90.12% (P0 parity campaign). The P0-B growth briefly
 dipped the floor to 89.96%; recovered by covering the pipelining trait defaults +
 `ratio_interval` arms and by the **PG-gated baseline smoke** (`baseline_postgres_runs_all_workloads`,
 `FLUXUM_BENCH_PG_URL` — the `Db::Pg` half and the real LISTEN/NOTIFY hop, formerly a named

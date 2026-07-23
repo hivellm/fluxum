@@ -402,4 +402,52 @@ fluxum_reducer_calls_total{outcome=\"ok\"} 42
 ";
         assert_eq!(parse_reducer_counts(metrics).ok, 42);
     }
+
+    #[test]
+    fn load_and_fanout_defaults_target_the_nfr_shapes() {
+        let load = LoadConfig::default();
+        assert!(load.measure >= Duration::from_secs(60), "TST-060 window");
+        assert!(load.pipeline > 1, "pipelined by default (F-007)");
+        let fanout = FanoutConfig::default();
+        assert_eq!(fanout.subscribers, 1_000, "TST-061 subscriber count");
+    }
+
+    /// A one-shot HTTP server answering `GET /metrics` with a Content-Length
+    /// body, then keeping the socket open — the admin transport's shape,
+    /// which a read-to-EOF would hang on.
+    fn serve_metrics_once(head: &'static str, body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            if let Ok((mut socket, _)) = listener.accept() {
+                let mut buf = [0u8; 512];
+                let _ = std::io::Read::read(&mut socket, &mut buf);
+                let _ = socket.write_all(head.as_bytes());
+                let _ = socket.write_all(body.as_bytes());
+                // Hold the socket open (keep-alive) to prove the reader
+                // honors Content-Length instead of waiting for EOF.
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn scrape_reads_to_content_length_over_a_kept_open_socket() {
+        const BODY: &str = "fluxum_reducer_calls_total{outcome=\"ok\"} 7\n";
+        let head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 43\r\n\r\n";
+        assert_eq!(BODY.len(), 43, "fixture length matches the header");
+        let addr = serve_metrics_once(head, BODY);
+        let body = scrape_metrics(&addr).unwrap();
+        assert_eq!(parse_reducer_counts(&body).ok, 7);
+    }
+
+    #[test]
+    fn live_scrape_reports_a_connect_failure() {
+        // Bind then drop: nothing listens.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        assert!(live_scrape(&addr).is_err());
+    }
 }
