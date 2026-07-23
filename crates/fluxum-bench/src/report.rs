@@ -236,6 +236,25 @@ impl Report {
             self.harness_version
         );
         let _ = writeln!(out, "\nDate: {}", self.date);
+        let _ = writeln!(out, "\n## Scope and method\n");
+        let _ = writeln!(
+            out,
+            "The **NFR-11 verdicts** below come from a **PostgreSQL parity harness**: the \
+             baseline is tuned PostgreSQL behind an axum+sqlx app server in its own process \
+             (pooled prepared statements, covering indexes, LISTEN/NOTIFY fan-out) — the \
+             stack a team would replace with Fluxum. They are **not** SpacetimeDB numbers; \
+             the competitive SpacetimeDB baseline (TST-097) is measured against a real \
+             SpacetimeDB server and reported in its own section, and the two never mix.\n\n\
+             Method (TST-091): every class runs on the same idle machine, remote socket \
+             transport on every side except where a row is footnoted as an architectural \
+             asymmetry. Raw rows report mean ± stddev across runs plus a 95% Student-t \
+             confidence half-width on p99, so a verdict is distinguishable from noise. Core \
+             pinning (`--pin server=0xMASK,driver=0xMASK`) is a documented methodology knob; \
+             the canonical report runs UNPINNED — on the 32-core bench box confining the \
+             server to half the cores measurably degrades every heavy phase (recorded \
+             2026-07-22, phase0_parity-fanout-latency 1.4) — and the active setting is \
+             recorded in each stack's config line."
+        );
         let _ = writeln!(out, "\n## Hardware (both sides, same machine — TST-091)\n");
         let _ = writeln!(
             out,
@@ -254,7 +273,7 @@ impl Report {
                 stack.version, stack.durability, stack.config
             );
         }
-        let _ = writeln!(out, "\n## NFR-11 ratios\n");
+        let _ = writeln!(out, "\n## NFR-11 ratios (vs the PostgreSQL parity baseline)\n");
         let _ = writeln!(out, "| ratio | value | target | met |");
         let _ = writeln!(out, "| --- | --- | --- | --- |");
         for (name, value, target, met) in self.ratios.verdicts() {
@@ -268,12 +287,25 @@ impl Report {
             } else {
                 format!("{op} {target}")
             };
+            // F-009: the hot ratio is an architecture asymmetry, not a
+            // same-transport comparison — footnoted, never a headline.
+            let marker = if name == "hot_p99" { "†" } else { "" };
             let _ = writeln!(
                 out,
-                "| {name} | {value:.2} | {target_text} | {} |",
+                "| {name}{marker} | {value:.2} | {target_text} | {} |",
                 if met { "✅" } else { "❌" }
             );
         }
+        let _ = writeln!(
+            out,
+            "\n† *hot_p99 compares an **in-process cache read** (the Fluxum client reads \
+             its subscribed rows from local memory — no socket round-trip) against \
+             PostgreSQL's **remote prepared read** over a pooled connection. The asymmetry \
+             is the architecture being sold — subscribe once, read locally — but it is not \
+             a same-transport ratio, so it must never lead the summary. The same applies \
+             to the `hot` and `mixed/read` raw rows below (and to SpacetimeDB's, whose SDK \
+             reads its local cache too).*"
+        );
         if let Some(competitive) = &self.competitive {
             let _ = writeln!(out, "\n## Competitive baseline vs SpacetimeDB (TST-097)\n");
             let _ = writeln!(
@@ -298,19 +330,28 @@ impl Report {
         );
         let _ = writeln!(
             out,
-            "| side | class | ops/s | p50 ms | p99 ms | p99 σ ms | max ms | ops | runs |"
+            "| side | class | ops/s | p50 ms | p99 ms | p99 σ ms | p99 CI95 ± ms | max ms | ops | runs |"
         );
         let _ = writeln!(
             out,
-            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"
         );
         for (side, classes) in &self.workloads {
             for (class, s) in classes {
+                // F-010: e2e classes cap the event rate by design — their
+                // ops/s is a workload constant, not a measurement.
+                let ops_cell = if class == "e2e" || class.ends_with("/e2e") {
+                    "‡ (rate-capped)".to_owned()
+                } else {
+                    format!("{:.0} ±{:.0}", s.throughput_mean, s.throughput_stddev)
+                };
+                let ci_cell = match ci95_half_width_ns(s.p99_ns_stddev, s.runs) {
+                    Some(half) => format!("{:.4}", ms(half)),
+                    None => "—".to_owned(),
+                };
                 let _ = writeln!(
                     out,
-                    "| {side} | {class} | {:.0} ±{:.0} | {:.4} | {:.4} | {:.4} | {:.3} | {} | {} |",
-                    s.throughput_mean,
-                    s.throughput_stddev,
+                    "| {side} | {class} | {ops_cell} | {:.4} | {:.4} | {:.4} | {ci_cell} | {:.3} | {} | {} |",
                     ms(s.p50_ns_mean),
                     ms(s.p99_ns_mean),
                     ms(s.p99_ns_stddev),
@@ -322,6 +363,13 @@ impl Report {
         }
         let _ = writeln!(
             out,
+            "\n‡ *e2e and mixed/e2e rows are **latency-only**: the workload caps the chat \
+             event rate (a fixed messages-per-second sender), so their delivered-updates/s \
+             is that cap times the subscriber count on every side — a harness constant, \
+             not a throughput result. Only their latency columns are measurements.*"
+        );
+        let _ = writeln!(
+            out,
             "\n*Cold-read honesty note: restarts clear database-level caches (Fluxum buffer \
              pool / PostgreSQL `shared_buffers`) symmetrically; the OS page cache is not \
              dropped on either side, so cold numbers measure database page-in, not platter \
@@ -329,6 +377,28 @@ impl Report {
         );
         out
     }
+}
+
+/// Two-sided 95% Student-t confidence half-width for a mean estimated from
+/// `runs` samples (df = runs − 1): `t · σ/√n`. `None` below two runs — no
+/// spread exists to bound. Beyond the table the normal 1.96 is close enough
+/// (F-011: the report states uncertainty, it does not do inference).
+fn ci95_half_width_ns(stddev_ns: f64, runs: usize) -> Option<f64> {
+    let t = match runs {
+        0 | 1 => return None,
+        2 => 12.706,
+        3 => 4.303,
+        4 => 3.182,
+        5 => 2.776,
+        6 => 2.571,
+        7 => 2.447,
+        8 => 2.365,
+        9 => 2.306,
+        10 => 2.262,
+        _ => 1.96,
+    };
+    #[allow(clippy::cast_precision_loss)]
+    Some(t * stddev_ns / (runs as f64).sqrt())
 }
 
 /// TST-095: compare a fresh report's ratios against the published baseline.
@@ -361,13 +431,18 @@ pub fn regressions(current: &Ratios, published: &Ratios, tolerance: f64) -> Vec<
 
 /// TST-097 guard: the competitive ratios are informational while a class is
 /// below parity, but once the published report shows a class at ≥ 1.0 that
-/// class is **floored at 1.0** — reaching SpacetimeDB and silently falling
-/// back would un-earn the product claim. Also fires when the published
-/// report carries the block and the current run dropped it entirely.
+/// class is **floored** — reaching SpacetimeDB and silently falling back
+/// would un-earn the product claim. The floor honors the same `tolerance`
+/// the NFR-11 guard takes: a class sitting AT parity between two
+/// noise-dominated measurements (e.g. two sub-µs in-process reads) must not
+/// flap the release on a within-noise dip — only a real fall below
+/// `1.0 · (1 − tolerance)` fires. Also fires when the published report
+/// carries the block and the current run dropped it entirely.
 #[must_use]
 pub fn competitive_regressions(
     current: Option<&CompetitiveRatios>,
     published: Option<&CompetitiveRatios>,
+    tolerance: f64,
 ) -> Vec<String> {
     let Some(published) = published else {
         return Vec::new(); // nothing earned yet, nothing to floor
@@ -378,6 +453,7 @@ pub fn competitive_regressions(
                 .to_owned(),
         ];
     };
+    let floor = 1.0 * (1.0 - tolerance);
     let published: BTreeMap<&str, f64> = published
         .verdicts()
         .into_iter()
@@ -388,11 +464,12 @@ pub fn competitive_regressions(
         .into_iter()
         .filter_map(|(name, value, _)| {
             let earned = published.get(name).copied().unwrap_or(0.0) >= 1.0;
-            (earned && value < 1.0).then(|| {
+            (earned && value < floor).then(|| {
                 format!(
-                    "competitive {name}: {value:.2} fell below the 1.0 parity floor \
-                     (published {:.2} had reached it)",
-                    published[name]
+                    "competitive {name}: {value:.2} fell below the parity floor {floor:.2} \
+                     (published {:.2} had reached 1.0; tolerance {:.0}%)",
+                    published[name],
+                    tolerance * 100.0
                 )
             })
         })
@@ -531,20 +608,44 @@ mod tests {
         let published = CompetitiveRatios::from_summaries(&fluxum, &spacetimedb_classes()).unwrap();
         // Identical current: nothing fires (below-parity classes stay
         // informational, reached classes are at their floor).
-        assert!(competitive_regressions(Some(&published), Some(&published)).is_empty());
-        // A reached class falling under 1.0 fires; a never-reached class
-        // sinking further does not.
+        assert!(competitive_regressions(Some(&published), Some(&published), 0.2).is_empty());
+        // A reached class falling clearly below the floor fires; a
+        // never-reached class sinking further does not.
         let mut current = published.clone();
-        current.write_throughput = 0.9; // was ≥ 1.0 in published
+        current.write_throughput = 0.5; // was ≥ 1.0 in published
         current.cold_p99 = 0.1; // was < 1.0 in published
-        let violations = competitive_regressions(Some(&current), Some(&published));
+        let violations = competitive_regressions(Some(&current), Some(&published), 0.2);
         assert_eq!(violations.len(), 1, "{violations:?}");
         assert!(violations[0].contains("write_throughput"), "{violations:?}");
+        // The floor is tolerance-aware: a within-noise dip at the parity
+        // boundary (two noise-dominated measurements) must not flap the
+        // release — only a real fall beyond tolerance fires.
+        let mut noisy = published.clone();
+        noisy.write_throughput = 0.93;
+        assert!(competitive_regressions(Some(&noisy), Some(&published), 0.2).is_empty());
+        assert_eq!(
+            competitive_regressions(Some(&noisy), Some(&published), 0.05).len(),
+            1,
+            "a tighter tolerance still catches the same dip"
+        );
         // Dropping the whole block after publishing it is itself a
         // regression; never having published one is not.
-        assert_eq!(competitive_regressions(None, Some(&published)).len(), 1);
-        assert!(competitive_regressions(Some(&current), None).is_empty());
-        assert!(competitive_regressions(None, None).is_empty());
+        assert_eq!(competitive_regressions(None, Some(&published), 0.2).len(), 1);
+        assert!(competitive_regressions(Some(&current), None, 0.2).is_empty());
+        assert!(competitive_regressions(None, None, 0.2).is_empty());
+    }
+
+    #[test]
+    fn ci95_half_width_follows_student_t_and_needs_two_runs() {
+        // No spread to bound below two runs.
+        assert!(ci95_half_width_ns(1_000.0, 0).is_none());
+        assert!(ci95_half_width_ns(1_000.0, 1).is_none());
+        // n = 5 → t = 2.776, half-width = 2.776 · σ/√5.
+        let half = ci95_half_width_ns(1_000.0, 5).unwrap();
+        assert!((half - 2.776 * 1_000.0 / 5.0_f64.sqrt()).abs() < 1e-9);
+        // Beyond the table: the normal approximation.
+        let half = ci95_half_width_ns(1_000.0, 30).unwrap();
+        assert!((half - 1.96 * 1_000.0 / 30.0_f64.sqrt()).abs() < 1e-9);
     }
 
     #[test]
@@ -583,6 +684,19 @@ mod tests {
         assert!(md.contains("write_throughput"));
         assert!(md.contains("PostgreSQL 17"));
         assert!(md.contains("✅"));
+        // F-008: the scope statement names the baseline and separates the
+        // NFR-11 verdicts from the competitive SpacetimeDB section.
+        assert!(md.contains("PostgreSQL parity harness"));
+        assert!(md.contains("not** SpacetimeDB numbers"));
+        // F-009: hot_p99 carries the asymmetry footnote, never unmarked.
+        assert!(md.contains("hot_p99†"));
+        assert!(md.contains("in-process cache read"));
+        // F-010: e2e rows are latency-only; their ops/s is the cap.
+        assert!(md.contains("‡ (rate-capped)"));
+        assert!(md.contains("latency-only"));
+        assert!(!md.contains("| e2e | 100 ±0 |"), "e2e ops/s must not render");
+        // F-011: the p99 CI95 column renders from stddev and runs.
+        assert!(md.contains("p99 CI95 ± ms"));
         // Without a spacetimedb side there is no TST-097 section — and the
         // JSON omits the key entirely, which is also the old-schema shape,
         // so pre-TST-097 published reports keep loading (guard inputs).

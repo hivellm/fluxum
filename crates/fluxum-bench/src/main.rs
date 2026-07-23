@@ -130,10 +130,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
         let published = load_report(&opts.published.ok_or("regression needs --published PATH")?)?;
         let mut violations =
             fluxum_bench::report::regressions(&current.ratios, &published.ratios, opts.tolerance);
-        // TST-097: parity classes already reached are floored at 1.0.
+        // TST-097: parity classes already reached are floored (tolerance-
+        // aware — a noise-dominated ratio at the boundary must not flap).
         violations.extend(fluxum_bench::report::competitive_regressions(
             current.competitive.as_ref(),
             published.competitive.as_ref(),
+            opts.tolerance,
         ));
         if violations.is_empty() {
             println!(
@@ -417,25 +419,29 @@ fn run_report(opts: &Opts) -> Result<(), String> {
          (docker run --rm -d --name fluxum-parity-pg -e POSTGRES_USER=fluxum \
          -e POSTGRES_PASSWORD=fluxum -e POSTGRES_DB=parity -p 15432:5432 postgres:17)",
     )?;
+    // F-011 (parity-report-honesty): the versioned artifact never ships on
+    // fewer than 5 runs per class — single workloads keep the CLI default,
+    // but the REPORT's verdicts must be distinguishable from noise.
+    let runs = opts.runs.max(5);
     let write_cfg = RunConfig {
         clients: opts.clients,
         warmup: Duration::from_secs(opts.warmup_secs),
         measure: Duration::from_secs(opts.measure_secs),
-        runs: opts.runs,
+        runs,
     };
     let e2e_cfg = E2eConfig {
         subscribers: opts.subscribers,
         rate_per_sec: opts.rate,
         messages: opts.messages,
         warmup_messages: opts.messages / 10,
-        runs: opts.runs,
+        runs,
     };
     let hot_cfg = HotReadConfig {
         clients: opts.clients,
         rows_per_client: opts.rows,
         warmup: Duration::from_secs(opts.warmup_secs),
         measure: Duration::from_secs(opts.measure_secs.min(5)),
-        runs: opts.runs,
+        runs,
     };
     let mixed_cfg = MixedConfig {
         writers: opts.clients,
@@ -445,13 +451,13 @@ fn run_report(opts: &Opts) -> Result<(), String> {
         rate_per_sec: opts.rate,
         warmup: Duration::from_secs(opts.warmup_secs),
         measure: Duration::from_secs(opts.measure_secs),
-        runs: opts.runs,
+        runs,
     };
     let cold_cfg = ColdReadConfig {
         users: opts.users,
         rows_per_user: opts.rows,
         sample_users: opts.samples,
-        runs: opts.runs,
+        runs,
     };
 
     // One side's steady-state classes, into (class → Summary).

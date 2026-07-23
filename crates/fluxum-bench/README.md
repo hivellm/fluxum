@@ -43,6 +43,13 @@ cargo build --release -p fluxum-server -p fluxum-bench
   --current docs/parity/report-vNEW.json --published docs/parity/report-vOLD.json
 ```
 
+The `report` command floors `--runs` at **5** (F-011: the versioned artifact's verdicts must be
+distinguishable from noise — raw rows carry a 95% Student-t confidence half-width on p99);
+single-workload invocations keep the CLI default. The regression guard's `--tolerance`
+(default 20%) applies to the NFR-11 ratios AND to the TST-097 parity floor, so a
+noise-dominated competitive ratio sitting at the boundary (two sub-µs in-process reads) cannot
+flap a release.
+
 Without `--url`, the harness boots the **release** `fluxum-server` found beside its own binary
 and refuses to fall back to a debug build — the no-argument path cannot produce dishonest
 numbers.
@@ -60,3 +67,8 @@ numbers.
 - The chat rate limit (20/s per identity, RED-050) applies only to the e2e/mixed senders and
   the same offered load is used on both sides; the write-throughput workload uses the uncapped
   task insert, since a Fluxum-side-only admission limit would falsify the ratio.
+- The report's own framing is part of the honesty surface (F-008..F-011): the header states
+  the NFR-11 verdicts are a **PostgreSQL parity harness** (the SpacetimeDB competitive block
+  is separate and never mixed in), the hot-read ratio is footnoted as an in-process-cache vs
+  remote-read architecture asymmetry rather than a same-transport comparison, and e2e rows are
+  latency-only (their ops/s is the workload's rate cap, not a measurement).
