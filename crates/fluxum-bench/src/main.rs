@@ -75,6 +75,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
         match flag.as_str() {
             "--side" => opts.side = value("--side")?,
             "--url" => opts.url = Some(value("--url")?),
+            "--http" => opts.http = Some(value("--http")?),
             "--database-url" => opts.database_url = Some(value("--database-url")?),
             "--port" => opts.port = parse(&value("--port")?)?,
             "--max-connections" => opts.max_connections = parse(&value("--max-connections")?)?,
@@ -160,6 +161,15 @@ fn run(args: Vec<String>) -> Result<(), String> {
     // versioned report artifact.
     if workload == "report" {
         return run_report(&opts);
+    }
+
+    // T6.6 load test (NFR-01/TST-060) + fan-out latency (NFR-04/TST-061):
+    // fluxum-only, self-booting server (both need the admin /metrics port).
+    if workload == "load" {
+        return run_load_command(&opts);
+    }
+    if workload == "fanout" {
+        return run_fanout_command(&opts);
     }
 
     // Cold reads own their server lifecycle (seed → restart → measure), so
@@ -424,6 +434,102 @@ fn emit(
 /// (F-007/NFR-01): picked from the P0-B sweep — past this window the
 /// throughput curve is flat, so a larger one only inflates queueing latency.
 const REPORT_PIPELINE_WINDOW: usize = 32;
+
+/// T6.6 / TST-060: the sustained load test. Boots the release server,
+/// hammers `add_task` from `--clients` pipelined connections for
+/// `--measure-secs` (default 60), and reports throughput via the
+/// `fluxum_reducer_calls_total` counter delta — the method TST-060
+/// mandates — with the errored-call count (must be zero).
+fn run_load_command(opts: &Opts) -> Result<(), String> {
+    use fluxum_bench::load::{LoadConfig, live_scrape, run_load};
+
+    let (side, http_addr, _server): (FluxumSide, String, Option<BenchServer>) = match &opts.url {
+        // With --url the operator runs the server; --http gives its admin
+        // port for the scrape (defaults to the url's host on the standard
+        // admin port would be a guess, so it is required).
+        Some(url) => {
+            let http = opts.http.clone().ok_or(
+                "load --url needs --http host:port (the server's admin/metrics port)",
+            )?;
+            (FluxumSide::new(url.clone()), http, None)
+        }
+        None => {
+            let server = BenchServer::start()?;
+            let http = format!("127.0.0.1:{}", server.http_port);
+            (FluxumSide::new(server.url.clone()), http, Some(server))
+        }
+    };
+
+    let cfg = LoadConfig {
+        connections: opts.clients.max(1),
+        pipeline: if opts.pipeline > 1 { opts.pipeline } else { 32 },
+        warmup: Duration::from_secs(opts.warmup_secs.max(1)),
+        measure: Duration::from_secs(opts.measure_secs.max(1)),
+    };
+    println!(
+        "== load: {} pipelined connections × window {} for {}s (scrape {http_addr}) ==",
+        cfg.connections,
+        cfg.pipeline,
+        cfg.measure.as_secs()
+    );
+    let result = run_load(&side, &cfg, || live_scrape(&http_addr))?;
+    println!(
+        "fluxum load: {:.0} calls/s (counter delta {} ok, {} err, {} shard-busy over {:.1}s) — NFR-01 (>= 100000/s, 0 err): {}",
+        result.calls_per_sec,
+        result.delta.ok,
+        result.delta.err,
+        result.delta.queue_full,
+        result.wall.as_secs_f64(),
+        if result.met { "MET" } else { "NOT MET" }
+    );
+    if !result.met {
+        // Honest ceiling: the shard's single-writer commit loop (P0-B); the
+        // number is real, the target is what it is measured against.
+        println!(
+            "note: the shard single-writer commit loop caps sustained throughput here \
+             (P0-B: ~15.6 us/commit); this is the measured NFR-01 ceiling, recorded not hidden"
+        );
+    }
+    Ok(())
+}
+
+/// T6.6 / TST-061: fan-out latency under load — 1,000 subscribers on a hot
+/// channel, commit→receipt p99 must be < 5 ms (NFR-04).
+fn run_fanout_command(opts: &Opts) -> Result<(), String> {
+    use fluxum_bench::load::{FanoutConfig, fanout_latency};
+
+    let (side, _server): (FluxumSide, Option<BenchServer>) = match &opts.url {
+        Some(url) => (FluxumSide::new(url.clone()), None),
+        None => {
+            let server = BenchServer::start()?;
+            (FluxumSide::new(server.url.clone()), Some(server))
+        }
+    };
+    let cfg = FanoutConfig {
+        subscribers: if opts.subscribers > 0 {
+            opts.subscribers
+        } else {
+            1_000
+        },
+        messages: opts.messages,
+        rate_per_sec: opts.rate,
+    };
+    println!(
+        "== fanout: {} subscribers, {} messages @ {}/s ==",
+        cfg.subscribers, cfg.messages, cfg.rate_per_sec
+    );
+    let ms = |ns: u64| ns as f64 / 1_000_000.0;
+    let result = fanout_latency(&side, &cfg)?;
+    println!(
+        "fluxum fanout: {} deliveries | p50 {:.4} ms | p99 {:.4} ms | max {:.4} ms — NFR-04 (p99 < 5 ms): {}",
+        result.deliveries,
+        ms(result.p50_ns),
+        ms(result.p99_ns),
+        ms(result.max_ns),
+        if result.met { "MET" } else { "NOT MET" }
+    );
+    Ok(())
+}
 
 /// TST-094/TST-096: run the full TST-092 matrix on both sides with one
 /// command and write the versioned report artifact (JSON + Markdown).
@@ -1058,6 +1164,7 @@ struct Opts {
     stdb_restart_cmd: Option<String>,
     stdb_note: Option<String>,
     pin: Option<String>,
+    http: Option<String>,
     pipeline: usize,
     subscribers: usize,
     rate: u32,
@@ -1094,6 +1201,7 @@ impl Default for Opts {
             stdb_restart_cmd: None,
             stdb_note: None,
             pin: None,
+            http: None,
             pipeline: 1,
             subscribers: 50,
             rate: 10,
@@ -1116,7 +1224,7 @@ fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
 }
 
 fn usage() -> String {
-    "usage: fluxum-bench <write|e2e|hot|cold|mixed> [--side fluxum|postgres|sqlite|spacetimedb] \
+    "usage: fluxum-bench <write|e2e|hot|cold|mixed|load|fanout> [--side fluxum|postgres|sqlite|spacetimedb] \
      [--url URL] \
      [--database-url URL] [--clients N] [--warmup-secs N] [--measure-secs N] [--runs N] \
      [--rows N] [--users N] [--samples N] [--memory-budget SIZE] [--cold-restart-cmd CMD] \
@@ -1126,6 +1234,10 @@ fn usage() -> String {
      [--stdb-url URL --stdb-reset-cmd CMD [--stdb-db NAME] [--stdb-note TEXT]] \
      [--pin server=0xMASK,driver=0xMASK] [--out DIR] \
      [--date YYYY-MM-DD] [--disk-note TEXT] [workload knobs]\n\
+     \x20      fluxum-bench load [--url URL --http HOST:PORT] [--clients N] [--pipeline N] \
+     [--warmup-secs N] [--measure-secs N]   (NFR-01/TST-060: fluxum-only, sustained)\n\
+     \x20      fluxum-bench fanout [--url URL] [--subscribers N] [--messages N] [--rate N]   \
+     (NFR-04/TST-061: commit->receipt p99)\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()

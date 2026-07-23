@@ -1,0 +1,261 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping the Fluxum /metrics endpoint",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "title": "Fluxum — shard overview (P0 metrics)",
+  "uid": "fluxum-overview",
+  "tags": ["fluxum", "spec-012"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "time": { "from": "now-30m", "to": "now" },
+  "refresh": "10s",
+  "templating": {
+    "list": [
+      {
+        "name": "shard",
+        "label": "Shard",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(fluxum_up, shard)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Liveness & lifecycle",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Up (fluxum_up)",
+      "description": "OBS-001: 1 when the shard is serving.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 4, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }
+          ],
+          "thresholds": { "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] }
+        }
+      },
+      "targets": [
+        { "expr": "max(fluxum_up{shard=~\"$shard\"})", "refId": "A" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Shard state (fluxum_shard_state)",
+      "description": "OBS-050: 0 starting, 1 recovering, 2 ready, 3 draining.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 5, "x": 4, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+              "0": { "text": "starting", "color": "yellow" },
+              "1": { "text": "recovering", "color": "orange" },
+              "2": { "text": "ready", "color": "green" },
+              "3": { "text": "draining", "color": "blue" }
+            } }
+          ]
+        }
+      },
+      "targets": [ { "expr": "max(fluxum_shard_state{shard=~\"$shard\"})", "refId": "A" } ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Overload (fluxum_overload_state)",
+      "description": "0 normal, 1 shed pre-auth, 2 shed all new.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 5, "x": 9, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": {
+              "0": { "text": "normal", "color": "green" },
+              "1": { "text": "shed pre-auth", "color": "orange" },
+              "2": { "text": "shed all new", "color": "red" }
+            } }
+          ]
+        }
+      },
+      "targets": [ { "expr": "max(fluxum_overload_state{shard=~\"$shard\"})", "refId": "A" } ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Last vs recovered tx_id",
+      "description": "OBS-013/030: commit watermark and the tx_id recovery resumed at.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 5, "w": 10, "x": 14, "y": 1 },
+      "targets": [
+        { "expr": "fluxum_shard_last_tx_id{shard=~\"$shard\"}", "legendFormat": "last {{shard}}", "refId": "A" },
+        { "expr": "fluxum_shard_recovered_tx_id{shard=~\"$shard\"}", "legendFormat": "recovered {{shard}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Reducer throughput & latency (NFR-01/03)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 6 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Reducer calls/s by outcome",
+      "description": "OBS-010: the TST-060 throughput surface (rate of the counter).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        { "expr": "sum(rate(fluxum_reducer_calls_total{shard=~\"$shard\",outcome=\"ok\"}[1m]))", "legendFormat": "ok", "refId": "A" },
+        { "expr": "sum(rate(fluxum_reducer_calls_total{shard=~\"$shard\",outcome=\"err\"}[1m]))", "legendFormat": "err", "refId": "B" },
+        { "expr": "sum(rate(fluxum_reducer_calls_total{shard=~\"$shard\",outcome=\"queue_full\"}[1m]))", "legendFormat": "shard-busy", "refId": "C" }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "timeseries",
+      "title": "Reducer duration p50/p99 (µs)",
+      "description": "OBS-011: commit latency percentiles from the histogram (NFR-03 p99 < 1 ms).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 7 },
+      "fieldConfig": { "defaults": { "unit": "µs" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(fluxum_reducer_duration_us_bucket{shard=~\"$shard\"}[5m])) by (le))", "legendFormat": "p50", "refId": "A" },
+        { "expr": "histogram_quantile(0.99, sum(rate(fluxum_reducer_duration_us_bucket{shard=~\"$shard\"}[5m])) by (le))", "legendFormat": "p99", "refId": "B" }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Writer queue depth & commits/rollbacks",
+      "description": "OBS-012/013: single-writer backlog + commit/rollback rates.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 14 },
+      "targets": [
+        { "expr": "fluxum_reducer_queue_depth{shard=~\"$shard\"}", "legendFormat": "queue depth {{shard}}", "refId": "A" },
+        { "expr": "sum(rate(fluxum_tx_commits_total{shard=~\"$shard\"}[1m]))", "legendFormat": "commits/s", "refId": "B" },
+        { "expr": "sum(rate(fluxum_tx_rollbacks_total{shard=~\"$shard\"}[1m]))", "legendFormat": "rollbacks/s", "refId": "C" }
+      ]
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Reducer aborts/s (SEC-046)",
+      "description": "Deadline / tx-budget aborts by reason.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        { "expr": "sum by (reason) (rate(fluxum_reducer_aborted_total{shard=~\"$shard\"}[5m]))", "legendFormat": "{{reason}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 20,
+      "type": "row",
+      "title": "Fan-out & subscriptions (NFR-04)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 21 }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Fan-out messages & rows/s",
+      "description": "OBS-021: TxUpdate delivery + rows delivered.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 22 },
+      "targets": [
+        { "expr": "sum(rate(fluxum_fanout_messages_total{shard=~\"$shard\"}[1m]))", "legendFormat": "messages/s", "refId": "A" },
+        { "expr": "sum(rate(fluxum_fanout_rows_total{shard=~\"$shard\"}[1m]))", "legendFormat": "rows/s", "refId": "B" }
+      ]
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Fan-out stage latency p99 (µs)",
+      "description": "OBS-023: per-stage delivery-pipeline latency (recv_lag/eval/enqueue/queue_wait/flush/server_total).",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 22 },
+      "fieldConfig": { "defaults": { "unit": "µs" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum(rate(fluxum_fanout_stage_us_bucket{shard=~\"$shard\"}[5m])) by (le, stage))", "legendFormat": "{{stage}}", "refId": "A" }
+      ]
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Subscriptions active & drops/s",
+      "description": "OBS-020/022: live plans + slow-consumer drops by reason.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 22 },
+      "targets": [
+        { "expr": "sum(fluxum_subscriptions_active{shard=~\"$shard\"})", "legendFormat": "active", "refId": "A" },
+        { "expr": "sum by (reason) (rate(fluxum_subscriber_drops_total{shard=~\"$shard\"}[5m]))", "legendFormat": "drop {{reason}}", "refId": "B" }
+      ]
+    },
+    {
+      "id": 30,
+      "type": "row",
+      "title": "Connections & security surface",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 29 }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Connections active & new/s",
+      "description": "OBS-040: live connections + accept rate.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 30 },
+      "targets": [
+        { "expr": "sum(fluxum_connections_active{shard=~\"$shard\"})", "legendFormat": "active", "refId": "A" },
+        { "expr": "sum(rate(fluxum_connections_total{shard=~\"$shard\"}[1m]))", "legendFormat": "new/s", "refId": "B" }
+      ]
+    },
+    {
+      "id": 32,
+      "type": "timeseries",
+      "title": "Auth success/failure per s",
+      "description": "SEC-031: auth outcomes — a failure spike is a brute-force signal.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 30 },
+      "targets": [
+        { "expr": "sum(rate(fluxum_auth_success_total{shard=~\"$shard\"}[1m]))", "legendFormat": "success/s", "refId": "A" },
+        { "expr": "sum(rate(fluxum_auth_failure_total{shard=~\"$shard\"}[1m]))", "legendFormat": "failure/s", "refId": "B" }
+      ]
+    },
+    {
+      "id": 33,
+      "type": "timeseries",
+      "title": "Rejections & rate-limits per s",
+      "description": "Connection/session/admin rejections + query rate-limits + connguard evictions.",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 30 },
+      "targets": [
+        { "expr": "sum by (reason) (rate(fluxum_conn_rejected_total{shard=~\"$shard\"}[5m]))", "legendFormat": "conn {{reason}}", "refId": "A" },
+        { "expr": "sum(rate(fluxum_session_rejected_total{shard=~\"$shard\"}[5m]))", "legendFormat": "session", "refId": "B" },
+        { "expr": "sum by (reason) (rate(fluxum_admin_rejected_total{shard=~\"$shard\"}[5m]))", "legendFormat": "admin {{reason}}", "refId": "C" },
+        { "expr": "sum(rate(fluxum_query_rate_limited_total{shard=~\"$shard\"}[5m]))", "legendFormat": "query rate-limited", "refId": "D" },
+        { "expr": "sum(rate(fluxum_query_aborted_total{shard=~\"$shard\"}[5m]))", "legendFormat": "query aborted", "refId": "E" },
+        { "expr": "sum(rate(fluxum_connguard_evictions_total{shard=~\"$shard\"}[5m]))", "legendFormat": "connguard evictions", "refId": "F" },
+        { "expr": "sum(fluxum_connguard_tracked_ips{shard=~\"$shard\"})", "legendFormat": "connguard tracked IPs", "refId": "G" }
+      ]
+    }
+  ]
+}
