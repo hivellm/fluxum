@@ -5,8 +5,8 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.16% lines** (4,138 uncovered of ~42.0k) — 2026-07-22, gate command
-below. History: 96.3% at the 2026-07-16 campaign (pre-T6.3, ~22.8k lines); the T6.3
+**Current standing:** **90.04% lines** (4,199 uncovered of ~42.2k) — 2026-07-23, gate command
+below, after the P0-A fan-out work (OBS-023 stage histogram, TST-091 pin helpers, commit hook). History: 96.3% at the 2026-07-16 campaign (pre-T6.3, ~22.8k lines); the T6.3
 parity-harness growth dropped the floor to 88.96% (2026-07-21), recovered on 2026-07-22 by
 (a) an in-process behavior test for the baseline app (`baseline/server.rs` `serve_on` seam:
 router + handlers + WebSocket fan-out + the SQLite `db.rs` half over real sockets) and
