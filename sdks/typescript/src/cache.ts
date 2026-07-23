@@ -156,6 +156,37 @@ export class RowCache {
     return total;
   }
 
+  /** The registered table names, sorted (deterministic iteration order). */
+  tableNames(): string[] {
+    return [...this.#tables.keys()].sort();
+  }
+
+  /**
+   * Project a full row to its primary key through the table's registered
+   * schema. `null` for an unregistered table.
+   */
+  projectPk(table: string, row: Uint8Array): string | null {
+    const state = this.#tables.get(table);
+    return state === undefined ? null : state.schema.pkOfRow(row);
+  }
+
+  /**
+   * The `[primary key, row]` pairs cached for `table`, in insertion order.
+   * Where several byte-distinct rows share a primary key (transiently
+   * possible under join semantics), only the canonical row — the one the pk
+   * projection resolves to — is listed. Empty for an unknown table.
+   */
+  pkRows(table: string): [string, Uint8Array][] {
+    const state = this.#tables.get(table);
+    if (state === undefined) return [];
+    const out: [string, Uint8Array][] = [];
+    for (const [key, entry] of state.byKey) {
+      const pk = state.schema.pkOfRow(entry.bytes);
+      if (state.byPk.get(pk) === key) out.push([pk, entry.bytes]);
+    }
+    return out;
+  }
+
   /**
    * Apply one `TxUpdate` and return the semantic events it produced.
    *

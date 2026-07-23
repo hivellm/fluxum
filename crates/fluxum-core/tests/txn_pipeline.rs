@@ -1032,7 +1032,7 @@ async fn the_commit_hook_fires_at_visibility_in_tx_id_order_and_skips_rollbacks(
     let seen: Arc<std::sync::Mutex<Vec<(u64, usize)>>> = Arc::default();
     let hook_seen = Arc::clone(&seen);
     let hook_store = Arc::clone(&store);
-    assert!(pipeline.set_commit_hook(Box::new(move |diff| {
+    assert!(pipeline.set_commit_hook(Box::new(move |diff, _meta| {
         let rows = hook_store.snapshot().row_count(aid).unwrap_or(0);
         hook_seen.lock().unwrap().push((diff.tx_id, rows));
     })));
@@ -1074,13 +1074,13 @@ async fn the_first_commit_hook_install_wins() {
     let hook_first = Arc::clone(&first);
     let hook_second = Arc::clone(&second);
     assert!(
-        pipeline.set_commit_hook(Box::new(move |_| {
+        pipeline.set_commit_hook(Box::new(move |_, _| {
             hook_first.fetch_add(1, Ordering::Relaxed);
         })),
         "the first install takes"
     );
     assert!(
-        !pipeline.set_commit_hook(Box::new(move |_| {
+        !pipeline.set_commit_hook(Box::new(move |_, _| {
             hook_second.fetch_add(1, Ordering::Relaxed);
         })),
         "a second install is refused, not silently swapped"

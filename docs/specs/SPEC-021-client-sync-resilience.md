@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Implemented through §4: CS-01x (optimistic mutations) and CS-032 (offline queue keys) live in both SDKs (`sdks/rust/src/optimistic.rs`, `sdks/typescript/src/optimistic.ts`); CS-02x and CS-030/031 landed with Phases 4–5. §5 (CS-04x durable persistence) remains open. |
 | **Phase / tasks** | Phase 4 (subscription offsets) · Phase 5 (transport/session, idempotency) · Phase 6 (SDK runtime) ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-30, FR-31, FR-42, FR-82 (extends); new: FR-120 (optimistic mutations), FR-121 (resumable subscriptions), FR-122 (reducer idempotency), FR-123 (SDK offline persistence) |
 | **Requirement prefix** | `CS-` |
-| **Source** | New (Fluxum-native). Closes the client-side gap the analysis flags: Convex ships optimistic updates, SpacetimeDB re-sends full `InitialData` on reconnect and its core SDKs are "dead on disconnect with stale caches". The Fluxum SDK is a stub today ([sdks/rust/src/lib.rs](../../sdks/rust/src/lib.rs)); there is no TypeScript SDK. |
+| **Source** | New (Fluxum-native). Closes the client-side gap the analysis flags: Convex ships optimistic updates, SpacetimeDB re-sends full `InitialData` on reconnect and its core SDKs are "dead on disconnect with stale caches". |
 
 Keywords **MUST**, **MUST NOT**, **SHALL**, **SHOULD**, **MAY** are RFC 2119. Requirement IDs
 `CS-xxx` are stable. Priority tags: `[P0]` MVP · `[P1]` competitive launch · `[P2]` post-launch.

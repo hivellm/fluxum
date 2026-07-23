@@ -1,29 +1,42 @@
-//! # fluxum-sdk — Fluxum Rust client SDK (home crate)
+//! # fluxum-sdk — Fluxum Rust client SDK
 //!
-//! Workspace slot for the Rust client SDK mandated by SPEC-011 (SDK-050): typed table
-//! access, reducer calls, and live subscriptions speaking FluxRPC (`u32 LE` frame +
-//! MessagePack envelope + FluxBIN rows) over TCP.
+//! The Rust client mandated by SPEC-011 (SDK-050): typed table access, reducer calls,
+//! and live subscriptions speaking FluxRPC (`u32 LE` frame + MessagePack envelope +
+//! FluxBIN rows) over raw TCP (`fluxum://host:15801`) or Streamable HTTP
+//! (`http://host:15800`).
 //!
-//! The client connection, cache, and codegen surface land with DAG task **T6.2** (after
-//! the gate-G5 wire freeze). Until then this crate pins the `sdks/rust` layout slot from
-//! ROADMAP M0 and re-exports the shared wire layer so the quality gate covers the
-//! SDK-facing protocol surface from day one (DAG T0.1, NFR-09).
+//! The pieces, bottom up:
 //!
-//! [`ResumeTracker`] is the exception: the resume bookkeeping SPEC-021 CS-020/CS-022
-//! puts on the client is exactly what the gate-G5 wire freeze constrains, so it ships
-//! ahead of the connection as a transport-free unit. T6.2 wires it to a real socket —
-//! feed it each `InitialData`/`TxUpdate`, and ask it what to send on reconnect.
+//! - [`protocol`] — the vendored wire layer (byte-identical to the server's crate;
+//!   `tests/protocol_sync.rs` enforces it).
+//! - [`RowCache`] — the byte-keyed, reference-counted local row store (SDK-040/044),
+//!   with net-difference reconnect reconciliation (SDK-047).
+//! - [`SyncedCache`] — the cache plus the **optimistic overlay** (SPEC-021 CS-010..012):
+//!   layered local mutations reconciled against authoritative updates without flicker.
+//! - [`OfflineQueue`] — queued reducer calls under stable idempotency keys (CS-032),
+//!   replayed exactly-once after an outage; snapshot/restore for durable persistence.
+//! - [`ResumeTracker`] — per-subscription applied offsets (CS-020/CS-022), driving the
+//!   HTTP blip `Resume` instead of a full re-download.
+//! - [`Connection`] — the blocking client an application holds: authenticate,
+//!   [`Connection::subscribe`], [`Connection::call_reducer`] /
+//!   [`Connection::call_reducer_async`] (write pipelining, SDK-032), and
+//!   [`Connection::call_optimistic`] for instant local application with offline replay.
 
 pub mod cache;
 pub mod client;
 mod http;
 pub mod idempotency;
+pub mod optimistic;
 pub mod protocol;
 pub mod resume;
 
 pub use cache::{RowCache, RowEvent, TableDiff, TableSchema, TableSnapshot};
-pub use client::{Connection, Error as ClientError, PendingReducer, ReconnectPolicy, RowListener};
-pub use idempotency::{OfflineQueue, QueuedCall};
+pub use client::{
+    Connection, Error as ClientError, PendingReducer, ReconnectPolicy, RejectedListener,
+    RowListener,
+};
+pub use idempotency::{OfflineQueue, QueueSnapshot, QueuedCall};
+pub use optimistic::{OptimisticOp, OptimisticStore, SyncedCache};
 pub use resume::{Reconnect, ResumeTracker};
 
 // The vendored protocol files are byte-for-byte copies of the server-side

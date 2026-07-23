@@ -18,6 +18,38 @@ Playwright cache, or installed Chrome/Edge) and driven over raw CDP — no brows
 new dependency. Without a server binary or a browser, those tests skip loudly instead of
 passing silently.
 
+## Optimistic mutations & the offline queue (SPEC-021 CS-010..012, CS-032)
+
+`callOptimistic(reducer, args, updater)` applies a mutation to the local cache **immediately**
+and returns the call's stable idempotency key:
+
+```ts
+const key = await db.callOptimistic('add_task', ['buy milk'], (store) => {
+  store.insert('Task', myPlausibleRowBytes); // upsert by pk; store.delete(table, pk) too
+});
+```
+
+The updater's rows render instantly (in `db.cache` and the row listeners) as an **overlay** on
+top of the authoritative cache. When the commit's own `TxUpdate` arrives, the overlay is swapped
+for the server's rows in one atomic event batch — an `update` (or nothing, when the bytes match),
+never a delete/insert flicker. If the reducer rejects, the overlay rolls back to the exact
+pre-mutation state and an `OptimisticRejectedError` (reducer, key, cause) reaches the `onError`
+listeners. Concurrent optimistic calls layer in submission order, and a rolled-back row can never
+be resurrected by a later update (CS-012).
+
+While **disconnected**, optimistic calls are not failed — they stay queued (and rendered) and
+replay in submission order when the session comes back. Every queued call carries an
+`idempotency_key` minted at enqueue time and reused verbatim on every retry (CS-032), so a replay
+whose first send actually reached the server is deduplicated server-side: exactly-once, even
+across a lost ack. `db.pendingMutations` is the number of calls still awaiting acknowledgement,
+and `OfflineQueue.snapshot()/restore()` round-trip the queue for the durable-persistence layer
+(CS-040, a separate task).
+
+One caveat inherits from the wire: commits are attributed to their overlay by
+`(caller identity, reducer)` in FIFO order, so concurrently mixing `callOptimistic` and plain
+`callReducer` on the same reducer — or two connections under one identity calling it — can drop
+an overlay one update early. The cost is a transient re-render, never divergence.
+
 ## Schema mismatch (SDK-043)
 
 Pass `schemaVersion` (the version your generated bindings embed) to

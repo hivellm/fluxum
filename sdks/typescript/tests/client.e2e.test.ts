@@ -244,3 +244,47 @@ test('owner_only rows are filtered by the server, not the client', { skip }, asy
   assert.equal(alice.cache.size, 1, 'alice sees her own task');
   assert.equal(bob.cache.size, 0, "bob never receives alice's task");
 });
+
+test('an optimistic call renders immediately and converges', { skip }, async (t) => {
+  // SPEC-021 CS-010/CS-011 against the real server: the updater's row shows
+  // before any round-trip; the commit's TxUpdate swaps it for the
+  // authoritative row with no duplicate left behind.
+  const server = await startServer('client-optimistic');
+  const db = await FluxumClient.connect({ url: server.httpUrl, tables: [TASK] });
+  t.after(async () => {
+    await db.close();
+    await server.stop();
+  });
+
+  await db.subscribe(['SELECT * FROM Task']);
+
+  // Seed one authoritative row to use as a byte template for the optimistic
+  // guess — its leading u64 id is fixed-width, so re-keying is a byte patch.
+  await db.callReducer('add_task', ['seed']);
+  let deadline = Date.now() + 5000;
+  while (db.cache.rows('Task').length === 0 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  const template = db.cache.rows('Task')[0];
+  assert.ok(template, 'the seed row arrived');
+
+  const temp = Uint8Array.from(template);
+  temp.fill(0xff, 0, 8); // a temp id the server will never mint
+
+  const key = await db.callOptimistic('add_task', ['seed'], (store) => {
+    store.insert('Task', temp);
+  });
+  assert.ok(key.length > 0, 'the submission handle is the minted key');
+  assert.equal(db.cache.rows('Task').length, 2, 'the optimistic row renders immediately');
+
+  // Converge: the overlay drops when the authoritative update applies — at
+  // no point does a duplicate or the temp id linger.
+  const tempId = String(new RowReader(temp).read('U64'));
+  deadline = Date.now() + 5000;
+  for (;;) {
+    const ids = db.cache.rows('Task').map((r) => String(new RowReader(r).read('U64')));
+    if (db.pendingMutations === 0 && ids.length === 2 && !ids.includes(tempId)) break;
+    assert.ok(Date.now() < deadline, `never converged: ids=${ids.join(',')}`);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+});

@@ -155,6 +155,40 @@
         "column": "owner",
         "kind": "owner_only"
       }
+    },
+    {
+      "access": "Private",
+      "auto_inc": null,
+      "columns": [
+        {
+          "name": "identity",
+          "type": "Identity"
+        },
+        {
+          "name": "reducer",
+          "type": "Str"
+        },
+        {
+          "name": "key",
+          "type": "Str"
+        },
+        {
+          "name": "created_us",
+          "type": "I64"
+        }
+      ],
+      "indexes": [],
+      "name": "__idempotency__",
+      "partition_by": null,
+      "primary_key": [
+        0,
+        1,
+        2
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
     }
   ],
   "views": []

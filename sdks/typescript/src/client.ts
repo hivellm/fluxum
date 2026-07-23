@@ -12,8 +12,8 @@
 // an opaque 400: `Authenticate.token` is `bin`, never nil, and `ReducerCall`
 // puts `version` BEFORE `args`.
 
-import { RowCache } from './cache.ts';
 import type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts';
+import { OfflineQueue, OptimisticStore, SyncedCache } from './optimistic.ts';
 import { decodeMessage, encodeMessage, sliceRowList } from './protocol.ts';
 import { BoundedQueue } from './queue.ts';
 import { reconnect } from './reconnect.ts';
@@ -74,6 +74,27 @@ export class SchemaMismatchError extends Error {
   }
 }
 
+/**
+ * An optimistic call the server REJECTED (SPEC-021 CS-011). The overlay has
+ * already rolled back when this reaches the {@link FluxumClient.onError}
+ * listeners — the error is how the application tells the user.
+ */
+export class OptimisticRejectedError extends Error {
+  /** The reducer that rejected. */
+  readonly reducer: string;
+  /** The rejected call's idempotency key (the `callOptimistic` handle). */
+  readonly key: string;
+  /** The reducer's own error. */
+  override readonly cause: ReducerError;
+  constructor(reducer: string, key: string, cause: ReducerError) {
+    super(`optimistic ${reducer} rejected: ${cause.message}`);
+    this.name = 'OptimisticRejectedError';
+    this.reducer = reducer;
+    this.key = key;
+    this.cause = cause;
+  }
+}
+
 /** A row-event listener. `old` is present only for `update`. */
 export type RowListener = (row: Uint8Array, old?: Uint8Array) => void;
 
@@ -126,9 +147,20 @@ interface DecodedMessage {
  */
 export class FluxumClient {
   readonly #options: FluxumClientOptions;
-  readonly #cache: RowCache;
+  readonly #cache: SyncedCache;
   readonly #inbound: BoundedQueue<DecodedMessage>;
   readonly #pending = new Map<number, Pending>();
+  /**
+   * The optimistic submission ledger (SPEC-021 CS-010/CS-032): every
+   * `callOptimistic` is queued here under a stable idempotency key, minted
+   * at enqueue — never at send — so a replay after a lost ack cannot
+   * double-apply.
+   */
+  readonly #queue = new OfflineQueue(mintClientId());
+  /** Request id of an in-flight optimistic attempt → its idempotency key. */
+  readonly #inFlight = new Map<number, string>();
+  /** Idempotency key → overlay layer id in the {@link SyncedCache}. */
+  readonly #optimisticLayers = new Map<string, number>();
   readonly #listeners = new Map<string, Set<RowListener>>();
   readonly #errorListeners = new Set<(err: Error) => void>();
   /**
@@ -181,7 +213,7 @@ export class FluxumClient {
 
   private constructor(options: FluxumClientOptions) {
     this.#options = options;
-    this.#cache = new RowCache(options.tables ?? []);
+    this.#cache = new SyncedCache(options.tables ?? []);
     this.#inbound = new BoundedQueue<DecodedMessage>({
       capacity: options.queueCapacity ?? 1024,
       name: 'inbound',
@@ -204,9 +236,22 @@ export class FluxumClient {
     return this.#identity;
   }
 
-  /** The local row cache. Stale while disconnected (SDK-047). */
-  get cache(): RowCache {
+  /**
+   * The local row cache — the effective view: authoritative rows plus any
+   * in-flight optimistic overlay (SPEC-021 CS-010). Stale while disconnected
+   * (SDK-047).
+   */
+  get cache(): SyncedCache {
     return this.#cache;
+  }
+
+  /**
+   * How many optimistic calls are still awaiting acknowledgement —
+   * including everything buffered while disconnected. `0` means every
+   * submitted call has been confirmed or rejected.
+   */
+  get pendingMutations(): number {
+    return this.#queue.pending.length;
   }
 
   /**
@@ -277,7 +322,7 @@ export class FluxumClient {
       for (const [queryId, diffs] of this.#toDiffsByQuery(message.payload[2])) {
         ids.push(queryId);
         this.#live.set(queryId, sql);
-        this.#dispatch(this.#cache.applyQueryDiff(queryId, diffs));
+        this.#dispatch(this.#cache.applyTx([[queryId, diffs]], null));
       }
     });
     return ids;
@@ -331,6 +376,106 @@ export class FluxumClient {
       );
     }
     throw new ReducerError(0, null, `reducer ${name} failed`);
+  }
+
+  /**
+   * Call a reducer **optimistically** (SPEC-021 CS-010): `updater` mutates
+   * the local store immediately — before the server confirms — and the call
+   * is queued with a stable `idempotency_key` (CS-032), returned as the
+   * submission handle.
+   *
+   * Fire-and-observe rather than await: the updater's rows show instantly
+   * in {@link cache} and fire the usual row listeners; the authoritative
+   * confirmation swaps the overlay for the server's rows in one atomic
+   * batch (CS-011, no flicker or duplicate); a rejection rolls the overlay
+   * back and surfaces an {@link OptimisticRejectedError} on
+   * {@link onError}. While DISCONNECTED the call simply stays queued and
+   * replays in submission order on reconnect — the stable key makes the
+   * replay exactly-once even when the first send's ack was lost.
+   *
+   * One caveat inherits from the wire: commits are attributed to their
+   * overlay by `(caller identity, reducer)` in FIFO order, so concurrently
+   * mixing `callOptimistic` and plain {@link callReducer} on the SAME
+   * reducer — or two connections under one identity calling it — can drop
+   * an overlay one update early. The cost is a transient re-render, never
+   * divergence.
+   */
+  async callOptimistic(
+    name: string,
+    args: readonly unknown[],
+    updater: (store: OptimisticStore) => void,
+  ): Promise<string> {
+    const { layer, events } = this.#cache.applyOptimistic(name, updater);
+    const key = this.#queue.enqueue(name, args);
+    this.#optimisticLayers.set(key, layer);
+    this.#dispatch(events);
+    await this.#sendQueued(key);
+    return key;
+  }
+
+  /**
+   * Transmit one queued call if the session is live. ANY failure leaves it
+   * queued — the reconnect replay resends it under the same key, which is
+   * the entire point of minting the key at enqueue time (CS-032).
+   */
+  async #sendQueued(key: string): Promise<void> {
+    const call = this.#queue.attempt(key);
+    if (call === null) return;
+    let sentId = -1;
+    try {
+      await this.#send('ReducerCall', (id) => {
+        sentId = id;
+        this.#inFlight.set(id, key);
+        return [id, call.reducer, null, call.args, call.idempotencyKey];
+      });
+    } catch {
+      if (sentId >= 0) this.#inFlight.delete(sentId);
+    }
+  }
+
+  /**
+   * Resolve an optimistic call's outcome (CS-011): `Ok` acknowledges the
+   * queued call and confirms its overlay; `Err` removes the call (a
+   * rejection is definitive, never retried), rolls the overlay back, and
+   * surfaces the rejection. Results for non-optimistic calls pass through.
+   */
+  #resolveOptimistic(id: number, outcome: unknown): void {
+    const key = this.#inFlight.get(id);
+    if (key === undefined) return;
+    this.#inFlight.delete(id);
+    const reducer =
+      this.#queue.pending.find((c) => c.idempotencyKey === key)?.reducer ?? '';
+    this.#queue.acknowledge(key);
+    const layer = this.#optimisticLayers.get(key);
+    this.#optimisticLayers.delete(key);
+    if (layer === undefined) return;
+
+    if (Array.isArray(outcome) && outcome[0] === 'Ok') {
+      this.#dispatch(this.#cache.confirm(layer, this.#live.size === 0));
+      return;
+    }
+    this.#dispatch(this.#cache.rollback(layer));
+    const detail = Array.isArray(outcome) ? outcome[1] : null;
+    const cause = Array.isArray(detail)
+      ? new ReducerError(
+          Number(detail[0]),
+          typeof detail[1] === 'string' ? detail[1] : null,
+          String(detail[2]),
+        )
+      : new ReducerError(0, null, `reducer ${reducer} rejected`);
+    this.#fail(new OptimisticRejectedError(reducer, key, cause));
+  }
+
+  /**
+   * Replay every queued optimistic call, in submission order, each under
+   * its ORIGINAL idempotency key (CS-032): a call whose first send actually
+   * applied before the session died is deduplicated by the server, so the
+   * replay is exactly-once.
+   */
+  async #replayOffline(): Promise<void> {
+    for (const call of [...this.#queue.pending]) {
+      await this.#sendQueued(call.idempotencyKey);
+    }
   }
 
   /** Close the session. Idempotent. */
@@ -392,6 +537,11 @@ export class FluxumClient {
     const err = reason ?? new Error('connection closed');
     for (const pending of this.#pending.values()) pending.reject(err);
     this.#pending.clear();
+    // Optimistic calls are NOT failed — that is their point. The dead
+    // session's request ids are forgotten (nothing will ever answer them),
+    // but the calls stay queued under their stable keys and their overlays
+    // stay rendered; the reconnect replays them exactly-once (CS-032).
+    this.#inFlight.clear();
 
     // A confirmed schema failure is not retriable: the bindings are stale and
     // reconnecting cannot regenerate them (SDK-043).
@@ -482,6 +632,9 @@ export class FluxumClient {
               );
             }
           }
+          // The session is whole again: replay every queued optimistic call
+          // in submission order under its original key (CS-032).
+          await this.#replayOffline();
         },
       },
       {
@@ -591,12 +744,32 @@ export class FluxumClient {
     switch (message.tag) {
       case 'TxUpdate': {
         // Field 5 is `tables`; the four before it are tx_id, timestamp,
-        // reducer_name and caller. The server sends one TxUpdate per query
-        // id (its tables all share it), so attribute by query for the
-        // SDK-044 refcount — a row two subscriptions both see is one cached
-        // row that survives dropping either.
-        for (const [queryId, diffs] of this.#toDiffsByQuery(message.payload[5])) {
-          this.#dispatch(this.#cache.applyQueryDiff(queryId, diffs));
+        // reducer_name and caller. Attribute by query for the SDK-044
+        // refcount. When the commit is this client's own — `caller` matches
+        // the session identity — the matching optimistic overlay drops in
+        // the same batch (SPEC-021 CS-011), which is what makes the swap
+        // flicker-free.
+        const caller = message.payload[3];
+        const own =
+          caller instanceof Uint8Array &&
+          this.#identity !== null &&
+          sameBytes(caller, this.#identity) &&
+          caller.some((b) => b !== 0);
+        this.#dispatch(
+          this.#cache.applyTx(
+            [...this.#toDiffsByQuery(message.payload[5]).entries()],
+            own ? String(message.payload[2] ?? '') : null,
+          ),
+        );
+        return;
+      }
+      case 'ReducerResult': {
+        // Optimistic calls resolve here, on the pump, not in a waiter:
+        // their submitter got a key back, not a promise of the outcome.
+        const id = message.payload[0];
+        if (typeof id === 'number') {
+          this.#resolveOptimistic(id, message.payload[1]);
+          this.#settle(id, () => message);
         }
         return;
       }
@@ -787,4 +960,23 @@ export class FluxumClient {
     }
     for (const listener of this.#errorListeners) listener(err);
   }
+}
+
+/** Byte-wise equality of two identity buffers. */
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+/**
+ * The offline queue's key namespace for this client instance (CS-032):
+ * unique enough that two clients sharing an identity cannot mint colliding
+ * keys. A DURABLE queue must reuse the id it persisted instead (CS-040).
+ */
+function mintClientId(): string {
+  const noise = Math.floor(Math.random() * 0xffff_ffff).toString(16);
+  return `${Date.now().toString(16)}-${noise}`;
 }

@@ -52,11 +52,14 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::cache::{RowCache, RowEvent, TableDiff, TableSchema, TableSnapshot};
+use crate::cache::{RowEvent, TableDiff, TableSchema, TableSnapshot};
 use crate::http::{ChunkedStream, HttpEndpoint};
+use crate::idempotency::OfflineQueue;
+use crate::optimistic::{OptimisticStore, SyncedCache};
 use crate::protocol::{
-    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall, Resume,
-    ServerMessage, Subscribe, TableUpdate, TxUpdate, Unsubscribe,
+    ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall,
+    ReducerError, ReducerResult, Resume, ServerMessage, Subscribe, TableUpdate, TxUpdate,
+    Unsubscribe,
 };
 use crate::resume::ResumeTracker;
 
@@ -165,6 +168,19 @@ fn backoff_delay(attempt: u32, policy: &ReconnectPolicy) -> Duration {
     Duration::from_millis(with_jitter as u64)
 }
 
+/// The offline queue's key namespace for this client instance (CS-032).
+/// Process id + wall-clock nanos: unique enough that two clients sharing an
+/// identity cannot mint colliding keys. A DURABLE queue must reuse the id it
+/// persisted instead (SDK offline persistence, CS-040) — that task threads a
+/// caller-supplied id through; until then the queue lives and dies with the
+/// process, so a fresh namespace per instance is exactly right.
+fn mint_client_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    format!("{:x}-{nanos:x}", std::process::id())
+}
+
 /// A cheap jitter source in `[-1, 1]` — the system clock's sub-second nanos.
 /// Backoff jitter needs decorrelation, not cryptographic quality, and this
 /// keeps the crate free of a rand dependency.
@@ -177,6 +193,25 @@ fn jitter_unit() -> f64 {
 
 /// A row-event listener: `(row, old)` — `old` is `Some` only for updates.
 pub type RowListener = Box<dyn Fn(&[u8], Option<&[u8]>) + Send + Sync>;
+
+/// A listener for optimistic calls the server REJECTED (SPEC-021 CS-011):
+/// `(reducer, idempotency_key, error)`. The overlay has already rolled back
+/// when this fires — the callback is how the application tells the user.
+pub type RejectedListener = Box<dyn Fn(&str, &str, &ReducerError) + Send + Sync>;
+
+/// The optimistic submission ledger (SPEC-021 CS-010/CS-032): the offline
+/// replay queue plus the maps binding a queued call's stable key to its
+/// overlay layer and to the request id its current attempt went out under.
+struct OptimisticState {
+    /// Every unacknowledged optimistic call, oldest first, each carrying the
+    /// idempotency key minted at enqueue (CS-032).
+    queue: OfflineQueue,
+    /// Request id of the in-flight attempt → the call's idempotency key.
+    /// Cleared on disconnect: a dead session's ids answer nothing.
+    in_flight: HashMap<u32, String>,
+    /// Idempotency key → overlay layer id in the [`SyncedCache`].
+    layers: HashMap<String, u64>,
+}
 
 /// One reply routed by the reader to a waiting request: a server message, or
 /// the error frame that ended the request.
@@ -237,10 +272,16 @@ struct Shared {
     policy: ReconnectPolicy,
     /// Request id → its reply channel (RPC-002 correlation).
     pending: Mutex<HashMap<u32, Sender<Routed>>>,
-    /// The row cache plus its per-query bookkeeping, behind one lock.
-    cache: Mutex<RowCache>,
+    /// The row cache — authoritative base plus the optimistic overlay
+    /// (SPEC-021 CS-010) — and its per-query bookkeeping, behind one lock.
+    cache: Mutex<SyncedCache>,
+    /// The optimistic queue + ledgers. Lock ORDER: `optimistic` before
+    /// `cache`, never the reverse.
+    optimistic: Mutex<OptimisticState>,
     /// `"<Table>:<insert|delete|update>"` → listeners.
     listeners: Mutex<HashMap<String, Vec<RowListener>>>,
+    /// Listeners for rejected optimistic calls (CS-011 rollback path).
+    rejected: Mutex<Vec<RejectedListener>>,
     /// The highest applied `tx_offset` per subscription (SPEC-021 CS-020),
     /// fed by every `InitialData`/`TxUpdate` this connection applies. It
     /// drives the HTTP blip `Resume` (CS-021) and is rebuilt on a full
@@ -354,8 +395,14 @@ impl Connection {
             token: token.to_vec(),
             policy,
             pending: Mutex::new(HashMap::new()),
-            cache: Mutex::new(RowCache::new(schemas)),
+            cache: Mutex::new(SyncedCache::new(schemas)),
+            optimistic: Mutex::new(OptimisticState {
+                queue: OfflineQueue::new(mint_client_id()),
+                in_flight: HashMap::new(),
+                layers: HashMap::new(),
+            }),
             listeners: Mutex::new(HashMap::new()),
+            rejected: Mutex::new(Vec::new()),
             resume: Mutex::new(ResumeTracker::new()),
             subs: Mutex::new(Vec::new()),
             identity: Mutex::new([0u8; 32]),
@@ -627,6 +674,102 @@ impl Connection {
         })
     }
 
+    /// Call a reducer **optimistically** (SPEC-021 CS-010): `updater` mutates
+    /// the local store immediately — before the server confirms — and the
+    /// call is queued with a stable `idempotency_key` (CS-032), returned as
+    /// the submission handle.
+    ///
+    /// The lifecycle is fire-and-observe rather than await:
+    ///
+    /// - the updater's rows show instantly in [`Connection::rows`] and fire
+    ///   the usual row listeners;
+    /// - on the authoritative confirmation the overlay is swapped for the
+    ///   server's rows in one atomic batch — no flicker, no duplicate
+    ///   (CS-011);
+    /// - on `ReducerResult::Err` the overlay rolls back to the exact
+    ///   pre-mutation state and the [`Connection::on_rejected`] listeners
+    ///   fire;
+    /// - while DISCONNECTED the call simply stays queued and replays in
+    ///   submission order when the session comes back (CS-032) — the stable
+    ///   key makes the replay exactly-once even when the first send's ack
+    ///   was lost.
+    ///
+    /// The updater runs under the client's internal locks: it must only use
+    /// the [`OptimisticStore`] it is handed, never call back into the
+    /// `Connection`.
+    ///
+    /// One caveat inherits from the wire (which this layer does not change):
+    /// commits are attributed to their overlay by `(caller identity,
+    /// reducer)` in FIFO order, so concurrently mixing `call_optimistic` and
+    /// plain [`Connection::call_reducer`] on the SAME reducer — or running
+    /// two connections under one identity calling it — can drop an overlay
+    /// one update early. The cost is a transient re-render, never divergence.
+    pub fn call_optimistic(
+        &self,
+        reducer: &str,
+        args: Vec<FluxValue>,
+        updater: impl FnOnce(&mut OptimisticStore<'_>),
+    ) -> Result<String, Error> {
+        let (key, events, message, id) = {
+            let mut optimistic = self
+                .shared
+                .optimistic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut cache = self
+                .shared
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (layer, events) = cache.apply_optimistic(reducer, updater);
+            let key = optimistic.queue.enqueue(reducer, args);
+            optimistic.layers.insert(key.clone(), layer);
+            let id = self.shared.alloc_id();
+            let message = optimistic.queue.attempt(&key, id);
+            optimistic.in_flight.insert(id, key.clone());
+            (key, events, message, id)
+        };
+        self.dispatch(events);
+        // Transmit if the session is live. ANY send failure leaves the call
+        // queued — the reconnect replay resends it under the same key, which
+        // is the entire point of minting the key at enqueue time.
+        if let Some(message) = message
+            && self.send(message).is_err()
+        {
+            self.shared
+                .optimistic
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .in_flight
+                .remove(&id);
+        }
+        Ok(key)
+    }
+
+    /// Register a listener for optimistic calls the server rejected. The
+    /// rollback has already been applied (and its row events dispatched)
+    /// when the listener runs.
+    pub fn on_rejected(&self, listener: RejectedListener) {
+        self.shared
+            .rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(listener);
+    }
+
+    /// How many optimistic calls are still awaiting acknowledgement —
+    /// including everything buffered while disconnected. `0` means every
+    /// submitted call has been confirmed or rejected.
+    pub fn pending_mutations(&self) -> usize {
+        self.shared
+            .optimistic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .queue
+            .pending()
+            .len()
+    }
+
     /// Test hook: kill the socket the background thread is reading, as an
     /// outage would, WITHOUT closing the client — the reconnect machinery
     /// must bring the session back. Hidden because applications have no
@@ -862,18 +1005,22 @@ fn apply_initial(shared: &Shared, initial: &InitialData) -> Vec<RowEvent> {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut events = Vec::new();
-    for (query_id, diffs) in group_by_query(&initial.tables) {
-        if reset {
-            // CS-022: drop this query's prior rows before the fresh snapshot.
-            events.extend(cache.release_query(query_id));
+    let by_query = group_by_query(&initial.tables);
+    if reset {
+        // CS-022: drop each query's prior rows before the fresh snapshot.
+        for (query_id, _) in &by_query {
+            events.extend(cache.release_query(*query_id));
         }
-        events.extend(cache.apply_query_diff(query_id, &diffs));
     }
+    events.extend(cache.apply_tx(&by_query, None));
     events
 }
 
 /// Apply a server-initiated `TxUpdate` to the cache, attributing rows by their
 /// stamped `query_id` (SDK-044) and advancing the resume offsets (CS-020).
+/// When the commit is this client's own — `caller` matches the session
+/// identity — the matching optimistic overlay drops in the same batch
+/// (SPEC-021 CS-011), which is what makes the swap flicker-free.
 fn apply_tx_update(shared: &Shared, update: &TxUpdate) -> Vec<RowEvent> {
     shared
         .resume
@@ -881,15 +1028,112 @@ fn apply_tx_update(shared: &Shared, update: &TxUpdate) -> Vec<RowEvent> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .apply_update(update);
 
+    let own = {
+        let identity = shared
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        update.caller == *identity && update.caller != [0u8; 32]
+    };
     let mut cache = shared
         .cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut events = Vec::new();
-    for (query_id, diffs) in group_by_query(&update.tables) {
-        events.extend(cache.apply_query_diff(query_id, &diffs));
+    cache.apply_tx(
+        &group_by_query(&update.tables),
+        own.then_some(update.reducer_name.as_str()),
+    )
+}
+
+/// Resolve an optimistic call's outcome (SPEC-021 CS-011): `Ok` acknowledges
+/// the queued call and confirms its overlay — dropping it now or holding it
+/// until the authoritative update lands; `Err` removes the call (a rejection
+/// is definitive, never retried) and rolls the overlay back, then tells the
+/// rejected listeners. Results for non-optimistic calls pass through
+/// untouched.
+fn resolve_optimistic(shared: &Shared, result: &ReducerResult) {
+    let no_subscriptions = shared
+        .subs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .is_empty();
+    let Some((key, layer, reducer)) = ({
+        let mut optimistic = shared
+            .optimistic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        optimistic.in_flight.remove(&result.id).map(|key| {
+            let reducer = optimistic
+                .queue
+                .pending()
+                .iter()
+                .find(|c| c.idempotency_key == key)
+                .map(|c| c.reducer.clone())
+                .unwrap_or_default();
+            optimistic.queue.acknowledge(&key);
+            let layer = optimistic.layers.remove(&key);
+            (key, layer, reducer)
+        })
+    }) else {
+        return;
+    };
+
+    let events = {
+        let mut cache = shared
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match (&result.outcome, layer) {
+            (Ok(()), Some(layer)) => cache.confirm(layer, no_subscriptions),
+            (Err(_), Some(layer)) => cache.rollback(layer),
+            (_, None) => Vec::new(),
+        }
+    };
+    dispatch_shared(shared, events);
+
+    if let Err(error) = &result.outcome {
+        let listeners = shared
+            .rejected
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for listener in listeners.iter() {
+            listener(&reducer, &key, error);
+        }
     }
-    events
+}
+
+/// Replay every queued optimistic call on a fresh session, in submission
+/// order, each under its ORIGINAL idempotency key (SPEC-021 CS-032): a call
+/// whose first send actually applied before the session died is deduplicated
+/// by the server, so the replay is exactly-once.
+fn replay_offline(shared: &Arc<Shared>) {
+    let attempts: Vec<ClientMessage> = {
+        let mut optimistic = shared
+            .optimistic
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let keys: Vec<String> = optimistic
+            .queue
+            .pending()
+            .iter()
+            .map(|c| c.idempotency_key.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|key| {
+                let id = shared.alloc_id();
+                let message = optimistic.queue.attempt(&key, id)?;
+                optimistic.in_flight.insert(id, key);
+                Some(message)
+            })
+            .collect()
+    };
+    for message in attempts {
+        if send_message(shared, &message).is_err() {
+            // The fresh session died mid-replay: the rest stay queued, keys
+            // untouched, and the next reconnect picks them up.
+            break;
+        }
+    }
 }
 
 /// Dispatch events to listeners without a `Connection` handle (reader thread).
@@ -1075,6 +1319,9 @@ fn recover_http(shared: &Arc<Shared>) -> Option<ReadHalf> {
                 Ok((200, Some(stream))) => {
                     shared.set_push_socket(stream.socket().ok());
                     if resume_subscriptions(shared, &session).is_ok() {
+                        // Calls queued during the blip never went out (their
+                        // POST failed): send them now, same keys.
+                        replay_offline(shared);
                         return Some(ReadHalf::Http(stream));
                     }
                     // The session survived but a subscription did not
@@ -1185,6 +1432,7 @@ fn try_tcp_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
     shared.set_push_socket(messages.stream.try_clone().ok());
     shared.set_writer(Some(WriteHalf::Tcp(writer)));
     dispatch_shared(shared, events);
+    replay_offline(shared);
     Ok(ReadHalf::Tcp(messages))
 }
 
@@ -1254,6 +1502,7 @@ fn try_http_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
     shared.set_push_socket(stream.socket().ok());
     shared.set_writer(Some(WriteHalf::Http { session }));
     dispatch_shared(shared, events);
+    replay_offline(shared);
     Ok(ReadHalf::Http(stream))
 }
 
@@ -1398,6 +1647,19 @@ fn route(shared: &Shared, message: ServerMessage) {
             let events = apply_tx_update(shared, &update);
             dispatch_shared(shared, events);
         }
+        ServerMessage::ReducerResult(result) => {
+            // Optimistic calls resolve here, on the reader, not in a waiter:
+            // their submitter got a key back, not a handle to await.
+            resolve_optimistic(shared, &result);
+            if let Some(tx) = shared
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&result.id)
+            {
+                let _ = tx.send(Ok(ServerMessage::ReducerResult(result)));
+            }
+        }
         ServerMessage::TxUpdateLight(_) => {}
         ServerMessage::Error(err) => {
             // A null-id error is server-initiated and belongs to nobody.
@@ -1459,11 +1721,22 @@ fn tcp_authenticate(shared: &Shared, messages: &mut MessageStream) -> Result<[u8
 /// Clearing the pending map drops each request's `Sender`; the waiting
 /// `recv()` then returns `Err`, which [`Connection::request`] maps to
 /// [`Error::Disconnected`]. No sentinel message is needed.
+///
+/// Optimistic calls are NOT failed — that is their point. The dead session's
+/// request ids are forgotten (nothing will ever answer them), but the calls
+/// stay queued under their stable keys and their overlays stay rendered; the
+/// reconnect replays them exactly-once (CS-032).
 fn fail_all(shared: &Shared) {
     shared
         .pending
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+    shared
+        .optimistic
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .in_flight
         .clear();
 }
 

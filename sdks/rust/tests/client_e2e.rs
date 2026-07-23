@@ -328,3 +328,172 @@ fn pipelined_calls_resolve_by_id_and_commit_in_submission_order() {
     }
     assert_eq!(*titles.lock().unwrap(), expected);
 }
+
+/// A plausible optimistic `Task` row: temp id + this client's identity +
+/// title. The server will re-mint the id — the optimistic row is a stand-in,
+/// swapped for the authoritative one when the commit's `TxUpdate` applies.
+fn optimistic_task_row(temp_id: u64, owner: [u8; 32], title: &str) -> Vec<u8> {
+    let mut writer = fluxum_sdk::protocol::FluxBinWriter::new();
+    writer.write_u64(temp_id);
+    writer.write_identity(&owner);
+    writer.write_str(title).unwrap();
+    writer.into_bytes()
+}
+
+/// Decode just the title from a full `Task` row.
+fn task_title(row: &[u8]) -> String {
+    let mut reader = FluxBinReader::new(row);
+    reader.read_u64().unwrap(); // id
+    reader.read_identity().unwrap(); // owner
+    reader.read_str().unwrap().to_owned()
+}
+
+#[test]
+fn an_optimistic_call_renders_immediately_and_converges() {
+    // SPEC-021 CS-010/CS-011: the updater's row shows before any round-trip;
+    // once the commit's TxUpdate applies, the cache holds exactly the
+    // authoritative row — no duplicate, no lingering temp row.
+    if skip() {
+        return;
+    }
+    let server = Server::start("optimistic");
+    let db = Connection::connect(&server.tcp_url, b"", [task_schema()]).expect("connect");
+    db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
+
+    let identity = db.identity();
+    let key = db
+        .call_optimistic("add_task", vec![FluxValue::Str("optimistic".into())], |s| {
+            s.insert("Task", optimistic_task_row(u64::MAX, identity, "optimistic"));
+        })
+        .expect("call_optimistic");
+    assert!(!key.is_empty(), "the submission handle is the minted key");
+
+    // Visible NOW — no server round-trip has completed yet (and even if it
+    // had, this assertion only requires the row to be there).
+    let rows = db.rows("Task");
+    assert_eq!(rows.len(), 1, "the optimistic row renders immediately");
+    assert_eq!(task_title(&rows[0]), "optimistic");
+
+    // Converge: the overlay drops when the authoritative update applies.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.pending_mutations() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db.pending_mutations(), 0, "the call resolved");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let rows = db.rows("Task");
+        if rows.len() == 1 && task_title(&rows[0]) == "optimistic" {
+            let mut reader = FluxBinReader::new(&rows[0]);
+            let id = reader.read_u64().unwrap();
+            if id != u64::MAX {
+                break; // the authoritative row, server-minted id
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cache never converged to the authoritative row: {rows:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn a_rejected_optimistic_call_rolls_back_and_reports() {
+    // SPEC-021 CS-011: `Err` removes the optimistic row, the cache matches
+    // server state exactly, and the rejected listener hears about it.
+    if skip() {
+        return;
+    }
+    let server = Server::start("optimistic-reject");
+    let db = Connection::connect(&server.tcp_url, b"", [chat_schema()]).expect("connect");
+    db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+
+    let rejections: Arc<Mutex<Vec<(String, String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&rejections);
+    db.on_rejected(Box::new(move |reducer, key, err| {
+        sink.lock().unwrap().push((reducer.to_owned(), key.to_owned(), err.code));
+    }));
+
+    let identity = db.identity();
+    // The demo module rejects an empty message (5001) — but the optimistic
+    // updater has already rendered it.
+    let key = db
+        .call_optimistic(
+            "send_chat",
+            vec![FluxValue::I64(1), FluxValue::Str(String::new())],
+            |s| {
+                let mut writer = fluxum_sdk::protocol::FluxBinWriter::new();
+                writer.write_u64(u64::MAX);
+                writer.write_identity(&identity);
+                writer.write_u32(1); // channel
+                writer.write_str("").unwrap();
+                writer.write_timestamp(0);
+                s.insert("ChatMessage", writer.into_bytes());
+            },
+        )
+        .expect("call_optimistic");
+    assert_eq!(db.rows("ChatMessage").len(), 1, "rendered optimistically");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.pending_mutations() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(db.rows("ChatMessage").is_empty(), "rolled back on Err");
+    let seen = rejections.lock().unwrap();
+    assert_eq!(seen.len(), 1, "the rejection listener fired once");
+    assert_eq!(seen[0].0, "send_chat");
+    assert_eq!(seen[0].1, key);
+    assert_eq!(seen[0].2, 5001, "REDUCER_USER_ERROR");
+}
+
+#[test]
+fn offline_optimistic_calls_replay_in_order_exactly_once() {
+    // SPEC-021 CS-032: calls made while the connection is down stay queued
+    // (and rendered), then replay in submission order on reconnect, each
+    // under its stable idempotency key — so nothing double-applies even if a
+    // first send actually reached the server.
+    if skip() {
+        return;
+    }
+    let server = Server::start("offline-replay");
+    let db = Connection::connect(&server.tcp_url, b"", [task_schema()]).expect("connect");
+    db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
+
+    // Kill the socket as an outage would, then submit while (as far as this
+    // thread knows) the session is down.
+    db.simulate_stream_loss();
+    let identity = db.identity();
+    for (i, title) in ["offline-a", "offline-b"].into_iter().enumerate() {
+        db.call_optimistic("add_task", vec![FluxValue::Str(title.into())], |s| {
+            s.insert(
+                "Task",
+                optimistic_task_row(u64::MAX - i as u64, identity, title),
+            );
+        })
+        .expect("call_optimistic while down");
+    }
+    // Both render locally regardless of connectivity.
+    assert_eq!(db.rows("Task").len(), 2, "queued calls render offline");
+
+    // The reconnect machinery replays the queue; every call applies once.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while db.pending_mutations() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db.pending_mutations(), 0, "the queue drained after replay");
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut titles: Vec<String> = db.rows("Task").iter().map(|r| task_title(r)).collect();
+        titles.sort();
+        if titles == ["offline-a", "offline-b"] {
+            break; // exactly once each — no duplicates, no leftovers
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay did not converge exactly-once: {titles:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}

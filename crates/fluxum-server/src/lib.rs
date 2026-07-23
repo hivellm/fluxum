@@ -47,6 +47,7 @@ use fluxum_core::auth::Authenticator;
 use fluxum_core::metrics::FanoutStage;
 use fluxum_core::reducer::{ReducerEngine, ViewRegistry};
 use fluxum_core::store::{MemStore, TxDiff};
+use fluxum_core::txn::CommitMeta;
 use fluxum_core::subscription::SubscriptionManager;
 use fluxum_core::types::Identity;
 
@@ -269,7 +270,7 @@ pub struct ShardContext {
     pub admin_identity: Identity,
     /// Broadcast of every committed [`TxDiff`]; the fan-out task evaluates
     /// subscriptions against each and pushes `TxUpdate`s (SUB-021).
-    commit_tx: broadcast::Sender<(Instant, Arc<TxDiff>)>,
+    commit_tx: broadcast::Sender<(Instant, Arc<TxDiff>, Arc<CommitMeta>)>,
     /// Monotonic `ConnectionId` allocator (ephemeral, never reused within a
     /// process; `0` is reserved for scheduled/system callers, RED-025).
     next_connection_id: AtomicU64,
@@ -460,11 +461,13 @@ impl ShardContext {
         // caller's response hop. Weak, or the pipeline's hook would cycle
         // back to the context that owns the pipeline.
         let hook_ctx = Arc::downgrade(&ctx);
-        ctx.engine.pipeline().set_commit_hook(Box::new(move |diff| {
-            if let Some(ctx) = hook_ctx.upgrade() {
-                ctx.publish_commit(diff.clone());
-            }
-        }));
+        ctx.engine
+            .pipeline()
+            .set_commit_hook(Box::new(move |diff, meta| {
+                if let Some(ctx) = hook_ctx.upgrade() {
+                    ctx.publish_commit_meta(diff.clone(), meta.clone());
+                }
+            }));
         ctx
     }
 
@@ -985,13 +988,29 @@ impl ShardContext {
     /// commit path — clients recover missed updates on reconnect via the
     /// `tx_id` gap (SPEC-006 acceptance 14). The send instant rides along
     /// so the fan-out can attribute its wake latency (OBS-023).
+    ///
+    /// Anonymous provenance — for internal publishes and tests. The commit
+    /// hook uses [`ShardContext::publish_commit_meta`], which is what stamps
+    /// the RPC-033 `reducer_name`/`caller` onto the fanned-out `TxUpdate`s.
     pub fn publish_commit(&self, diff: TxDiff) {
+        self.publish_commit_meta(diff, CommitMeta::anonymous());
+    }
+
+    /// [`ShardContext::publish_commit`] carrying the commit's provenance
+    /// (SPEC-021 CS-011): the fan-out stamps `meta` onto every `TxUpdate` so
+    /// a client can attribute its own commits and reconcile optimistic
+    /// mutations.
+    pub fn publish_commit_meta(&self, diff: TxDiff, meta: CommitMeta) {
         self.last_tx_id.fetch_max(diff.tx_id, Ordering::Relaxed);
-        let _ = self.commit_tx.send((Instant::now(), Arc::new(diff)));
+        let _ = self
+            .commit_tx
+            .send((Instant::now(), Arc::new(diff), Arc::new(meta)));
     }
 
     /// A receiver for the commit broadcast (one per fan-out task).
-    pub fn subscribe_commits(&self) -> broadcast::Receiver<(Instant, Arc<TxDiff>)> {
+    pub fn subscribe_commits(
+        &self,
+    ) -> broadcast::Receiver<(Instant, Arc<TxDiff>, Arc<CommitMeta>)> {
         self.commit_tx.subscribe()
     }
 }
@@ -1067,7 +1086,7 @@ pub(crate) fn spawn_fanout_for(
         };
         let codec = FrameCodec::default();
         loop {
-            let (committed_at, diff) = tokio::select! {
+            let (committed_at, diff, meta) = tokio::select! {
                 _ = shutdown.notified() => break,
                 recv = commits.recv() => match recv {
                     Ok(entry) => entry,
@@ -1124,6 +1143,12 @@ pub(crate) fn spawn_fanout_for(
                     // SPEC-007 SHD-051: tag the originating shard so a client
                     // subscribed on several shards can attribute per-shard order.
                     tx_update.shard_id = ctx.shard_id;
+                    // RPC-033 provenance: which reducer committed this, and
+                    // for whom. This is what lets a client attribute its own
+                    // commits and drop the matching optimistic overlay in the
+                    // same update (SPEC-021 CS-011).
+                    tx_update.reducer_name = meta.reducer_name.clone();
+                    tx_update.caller = *meta.caller.as_bytes();
                     for table in &mut tx_update.tables {
                         table.query_id = query_id;
                     }

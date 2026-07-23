@@ -72,7 +72,12 @@ pub type ReducerFn = Box<dyn for<'a, 'b> FnOnce(&'a mut Tx<'b>) -> Result<()> + 
 /// [`CommitLog::wait_written`] (TXN-004): a subscriber may see a commit that
 /// a crash inside the documented ~50 ms window erases, which the SPEC-021
 /// reconnect resync heals — the same trade respond-after-merge already made.
-pub type CommitHook = Box<dyn Fn(&TxDiff) + Send + Sync + 'static>;
+///
+/// The hook also receives the commit's [`CommitMeta`] so the fan-out can
+/// stamp the RPC-033 `TxUpdate` provenance fields (`reducer_name`, `caller`)
+/// — what lets a client attribute its own commits and reconcile optimistic
+/// mutations (SPEC-021 CS-011).
+pub type CommitHook = Box<dyn Fn(&TxDiff, &CommitMeta) + Send + Sync + 'static>;
 
 /// Tuning knobs for a [`TxPipeline`] (SPEC-003 §3; wired into `config.yml`
 /// with the server assembly).
@@ -323,7 +328,7 @@ impl TxPipelineWorker {
         // delivery gate — the ack's TXN-004 written-watermark wait stays
         // with the caller (P0-A 1.3, F-006).
         if let Some(hook) = self.commit_hook.get() {
-            hook(&diff);
+            hook(&diff, meta);
         }
         let tx_id = diff.tx_id;
         // TXN-021 step 9 / TXN-004: enqueue on the commit-log writer before

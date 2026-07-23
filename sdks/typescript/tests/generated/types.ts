@@ -71,3 +71,28 @@ export interface Task {
  */
 export type TaskKey = [bigint];
 
+/**
+ * Row of the `__idempotency__` table.
+ * Primary key: `identity`, `reducer`, `key`.
+ */
+export interface __idempotency__ {
+  /**
+   * Primary key.
+   */
+  identity: Identity;
+  /**
+   * Primary key.
+   */
+  reducer: string;
+  /**
+   * Primary key.
+   */
+  key: string;
+  created_us: bigint;
+}
+
+/**
+ * Primary key of `__idempotency__`, in declaration order.
+ */
+export type __idempotency__Key = [Identity, string, string];
+

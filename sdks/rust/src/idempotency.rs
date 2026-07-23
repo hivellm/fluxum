@@ -15,8 +15,9 @@
 use crate::protocol::{ClientMessage, ReducerCall};
 
 /// A call queued for submission, carrying the stable key it will keep for
-/// every retry (CS-032).
-#[derive(Debug, Clone, PartialEq)]
+/// every retry (CS-032). Serializable so a durable queue (CS-040) can store
+/// it and a restart can replay it under its original key.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct QueuedCall {
     /// The reducer to run.
     pub reducer: String,
@@ -98,6 +99,19 @@ impl OfflineQueue {
         Some(call.to_message(id))
     }
 
+    /// Hand a SPECIFIC queued call to the transport (replay walks the queue
+    /// in order but sends each call under its own request id), bumping its
+    /// attempt count. The key is untouched. `None` if the key is not queued
+    /// (already acknowledged).
+    pub fn attempt(&mut self, idempotency_key: &str, id: u32) -> Option<ClientMessage> {
+        let call = self
+            .pending
+            .iter_mut()
+            .find(|c| c.idempotency_key == idempotency_key)?;
+        call.attempts += 1;
+        Some(call.to_message(id))
+    }
+
     /// Drop a call once the server has acknowledged it. A `ReducerResult`
     /// for a deduplicated replay is an ack like any other: the server has
     /// applied it exactly once, so the client stops resending.
@@ -112,6 +126,40 @@ impl OfflineQueue {
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }
+
+    /// A point-in-time image of the whole queue, for durable persistence
+    /// (SPEC-021 CS-040): everything a restart needs to replay each call
+    /// under its ORIGINAL key — a fresh key would double-apply (CS-032).
+    pub fn snapshot(&self) -> QueueSnapshot {
+        QueueSnapshot {
+            client_id: self.client_id.clone(),
+            next_seq: self.next_seq,
+            pending: self.pending.clone(),
+        }
+    }
+
+    /// Rebuild a queue from a persisted [`QueueSnapshot`]: the pending calls
+    /// keep their minted keys, and `next_seq` resumes where it left off so
+    /// no future call can reuse a key issued before the restart.
+    pub fn restore(snapshot: QueueSnapshot) -> Self {
+        Self {
+            client_id: snapshot.client_id,
+            next_seq: snapshot.next_seq,
+            pending: snapshot.pending,
+        }
+    }
+}
+
+/// A serializable image of an [`OfflineQueue`] (CS-040): the client identity
+/// namespace, the key counter, and every call still awaiting its ack.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct QueueSnapshot {
+    /// The queue's key namespace.
+    pub client_id: String,
+    /// The next key sequence number.
+    pub next_seq: u64,
+    /// The calls awaiting acknowledgement, oldest first.
+    pub pending: Vec<QueuedCall>,
 }
 
 #[cfg(test)]
@@ -172,6 +220,40 @@ mod tests {
         assert!(!queue.acknowledge(&k1));
         assert!(queue.acknowledge(&k2));
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn a_snapshot_round_trips_with_original_keys_and_counter() {
+        // CS-040/CS-032: a call queued before a restart must replay under
+        // its original key, and the counter must resume so no later call can
+        // collide with a key issued before the restart.
+        let mut queue = OfflineQueue::new("client-a");
+        let k1 = queue.enqueue("transfer", vec![]);
+
+        let bytes = rmp_serde::to_vec(&queue.snapshot()).unwrap();
+        let restored: QueueSnapshot = rmp_serde::from_slice(&bytes).unwrap();
+        let mut queue = OfflineQueue::restore(restored);
+
+        assert_eq!(queue.pending().len(), 1);
+        assert_eq!(queue.pending()[0].idempotency_key, k1);
+        let k2 = queue.enqueue("transfer", vec![]);
+        assert_ne!(k1, k2, "the counter resumed, not restarted");
+    }
+
+    #[test]
+    fn attempt_by_key_renders_the_named_call_and_bumps_its_count() {
+        let mut queue = OfflineQueue::new("c");
+        let _k1 = queue.enqueue("a", vec![]);
+        let k2 = queue.enqueue("b", vec![]);
+        let ClientMessage::ReducerCall(call) = queue.attempt(&k2, 7).unwrap() else {
+            panic!("expected a ReducerCall");
+        };
+        assert_eq!(call.reducer, "b");
+        assert_eq!(call.idempotency_key, Some(k2.clone()));
+        assert_eq!(queue.pending()[1].attempts, 1);
+        assert_eq!(queue.pending()[0].attempts, 0, "only the named call");
+        queue.acknowledge(&k2);
+        assert!(queue.attempt(&k2, 8).is_none(), "acknowledged: gone");
     }
 
     #[test]

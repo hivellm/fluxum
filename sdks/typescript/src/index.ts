@@ -32,11 +32,20 @@ export type { ServerMessage } from './protocol.ts';
 export { FluxBinError, RowReader, decodeRow, toHex } from './fluxbin.ts';
 export type { FluxType, FluxValue } from './fluxbin.ts';
 
-export { FluxumClient, ReducerError, SchemaMismatchError, ServerError } from './client.ts';
+export {
+  FluxumClient,
+  OptimisticRejectedError,
+  ReducerError,
+  SchemaMismatchError,
+  ServerError,
+} from './client.ts';
 export type { FluxumClientOptions, RowListener } from './client.ts';
 
 export { RowCache, UnknownTableError } from './cache.ts';
 export type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts';
+
+export { OfflineQueue, OptimisticStore, SyncedCache } from './optimistic.ts';
+export type { OptimisticOp, QueueSnapshot, QueuedCall } from './optimistic.ts';
 
 export { BoundedQueue, QueueOverflowError } from './queue.ts';
 export type { BoundedQueueOptions } from './queue.ts';

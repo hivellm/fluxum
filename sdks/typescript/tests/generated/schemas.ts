@@ -62,9 +62,23 @@ export function tableSchemaTask(): TableSchema {
 }
 
 /**
+ * The SDK cache hooks for `__idempotency__` (SDK-040): stable primary-key
+ * projections over the full-row and delete-entry wire layouts.
+ */
+export function tableSchema__idempotency__(): TableSchema {
+  const rowPlan = [['Identity', true], ['Str', true], ['Str', true]] as ReadonlyArray<readonly [FluxType, boolean]>;
+  const deletePlan = [['Identity', true], ['Str', true], ['Str', true]] as ReadonlyArray<readonly [FluxType, boolean]>;
+  return {
+    name: '__idempotency__',
+    pkOfRow: (row) => projectKey(row, rowPlan),
+    pkOfDelete: (entry) => projectKey(entry, deletePlan),
+  };
+}
+
+/**
  * Every table's cache hooks, in schema order — ready to pass as the
  * `tables` option of `FluxumClient.connect`.
  */
 export function allTableSchemas(): TableSchema[] {
-  return [tableSchemaChatMessage(), tableSchemaOnlineUser(), tableSchemaTask()];
+  return [tableSchemaChatMessage(), tableSchemaOnlineUser(), tableSchemaTask(), tableSchema__idempotency__()];
 }

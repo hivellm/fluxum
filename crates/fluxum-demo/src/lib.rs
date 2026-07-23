@@ -25,6 +25,15 @@ use fluxum_macros as fluxum;
 /// Calling it is the whole point; it does nothing else.
 pub fn link() {}
 
+// The dedup window for client idempotency keys (SPEC-021 CS-030/CS-031): a
+// system table like `__schedule__`, registered by any module that wants
+// exactly-once submission. The SDK attaches a key to every optimistic /
+// offline-queued call (CS-032), so the reference module must accept them —
+// without this row store the engine refuses any `ReducerCall` carrying a key.
+fluxum_core::schema::inventory::submit! {
+    fluxum_core::schema::TableDef(&fluxum_core::reducer::IDEMPOTENCY_TABLE)
+}
+
 // --- Tables -----------------------------------------------------------------
 
 /// A chat message. Public: every subscriber sees every message.

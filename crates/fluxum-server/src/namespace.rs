@@ -39,6 +39,7 @@ use tokio::sync::{Mutex, broadcast};
 use fluxum_core::reducer::ReducerEngine;
 use fluxum_core::store::{MemStore, TxDiff};
 use fluxum_core::subscription::SubscriptionManager;
+use fluxum_core::txn::CommitMeta;
 
 /// The name of the implicit database a connection binds to when it names
 /// none (OPS-050): the [`crate::ShardContext`]'s own engine/subscriptions.
@@ -50,7 +51,7 @@ pub struct Namespace {
     name: String,
     engine: ReducerEngine,
     subscriptions: Mutex<SubscriptionManager>,
-    commit_tx: broadcast::Sender<(std::time::Instant, Arc<TxDiff>)>,
+    commit_tx: broadcast::Sender<(std::time::Instant, Arc<TxDiff>, Arc<CommitMeta>)>,
     last_tx_id: AtomicU64,
     /// This tenant's resource ceilings and their live state (OPS-060).
     /// Unbounded unless [`Namespace::with_quotas`] set them.
@@ -109,11 +110,13 @@ impl Namespace {
         // engine, pipeline, and broadcast. Weak breaks the ns → engine →
         // pipeline → hook → ns cycle.
         let hook_ns = Arc::downgrade(&ns);
-        ns.engine.pipeline().set_commit_hook(Box::new(move |diff| {
-            if let Some(ns) = hook_ns.upgrade() {
-                ns.publish_commit(diff.clone());
-            }
-        }));
+        ns.engine
+            .pipeline()
+            .set_commit_hook(Box::new(move |diff, meta| {
+                if let Some(ns) = hook_ns.upgrade() {
+                    ns.publish_commit_meta(diff.clone(), meta.clone());
+                }
+            }));
         ns
     }
 
@@ -174,18 +177,26 @@ impl Namespace {
 
     /// Publish a committed diff to *this namespace's* fan-out. A diff never
     /// reaches another namespace's subscribers. The send instant rides
-    /// along for the OBS-023 stage attribution.
+    /// along for the OBS-023 stage attribution. Anonymous provenance — the
+    /// commit hook uses [`Namespace::publish_commit_meta`].
     pub fn publish_commit(&self, diff: TxDiff) {
+        self.publish_commit_meta(diff, CommitMeta::anonymous());
+    }
+
+    /// [`Namespace::publish_commit`] carrying the commit's provenance, so
+    /// the fan-out can stamp RPC-033 `reducer_name`/`caller` (SPEC-021
+    /// CS-011).
+    pub fn publish_commit_meta(&self, diff: TxDiff, meta: CommitMeta) {
         self.last_tx_id.fetch_max(diff.tx_id, Ordering::Relaxed);
         let _ = self
             .commit_tx
-            .send((std::time::Instant::now(), Arc::new(diff)));
+            .send((std::time::Instant::now(), Arc::new(diff), Arc::new(meta)));
     }
 
     /// A receiver for this namespace's commit broadcast (one per fan-out).
     pub fn subscribe_commits(
         &self,
-    ) -> broadcast::Receiver<(std::time::Instant, Arc<TxDiff>)> {
+    ) -> broadcast::Receiver<(std::time::Instant, Arc<TxDiff>, Arc<CommitMeta>)> {
         self.commit_tx.subscribe()
     }
 

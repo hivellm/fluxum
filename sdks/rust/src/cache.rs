@@ -188,6 +188,41 @@ impl RowCache {
         self.tables.values().map(|s| s.by_key.len()).sum()
     }
 
+    /// The registered table names, sorted (deterministic iteration order).
+    pub fn table_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.tables.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
+    /// Project a full row to its primary key through the table's registered
+    /// schema. `None` for an unregistered table.
+    pub fn project_pk(&self, table: &str, row: &[u8]) -> Option<Vec<u8>> {
+        self.tables
+            .get(table)
+            .map(|state| (state.schema.pk_of_row)(row))
+    }
+
+    /// The `(primary key, row)` pairs cached for `table`, in insertion order.
+    /// Where several byte-distinct rows share a primary key (transiently
+    /// possible under join semantics), only the canonical row — the one the
+    /// pk projection resolves to — is listed. Empty for an unknown table.
+    pub fn pk_rows(&self, table: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(state) = self.tables.get(table) else {
+            return Vec::new();
+        };
+        state
+            .order
+            .iter()
+            .filter_map(|key| {
+                let entry = state.by_key.get(key)?;
+                let pk = (state.schema.pk_of_row)(&entry.bytes);
+                let canonical = state.by_pk.get(&pk).map(Vec::as_slice) == Some(key.as_slice());
+                canonical.then(|| (pk, entry.bytes.clone()))
+            })
+            .collect()
+    }
+
     /// Apply a `TxUpdate` (or `InitialData`) belonging to a KNOWN subscription
     /// query, tracking which rows the query holds so a later
     /// [`RowCache::release_query`] can drop exactly them (SDK-044).
@@ -640,6 +675,32 @@ mod tests {
             }]
         );
         assert_eq!(c.size(), 0);
+    }
+
+    #[test]
+    fn pk_accessors_expose_the_projection_surface() {
+        // The seam the optimistic overlay composes over (SPEC-021 CS-010).
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0), row(2, 5)], vec![]));
+        assert_eq!(c.table_names(), vec!["Task".to_owned()]);
+        assert_eq!(c.project_pk("Task", &row(2, 5)), Some(vec![2]));
+        assert_eq!(c.project_pk("Ghost", &row(2, 5)), None);
+        assert_eq!(
+            c.pk_rows("Task"),
+            vec![(vec![1], row(1, 0)), (vec![2], row(2, 5))]
+        );
+        assert!(c.pk_rows("Ghost").is_empty());
+    }
+
+    #[test]
+    fn pk_rows_lists_only_the_canonical_row_per_pk() {
+        // Two byte-distinct rows under one pk (transient join-semantics
+        // state): only the row the projection resolves to is listed.
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0)], vec![]));
+        c.apply_query_diff(2, &diff(vec![row(1, 9)], vec![]));
+        assert_eq!(c.rows("Task").len(), 2, "both byte rows are cached");
+        assert_eq!(c.pk_rows("Task"), vec![(vec![1], row(1, 9))]);
     }
 
     #[test]
