@@ -361,4 +361,20 @@ mod tests {
         let err = dev_loop(&options).unwrap_err();
         assert!(err.to_string().contains("fluxum init"), "{err}");
     }
+
+    #[test]
+    fn a_failed_cycle_in_once_mode_reports_and_returns() {
+        // A crate dir with a bogus prebuilt binary: the spawn fails, the
+        // failure is surfaced (1.8) and once-mode returns instead of
+        // looping — no server, no hang.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        let options = DevOptions {
+            path: dir.path().to_path_buf(),
+            once: true,
+            prebuilt: Some(dir.path().join("no-such-binary.exe")),
+            ..DevOptions::default()
+        };
+        dev_loop(&options).unwrap(); // once-mode returns after the surfaced failure
+    }
 }

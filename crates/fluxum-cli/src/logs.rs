@@ -336,6 +336,63 @@ mod tests {
         assert!(passes(info, None));
     }
 
+    /// A one-shot fake `/logs` endpoint answering with a fixed head+body.
+    fn serve_logs_once(head: &'static str, body: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let Ok((mut socket, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = std::io::Read::read(&mut socket, &mut buf);
+            let _ = socket.write_all(head.as_bytes());
+            let _ = socket.write_all(body);
+        });
+        addr
+    }
+
+    #[test]
+    fn stream_prints_filtered_rendered_lines_until_the_last_chunk() {
+        const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                            Transfer-Encoding: chunked\r\n\r\n";
+        // info (filtered out), warn (kept), keep-alive, terminator.
+        const BODY: &[u8] = b"2a\r\n{\"level\":\"INFO\",\"fields\":{\"message\":\"a\"}}\n\r\n\
+                              2a\r\n{\"level\":\"WARN\",\"fields\":{\"message\":\"b\"}}\n\r\n\
+                              1\r\n\n\r\n0\r\n\r\n";
+        let addr = serve_logs_once(HEAD, BODY);
+        let options = LogsOptions {
+            server: addr,
+            follow: false,
+            level: Some(Level::Warn),
+            format: Format::Pretty,
+        };
+        let mut out = Vec::new();
+        stream(&options, &mut out).unwrap();
+        let printed = String::from_utf8(out).unwrap();
+        assert!(printed.contains("WARN"), "{printed}");
+        assert!(printed.contains(": b"), "{printed}");
+        assert!(!printed.contains(": a"), "info was below the floor: {printed}");
+    }
+
+    #[test]
+    fn stream_surfaces_a_guard_refusal_with_its_message() {
+        const HEAD: &str = "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\n\
+                            Content-Length: 41\r\n\r\n";
+        const BODY: &[u8] = br#"{"success":false,"error":"not from here"}"#;
+        let addr = serve_logs_once(HEAD, BODY);
+        let options = LogsOptions {
+            server: addr,
+            follow: true,
+            level: None,
+            format: Format::Json,
+        };
+        let err = stream(&options, &mut Vec::new()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("403"), "{text}");
+        assert!(text.contains("not from here"), "{text}");
+    }
+
     #[test]
     fn pretty_rendering_shows_clock_level_target_message_and_extras() {
         let line = r#"{"timestamp":"2026-07-23T12:34:56.789Z","level":"WARN","target":"fluxum::server","fields":{"message":"slow reducer","duration_us":1500}}"#;

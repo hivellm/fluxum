@@ -493,4 +493,34 @@ mod tests {
         // `schema export` without --server is a usage error, not a panic.
         assert_eq!(run(["schema", "export"]), 2);
     }
+
+    #[test]
+    fn inner_loop_commands_validate_their_flags() {
+        // `init` needs a directory; `logs` needs --server; every enum flag
+        // rejects garbage with a usage error (2), never a panic.
+        assert_eq!(run(["init"]), 2);
+        assert_eq!(run(["init", "--name", "x"]), 2, "a flag is not a directory");
+        assert_eq!(run(["logs"]), 2);
+        assert_eq!(run(["logs", "--server", "h:1", "--level", "loud"]), 2);
+        assert_eq!(run(["logs", "--server", "h:1", "--format", "xml"]), 2);
+        assert_eq!(run(["dev", "--lang", "cobol"]), 2);
+        // `dev` on a directory without a crate is a real (1) failure that
+        // names `fluxum init`.
+        let empty = tempfile::tempdir().unwrap();
+        let path = empty.path().display().to_string();
+        assert_eq!(run(["dev", "--path", &path]), 1);
+    }
+
+    #[test]
+    fn init_through_the_cli_scaffolds_and_reports_the_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("demo-app").display().to_string();
+        assert_eq!(
+            run(["init", &target, "--fluxum-path", "/checkout/fluxum"]),
+            0
+        );
+        assert!(std::path::Path::new(&target).join("src/main.rs").exists());
+        // Re-running refuses to clobber the crate it just made.
+        assert_eq!(run(["init", &target]), 1);
+    }
 }
