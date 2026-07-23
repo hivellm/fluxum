@@ -104,6 +104,23 @@ of the correctness contract.
   Reasons correspond to the backpressure and framing rules in
   [SPEC-005](SPEC-005-subscriptions.md) and [SPEC-006](SPEC-006-protocol-fluxrpc.md).
 
+- **OBS-023** [P1] Fan-out delivery-pipeline stage latency:
+
+  ```
+  fluxum_fanout_stage_us{shard, stage}  Histogram
+  ```
+
+  - `stage`: `"recv_lag"` (commit visibility → fan-out task woke) | `"eval"` (subscription
+    evaluation under the SUB-041 mutex) | `"enqueue"` (encode + every subscriber `try_send`,
+    per diff) | `"queue_wait"` (per frame, enqueue → its writer task dequeued it) | `"flush"`
+    (per frame, one socket write) | `"server_total"` (commit visibility → every subscriber
+    enqueued)
+
+  Attributes the server-side share of change→subscriber latency (NFR-11) stage by stage, so a
+  fan-out regression names the stage that moved instead of a single opaque number. Recorded
+  lock-free from the fan-out and writer tasks; buckets as in OBS-011. Zero-valued series are
+  emitted for every stage so dashboards can rely on the label set.
+
 ## 5. Storage metrics
 
 - **OBS-030** [P1] Table row counts:

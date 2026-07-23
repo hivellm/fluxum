@@ -216,6 +216,17 @@ per-shard mechanism.
                                                         // delivery subject to SUB-041/SUB-042
   ```
 
+  **Delivery visibility semantics.** Fan-out SHALL start at **commit visibility**: the shard's
+  single writer publishes each committed diff to the fan-out in `tx_id` order, concurrently with
+  the commit-log handoff (SPEC-003 TXN-021 steps 9/10). Delivery SHALL NOT gate on the written
+  watermark or the fsync: a `TxUpdate` is a cache delta, not a durability receipt — the durable
+  promise is the caller's `ReducerResult`, which does gate on the written watermark (TXN-004). A
+  crash inside the async-durability window (NFR-08) can therefore erase a commit a subscriber
+  already saw; the SPEC-021 reconnect resync reconciles subscriber caches against the recovered
+  state. In replica-set `semi_sync` mode this is superseded by the quorum visibility barrier
+  (SPEC-014 acceptance 2), which withholds both `ReducerResult` and `TxUpdate` until quorum
+  append.
+
 - **SUB-022** [P0] **Fan-out cost model.** The per-commit fan-out cost MUST be
   O(P_matched + S_matched), where P_matched is the number of unique plans selected by the pruning
   indexes (SUB-023, SUB-040) for the commit's delta rows and S_matched is the number of

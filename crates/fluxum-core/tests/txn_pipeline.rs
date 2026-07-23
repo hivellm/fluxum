@@ -1017,3 +1017,83 @@ async fn non_string_panic_payloads_are_reported_generically() {
         "{err}"
     );
 }
+
+// --- P0-A 1.3: the commit-visibility fan-out hook (TXN-021 steps 9/10) --------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_commit_hook_fires_at_visibility_in_tx_id_order_and_skips_rollbacks() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, pipeline, _worker) = pipeline_in(dir.path(), TxPipelineOptions::default());
+    let aid = store.table_id("Account").unwrap();
+
+    // Record (tx_id, rows a fresh snapshot sees) at every hook firing: the
+    // diff must already be visible (fired after the atomic merge), in
+    // strict tx_id order (fired by the single writer, TXN-021 steps 9/10).
+    let seen: Arc<std::sync::Mutex<Vec<(u64, usize)>>> = Arc::default();
+    let hook_seen = Arc::clone(&seen);
+    let hook_store = Arc::clone(&store);
+    assert!(pipeline.set_commit_hook(Box::new(move |diff| {
+        let rows = hook_store.snapshot().row_count(aid).unwrap_or(0);
+        hook_seen.lock().unwrap().push((diff.tx_id, rows));
+    })));
+
+    for i in 0..3u64 {
+        let email = format!("user{i}@example.com");
+        pipeline
+            .call(Box::new(move |tx| {
+                tx.insert(aid, account(&email, 1))?;
+                Ok(())
+            }))
+            .await
+            .unwrap();
+    }
+    // A rollback generates no subscription event (TXN-022 step 5).
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.insert(aid, account("ghost@example.com", 1))?;
+            Err(fluxum_core::FluxumError::Storage("business rule".into()))
+        }))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(1, 1), (2, 2), (3, 3)],
+        "tx_id order, each diff already visible, no rollback entry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_first_commit_hook_install_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, pipeline, _worker) = pipeline_in(dir.path(), TxPipelineOptions::default());
+    let aid = store.table_id("Account").unwrap();
+
+    let first = Arc::new(AtomicU64::new(0));
+    let second = Arc::new(AtomicU64::new(0));
+    let hook_first = Arc::clone(&first);
+    let hook_second = Arc::clone(&second);
+    assert!(
+        pipeline.set_commit_hook(Box::new(move |_| {
+            hook_first.fetch_add(1, Ordering::Relaxed);
+        })),
+        "the first install takes"
+    );
+    assert!(
+        !pipeline.set_commit_hook(Box::new(move |_| {
+            hook_second.fetch_add(1, Ordering::Relaxed);
+        })),
+        "a second install is refused, not silently swapped"
+    );
+
+    pipeline
+        .call(Box::new(move |tx| {
+            tx.insert(aid, account("ana@example.com", 100))?;
+            Ok(())
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(first.load(Ordering::Relaxed), 1);
+    assert_eq!(second.load(Ordering::Relaxed), 0);
+}
