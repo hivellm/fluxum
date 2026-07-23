@@ -39,17 +39,39 @@ pub mod tls;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use tokio::sync::{Mutex, Notify, broadcast, mpsc};
 
 use fluxum_core::auth::Authenticator;
+use fluxum_core::metrics::FanoutStage;
 use fluxum_core::reducer::{ReducerEngine, ViewRegistry};
 use fluxum_core::store::{MemStore, TxDiff};
 use fluxum_core::subscription::SubscriptionManager;
 use fluxum_core::types::Identity;
 
 /// One encoded, framed message ready for a connection's socket.
-pub type OutFrame = Arc<Vec<u8>>;
+/// One outbound frame plus its enqueue instant, so the writer can attribute
+/// queue + task-wake latency (OBS-023 `queue_wait`). The bytes stay shared:
+/// a fan-out clones the `Arc`, never the frame.
+#[derive(Debug, Clone)]
+pub struct OutFrame {
+    /// When the sending side queued it.
+    pub enqueued_at: Instant,
+    /// The encoded frame bytes.
+    pub bytes: Arc<Vec<u8>>,
+}
+
+impl OutFrame {
+    /// Wrap `bytes` stamped with the current instant.
+    #[must_use]
+    pub fn now(bytes: Arc<Vec<u8>>) -> Self {
+        Self {
+            enqueued_at: Instant::now(),
+            bytes,
+        }
+    }
+}
 
 /// A live connection's fan-out handle: a bounded outbound queue (drained by
 /// the connection's writer task) plus a shutdown signal. A full queue is the
@@ -247,7 +269,7 @@ pub struct ShardContext {
     pub admin_identity: Identity,
     /// Broadcast of every committed [`TxDiff`]; the fan-out task evaluates
     /// subscriptions against each and pushes `TxUpdate`s (SUB-021).
-    commit_tx: broadcast::Sender<Arc<TxDiff>>,
+    commit_tx: broadcast::Sender<(Instant, Arc<TxDiff>)>,
     /// Monotonic `ConnectionId` allocator (ephemeral, never reused within a
     /// process; `0` is reserved for scheduled/system callers, RED-025).
     next_connection_id: AtomicU64,
@@ -955,14 +977,15 @@ impl ShardContext {
     /// Publish a committed diff to the fan-out (called after a reducer
     /// commit). A lagging fan-out drops old diffs rather than block the
     /// commit path — clients recover missed updates on reconnect via the
-    /// `tx_id` gap (SPEC-006 acceptance 14).
+    /// `tx_id` gap (SPEC-006 acceptance 14). The send instant rides along
+    /// so the fan-out can attribute its wake latency (OBS-023).
     pub fn publish_commit(&self, diff: TxDiff) {
         self.last_tx_id.fetch_max(diff.tx_id, Ordering::Relaxed);
-        let _ = self.commit_tx.send(Arc::new(diff));
+        let _ = self.commit_tx.send((Instant::now(), Arc::new(diff)));
     }
 
     /// A receiver for the commit broadcast (one per fan-out task).
-    pub fn subscribe_commits(&self) -> broadcast::Receiver<Arc<TxDiff>> {
+    pub fn subscribe_commits(&self) -> broadcast::Receiver<(Instant, Arc<TxDiff>)> {
         self.commit_tx.subscribe()
     }
 }
@@ -997,6 +1020,32 @@ pub(crate) fn spawn_fanout(ctx: Arc<ShardContext>, shutdown: Arc<Notify>) {
     spawn_fanout_for(ctx, None, shutdown);
 }
 
+/// Enqueue one delta frame on one subscriber's writer queue, dropping the
+/// slow (SUB-042 Full tier — never block the fan-out) or the dead.
+async fn deliver_frame(
+    ctx: &ShardContext,
+    conn_id: u128,
+    handle: &ConnHandle,
+    frame: OutFrame,
+    rows: u64,
+) {
+    match handle.sink.try_send(frame) {
+        // OBS-021: one TxUpdate delivered.
+        Ok(()) => ctx.metrics().note_fanout(rows),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            tracing::warn!(target: "fluxum::fanout", connection = conn_id,
+                "subscriber dropped: send buffer full");
+            ctx.metrics()
+                .note_drop(fluxum_core::metrics::DropReason::BufferFull);
+            handle.shutdown.notify_waiters();
+            ctx.connections.remove(conn_id).await;
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            ctx.connections.remove(conn_id).await;
+        }
+    }
+}
+
 /// One fan-out loop over `namespace` (`None` = the default database).
 pub(crate) fn spawn_fanout_for(
     ctx: Arc<ShardContext>,
@@ -1012,19 +1061,25 @@ pub(crate) fn spawn_fanout_for(
         };
         let codec = FrameCodec::default();
         loop {
-            let diff = tokio::select! {
+            let (committed_at, diff) = tokio::select! {
                 _ = shutdown.notified() => break,
                 recv = commits.recv() => match recv {
-                    Ok(diff) => diff,
+                    Ok(entry) => entry,
                     // Lagged: the fan-out fell behind; clients recover on
                     // reconnect via the tx_id gap (SPEC-006 acceptance 14).
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 },
             };
+            // OBS-023 stage attribution (phase0_parity-fanout-latency): how
+            // long the diff waited for this task to wake…
+            let us = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+            ctx.metrics()
+                .note_fanout_stage(FanoutStage::RecvLag, us(committed_at.elapsed()));
 
-            // Evaluate once (SUB-041: mutex held only across evaluation),
-            // against this namespace's subscriptions only.
+            // …then evaluate once (SUB-041: mutex held only across
+            // evaluation), against this namespace's subscriptions only.
+            let eval_started = Instant::now();
             let deltas = {
                 let manager = match &namespace {
                     Some(ns) => ns.subscriptions().lock().await,
@@ -1039,6 +1094,10 @@ pub(crate) fn spawn_fanout_for(
                     }
                 }
             };
+            ctx.metrics()
+                .note_fanout_stage(FanoutStage::Eval, us(eval_started.elapsed()));
+            let had_deltas = !deltas.is_empty();
+            let enqueue_started = Instant::now();
 
             for delta in deltas {
                 // Group the targets by the query_id THEY know this query by
@@ -1077,26 +1136,27 @@ pub(crate) fn spawn_fanout_for(
                     let Ok(framed) = codec.encode(&body) else {
                         continue;
                     };
-                    let frame: OutFrame = Arc::new(framed);
+                    let bytes = Arc::new(framed);
+                    // Inline enqueue for every size: chunked parallel spawns
+                    // were tried here (phase0_parity-fanout-latency 1.2) and
+                    // measured NO better than the inline loop at 50
+                    // subscribers (p99 734 µs vs 686 µs) while risking a
+                    // convoy behind a starved chunk task — the enqueue loop
+                    // itself is ~36 µs; the cost lives in the writers'
+                    // dispatch and socket writes, not here.
                     for (conn_id, handle) in ctx.connections.handles_for(&conns).await {
-                        match handle.sink.try_send(Arc::clone(&frame)) {
-                            // OBS-021: one TxUpdate delivered.
-                            Ok(()) => ctx.metrics().note_fanout(rows),
-                            // SUB-042 Full tier: never block — drop the consumer.
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                tracing::warn!(target: "fluxum::fanout", connection = conn_id,
-                                "subscriber dropped: send buffer full");
-                                ctx.metrics()
-                                    .note_drop(fluxum_core::metrics::DropReason::BufferFull);
-                                handle.shutdown.notify_waiters();
-                                ctx.connections.remove(conn_id).await;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                ctx.connections.remove(conn_id).await;
-                            }
-                        }
+                        let frame = OutFrame::now(Arc::clone(&bytes));
+                        deliver_frame(&ctx, conn_id, &handle, frame, rows).await;
                     }
                 }
+            }
+            // OBS-023: only diffs that actually delivered something — a
+            // no-subscriber commit would flood the histogram with zeros.
+            if had_deltas {
+                ctx.metrics()
+                    .note_fanout_stage(FanoutStage::Enqueue, us(enqueue_started.elapsed()));
+                ctx.metrics()
+                    .note_fanout_stage(FanoutStage::ServerTotal, us(committed_at.elapsed()));
             }
         }
     });

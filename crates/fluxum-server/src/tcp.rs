@@ -353,7 +353,7 @@ async fn drive_connection(
     // The per-connection outbound queue (SUB-042 send buffer) + its writer.
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(options.send_queue_depth);
     let conn_shutdown = Arc::new(Notify::new());
-    let writer = tokio::spawn(writer_task(write_half, out_rx));
+    let writer = tokio::spawn(writer_task(write_half, out_rx, Arc::clone(ctx.metrics())));
 
     let mut session = Session::new(Arc::clone(&ctx));
     // SEC-047: key the source-side query-admission bucket on the resolved
@@ -585,11 +585,23 @@ async fn route_frame(
 }
 
 /// The writer task: drain the outbound queue to the socket in order.
-async fn writer_task(mut write_half: WriteHalf<MaybeTls>, mut out_rx: mpsc::Receiver<OutFrame>) {
+async fn writer_task(
+    mut write_half: WriteHalf<MaybeTls>,
+    mut out_rx: mpsc::Receiver<OutFrame>,
+    metrics: Arc<fluxum_core::metrics::Metrics>,
+) {
     while let Some(frame) = out_rx.recv().await {
-        if write_half.write_all(&frame).await.is_err() {
+        // OBS-023: queue + writer-wake latency, then the socket write.
+        let us = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
+        metrics.note_fanout_stage(
+            fluxum_core::metrics::FanoutStage::QueueWait,
+            us(frame.enqueued_at.elapsed()),
+        );
+        let began = std::time::Instant::now();
+        if write_half.write_all(&frame.bytes).await.is_err() {
             break;
         }
+        metrics.note_fanout_stage(fluxum_core::metrics::FanoutStage::Flush, us(began.elapsed()));
     }
     let _ = write_half.shutdown().await;
 }
@@ -642,7 +654,7 @@ async fn read_with_deadline(
 fn frame_message(codec: &FrameCodec, message: &ServerMessage) -> Result<OutFrame, ()> {
     let body = message.encode().map_err(|_| ())?;
     let framed = codec.encode(&body).map_err(|_| ())?;
-    Ok(Arc::new(framed))
+    Ok(OutFrame::now(Arc::new(framed)))
 }
 
 /// A framed `Error` message.
@@ -653,5 +665,5 @@ fn error_frame(
     message: impl Into<String>,
 ) -> OutFrame {
     let msg = ServerMessage::Error(ErrorMessage::from_catalog(id, code, message, Vec::new()));
-    frame_message(codec, &msg).unwrap_or_else(|()| Arc::new(Vec::new()))
+    frame_message(codec, &msg).unwrap_or_else(|()| OutFrame::now(Arc::new(Vec::new())))
 }

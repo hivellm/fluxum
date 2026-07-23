@@ -92,6 +92,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--stdb-reset-cmd" => opts.stdb_reset_cmd = Some(value("--stdb-reset-cmd")?),
             "--stdb-restart-cmd" => opts.stdb_restart_cmd = Some(value("--stdb-restart-cmd")?),
             "--stdb-note" => opts.stdb_note = Some(value("--stdb-note")?),
+            "--pin" => opts.pin = Some(value("--pin")?),
             "--subscribers" => opts.subscribers = parse(&value("--subscribers")?)?,
             "--rate" => opts.rate = parse(&value("--rate")?)?,
             "--messages" => opts.messages = parse(&value("--messages")?)?,
@@ -104,6 +105,14 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--tolerance" => opts.tolerance = parse(&value("--tolerance")?)?,
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
+    }
+
+    // TST-091 core pinning (P0-A 1.4): the driver self-pins here; every
+    // server spawn below re-pins its child to the server mask.
+    if let Some(spec) = &opts.pin {
+        let masks = parse_pin(spec)?;
+        let _ = PIN.set(masks);
+        pin_pid(std::process::id(), masks.driver)?;
     }
 
     // Not a measurement: serve the baseline app (spawned by the baseline
@@ -577,8 +586,9 @@ fn run_report(opts: &Opts) -> Result<(), String> {
                              ~50 ms OS-crash window (NFR-08)"
                     .to_owned(),
                 config: format!(
-                    "development profile, memory budget {}",
-                    opts.memory_budget.as_deref().unwrap_or("default (auto)")
+                    "development profile, memory budget {}{}",
+                    opts.memory_budget.as_deref().unwrap_or("default (auto)"),
+                    pin_note(opts)
                 ),
             },
         ),
@@ -592,8 +602,9 @@ fn run_report(opts: &Opts) -> Result<(), String> {
                 config: format!(
                     "axum+sqlx app server (own process), pooled prepared statements \
                      (max_connections={}), covering indexes task(owner) and \
-                     chat_message(channel,id), LISTEN/NOTIFY fan-out",
-                    opts.max_connections
+                     chat_message(channel,id), LISTEN/NOTIFY fan-out{}",
+                    opts.max_connections,
+                    pin_note(opts)
                 ),
             },
         ),
@@ -898,6 +909,77 @@ fn stdb_ready(url: &str, db_name: &str) -> Result<(), String> {
     }
 }
 
+/// TST-091 methodology (phase0_parity-fanout-latency 1.4): pin every
+/// server-side process and the driver to **disjoint core sets**, so the
+/// driver's 50+ subscriber reader threads never steal scheduler time from
+/// the server under measurement. Measured on the bench box (32 logical
+/// cores): fluxum e2e p99 771 µs shared → 686 µs split. Spec:
+/// `--pin server=0xFFFF,driver=0xFFFF0000` (hex CPU masks; on Windows via
+/// PowerShell ProcessorAffinity, on Unix via taskset). Containerized
+/// servers (PostgreSQL, SpacetimeDB) run inside the Docker VM's own cores
+/// and are unaffected — recorded in the report config either way.
+#[derive(Debug, Clone, Copy)]
+struct PinMasks {
+    server: u64,
+    driver: u64,
+}
+
+/// The active `--pin` masks, readable from the server-spawn helpers.
+static PIN: std::sync::OnceLock<PinMasks> = std::sync::OnceLock::new();
+
+/// The report-config note recording the active pinning (TST-091 honesty:
+/// the methodology is part of the published configuration).
+fn pin_note(opts: &Opts) -> String {
+    opts.pin
+        .as_deref()
+        .map(|spec| format!(", cores pinned {spec} (server processes vs driver — P0-A 1.4)"))
+        .unwrap_or_default()
+}
+
+/// Parse `server=0xMASK,driver=0xMASK`.
+fn parse_pin(spec: &str) -> Result<PinMasks, String> {
+    let mut server = None;
+    let mut driver = None;
+    for part in spec.split(',') {
+        let (key, mask) = part
+            .split_once('=')
+            .ok_or_else(|| format!("--pin part {part:?}: expected key=0xMASK"))?;
+        let mask = u64::from_str_radix(mask.trim_start_matches("0x"), 16)
+            .map_err(|_| format!("--pin {key}: cannot parse {mask:?} as a hex mask"))?;
+        match key {
+            "server" => server = Some(mask),
+            "driver" => driver = Some(mask),
+            other => return Err(format!("--pin: unknown key {other:?} (server|driver)")),
+        }
+    }
+    match (server, driver) {
+        (Some(server), Some(driver)) => Ok(PinMasks { server, driver }),
+        _ => Err("--pin needs both masks: server=0xMASK,driver=0xMASK".to_owned()),
+    }
+}
+
+/// Apply a CPU affinity mask to a live process.
+fn pin_pid(pid: u32, mask: u64) -> Result<(), String> {
+    let command = if cfg!(windows) {
+        format!(
+            "powershell -NoProfile -Command \"(Get-Process -Id {pid}).ProcessorAffinity = {mask}\""
+        )
+    } else {
+        format!("taskset -a -p {mask:x} {pid}")
+    };
+    run_shell(&command)
+}
+
+/// Pin a just-spawned server child to the `--pin` server mask (children
+/// inherit the driver's mask on Windows, so every spawn re-pins).
+fn pin_server_child(child: &Child) {
+    if let Some(masks) = PIN.get()
+        && let Err(e) = pin_pid(child.id(), masks.server)
+    {
+        eprintln!("warning: could not pin server pid {}: {e}", child.id());
+    }
+}
+
 /// Run a caller-supplied shell command (the PostgreSQL cold-restart hook).
 fn run_shell(command: &str) -> Result<(), String> {
     let status = if cfg!(windows) {
@@ -933,6 +1015,7 @@ struct Opts {
     stdb_reset_cmd: Option<String>,
     stdb_restart_cmd: Option<String>,
     stdb_note: Option<String>,
+    pin: Option<String>,
     subscribers: usize,
     rate: u32,
     messages: u32,
@@ -967,6 +1050,7 @@ impl Default for Opts {
             stdb_reset_cmd: None,
             stdb_restart_cmd: None,
             stdb_note: None,
+            pin: None,
             subscribers: 50,
             rate: 10,
             messages: 100,
@@ -995,7 +1079,8 @@ fn usage() -> String {
      [--stdb-url URL] [--stdb-db NAME] \
      [--subscribers N] [--rate N] [--messages N] [--max-connections N] [--json PATH]\n\
      \x20      fluxum-bench report --database-url URL --cold-restart-cmd CMD \
-     [--stdb-url URL --stdb-reset-cmd CMD [--stdb-db NAME] [--stdb-note TEXT]] [--out DIR] \
+     [--stdb-url URL --stdb-reset-cmd CMD [--stdb-db NAME] [--stdb-note TEXT]] \
+     [--pin server=0xMASK,driver=0xMASK] [--out DIR] \
      [--date YYYY-MM-DD] [--disk-note TEXT] [workload knobs]\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
@@ -1044,6 +1129,9 @@ impl BaselineServer {
             .stderr(Stdio::inherit())
             .spawn()
             .map_err(|e| format!("spawn baseline-server: {e}"))?;
+        // TST-091: the incumbent's app server gets the same server-side
+        // cores as fluxum-server (P0-A 1.4 pinning, when active).
+        pin_server_child(&child);
         wait_for_port(port, Duration::from_secs(20))?;
         Ok(child)
     }
@@ -1171,6 +1259,8 @@ fn launch_fluxum(
     let child = command
         .spawn()
         .map_err(|e| format!("spawn {}: {e}", binary.display()))?;
+    // P0-A 1.4: onto the server cores, away from the driver's threads.
+    pin_server_child(&child);
     wait_for_port(tcp_port, Duration::from_secs(20))?;
     Ok(child)
 }

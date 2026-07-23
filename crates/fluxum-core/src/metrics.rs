@@ -313,6 +313,72 @@ impl ReducerStat {
     }
 }
 
+/// One delivery-pipeline stage of the commit→subscriber fan-out path
+/// (OBS-023, phase0_parity-fanout-latency 1.1): the `stage` label of
+/// `fluxum_fanout_stage_us{shard,stage}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutStage {
+    /// Commit broadcast → the fan-out task woke with the diff.
+    RecvLag = 0,
+    /// Subscription-manager lock + `on_commit` evaluation.
+    Eval = 1,
+    /// Envelope encode + every subscriber's queue `try_send`, per diff.
+    Enqueue = 2,
+    /// One frame's `write_all` on a subscriber socket (writer task).
+    Flush = 3,
+    /// Commit broadcast → every subscriber enqueued (recv+eval+enqueue).
+    ServerTotal = 4,
+    /// Frame enqueued → its writer task dequeued it (queue + task wake).
+    QueueWait = 5,
+}
+
+impl FanoutStage {
+    /// The Prometheus `stage` label value.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RecvLag => "recv_lag",
+            Self::Eval => "eval",
+            Self::Enqueue => "enqueue",
+            Self::Flush => "flush",
+            Self::ServerTotal => "server_total",
+            Self::QueueWait => "queue_wait",
+        }
+    }
+
+    /// Every stage, so `/metrics` emits a zero series per label.
+    pub const ALL: [Self; 6] = [
+        Self::RecvLag,
+        Self::Eval,
+        Self::Enqueue,
+        Self::Flush,
+        Self::ServerTotal,
+        Self::QueueWait,
+    ];
+}
+
+/// Lock-free histogram for one [`FanoutStage`] (recorded from the async
+/// fan-out task and every writer task — no mutex on the delivery path).
+/// Buckets share [`REDUCER_DURATION_BUCKETS_US`].
+#[derive(Debug, Default)]
+struct FanoutStageStat {
+    buckets: [AtomicU64; 9],
+    over: AtomicU64,
+    sum_us: AtomicU64,
+    count: AtomicU64,
+}
+
+impl FanoutStageStat {
+    fn record(&self, us: u64) {
+        match REDUCER_DURATION_BUCKETS_US.iter().position(|b| us <= *b) {
+            Some(i) => &self.buckets[i],
+            None => &self.over,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        self.sum_us.fetch_add(us, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A shard's live `fluxum_*` counters (SPEC-012). Cheap atomic increments on
 /// the hot path; the per-reducer map is behind a mutex touched only at call
 /// admission (off the single-writer commit path).
@@ -329,6 +395,7 @@ pub struct Metrics {
     subscriptions_active: AtomicI64,
     fanout_messages: AtomicU64,
     fanout_rows: AtomicU64,
+    fanout_stages: [FanoutStageStat; 6],
     drops_buffer_full: AtomicU64,
     drops_idle: AtomicU64,
     drops_frame_too_large: AtomicU64,
@@ -437,6 +504,7 @@ impl Metrics {
             subscriptions_active: AtomicI64::new(0),
             fanout_messages: AtomicU64::new(0),
             fanout_rows: AtomicU64::new(0),
+            fanout_stages: Default::default(),
             drops_buffer_full: AtomicU64::new(0),
             drops_idle: AtomicU64::new(0),
             drops_frame_too_large: AtomicU64::new(0),
@@ -566,6 +634,11 @@ impl Metrics {
     pub fn note_fanout(&self, rows: u64) {
         self.fanout_messages.fetch_add(1, Ordering::Relaxed);
         self.fanout_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// OBS-023: one observation of a fan-out delivery-pipeline stage.
+    pub fn note_fanout_stage(&self, stage: FanoutStage, duration_us: u64) {
+        self.fanout_stages[stage as usize].record(duration_us);
     }
 
     /// OBS-022: a subscriber was dropped.
@@ -842,6 +915,33 @@ impl Metrics {
             self.fanout_messages.load(Ordering::Relaxed),
             self.fanout_rows.load(Ordering::Relaxed),
         );
+        // --- fan-out stage latency histogram (OBS-023) ---
+        out.push_str(
+            "# HELP fluxum_fanout_stage_us Commit→subscriber delivery pipeline stage latency.\n\
+             # TYPE fluxum_fanout_stage_us histogram\n",
+        );
+        for stage in FanoutStage::ALL {
+            let stat = &self.fanout_stages[stage as usize];
+            let label = stage.label();
+            let mut cumulative = 0u64;
+            for (i, bound) in REDUCER_DURATION_BUCKETS_US.iter().enumerate() {
+                cumulative += stat.buckets[i].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "fluxum_fanout_stage_us_bucket{{shard=\"{shard}\",stage=\"{label}\",le=\"{bound}\"}} {cumulative}",
+                );
+            }
+            cumulative += stat.over.load(Ordering::Relaxed);
+            let _ = writeln!(
+                out,
+                "fluxum_fanout_stage_us_bucket{{shard=\"{shard}\",stage=\"{label}\",le=\"+Inf\"}} {cumulative}\n\
+                 fluxum_fanout_stage_us_sum{{shard=\"{shard}\",stage=\"{label}\"}} {}\n\
+                 fluxum_fanout_stage_us_count{{shard=\"{shard}\",stage=\"{label}\"}} {}",
+                stat.sum_us.load(Ordering::Relaxed),
+                stat.count.load(Ordering::Relaxed),
+            );
+        }
+
         out.push_str(
             "# HELP fluxum_subscriber_drops_total Dropped subscribers by reason.\n\
              # TYPE fluxum_subscriber_drops_total counter\n",

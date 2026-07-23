@@ -1037,7 +1037,12 @@ async fn handle_get(
             _ = shutdown.notified() => break Ok(()),
             frame = out_rx.recv() => match frame {
                 Some(frame) => {
-                    if write_chunk(&mut stream, &frame).await.is_err() {
+                    // OBS-023: same queue_wait stage as the TCP writer.
+                    state.ctx.metrics().note_fanout_stage(
+                        fluxum_core::metrics::FanoutStage::QueueWait,
+                        u64::try_from(frame.enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    );
+                    if write_chunk(&mut stream, &frame.bytes).await.is_err() {
                         // The client vanished mid-stream: a transport blip,
                         // not a goodbye (SPEC-021 CS-021).
                         exit = GetExit::Detached;

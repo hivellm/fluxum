@@ -50,7 +50,7 @@ pub struct Namespace {
     name: String,
     engine: ReducerEngine,
     subscriptions: Mutex<SubscriptionManager>,
-    commit_tx: broadcast::Sender<Arc<TxDiff>>,
+    commit_tx: broadcast::Sender<(std::time::Instant, Arc<TxDiff>)>,
     last_tx_id: AtomicU64,
     /// This tenant's resource ceilings and their live state (OPS-060).
     /// Unbounded unless [`Namespace::with_quotas`] set them.
@@ -161,14 +161,19 @@ impl Namespace {
     }
 
     /// Publish a committed diff to *this namespace's* fan-out. A diff never
-    /// reaches another namespace's subscribers.
+    /// reaches another namespace's subscribers. The send instant rides
+    /// along for the OBS-023 stage attribution.
     pub fn publish_commit(&self, diff: TxDiff) {
         self.last_tx_id.fetch_max(diff.tx_id, Ordering::Relaxed);
-        let _ = self.commit_tx.send(Arc::new(diff));
+        let _ = self
+            .commit_tx
+            .send((std::time::Instant::now(), Arc::new(diff)));
     }
 
     /// A receiver for this namespace's commit broadcast (one per fan-out).
-    pub fn subscribe_commits(&self) -> broadcast::Receiver<Arc<TxDiff>> {
+    pub fn subscribe_commits(
+        &self,
+    ) -> broadcast::Receiver<(std::time::Instant, Arc<TxDiff>)> {
         self.commit_tx.subscribe()
     }
 
