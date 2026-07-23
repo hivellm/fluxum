@@ -791,3 +791,47 @@ fn e2e_run(side: &dyn Side, cfg: &E2eConfig, run: u64) -> Result<RunResult, Stri
         latencies_ns,
     })
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// A side with no pipelining support — the trait defaults must refuse
+    /// with a message naming the capability, never panic or silently ack.
+    struct RequestResponseOnly;
+
+    impl BenchClient for RequestResponseOnly {
+        fn add_task(&mut self, _title: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn send_chat(&mut self, _channel: u32, _content: &str) -> Result<(), String> {
+            Ok(())
+        }
+        fn subscribe_chat(
+            &mut self,
+            _channel: u32,
+            _on_message: Box<dyn Fn(&str) + Send + Sync>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn prepare_reads(&mut self, _rows: u32) -> Result<(), String> {
+            Ok(())
+        }
+        fn hot_read(&mut self) -> Result<String, String> {
+            Ok(String::new())
+        }
+        fn load_my_data(&mut self) -> Result<u32, String> {
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn pipelining_defaults_refuse_on_request_response_sides() {
+        let mut client = RequestResponseOnly;
+        let err = client.start_task("t").unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+        let err = client.finish_task(0).unwrap_err();
+        assert!(err.contains("not supported"), "{err}");
+    }
+}

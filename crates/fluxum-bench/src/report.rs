@@ -706,6 +706,23 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ratio_intervals_cover_every_nfr_ratio_and_reject_unknown_names() {
+        let report = report_with_hot(120.0, 45.0);
+        for name in ["write_throughput", "e2e_p99", "hot_p99", "cold_p99"] {
+            let (lo, hi) = ratio_interval(&report, name).unwrap();
+            assert!(lo > 0.0 && hi >= lo, "{name}: [{lo}, {hi}]");
+        }
+        // The hot band widens around its point estimate (σ 45 over 5 runs);
+        // a zero-σ ratio collapses to (almost) a point.
+        let (hot_lo, hot_hi) = ratio_interval(&report, "hot_p99").unwrap();
+        let point = report.ratios.hot_p99;
+        assert!(hot_lo < point && point < hot_hi);
+        let (w_lo, w_hi) = ratio_interval(&report, "write_throughput").unwrap();
+        assert!((w_hi - w_lo) / w_lo < 0.01, "zero-σ write band is tight");
+        assert!(ratio_interval(&report, "nonsense").is_none());
+    }
+
     /// A spacetimedb side whose classes make every competitive ratio land
     /// on an easily-asserted value against [`sides`]'s fluxum numbers.
     fn spacetimedb_classes() -> BTreeMap<String, Summary> {
