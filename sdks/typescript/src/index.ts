@@ -47,6 +47,9 @@ export type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts
 export { OfflineQueue, OptimisticStore, SyncedCache } from './optimistic.ts';
 export type { OptimisticOp, QueueSnapshot, QueuedCall } from './optimistic.ts';
 
+export { ClientStore, IndexedDbBackend, MemoryBackend, querySnapshots } from './persist.ts';
+export type { PersistedMeta, PersistedQuery, PersistenceBackend } from './persist.ts';
+
 export { BoundedQueue, QueueOverflowError } from './queue.ts';
 export type { BoundedQueueOptions } from './queue.ts';
 

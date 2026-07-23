@@ -171,6 +171,28 @@ export class RowCache {
   }
 
   /**
+   * The rows a subscription currently holds, per table (SDK-044 bookkeeping
+   * read back out) — what the durable client state persists per query
+   * (SPEC-021 CS-040). Empty for an unknown query.
+   */
+  querySnapshot(queryId: number): TableSnapshot[] {
+    const held = this.#queryKeys.get(queryId);
+    if (held === undefined) return [];
+    const snapshots: TableSnapshot[] = [];
+    for (const table of [...held.keys()].sort()) {
+      const keys = held.get(table);
+      const state = this.#tables.get(table);
+      if (keys === undefined || state === undefined) continue;
+      const rows: Uint8Array[] = [];
+      for (const [key, entry] of state.byKey) {
+        if (keys.has(key)) rows.push(entry.bytes);
+      }
+      snapshots.push({ table, rows });
+    }
+    return snapshots;
+  }
+
+  /**
    * The `[primary key, row]` pairs cached for `table`, in insertion order.
    * Where several byte-distinct rows share a primary key (transiently
    * possible under join semantics), only the canonical row — the one the pk

@@ -56,6 +56,7 @@ use crate::cache::{RowEvent, TableDiff, TableSchema, TableSnapshot};
 use crate::http::{ChunkedStream, HttpEndpoint};
 use crate::idempotency::OfflineQueue;
 use crate::optimistic::{OptimisticStore, SyncedCache};
+use crate::persist::{ClientStore, PersistedMeta, PersistedQuery, PersistenceBackend};
 use crate::protocol::{
     ClientMessage, ErrorMessage, FluxValue, Frame, FrameCodec, InitialData, ReducerCall,
     ReducerError, ReducerResult, Resume, ServerMessage, Subscribe, TableUpdate, TxUpdate,
@@ -289,6 +290,13 @@ struct Shared {
     resume: Mutex<ResumeTracker>,
     /// Live subscriptions, in registration order — the reconnect replay set.
     subs: Mutex<Vec<SubEntry>>,
+    /// The durable local store (SPEC-021 CS-040), when persistence was
+    /// opted into. `None` — the default — is exactly the old client.
+    persist: Option<ClientStore>,
+    /// The identity the hydrated state belonged to, consumed by the first
+    /// [`replay_offline`]: a mismatch (a different user logged in) discards
+    /// the queued mutations instead of replaying them as someone else.
+    hydrated_identity: Mutex<Option<[u8; 32]>>,
     /// The 32-byte identity the server derived for this session (SPEC-009).
     identity: Mutex<[u8; 32]>,
     /// The write half of the current session. `None` while disconnected, so
@@ -383,10 +391,68 @@ impl Connection {
         schemas: impl IntoIterator<Item = TableSchema>,
         policy: ReconnectPolicy,
     ) -> Result<Self, Error> {
+        Self::connect_impl(url, token, schemas, policy, None)
+    }
+
+    /// [`Connection::connect_with`] with **durable local persistence**
+    /// (SPEC-021 CS-040/CS-041), opt-in: subscribed rows, resume offsets,
+    /// and the offline mutation queue are written through to `backend`
+    /// under `(url, client_id)`, and a restart hydrates from it.
+    ///
+    /// On startup the persisted subscriptions are re-registered and the
+    /// fresh `InitialData` is reconciled against the hydrated rows, so the
+    /// application hears only the NET difference — not a cold re-download's
+    /// worth of inserts. Queued mutations replay in submission order under
+    /// their ORIGINAL idempotency keys (CS-032): a call queued before the
+    /// restart applies exactly once. If the fresh session authenticates as
+    /// a DIFFERENT identity than the persisted state's, the queue is
+    /// discarded rather than replayed as someone else, and the store is
+    /// cleared.
+    ///
+    /// `client_id` must be stable for this logical client across restarts —
+    /// it namespaces both the store and the idempotency keys.
+    pub fn connect_persistent(
+        url: &str,
+        token: &[u8],
+        schemas: impl IntoIterator<Item = TableSchema>,
+        policy: ReconnectPolicy,
+        backend: std::sync::Arc<dyn PersistenceBackend>,
+        client_id: impl Into<String>,
+    ) -> Result<Self, Error> {
+        let client_id = client_id.into();
+        let store = ClientStore::new(backend, url, &client_id);
+        Self::connect_impl(url, token, schemas, policy, Some((store, client_id)))
+    }
+
+    fn connect_impl(
+        url: &str,
+        token: &[u8],
+        schemas: impl IntoIterator<Item = TableSchema>,
+        policy: ReconnectPolicy,
+        persistence: Option<(ClientStore, String)>,
+    ) -> Result<Self, Error> {
         let target = parse_url(url)?;
         let (addr, http) = match &target {
             Target::Tcp(addr) => (addr.clone(), None),
             Target::Http(addr) => (String::new(), Some(HttpEndpoint { addr: addr.clone() })),
+        };
+
+        // Hydrate the meta blob first (CS-041): the queue must exist —
+        // restored, keys intact — before anything can transmit.
+        let (persist, queue, hydrated_identity, hydrated_queries) = match persistence {
+            None => (None, OfflineQueue::new(mint_client_id()), None, Vec::new()),
+            Some((store, client_id)) => {
+                let meta = store.load_meta();
+                let queries = store.load_queries();
+                let (queue, identity) = match meta {
+                    Some(meta) => {
+                        let identity: Option<[u8; 32]> = meta.identity.as_slice().try_into().ok();
+                        (OfflineQueue::restore(meta.queue), identity)
+                    }
+                    None => (OfflineQueue::new(client_id), None),
+                };
+                (Some(store), queue, identity, queries)
+            }
         };
 
         let shared = Arc::new(Shared {
@@ -397,7 +463,7 @@ impl Connection {
             pending: Mutex::new(HashMap::new()),
             cache: Mutex::new(SyncedCache::new(schemas)),
             optimistic: Mutex::new(OptimisticState {
-                queue: OfflineQueue::new(mint_client_id()),
+                queue,
                 in_flight: HashMap::new(),
                 layers: HashMap::new(),
             }),
@@ -405,6 +471,8 @@ impl Connection {
             rejected: Mutex::new(Vec::new()),
             resume: Mutex::new(ResumeTracker::new()),
             subs: Mutex::new(Vec::new()),
+            persist,
+            hydrated_identity: Mutex::new(hydrated_identity),
             identity: Mutex::new([0u8; 32]),
             writer: Mutex::new(None),
             push_socket: Mutex::new(None),
@@ -413,7 +481,48 @@ impl Connection {
             wake: Condvar::new(),
         });
 
+        // Seed the hydrated subscriptions as if a previous session had
+        // registered them: rows into the cache, SQL into the replay set.
+        // The session establishment below then resubscribes and RECONCILES
+        // — the application sees the persisted rows plus the net change,
+        // never a cold re-download (CS-041).
+        let hydrated = !hydrated_queries.is_empty();
+        for query in &hydrated_queries {
+            let app_id = shared.alloc_id();
+            {
+                let mut subs = shared
+                    .subs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                subs.push(SubEntry {
+                    sql: query.sql.clone(),
+                    app_id,
+                    server_id: app_id,
+                });
+            }
+            let diffs: Vec<TableDiff> = query
+                .snapshots()
+                .into_iter()
+                .map(|snapshot| TableDiff {
+                    table: snapshot.table,
+                    inserts: snapshot.rows,
+                    deletes: Vec::new(),
+                })
+                .collect();
+            // No listeners exist yet; hydration events go nowhere by design.
+            let _ = shared
+                .cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .apply_tx(&[(app_id, diffs)], None);
+        }
+
         let read_half = match target {
+            // A hydrated TCP client establishes exactly like a reconnect —
+            // authenticate, resubscribe the replay set, reconcile, replay
+            // the queue. Without hydration the historical inline handshake
+            // is kept as-is.
+            Target::Tcp(_) if hydrated => try_tcp_session(&shared)?,
             Target::Tcp(_) => {
                 let stream = TcpStream::connect(&shared.addr)?;
                 // Reducer calls are small request/response frames; Nagle
@@ -430,10 +539,13 @@ impl Connection {
                     .identity
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+                // A restored queue may hold calls from before the restart
+                // even when no query state was persisted.
+                replay_offline(&shared);
                 ReadHalf::Tcp(messages)
             }
-            // The first HTTP session IS a full establishment with an empty
-            // replay set: authenticate, (no queries yet), open the stream.
+            // The first HTTP session IS a full establishment: authenticate,
+            // resubscribe whatever was hydrated, reconcile, open the stream.
             Target::Http(_) => try_http_session(&shared)?,
         };
 
@@ -529,6 +641,7 @@ impl Connection {
             }
         }
         self.dispatch(events);
+        persist_state(&self.shared);
         Ok(ids)
     }
 
@@ -552,7 +665,8 @@ impl Connection {
             return Ok(());
         }
         // Resolve handles to the CURRENT session's server ids and drop them
-        // from the reconnect replay set.
+        // from the reconnect replay set (and the durable store's).
+        let mut dropped_sqls: Vec<String> = Vec::new();
         let server_ids: Vec<u32> = {
             let mut subs = self
                 .shared
@@ -563,7 +677,11 @@ impl Connection {
                 .iter()
                 .map(|app_id| {
                     match subs.iter().position(|e| e.app_id == *app_id) {
-                        Some(pos) => subs.remove(pos).server_id,
+                        Some(pos) => {
+                            let entry = subs.remove(pos);
+                            dropped_sqls.push(entry.sql);
+                            entry.server_id
+                        }
                         // Unknown handle — pass it through untranslated, the
                         // pre-reconnect behaviour for raw ids.
                         None => *app_id,
@@ -601,6 +719,12 @@ impl Connection {
             }
         }
         self.dispatch(events);
+        if let Some(store) = &self.shared.persist {
+            for sql in &dropped_sqls {
+                store.delete_query(sql);
+            }
+        }
+        persist_state(&self.shared);
         Ok(())
     }
 
@@ -743,6 +867,9 @@ impl Connection {
                 .in_flight
                 .remove(&id);
         }
+        // The queue changed: capture it now, so a crash before the ack still
+        // replays this call under its key after restart (CS-040/CS-032).
+        persist_state(&self.shared);
         Ok(key)
     }
 
@@ -1090,6 +1217,7 @@ fn resolve_optimistic(shared: &Shared, result: &ReducerResult) {
         }
     };
     dispatch_shared(shared, events);
+    persist_state(shared);
 
     if let Err(error) = &result.outcome {
         let listeners = shared
@@ -1107,6 +1235,44 @@ fn resolve_optimistic(shared: &Shared, result: &ReducerResult) {
 /// whose first send actually applied before the session died is deduplicated
 /// by the server, so the replay is exactly-once.
 fn replay_offline(shared: &Arc<Shared>) {
+    // Hydration guard (CS-040 identity keying): if the persisted state
+    // belonged to a DIFFERENT identity than this session authenticated as,
+    // its queued mutations must not replay as the new user. Discard them
+    // and clear the store; the cache reconcile has already limited rows to
+    // what the new identity may see.
+    let hydrated = shared
+        .hydrated_identity
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(expected) = hydrated {
+        let current = *shared
+            .identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if expected != current {
+            {
+                let mut optimistic = shared
+                    .optimistic
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let keys: Vec<String> = optimistic
+                    .queue
+                    .pending()
+                    .iter()
+                    .map(|c| c.idempotency_key.clone())
+                    .collect();
+                for key in keys {
+                    optimistic.queue.acknowledge(&key);
+                }
+                optimistic.layers.clear();
+            }
+            if let Some(store) = &shared.persist {
+                store.clear();
+            }
+            return;
+        }
+    }
     let attempts: Vec<ClientMessage> = {
         let mut optimistic = shared
             .optimistic
@@ -1133,6 +1299,76 @@ fn replay_offline(shared: &Arc<Shared>) {
             // untouched, and the next reconnect picks them up.
             break;
         }
+    }
+    // A fresh session just adopted new query ids and rows (and the queue's
+    // attempt counts moved): capture the post-establishment state.
+    persist_state(shared);
+}
+
+/// Write the client's durable state through to the local store (CS-040):
+/// the meta blob (identity + offline queue) and one blob per live
+/// subscription (SQL, applied offset, held rows). A no-op without
+/// persistence.
+///
+/// Locks are taken ONE at a time, copying out — never nested — so this can
+/// run from any thread without ordering constraints. A write racing a
+/// concurrent update may persist a snapshot a moment old; hydration always
+/// reconciles against fresh server data, so staleness costs a slightly
+/// larger net-diff, never correctness.
+fn persist_state(shared: &Shared) {
+    let Some(store) = &shared.persist else { return };
+    let identity = *shared
+        .identity
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let queue = shared
+        .optimistic
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .queue
+        .snapshot();
+    store.save_meta(&PersistedMeta {
+        identity: identity.to_vec(),
+        queue,
+    });
+
+    let subs: Vec<(String, u32)> = shared
+        .subs
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|e| (e.sql.clone(), e.server_id))
+        .collect();
+    for (sql, server_id) in subs {
+        let tx_offset = shared
+            .resume
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .applied_offset(server_id)
+            .unwrap_or(0);
+        let snapshots = shared
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_snapshot(server_id);
+        let tables = snapshots
+            .into_iter()
+            .map(|snapshot| {
+                (
+                    snapshot.table,
+                    snapshot
+                        .rows
+                        .into_iter()
+                        .map(serde_bytes::ByteBuf::from)
+                        .collect(),
+                )
+            })
+            .collect();
+        store.save_query(&PersistedQuery {
+            sql,
+            tx_offset,
+            tables,
+        });
     }
 }
 
@@ -1555,6 +1791,7 @@ fn resume_subscriptions(shared: &Arc<Shared>, session: &str) -> Result<(), Error
             }
         }
     }
+    persist_state(shared);
     Ok(())
 }
 
@@ -1646,6 +1883,7 @@ fn route(shared: &Shared, message: ServerMessage) {
         ServerMessage::TxUpdate(update) => {
             let events = apply_tx_update(shared, &update);
             dispatch_shared(shared, events);
+            persist_state(shared);
         }
         ServerMessage::ReducerResult(result) => {
             // Optimistic calls resolve here, on the reader, not in a waiter:

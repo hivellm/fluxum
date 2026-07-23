@@ -50,6 +50,23 @@ One caveat inherits from the wire: commits are attributed to their overlay by
 `callReducer` on the same reducer — or two connections under one identity calling it — can drop
 an overlay one update early. The cost is a transient re-render, never divergence.
 
+## Offline local persistence (SPEC-021 CS-040/CS-041)
+
+Opt-in: pass `persistence: { backend, clientId }` to `FluxumClient.connect` — in the browser,
+`backend: new IndexedDbBackend()`; tests use `MemoryBackend`; anything implementing the
+four-method `PersistenceBackend` interface works. Subscribed rows and the offline mutation queue
+are written through as they change, keyed by `(url, clientId)` with the session identity stored
+inside.
+
+On the next load, `connect` hydrates the cache and queue BEFORE any network I/O, then
+re-establishes exactly like a reconnect: the persisted queries are resubscribed, the fresh
+`InitialData` is reconciled so listeners hear only the **net difference** (never a cold
+re-download's worth of inserts), and queued calls replay in submission order under their
+original idempotency keys — exactly-once across the reload. If the fresh session authenticates
+as a **different identity**, the hydrated queue is discarded rather than replayed as the new
+user, and the store is cleared. Optimistic overlays are not persisted (an updater is a closure,
+not data); a restored call's effect arrives with its authoritative `TxUpdate`.
+
 ## Schema mismatch (SDK-043)
 
 Pass `schemaVersion` (the version your generated bindings embed) to

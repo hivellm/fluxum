@@ -14,6 +14,8 @@
 
 import type { RowEvent, TableDiff, TableSchema, TableSnapshot } from './cache.ts';
 import { OfflineQueue, OptimisticStore, SyncedCache } from './optimistic.ts';
+import { ClientStore, querySnapshots } from './persist.ts';
+import type { PersistenceBackend } from './persist.ts';
 import { decodeMessage, encodeMessage, sliceRowList } from './protocol.ts';
 import { BoundedQueue } from './queue.ts';
 import { reconnect } from './reconnect.ts';
@@ -111,6 +113,14 @@ export interface FluxumClientOptions {
   queueCapacity?: number;
   /** Reconnect tuning, or `false` to fail instead of retrying. */
   reconnect?: BackoffOptions | false;
+  /**
+   * Durable local persistence (SPEC-021 CS-040/CS-041), opt-in: subscribed
+   * rows and the offline mutation queue are written through to `backend`
+   * under `(url, clientId)`, and a reload hydrates from it — the cache
+   * renders instantly and queued calls replay exactly-once under their
+   * original idempotency keys. `clientId` must be stable across reloads.
+   */
+  persistence?: { backend: PersistenceBackend; clientId: string };
   /** Injected in tests; HTTP only. */
   fetch?: typeof globalThis.fetch;
 }
@@ -154,13 +164,21 @@ export class FluxumClient {
    * The optimistic submission ledger (SPEC-021 CS-010/CS-032): every
    * `callOptimistic` is queued here under a stable idempotency key, minted
    * at enqueue — never at send — so a replay after a lost ack cannot
-   * double-apply.
+   * double-apply. Replaced by the restored queue when persistence hydrates.
    */
-  readonly #queue = new OfflineQueue(mintClientId());
+  #queue: OfflineQueue;
   /** Request id of an in-flight optimistic attempt → its idempotency key. */
   readonly #inFlight = new Map<number, string>();
   /** Idempotency key → overlay layer id in the {@link SyncedCache}. */
   readonly #optimisticLayers = new Map<string, number>();
+  /** The durable local store (CS-040), when persistence was opted into. */
+  readonly #store: ClientStore | null;
+  /**
+   * The identity the hydrated state belonged to, consumed after the first
+   * authenticate: a mismatch (a different user logged in) discards the
+   * queued mutations instead of replaying them as someone else.
+   */
+  #hydratedIdentity: Uint8Array | null = null;
   readonly #listeners = new Map<string, Set<RowListener>>();
   readonly #errorListeners = new Set<(err: Error) => void>();
   /**
@@ -214,6 +232,10 @@ export class FluxumClient {
   private constructor(options: FluxumClientOptions) {
     this.#options = options;
     this.#cache = new SyncedCache(options.tables ?? []);
+    this.#queue = new OfflineQueue(options.persistence?.clientId ?? mintClientId());
+    this.#store = options.persistence
+      ? new ClientStore(options.persistence.backend, options.url, options.persistence.clientId)
+      : null;
     this.#inbound = new BoundedQueue<DecodedMessage>({
       capacity: options.queueCapacity ?? 1024,
       name: 'inbound',
@@ -223,12 +245,85 @@ export class FluxumClient {
   /** Connect, authenticate, and return a live client. */
   static async connect(options: FluxumClientOptions): Promise<FluxumClient> {
     const client = new FluxumClient(options);
+    // Hydrate BEFORE any network I/O (CS-041): the persisted rows are in
+    // the cache and the restored queue is ready to replay even if the
+    // connection takes a while (or the first attempt fails).
+    await client.#hydrate();
     // The pump starts BEFORE the handshake. Authenticating first deadlocks:
     // the reply lands in the inbound queue with no consumer, and the consumer
     // cannot start because it is behind the very reply it would deliver.
     void client.#pump();
     await client.#openAndAuthenticate();
+    // A hydrated client re-establishes like a reconnect: resubscribe the
+    // persisted queries, reconcile to the net difference, replay the queue
+    // under its original keys (CS-041/CS-032) — after the identity guard.
+    if (client.#store !== null) {
+      await client.#guardHydratedIdentity();
+      if (client.#requested.size > 0) {
+        await client.#resubscribeAll();
+        await client.#reconcileAndReplay();
+      } else {
+        await client.#replayOffline();
+        void client.#persistState();
+      }
+    }
     return client;
+  }
+
+  /** Load persisted state: the queue (keys intact) and the cached rows. */
+  async #hydrate(): Promise<void> {
+    if (this.#store === null) return;
+    const meta = await this.#store.loadMeta();
+    if (meta !== null) {
+      this.#queue = OfflineQueue.restore(meta.queue);
+      this.#hydratedIdentity = meta.identity;
+    }
+    const queries = await this.#store.loadQueries();
+    let placeholder = 0x7fff0000; // never collides with server-assigned ids
+    for (const query of queries) {
+      this.#requested.add(query.sql);
+      const diffs: TableDiff[] = querySnapshots(query).map((snapshot) => ({
+        table: snapshot.table,
+        inserts: snapshot.rows,
+        deletes: [],
+      }));
+      // No listeners exist yet; hydration events go nowhere by design.
+      this.#cache.applyTx([[placeholder, diffs]], null);
+      placeholder += 1;
+    }
+  }
+
+  /**
+   * CS-040 keys state by identity: if the fresh session authenticated as a
+   * DIFFERENT identity than the persisted state's, discard the queued
+   * mutations (never replay them as someone else) and clear the store. The
+   * cache reconcile limits rows to what the new identity may see.
+   */
+  async #guardHydratedIdentity(): Promise<void> {
+    const expected = this.#hydratedIdentity;
+    this.#hydratedIdentity = null;
+    if (expected === null || this.#identity === null) return;
+    if (sameBytes(expected, this.#identity)) return;
+    for (const call of [...this.#queue.pending]) {
+      this.#queue.acknowledge(call.idempotencyKey);
+    }
+    this.#optimisticLayers.clear();
+    await this.#store?.clear();
+  }
+
+  /** Write the durable state through to the local store (CS-040). */
+  async #persistState(): Promise<void> {
+    if (this.#store === null) return;
+    await this.#store.saveMeta({
+      identity: this.#identity ?? new Uint8Array(32),
+      queue: this.#queue.snapshot(),
+    });
+    for (const [queryId, sql] of this.#live) {
+      const tables: [string, Uint8Array[]][] = this.#cache
+        .querySnapshot(queryId)
+        .map((snapshot) => [snapshot.table, snapshot.rows]);
+      await this.#store.saveQuery({ sql, txOffset: 0, tables });
+    }
   }
 
   /** The 32-byte identity the server derived for this session (SPEC-009). */
@@ -325,6 +420,7 @@ export class FluxumClient {
         this.#dispatch(this.#cache.applyTx([[queryId, diffs]], null));
       }
     });
+    void this.#persistState();
     return ids;
   }
 
@@ -348,9 +444,11 @@ export class FluxumClient {
       // but the client tracks them as distinct ids).
       if (sql !== undefined && ![...this.#live.values()].includes(sql)) {
         this.#requested.delete(sql);
+        void this.#store?.deleteQuery(sql);
       }
       this.#dispatch(this.#cache.releaseQuery(queryId));
     }
+    void this.#persistState();
   }
 
   /**
@@ -409,6 +507,9 @@ export class FluxumClient {
     const key = this.#queue.enqueue(name, args);
     this.#optimisticLayers.set(key, layer);
     this.#dispatch(events);
+    // The queue changed: capture it now, so a reload before the ack still
+    // replays this call under its key (CS-040/CS-032).
+    await this.#persistState();
     await this.#sendQueued(key);
     return key;
   }
@@ -446,6 +547,7 @@ export class FluxumClient {
     const reducer =
       this.#queue.pending.find((c) => c.idempotencyKey === key)?.reducer ?? '';
     this.#queue.acknowledge(key);
+    void this.#persistState();
     const layer = this.#optimisticLayers.get(key);
     this.#optimisticLayers.delete(key);
     if (layer === undefined) return;
@@ -560,82 +662,8 @@ export class FluxumClient {
         // Authentication happens inside connect: on this transport the token
         // travels in the same handshake that establishes the session.
         authenticate: async () => {},
-        resubscribe: async () => {
-          if (this.#requested.size === 0) return;
-          const queries = [...this.#requested];
-          const messages = await this.#requestMany(
-            'Subscribe',
-            (id) => [id, queries],
-            queries.length,
-          );
-          const payloads = messages.map((m) => m.payload);
-          const mismatch = this.#schemaMismatch(payloads);
-          if (mismatch !== null) {
-            // Second sighting = confirmation: the refresh-and-reconnect pass
-            // already ran (or this reconnect IS that pass) and the server
-            // still answers with a version these bindings were not generated
-            // from. The error is fatal to the loop (see `fatal` below).
-            if (this.#mismatchRetried) {
-              throw this.#confirmMismatch(mismatch.expected, mismatch.actual);
-            }
-            // First sighting on a reconnect — the server migrated while this
-            // client was away. Run the refresh half of the drill here, then
-            // fail the attempt so the loop retries once against fresh state.
-            this.#mismatchRetried = true;
-            const refreshed = await this.#refreshSchemaVersion();
-            if (refreshed !== null && refreshed !== mismatch.expected) {
-              throw this.#confirmMismatch(mismatch.expected, refreshed);
-            }
-            throw new Error(
-              `InitialData.schema_version ${mismatch.actual} != ${mismatch.expected}; ` +
-                'refreshed the schema, retrying once (SDK-043)',
-            );
-          }
-          // Rebind id → SQL: the server reassigned query ids on resubscribe.
-          // Response order matches request order (RPC-032), so payload[i]
-          // belongs to queries[i].
-          this.#live.clear();
-          payloads.forEach((payload, i) => {
-            const sql = queries[i] ?? '';
-            for (const queryId of this.#toDiffsByQuery(payload[2]).keys()) {
-              this.#live.set(queryId, sql);
-            }
-          });
-          // Stashed for the reconcile step, which must run after every query
-          // is registered — reconciling per-query would delete rows the next
-          // query is about to restore.
-          this.#pendingSnapshot = payloads;
-        },
-        reconcile: async () => {
-          if (this.#pendingSnapshot === null) return;
-          // Merged into one reconcile pass: `RowCache.reconcile` treats a
-          // table absent from its input as unsubscribed and drops its rows,
-          // so feeding it one query at a time would delete everything the
-          // other queries cover.
-          const tables = this.#pendingSnapshot.flatMap((payload) => {
-            const [, , t] = payload as [unknown, unknown, unknown];
-            return Array.isArray(t) ? t : [];
-          });
-          const snapshots = this.#pendingSnapshot;
-          this.#pendingSnapshot = null;
-          this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
-          // Rebuild per-query membership: the server reassigned query ids on
-          // resubscribe, so the old attribution is stale. Refcounts were just
-          // rebuilt by `reconcile`; `trackQuery` only re-records which query
-          // holds what, leaving those counts untouched (SDK-044).
-          this.#cache.resetQueries();
-          for (const payload of snapshots) {
-            for (const [queryId, diffs] of this.#toDiffsByQuery(payload[2])) {
-              this.#cache.trackQuery(
-                queryId,
-                diffs.map((diff) => ({ table: diff.table, rows: diff.inserts })),
-              );
-            }
-          }
-          // The session is whole again: replay every queued optimistic call
-          // in submission order under its original key (CS-032).
-          await this.#replayOffline();
-        },
+        resubscribe: async () => this.#resubscribeAll(),
+        reconcile: async () => this.#reconcileAndReplay(),
       },
       {
         ...(this.#options.reconnect ?? {}),
@@ -673,6 +701,91 @@ export class FluxumClient {
         else if (!this.#closed) this.#fail(error);
       },
     );
+  }
+
+  /**
+   * Re-register every requested query on the current session. Shared by the
+   * reconnect loop and the persistence hydration path (CS-041) — both are
+   * "a fresh session must carry the subscriptions an old state expects".
+   */
+  async #resubscribeAll(): Promise<void> {
+    if (this.#requested.size === 0) return;
+    const queries = [...this.#requested];
+    const messages = await this.#requestMany('Subscribe', (id) => [id, queries], queries.length);
+    const payloads = messages.map((m) => m.payload);
+    const mismatch = this.#schemaMismatch(payloads);
+    if (mismatch !== null) {
+      // Second sighting = confirmation: the refresh-and-reconnect pass
+      // already ran (or this reconnect IS that pass) and the server
+      // still answers with a version these bindings were not generated
+      // from. The error is fatal to the loop (see `fatal` below).
+      if (this.#mismatchRetried) {
+        throw this.#confirmMismatch(mismatch.expected, mismatch.actual);
+      }
+      // First sighting on a reconnect — the server migrated while this
+      // client was away. Run the refresh half of the drill here, then
+      // fail the attempt so the loop retries once against fresh state.
+      this.#mismatchRetried = true;
+      const refreshed = await this.#refreshSchemaVersion();
+      if (refreshed !== null && refreshed !== mismatch.expected) {
+        throw this.#confirmMismatch(mismatch.expected, refreshed);
+      }
+      throw new Error(
+        `InitialData.schema_version ${mismatch.actual} != ${mismatch.expected}; ` +
+          'refreshed the schema, retrying once (SDK-043)',
+      );
+    }
+    // Rebind id → SQL: the server reassigned query ids on resubscribe.
+    // Response order matches request order (RPC-032), so payload[i]
+    // belongs to queries[i].
+    this.#live.clear();
+    payloads.forEach((payload, i) => {
+      const sql = queries[i] ?? '';
+      for (const queryId of this.#toDiffsByQuery(payload[2]).keys()) {
+        this.#live.set(queryId, sql);
+      }
+    });
+    // Stashed for the reconcile step, which must run after every query
+    // is registered — reconciling per-query would delete rows the next
+    // query is about to restore.
+    this.#pendingSnapshot = payloads;
+  }
+
+  /**
+   * Reconcile the stashed resubscribe snapshot against the cache — the
+   * application hears only the net difference — then replay the offline
+   * queue in submission order under its original keys (CS-032).
+   */
+  async #reconcileAndReplay(): Promise<void> {
+    if (this.#pendingSnapshot === null) return;
+    // Merged into one reconcile pass: `RowCache.reconcile` treats a
+    // table absent from its input as unsubscribed and drops its rows,
+    // so feeding it one query at a time would delete everything the
+    // other queries cover.
+    const tables = this.#pendingSnapshot.flatMap((payload) => {
+      const [, , t] = payload as [unknown, unknown, unknown];
+      return Array.isArray(t) ? t : [];
+    });
+    const snapshots = this.#pendingSnapshot;
+    this.#pendingSnapshot = null;
+    this.#dispatch(this.#cache.reconcile(this.#toSnapshots(tables)));
+    // Rebuild per-query membership: the server reassigned query ids on
+    // resubscribe, so the old attribution is stale. Refcounts were just
+    // rebuilt by `reconcile`; `trackQuery` only re-records which query
+    // holds what, leaving those counts untouched (SDK-044).
+    this.#cache.resetQueries();
+    for (const payload of snapshots) {
+      for (const [queryId, diffs] of this.#toDiffsByQuery(payload[2])) {
+        this.#cache.trackQuery(
+          queryId,
+          diffs.map((diff) => ({ table: diff.table, rows: diff.inserts })),
+        );
+      }
+    }
+    // The session is whole again: replay every queued optimistic call
+    // in submission order under its original key (CS-032).
+    await this.#replayOffline();
+    void this.#persistState();
   }
 
   // --- Request correlation (RPC-002) ---------------------------------------
@@ -761,6 +874,7 @@ export class FluxumClient {
             own ? String(message.payload[2] ?? '') : null,
           ),
         );
+        void this.#persistState();
         return;
       }
       case 'ReducerResult': {

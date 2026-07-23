@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Implemented through §4: CS-01x (optimistic mutations) and CS-032 (offline queue keys) live in both SDKs (`sdks/rust/src/optimistic.rs`, `sdks/typescript/src/optimistic.ts`); CS-02x and CS-030/031 landed with Phases 4–5. §5 (CS-04x durable persistence) remains open. |
+| **Status** | Implemented: CS-01x (optimistic mutations) and CS-032 (offline queue keys) live in both SDKs (`sdks/rust/src/optimistic.rs`, `sdks/typescript/src/optimistic.ts`); CS-02x and CS-030/031 landed with Phases 4–5; CS-04x (durable persistence) lives in `sdks/rust/src/persist.rs` and `sdks/typescript/src/persist.ts` — on a fresh session the CS-041 reconcile is a resubscribe + net-difference pass (RPC-026 scopes `Resume` to a surviving session's query ids). |
 | **Phase / tasks** | Phase 4 (subscription offsets) · Phase 5 (transport/session, idempotency) · Phase 6 (SDK runtime) ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-30, FR-31, FR-42, FR-82 (extends); new: FR-120 (optimistic mutations), FR-121 (resumable subscriptions), FR-122 (reducer idempotency), FR-123 (SDK offline persistence) |
 | **Requirement prefix** | `CS-` |

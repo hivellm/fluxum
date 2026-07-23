@@ -198,6 +198,15 @@ export class SyncedCache {
     return this.#finish(before, tables, baseEvents);
   }
 
+  /**
+   * Forward of {@link RowCache.querySnapshot} — the authoritative rows a
+   * subscription holds, the unit the durable client state persists per
+   * query (CS-040). Optimistic overlays are deliberately absent.
+   */
+  querySnapshot(queryId: number): TableSnapshot[] {
+    return this.#base.querySnapshot(queryId);
+  }
+
   /** Forward of {@link RowCache.resetQueries} (no visible rows change). */
   resetQueries(): void {
     this.#base.resetQueries();

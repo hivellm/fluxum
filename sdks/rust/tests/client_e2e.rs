@@ -447,6 +447,209 @@ fn a_rejected_optimistic_call_rolls_back_and_reports() {
     assert_eq!(seen[0].2, 5001, "REDUCER_USER_ERROR");
 }
 
+/// A fresh file-backend rooted in a per-test temp directory.
+fn file_backend(label: &str) -> std::sync::Arc<fluxum_sdk::FileBackend> {
+    let dir = std::env::temp_dir().join(format!("fluxum-sdk-persist-{label}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::sync::Arc::new(fluxum_sdk::FileBackend::new(&dir).expect("backend dir"))
+}
+
+fn no_reconnect() -> fluxum_sdk::ReconnectPolicy {
+    fluxum_sdk::ReconnectPolicy {
+        enabled: false,
+        ..fluxum_sdk::ReconnectPolicy::default()
+    }
+}
+
+#[test]
+fn persisted_state_hydrates_and_reconciles_across_a_restart() {
+    // SPEC-021 CS-040/CS-041: session 1 subscribes and writes; a "restart"
+    // (new Connection, same backend + client_id) hydrates the rows, replays
+    // the subscription, and reconciles — a row committed WHILE the client
+    // was away is already there when connect returns, no explicit subscribe.
+    if skip() {
+        return;
+    }
+    let server = Server::start("persist-hydrate");
+    let backend = file_backend("hydrate");
+
+    let db = Connection::connect_persistent(
+        &server.tcp_url,
+        b"tok",
+        [task_schema()],
+        fluxum_sdk::ReconnectPolicy::default(),
+        backend.clone(),
+        "cli-1",
+    )
+    .expect("session 1");
+    db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
+    db.call_reducer("add_task", vec![FluxValue::Str("persisted".into())])
+        .expect("add_task");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.rows("Task").is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db.rows("Task").len(), 1, "session 1 converged");
+    drop(db);
+
+    // Someone (same identity) commits while "we" are down.
+    let writer =
+        Connection::connect(&server.tcp_url, b"tok", [task_schema()]).expect("writer");
+    writer
+        .call_reducer("add_task", vec![FluxValue::Str("while away".into())])
+        .expect("add_task while away");
+    drop(writer);
+
+    // The restart: hydration + resubscribe + reconcile happen INSIDE
+    // connect, so both rows are present the moment it returns.
+    let db2 = Connection::connect_persistent(
+        &server.tcp_url,
+        b"tok",
+        [task_schema()],
+        fluxum_sdk::ReconnectPolicy::default(),
+        backend,
+        "cli-1",
+    )
+    .expect("session 2");
+    let mut titles: Vec<String> = db2.rows("Task").iter().map(|r| task_title(r)).collect();
+    titles.sort();
+    assert_eq!(
+        titles,
+        vec!["persisted".to_owned(), "while away".to_owned()],
+        "hydrated + net difference, no explicit subscribe"
+    );
+
+    // And the replayed subscription is LIVE, not a static snapshot.
+    db2.call_reducer("add_task", vec![FluxValue::Str("live".into())])
+        .expect("add_task live");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db2.rows("Task").len() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db2.rows("Task").len(), 3, "updates keep flowing");
+}
+
+#[test]
+fn a_queued_mutation_survives_a_restart_and_replays_once() {
+    // CS-041 scenario: queue offline, crash, restart — the call replays
+    // under its ORIGINAL key (CS-032) and applies exactly once.
+    if skip() {
+        return;
+    }
+    let server = Server::start("persist-queue");
+    let backend = file_backend("queue");
+
+    let db = Connection::connect_persistent(
+        &server.tcp_url,
+        b"tok",
+        [task_schema()],
+        no_reconnect(), // stay down once the socket dies: a clean "crash"
+        backend.clone(),
+        "cli-1",
+    )
+    .expect("session 1");
+    db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
+    let identity = db.identity();
+
+    db.simulate_stream_loss();
+    db.call_optimistic("add_task", vec![FluxValue::Str("queued".into())], |s| {
+        s.insert("Task", optimistic_task_row(u64::MAX, identity, "queued"));
+    })
+    .expect("queue offline");
+    assert_eq!(db.pending_mutations(), 1, "unacknowledged, persisted");
+    drop(db);
+
+    let db2 = Connection::connect_persistent(
+        &server.tcp_url,
+        b"tok",
+        [task_schema()],
+        fluxum_sdk::ReconnectPolicy::default(),
+        backend,
+        "cli-1",
+    )
+    .expect("session 2");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while db2.pending_mutations() > 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(db2.pending_mutations(), 0, "the restored queue drained");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let titles: Vec<String> = db2.rows("Task").iter().map(|r| task_title(r)).collect();
+        if titles == vec!["queued".to_owned()] {
+            break; // exactly once, and the temp row is gone
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replay did not converge exactly-once: {titles:?}"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn a_different_identity_discards_the_hydrated_queue() {
+    // CS-040 keys state by identity: if another user starts on the same
+    // store, the previous user's queued mutations must NOT replay as them.
+    if skip() {
+        return;
+    }
+    let server = Server::start("persist-identity");
+    let backend = file_backend("identity");
+
+    let alice = Connection::connect_persistent(
+        &server.tcp_url,
+        b"alice",
+        [chat_schema()],
+        no_reconnect(),
+        backend.clone(),
+        "shared-device",
+    )
+    .expect("alice");
+    alice.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    let alice_id = alice.identity();
+    alice.simulate_stream_loss();
+    alice
+        .call_optimistic(
+            "send_chat",
+            vec![FluxValue::I64(1), FluxValue::Str("alice offline".into())],
+            |s| {
+                let mut writer = fluxum_sdk::protocol::FluxBinWriter::new();
+                writer.write_u64(u64::MAX);
+                writer.write_identity(&alice_id);
+                writer.write_u32(1);
+                writer.write_str("alice offline").unwrap();
+                writer.write_timestamp(0);
+                s.insert("ChatMessage", writer.into_bytes());
+            },
+        )
+        .expect("alice queues offline");
+    assert_eq!(alice.pending_mutations(), 1);
+    drop(alice);
+
+    let bob = Connection::connect_persistent(
+        &server.tcp_url,
+        b"bob",
+        [chat_schema()],
+        fluxum_sdk::ReconnectPolicy::default(),
+        backend,
+        "shared-device",
+    )
+    .expect("bob");
+    assert_eq!(
+        bob.pending_mutations(),
+        0,
+        "alice's queue was discarded, not replayed as bob"
+    );
+    // Negative outcome needs a beat: were the call wrongly replayed, the
+    // public ChatMessage row would land on bob's live subscription.
+    std::thread::sleep(Duration::from_millis(750));
+    assert!(
+        bob.rows("ChatMessage").is_empty(),
+        "alice's offline message never applied under bob"
+    );
+}
+
 #[test]
 fn offline_optimistic_calls_replay_in_order_exactly_once() {
     // SPEC-021 CS-032: calls made while the connection is down stay queued

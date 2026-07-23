@@ -358,6 +358,35 @@ impl RowCache {
         }
     }
 
+    /// The rows a subscription currently holds, per table (SDK-044
+    /// bookkeeping read back out) — what the durable client state persists
+    /// per query (SPEC-021 CS-040). Row order follows the table's insertion
+    /// order; empty for an unknown query.
+    pub fn query_snapshot(&self, query_id: u32) -> Vec<TableSnapshot> {
+        let Some(held) = self.query_keys.get(&query_id) else {
+            return Vec::new();
+        };
+        let mut tables: Vec<&String> = held.keys().collect();
+        tables.sort();
+        tables
+            .into_iter()
+            .filter_map(|table| {
+                let keys = held.get(table)?;
+                let state = self.tables.get(table)?;
+                let rows: Vec<Vec<u8>> = state
+                    .order
+                    .iter()
+                    .filter(|key| keys.contains(key.as_slice()))
+                    .filter_map(|key| state.by_key.get(key).map(|e| e.bytes.clone()))
+                    .collect();
+                Some(TableSnapshot {
+                    table: table.clone(),
+                    rows,
+                })
+            })
+            .collect()
+    }
+
     /// Rebuild from a fresh `InitialData` and return only the net difference
     /// (SDK-047).
     ///
@@ -690,6 +719,23 @@ mod tests {
             vec![(vec![1], row(1, 0)), (vec![2], row(2, 5))]
         );
         assert!(c.pk_rows("Ghost").is_empty());
+    }
+
+    #[test]
+    fn query_snapshot_reads_back_exactly_what_a_query_holds() {
+        // The persistence unit (SPEC-021 CS-040): per-query attribution out,
+        // in table insertion order, without another query's rows.
+        let mut c = cache();
+        c.apply_query_diff(1, &diff(vec![row(1, 0), row(2, 0)], vec![]));
+        c.apply_query_diff(2, &diff(vec![row(2, 0), row(3, 0)], vec![]));
+
+        let snap = c.query_snapshot(1);
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].table, "Task");
+        assert_eq!(snap[0].rows, vec![row(1, 0), row(2, 0)]);
+        let snap2 = c.query_snapshot(2);
+        assert_eq!(snap2[0].rows, vec![row(2, 0), row(3, 0)]);
+        assert!(c.query_snapshot(9).is_empty(), "unknown query: empty");
     }
 
     #[test]

@@ -15,18 +15,23 @@
 //!   layered local mutations reconciled against authoritative updates without flicker.
 //! - [`OfflineQueue`] — queued reducer calls under stable idempotency keys (CS-032),
 //!   replayed exactly-once after an outage; snapshot/restore for durable persistence.
+//! - [`persist`] — the opt-in durable local store (CS-040/CS-041): subscribed rows and
+//!   the queue written through to a [`PersistenceBackend`], hydrated on restart and
+//!   reconciled to the net difference.
 //! - [`ResumeTracker`] — per-subscription applied offsets (CS-020/CS-022), driving the
 //!   HTTP blip `Resume` instead of a full re-download.
 //! - [`Connection`] — the blocking client an application holds: authenticate,
 //!   [`Connection::subscribe`], [`Connection::call_reducer`] /
-//!   [`Connection::call_reducer_async`] (write pipelining, SDK-032), and
-//!   [`Connection::call_optimistic`] for instant local application with offline replay.
+//!   [`Connection::call_reducer_async`] (write pipelining, SDK-032),
+//!   [`Connection::call_optimistic`] for instant local application with offline replay,
+//!   and [`Connection::connect_persistent`] for the durable variant.
 
 pub mod cache;
 pub mod client;
 mod http;
 pub mod idempotency;
 pub mod optimistic;
+pub mod persist;
 pub mod protocol;
 pub mod resume;
 
@@ -37,6 +42,9 @@ pub use client::{
 };
 pub use idempotency::{OfflineQueue, QueueSnapshot, QueuedCall};
 pub use optimistic::{OptimisticOp, OptimisticStore, SyncedCache};
+pub use persist::{
+    ClientStore, FileBackend, MemoryBackend, PersistedMeta, PersistedQuery, PersistenceBackend,
+};
 pub use resume::{Reconnect, ResumeTracker};
 
 // The vendored protocol files are byte-for-byte copies of the server-side

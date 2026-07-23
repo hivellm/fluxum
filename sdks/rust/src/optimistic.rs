@@ -273,6 +273,14 @@ impl SyncedCache {
         self.finish(&before, &tables, base_events)
     }
 
+    /// Forward of [`RowCache::query_snapshot`] — the authoritative rows a
+    /// subscription holds, the unit the durable client state persists per
+    /// query (CS-040). Optimistic overlays are deliberately absent: they
+    /// are in-flight feedback, not state to survive a restart.
+    pub fn query_snapshot(&self, query_id: u32) -> Vec<TableSnapshot> {
+        self.base.query_snapshot(query_id)
+    }
+
     /// Forward of [`RowCache::reset_queries`] (no visible rows change).
     pub fn reset_queries(&mut self) {
         self.base.reset_queries();

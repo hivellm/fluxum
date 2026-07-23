@@ -5,19 +5,19 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.02% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
-drivers live), after phase6_sdk-optimistic-mutations-offline-queue. **The floor is recovered**
-from the ~89.8% breach the T6.6 leva recorded: the optimistic-mutation layer landed at
-96–98% per file (`sdks/rust/src/optimistic.rs` 96.9%, `idempotency.rs` 97.9%, `cache.rs`
-96.0%, `client.rs` 91.8%) plus targeted tests over the new pk-accessor/overlay seams. The
-margin is 0.02pp — one hair. The **standing debt items below are still open** (they are why
-the margin is thin, category 9 aside): (a) the `fluxum dev` watch/restart loop body + `logs`
-network glue (T6 inner-loop); (b) the `fluxum-bench load`/`fanout` command handlers in
-`main.rs` + `load.rs` sustained paths the short-window smokes don't reach (the
-`/metrics`-scrape and counter parsing ARE covered). **The next task touching fluxum-cli or
-fluxum-bench should still factor those into pure functions and cover them** — that is what
-buys back a real margin. Prior standings: ~89.8% (T6.6), 89.93% (T6 inner-loop), 90.12%
-(P0 parity campaign). The P0-B growth briefly
+**Current standing:** **90.09% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
+drivers live), after phase6_sdk-offline-local-persistence. **The floor is recovered** from
+the ~89.8% breach the T6.6 leva recorded — first by the optimistic-mutation layer (90.02%,
+`sdks/rust/src/optimistic.rs` at 96.9%, `idempotency.rs` 97.9%, `cache.rs` 96.0%,
+`client.rs` 91.8%), then nudged up by the persistence layer's unit+e2e suite. The margin is
+still thin (0.09pp). The **standing debt items below remain open** (they are why the margin
+is thin, category 9 aside): (a) the `fluxum dev` watch/restart loop body + `logs` network
+glue (T6 inner-loop); (b) the `fluxum-bench load`/`fanout` command handlers in `main.rs` +
+`load.rs` sustained paths the short-window smokes don't reach (the `/metrics`-scrape and
+counter parsing ARE covered). **The next task touching fluxum-cli or fluxum-bench should
+still factor those into pure functions and cover them** — that is what buys back a real
+margin. Prior standings: 90.02% (optimistic mutations), ~89.8% (T6.6), 89.93% (T6
+inner-loop), 90.12% (P0 parity campaign). The P0-B growth briefly
 dipped the floor to 89.96%; recovered by covering the pipelining trait defaults +
 `ratio_interval` arms and by the **PG-gated baseline smoke** (`baseline_postgres_runs_all_workloads`,
 `FLUXUM_BENCH_PG_URL` — the `Db::Pg` half and the real LISTEN/NOTIFY hop, formerly a named
