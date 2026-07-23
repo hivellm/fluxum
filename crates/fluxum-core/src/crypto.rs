@@ -78,7 +78,7 @@ impl AtRestKey {
             )));
         }
         let mut bytes = [0u8; KEY_LEN];
-        for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             let s = std::str::from_utf8(chunk)
                 .map_err(|_| FluxumError::Config("at-rest key is not valid hex".into()))?;
             bytes[i] = u8::from_str_radix(s, 16)

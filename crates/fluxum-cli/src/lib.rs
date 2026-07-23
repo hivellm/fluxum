@@ -396,7 +396,6 @@ fn flag(args: &[&str], name: &str) -> Option<String> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::io::Write as _;
     use std::net::TcpListener;
 
     use super::*;
@@ -417,7 +416,7 @@ mod tests {
                  Content-Length: {}\r\n\r\n{body}",
                 body.len()
             );
-            let _ = stream.write_all(response.as_bytes());
+            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
         });
         addr
     }

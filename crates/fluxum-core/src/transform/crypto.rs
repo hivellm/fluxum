@@ -181,7 +181,7 @@ fn parse_secret(hex: &str) -> Result<[u8; 32]> {
         )));
     }
     let mut bytes = [0u8; 32];
-    for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+    for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         let s = std::str::from_utf8(chunk)
             .map_err(|_| FluxumError::Config("x25519 key is not valid hex".into()))?;
         bytes[i] = u8::from_str_radix(s, 16)

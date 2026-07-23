@@ -188,10 +188,7 @@ pub fn run_load(
             started.wait();
             while !stop.load(Ordering::Relaxed) {
                 while inflight.len() < window {
-                    match client.start_task(&format!("load {i}")) {
-                        Ok(token) => inflight.push_back(token),
-                        Err(e) => return Err(e),
-                    }
+                    inflight.push_back(client.start_task(&format!("load {i}"))?);
                     i += 1;
                 }
                 if let Some(token) = inflight.pop_front() {
