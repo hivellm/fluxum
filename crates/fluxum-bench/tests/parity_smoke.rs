@@ -155,15 +155,25 @@ fn pipelined_write_workload_keeps_a_window_in_flight_and_acks_everything() {
 /// with no external database to arrange, so the whole client→app-server→SQL
 /// →push→client loop is asserted in CI. The PostgreSQL path differs only in
 /// the `Db` arm and the NOTIFY hop, exercised by the report runs.
-struct SqliteBaseline {
+struct BaselineApp {
     child: Child,
     base_url: String,
     port: u16,
     database_url: String,
 }
 
-impl SqliteBaseline {
-    fn start(label: &str) -> SqliteBaseline {
+impl BaselineApp {
+    fn start(label: &str) -> BaselineApp {
+        let db = std::env::temp_dir().join(format!(
+            "fluxum-parity-{label}-{}.sqlite",
+            std::process::id()
+        ));
+        Self::start_on(&format!("sqlite://{}", db.display()))
+    }
+
+    /// The same app server over an operator-arranged database URL (the
+    /// docker PostgreSQL for the PG-gated smoke).
+    fn start_on(database_url: &str) -> BaselineApp {
         let free = || {
             TcpListener::bind("127.0.0.1:0")
                 .unwrap()
@@ -172,17 +182,12 @@ impl SqliteBaseline {
                 .port()
         };
         let port = free();
-        let db = std::env::temp_dir().join(format!(
-            "fluxum-parity-{label}-{}.sqlite",
-            std::process::id()
-        ));
-        let database_url = format!("sqlite://{}", db.display());
-        let child = Self::launch(&database_url, port);
-        SqliteBaseline {
+        let child = Self::launch(database_url, port);
+        BaselineApp {
             child,
             base_url: format!("http://127.0.0.1:{port}"),
             port,
-            database_url,
+            database_url: database_url.to_owned(),
         }
     }
 
@@ -211,7 +216,7 @@ impl SqliteBaseline {
     }
 }
 
-impl Drop for SqliteBaseline {
+impl Drop for BaselineApp {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -220,7 +225,7 @@ impl Drop for SqliteBaseline {
 
 #[test]
 fn baseline_sqlite_runs_all_workloads() {
-    let server = SqliteBaseline::start("smoke");
+    let server = BaselineApp::start("smoke");
     let side = BaselineSide::new(server.base_url.clone(), "sqlite");
     assert_eq!(side.name(), "sqlite");
 
@@ -253,6 +258,57 @@ fn baseline_sqlite_runs_all_workloads() {
     };
     let runs = hot_read_workload(&side, &hot_cfg).expect("baseline hot-read workload");
     assert!(runs[0].ops > 0, "no baseline hot reads measured");
+}
+
+/// The PostgreSQL half of the baseline (`Db::Pg` + the real LISTEN/NOTIFY
+/// hop) — gated on an operator-arranged docker PG, exactly like the
+/// SpacetimeDB smoke: present in the coverage-gate run, skipped where no
+/// database exists. Closes the "PG half exercised only by report runs"
+/// residual in docs/COVERAGE.md.
+#[test]
+fn baseline_postgres_runs_all_workloads() {
+    let Ok(url) = std::env::var("FLUXUM_BENCH_PG_URL") else {
+        eprintln!(
+            "skipping: set FLUXUM_BENCH_PG_URL=postgres://fluxum:fluxum@127.0.0.1:15432/parity \
+             (docker fluxum-parity-pg) to run the PG baseline smoke"
+        );
+        return;
+    };
+    let server = BaselineApp::start_on(&url);
+    let side = BaselineSide::new(server.base_url.clone(), "postgres");
+    assert_eq!(side.name(), "postgres");
+
+    let write_cfg = RunConfig {
+        clients: 2,
+        pipeline: 1,
+        warmup: Duration::from_millis(200),
+        measure: Duration::from_secs(1),
+        runs: 1,
+    };
+    let runs = write_workload(&side, &write_cfg).expect("pg write workload");
+    assert!(runs[0].ops > 0, "no acked PG writes");
+
+    // The e2e loop crosses the database: INSERT + pg_notify inside the
+    // statement → LISTEN connection → broadcast → WebSocket → callback.
+    let e2e_cfg = E2eConfig {
+        subscribers: 3,
+        rate_per_sec: 20,
+        messages: 10,
+        warmup_messages: 2,
+        runs: 1,
+    };
+    let runs = e2e_workload(&side, &e2e_cfg).expect("pg e2e workload");
+    assert_eq!(runs[0].ops, 10 * 3, "every message reaches every subscriber");
+
+    let hot_cfg = HotReadConfig {
+        clients: 2,
+        rows_per_client: 10,
+        warmup: Duration::from_millis(200),
+        measure: Duration::from_secs(1),
+        runs: 1,
+    };
+    let runs = hot_read_workload(&side, &hot_cfg).expect("pg hot-read workload");
+    assert!(runs[0].ops > 0, "no PG hot reads measured");
 }
 
 #[test]
@@ -305,7 +361,7 @@ fn cold_read_workload_survives_a_restart_on_both_sides() {
     assert_eq!(runs[0].ops, 4);
     assert_eq!(runs[0].latencies_ns.len(), 4);
 
-    let mut baseline = SqliteBaseline::start("cold");
+    let mut baseline = BaselineApp::start("cold");
     let side = BaselineSide::new(baseline.base_url.clone(), "sqlite");
     let restart = {
         let baseline = std::cell::RefCell::new(&mut baseline);

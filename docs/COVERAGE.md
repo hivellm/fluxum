@@ -5,15 +5,18 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.04% lines** (4,199 uncovered of ~42.2k) — 2026-07-23, gate command
-below, after the P0-A fan-out work (OBS-023 stage histogram, TST-091 pin helpers, commit hook). History: 96.3% at the 2026-07-16 campaign (pre-T6.3, ~22.8k lines); the T6.3
+**Current standing:** see the gate log — 2026-07-23, gate command below, after the P0 parity
+campaign (OBS-023 stage histogram, commit hook, SDK write pipelining). The P0-B growth briefly
+dipped the floor to 89.96%; recovered by covering the pipelining trait defaults +
+`ratio_interval` arms and by the **PG-gated baseline smoke** (`baseline_postgres_runs_all_workloads`,
+`FLUXUM_BENCH_PG_URL` — the `Db::Pg` half and the real LISTEN/NOTIFY hop, formerly a named
+residual). History: 96.3% at the 2026-07-16 campaign (pre-T6.3, ~22.8k lines); the T6.3
 parity-harness growth dropped the floor to 88.96% (2026-07-21), recovered on 2026-07-22 by
 (a) an in-process behavior test for the baseline app (`baseline/server.rs` `serve_on` seam:
 router + handlers + WebSocket fan-out + the SQLite `db.rs` half over real sockets) and
 (b) categories 10/11 below — generated bindings and sync-gated vendored copies are counted at
 their source of truth, not double-billed. Largest honest residuals: `fluxum-bench/src/main.rs`
-CLI (category 9), the baseline's PostgreSQL half (LISTEN/NOTIFY — exercised only against the
-docker PG in parity runs), `boot.rs`/`main.rs` entry points.
+CLI (category 9), `boot.rs`/`main.rs` entry points.
 
 ## How proc-macro coverage works here
 
@@ -65,7 +68,8 @@ or `compile_error!` messages. trybuild remains the diagnostics-format golden lay
 Gate command of record:
 `cargo llvm-cov --workspace --ignore-filename-regex "spacetimedb_bindings|sdks[/\\\\]rust[/\\\\]src[/\\\\]protocol"`
 (with `FLUXUM_BENCH_STDB_URL` set when the pinned SpacetimeDB container is up, so the
-TST-097 side driver is exercised live).
+TST-097 side driver is exercised live, and `FLUXUM_BENCH_PG_URL` set when the docker PG is
+up, so the baseline's PostgreSQL half runs).
 
 Per-line detail lives in the per-area reports of the coverage campaign (2026-07-16); when one of
 these categories gains a test seam (e.g. injectable fs faults), the corresponding lines move out
