@@ -658,14 +658,11 @@ async fn handle_logs(
         // An embedded assembly that never called `logging::init` has no tap.
         return write_simple(&mut stream, 503, "Service Unavailable").await;
     };
-    let follow = request
-        .path
-        .split_once('?')
-        .is_some_and(|(_, query)| {
-            query
-                .split('&')
-                .any(|p| matches!(p, "follow" | "follow=1" | "follow=true"))
-        });
+    let follow = request.path.split_once('?').is_some_and(|(_, query)| {
+        query
+            .split('&')
+            .any(|p| matches!(p, "follow" | "follow=1" | "follow=true"))
+    });
 
     const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
                         Transfer-Encoding: chunked\r\n\

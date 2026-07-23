@@ -76,7 +76,8 @@ impl Server {
     fn start(label: &str) -> Self {
         let http_port = free_port();
         let tcp_port = free_port();
-        let data_dir = std::env::temp_dir().join(format!("fluxum-conf-{label}-{}", std::process::id()));
+        let data_dir =
+            std::env::temp_dir().join(format!("fluxum-conf-{label}-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&data_dir);
 
         let child = Self::launch(http_port, tcp_port, &data_dir);
@@ -153,7 +154,10 @@ fn load_corpus() -> Corpus {
             })
             .collect();
         tables.insert(name.clone(), cols);
-        pk.insert(name.clone(), spec["primary_key"].as_str().unwrap().to_owned());
+        pk.insert(
+            name.clone(),
+            spec["primary_key"].as_str().unwrap().to_owned(),
+        );
     }
     let scenarios = doc["scenarios"]
         .as_array()
@@ -195,9 +199,7 @@ fn canonical_row(cols: &[(String, String)], bytes: &[u8]) -> HashMap<String, Val
             "Str" => Value::from(reader.read_str().unwrap().to_owned()),
             "Bytes" => Value::from(hex(reader.read_bytes().unwrap())),
             "Identity" => Value::from(hex(&reader.read_identity().unwrap())),
-            "ConnectionId" => {
-                Value::from(hex(&reader.read_connection_id().unwrap().to_le_bytes()))
-            }
+            "ConnectionId" => Value::from(hex(&reader.read_connection_id().unwrap().to_le_bytes())),
             other => panic!("corpus type {other} not handled by the Rust runner"),
         };
         row.insert(name.clone(), value);
@@ -356,12 +358,14 @@ impl<'a> Session<'a> {
         &self.resolve(expected) == actual
     }
 
-    fn row_matches(&self, expected: &serde_json::Map<String, Value>, actual: &HashMap<String, Value>) -> bool {
-        expected.iter().all(|(col, want)| {
-            actual
-                .get(col)
-                .is_some_and(|got| self.matches(want, got))
-        })
+    fn row_matches(
+        &self,
+        expected: &serde_json::Map<String, Value>,
+        actual: &HashMap<String, Value>,
+    ) -> bool {
+        expected
+            .iter()
+            .all(|(col, want)| actual.get(col).is_some_and(|got| self.matches(want, got)))
     }
 
     fn canonical_rows(&self, client: &Connection, table: &str) -> Vec<HashMap<String, Value>> {
@@ -414,23 +418,44 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
             session.server.restart();
         }
         "subscribe" => {
-            let queries: Vec<&str> =
-                body["queries"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
-            let ids = session.client(&body["client"]).subscribe(&queries).expect("subscribe");
+            let queries: Vec<&str> = body["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|q| q.as_str().unwrap())
+                .collect();
+            let ids = session
+                .client(&body["client"])
+                .subscribe(&queries)
+                .expect("subscribe");
             if let Some(label) = body.get("as").and_then(Value::as_str) {
                 session.handles.insert(label.to_owned(), ids);
             }
         }
         "subscribe_error" => {
-            let queries: Vec<&str> =
-                body["queries"].as_array().unwrap().iter().map(|q| q.as_str().unwrap()).collect();
-            let err = session.client(&body["client"]).subscribe(&queries).unwrap_err();
+            let queries: Vec<&str> = body["queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|q| q.as_str().unwrap())
+                .collect();
+            let err = session
+                .client(&body["client"])
+                .subscribe(&queries)
+                .unwrap_err();
             assert_error(&err, &body["expect_error"]);
         }
         "unsubscribe" => {
             let label = body["handles"].as_str().unwrap();
-            let ids = session.handles.get(label).unwrap_or_else(|| panic!("unknown handle {label}")).clone();
-            session.client(&body["client"]).unsubscribe(&ids).expect("unsubscribe");
+            let ids = session
+                .handles
+                .get(label)
+                .unwrap_or_else(|| panic!("unknown handle {label}"))
+                .clone();
+            session
+                .client(&body["client"])
+                .unsubscribe(&ids)
+                .expect("unsubscribe");
         }
         "call" => {
             let reducer = body["reducer"].as_str().unwrap();
@@ -459,7 +484,11 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
             let client_name = body["client"].clone();
             let table = body["table"].as_str().unwrap().to_owned();
             let empty = serde_json::Map::new();
-            let where_ = body.get("where").and_then(Value::as_object).unwrap_or(&empty).clone();
+            let where_ = body
+                .get("where")
+                .and_then(Value::as_object)
+                .unwrap_or(&empty)
+                .clone();
             let want: usize = match kind.as_str() {
                 "await_row" => 1,
                 "await_gone" => 0,
@@ -499,7 +528,10 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
                 });
                 actual.remove(pos);
             }
-            assert!(actual.is_empty(), "{table}: unexpected extra rows {actual:?}");
+            assert!(
+                actual.is_empty(),
+                "{table}: unexpected extra rows {actual:?}"
+            );
         }
         "expect_distinct_identities" => {
             let names = body["clients"].as_array().unwrap();
@@ -521,7 +553,11 @@ fn assert_error(err: &fluxum_sdk::ClientError, expect: &Value) {
     use fluxum_sdk::ClientError;
     let expect = expect.as_object().unwrap();
     let (code, catalog, message): (Option<u16>, Option<&str>, String) = match err {
-        ClientError::Server { code, name, message } => (Some(*code), Some(name), message.clone()),
+        ClientError::Server {
+            code,
+            name,
+            message,
+        } => (Some(*code), Some(name), message.clone()),
         ClientError::Reducer { code, message, .. } => (Some(*code), None, message.clone()),
         other => (None, None, other.to_string()),
     };
@@ -540,7 +576,10 @@ fn assert_error(err: &fluxum_sdk::ClientError, expect: &Value) {
 fn conformance_corpus_is_green() {
     let binary = server_binary();
     if !binary.exists() {
-        eprintln!("skipping: no server binary at {} — run: cargo build -p fluxum-server", binary.display());
+        eprintln!(
+            "skipping: no server binary at {} — run: cargo build -p fluxum-server",
+            binary.display()
+        );
         return;
     }
     let corpus = load_corpus();
@@ -548,7 +587,10 @@ fn conformance_corpus_is_green() {
     for transport in [Transport::Tcp, Transport::Http] {
         for name in &corpus.scenarios {
             let scenario: Value = serde_json::from_str(
-                &std::fs::read_to_string(corpus_dir().join("scenarios").join(format!("{name}.json"))).unwrap(),
+                &std::fs::read_to_string(
+                    corpus_dir().join("scenarios").join(format!("{name}.json")),
+                )
+                .unwrap(),
             )
             .unwrap();
 

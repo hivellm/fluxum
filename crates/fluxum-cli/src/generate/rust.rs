@@ -173,10 +173,7 @@ fn flux_value_expr(rust: &str, arg: &str) -> String {
 }
 
 fn doc_comment(lines: &[String], indent: &str) -> String {
-    lines
-        .iter()
-        .map(|l| format!("{indent}/// {l}\n"))
-        .collect()
+    lines.iter().map(|l| format!("{indent}/// {l}\n")).collect()
 }
 
 /// Generate the Rust binding file(s) from a `/schema` document. Returns
@@ -510,10 +507,15 @@ mod tests {
         let files = generate(&schema()).unwrap();
         let m = &files["mod.rs"];
         assert!(
-            m.contains("pub fn complete_task(&self, task_id: u64) -> Result<(), fluxum_sdk::ClientError>"),
+            m.contains(
+                "pub fn complete_task(&self, task_id: u64) -> Result<(), fluxum_sdk::ClientError>"
+            ),
             "{m}"
         );
-        assert!(m.contains("self.conn.call_reducer(\"complete_task\""), "{m}");
+        assert!(
+            m.contains("self.conn.call_reducer(\"complete_task\""),
+            "{m}"
+        );
         assert!(!m.contains("tick_only"), "{m}");
         assert!(m.contains("5/s"), "{m}");
     }

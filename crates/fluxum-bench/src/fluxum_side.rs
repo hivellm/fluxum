@@ -151,7 +151,9 @@ impl BenchClient for FluxumClient {
             }),
         );
         self.connection
-            .subscribe(&[&format!("SELECT * FROM ChatMessage WHERE channel = {channel}")])
+            .subscribe(&[&format!(
+                "SELECT * FROM ChatMessage WHERE channel = {channel}"
+            )])
             .map_err(|e| format!("subscribe_chat: {e}"))?;
         Ok(())
     }
@@ -208,7 +210,9 @@ impl BenchClient for FluxumClient {
     }
 
     fn hot_read(&mut self) -> Result<String, String> {
-        let Some(&key) = self.read_keys.get(self.read_cursor % self.read_keys.len().max(1))
+        let Some(&key) = self
+            .read_keys
+            .get(self.read_cursor % self.read_keys.len().max(1))
         else {
             return Err("hot_read before prepare_reads".to_owned());
         };

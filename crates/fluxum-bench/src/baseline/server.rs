@@ -134,7 +134,7 @@ async fn pump(mut socket: WebSocket, mut receiver: broadcast::Receiver<ChatPush>
                     return; // client went away
                 }
             }
-            Ok(_) => {}                                        // other channel
+            Ok(_) => {}                                       // other channel
             Err(broadcast::error::RecvError::Lagged(_)) => {} // slow socket: skip, like any push hub
             Err(broadcast::error::RecvError::Closed) => return,
         }
@@ -182,12 +182,10 @@ async fn listen_task(pool: sqlx::PgPool, fanout: broadcast::Sender<ChatPush>) {
     }
     loop {
         match listener.recv().await {
-            Ok(notification) => {
-                match serde_json::from_str::<ChatPush>(notification.payload()) {
-                    Ok(push) => drop(fanout.send(push)),
-                    Err(e) => eprintln!("baseline-server: bad NOTIFY payload: {e}"),
-                }
-            }
+            Ok(notification) => match serde_json::from_str::<ChatPush>(notification.payload()) {
+                Ok(push) => drop(fanout.send(push)),
+                Err(e) => eprintln!("baseline-server: bad NOTIFY payload: {e}"),
+            },
             Err(e) => {
                 // The listener reconnects internally; a persistent error
                 // here means the database is gone.
@@ -255,7 +253,9 @@ mod tests {
                 .as_nanos()
         ));
         let url = format!("sqlite://{}", db_path.display());
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             serve_on(&url, 4, listener).await.unwrap();
@@ -332,8 +332,7 @@ mod tests {
             assert_eq!(sent.status(), 201);
         }
         let frame = socket.read().unwrap();
-        let push: serde_json::Value =
-            serde_json::from_str(frame.to_text().unwrap()).unwrap();
+        let push: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
         assert_eq!(push["channel"], 7);
         assert_eq!(push["content"], "delivered");
     }
@@ -354,7 +353,9 @@ mod tests {
             );
             return;
         };
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
             serve_on(&url, 4, listener).await.unwrap();
@@ -400,8 +401,10 @@ mod tests {
         assert_eq!(hot["title"], "second task");
 
         // The LISTEN/NOTIFY fan-out: channel-filtered, cross-database.
-        let ws_url =
-            format!("{}/subscribe?channel={channel}", base.replace("http://", "ws://"));
+        let ws_url = format!(
+            "{}/subscribe?channel={channel}",
+            base.replace("http://", "ws://")
+        );
         let (mut socket, _) = tungstenite::connect(&ws_url).unwrap();
         for (target, content) in [(channel + 1, "other channel"), (channel, "delivered")] {
             let sent = agent

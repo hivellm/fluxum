@@ -1681,7 +1681,9 @@ fn try_http_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
     // 1. Authenticate: the response carries the AuthResult and mints the
     // session token (RPC-007).
     let (_, auth) = shared.authenticate_message();
-    let response = endpoint.post(None, &encode_framed(&auth)?).map_err(Error::Io)?;
+    let response = endpoint
+        .post(None, &encode_framed(&auth)?)
+        .map_err(Error::Io)?;
     if response.status != 200 {
         return Err(Error::Http(response.status));
     }

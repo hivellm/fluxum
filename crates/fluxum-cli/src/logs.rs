@@ -226,7 +226,11 @@ pub fn stream(options: &LogsOptions, out: &mut dyn Write) -> Result<(), CliError
     let addr = crate::host_port(&options.server);
     let mut socket =
         TcpStream::connect(addr).map_err(|e| CliError::Connect(format!("{addr}: {e}")))?;
-    let path = if options.follow { "/logs?follow=1" } else { "/logs" };
+    let path = if options.follow {
+        "/logs?follow=1"
+    } else {
+        "/logs"
+    };
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: {addr}\r\nAccept: application/x-ndjson\r\n\
          Connection: close\r\n\r\n"
@@ -239,9 +243,13 @@ pub fn stream(options: &LogsOptions, out: &mut dyn Write) -> Result<(), CliError
     let mut head = Vec::new();
     let mut chunk = [0u8; 4096];
     let body_start = loop {
-        let n = socket.read(&mut chunk).map_err(|e| CliError::Connect(e.to_string()))?;
+        let n = socket
+            .read(&mut chunk)
+            .map_err(|e| CliError::Connect(e.to_string()))?;
         if n == 0 {
-            return Err(CliError::Response("connection closed before headers".into()));
+            return Err(CliError::Response(
+                "connection closed before headers".into(),
+            ));
         }
         head.extend_from_slice(&chunk[..n]);
         if let Some(split) = find(&head, b"\r\n\r\n") {
@@ -263,7 +271,9 @@ pub fn stream(options: &LogsOptions, out: &mut dyn Write) -> Result<(), CliError
             .ok()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
             .unwrap_or_else(|| body.trim().to_owned());
-        return Err(CliError::Response(format!("server answered {status}: {message}")));
+        return Err(CliError::Response(format!(
+            "server answered {status}: {message}"
+        )));
     }
 
     let mut decoder = ChunkDecoder::default();
@@ -280,7 +290,9 @@ pub fn stream(options: &LogsOptions, out: &mut dyn Write) -> Result<(), CliError
         if decoder.is_done() {
             return Ok(());
         }
-        let n = socket.read(&mut chunk).map_err(|e| CliError::Connect(e.to_string()))?;
+        let n = socket
+            .read(&mut chunk)
+            .map_err(|e| CliError::Connect(e.to_string()))?;
         if n == 0 {
             return Ok(()); // server went away — the stream simply ends
         }
@@ -372,7 +384,10 @@ mod tests {
         let printed = String::from_utf8(out).unwrap();
         assert!(printed.contains("WARN"), "{printed}");
         assert!(printed.contains(": b"), "{printed}");
-        assert!(!printed.contains(": a"), "info was below the floor: {printed}");
+        assert!(
+            !printed.contains(": a"),
+            "info was below the floor: {printed}"
+        );
     }
 
     #[test]

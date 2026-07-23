@@ -113,7 +113,9 @@ impl PersistenceBackend for FileBackend {
             let Some(encoded) = name.strip_suffix(".bin") else {
                 continue; // a .tmp remnant or foreign file
             };
-            let Some(bytes) = unhex(encoded) else { continue };
+            let Some(bytes) = unhex(encoded) else {
+                continue;
+            };
             let Ok(key) = String::from_utf8(bytes) else {
                 continue;
             };
@@ -379,7 +381,10 @@ mod tests {
 
         store.delete_query(&query.sql);
         assert!(store.load_queries().is_empty());
-        assert!(store.load_meta().is_some(), "meta untouched by query delete");
+        assert!(
+            store.load_meta().is_some(),
+            "meta untouched by query delete"
+        );
 
         store.clear();
         assert!(store.load_meta().is_none(), "clear drops the namespace");

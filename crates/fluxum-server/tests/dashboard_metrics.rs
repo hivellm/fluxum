@@ -13,7 +13,9 @@ use std::sync::Arc;
 use fluxum_core::auth::{Authenticator, NoneProvider, ServerPeerRegistry};
 use fluxum_core::commitlog::{CommitLog, CommitLogOptions};
 use fluxum_core::reducer::{LifecycleHooks, ReducerEngine, ReducerRegistry};
-use fluxum_core::schema::{ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule};
+use fluxum_core::schema::{
+    ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule,
+};
 use fluxum_core::store::MemStore;
 use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
@@ -42,7 +44,13 @@ fn build_ctx() -> Arc<ShardContext> {
     let schema = Schema::from_tables([&NOTE]).unwrap();
     let store = Arc::new(MemStore::new(&schema).unwrap());
     let log = Arc::new(
-        CommitLog::open(&dir.path().join("log"), SHARD, 1, CommitLogOptions::default()).unwrap(),
+        CommitLog::open(
+            &dir.path().join("log"),
+            SHARD,
+            1,
+            CommitLogOptions::default(),
+        )
+        .unwrap(),
     );
     let (pipeline, worker) =
         TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();

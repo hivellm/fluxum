@@ -346,7 +346,7 @@ async fn health_and_metrics_stay_open_for_scrapers_but_can_be_gated() {
     server.shutdown();
 }
 
-// --- F-004: schedule-only reducers are not invokable over the admin route ---------
+// --- F-004: schedule-only reducers are not invocable over the admin route ---------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_schedule_only_reducer_is_refused_on_the_admin_route() {

@@ -13,7 +13,9 @@ use fluxum_core::auth::{Authenticator, NoneProvider, ServerPeerRegistry};
 use fluxum_core::commitlog::{CommitLog, CommitLogOptions};
 use fluxum_core::config::{LogFormat, LoggingConfig};
 use fluxum_core::reducer::{LifecycleHooks, ReducerEngine, ReducerRegistry};
-use fluxum_core::schema::{ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule};
+use fluxum_core::schema::{
+    ColumnSchema, FluxType, Schema, TableAccess, TableSchema, VisibilityRule,
+};
 use fluxum_core::store::MemStore;
 use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
@@ -77,9 +79,7 @@ async fn read_until(socket: &mut TcpStream, needle: &str, deadline: Duration) ->
         if text.contains(needle) {
             return text;
         }
-        let Ok(read) =
-            tokio::time::timeout_at(end, socket.read(&mut chunk)).await
-        else {
+        let Ok(read) = tokio::time::timeout_at(end, socket.read(&mut chunk)).await else {
             return text; // deadline — return what arrived for the assert message
         };
         match read {
@@ -143,10 +143,20 @@ async fn logs_endpoint_serves_the_ring_and_follows_live_lines() {
         .await
         .unwrap();
     // Wait until the catch-up is through before emitting the live line.
-    let head = read_until(&mut socket, "ring-line-before-connect", Duration::from_secs(5)).await;
+    let head = read_until(
+        &mut socket,
+        "ring-line-before-connect",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(head.contains("ring-line-before-connect"), "{head}");
     tracing::warn!(target: "logs_test", "live-line-after-attach");
-    let live = read_until(&mut socket, "live-line-after-attach", Duration::from_secs(5)).await;
+    let live = read_until(
+        &mut socket,
+        "live-line-after-attach",
+        Duration::from_secs(5),
+    )
+    .await;
     assert!(
         live.contains("live-line-after-attach"),
         "the follow stream delivers new lines: {live}"

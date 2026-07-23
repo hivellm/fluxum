@@ -29,7 +29,11 @@ fn a_non_owner_call_errors_and_leaves_the_row_unchanged() {
     let mallory = shard.identity("mallory");
 
     shard
-        .call(alice, "add_task", vec![FluxValue::Str("ship the testkit".into())])
+        .call(
+            alice,
+            "add_task",
+            vec![FluxValue::Str("ship the testkit".into())],
+        )
         .expect("alice adds her task");
     let before = shard.rows("Task");
     assert_eq!(before.len(), 1);
@@ -38,7 +42,11 @@ fn a_non_owner_call_errors_and_leaves_the_row_unchanged() {
         .call(mallory, "complete_task", vec![FluxValue::I64(1)])
         .expect_err("mallory must be refused");
     assert!(err.to_string().contains("not your task"), "{err}");
-    assert_eq!(shard.rows("Task"), before, "rolled back: the row is unchanged");
+    assert_eq!(
+        shard.rows("Task"),
+        before,
+        "rolled back: the row is unchanged"
+    );
 }
 
 #[test]
@@ -47,7 +55,11 @@ fn receipts_expose_the_emitted_diff() {
     let alice = shard.identity("alice");
 
     let receipt = shard
-        .call(alice, "add_task", vec![FluxValue::Str("read the diff".into())])
+        .call(
+            alice,
+            "add_task",
+            vec![FluxValue::Str("read the diff".into())],
+        )
         .expect("add_task");
     assert_eq!(receipt.touched(), vec!["Task"]);
     let inserted = receipt.inserted("Task");
@@ -204,8 +216,14 @@ fn a_torn_tail_is_quarantined_and_the_prefix_survives() {
 fn faults_on_an_empty_log_report_nothing_to_corrupt() {
     let shard = TestShard::new(1).expect("boot");
     let mut crashed = shard.crash();
-    assert!(!crashed.lose_last_commit().expect("no entries"), "nothing to lose");
-    assert!(!crashed.tear_last_commit().expect("no entries"), "nothing to tear");
+    assert!(
+        !crashed.lose_last_commit().expect("no entries"),
+        "nothing to lose"
+    );
+    assert!(
+        !crashed.tear_last_commit().expect("no entries"),
+        "nothing to tear"
+    );
     let shard = crashed.recover().expect("recover an empty shard");
     assert!(shard.rows("Task").is_empty());
 }
@@ -220,7 +238,11 @@ fn the_simulated_clock_is_visible_and_advanceable() {
     // The clock stamps ctx.timestamp: send_chat writes sent_at from it.
     let user = shard.identity("user");
     shard
-        .call(user, "send_chat", vec![FluxValue::I64(1), FluxValue::Str("hi".into())])
+        .call(
+            user,
+            "send_chat",
+            vec![FluxValue::I64(1), FluxValue::Str("hi".into())],
+        )
         .expect("send_chat");
     let rows = shard.rows("ChatMessage");
     assert_eq!(rows.len(), 1);

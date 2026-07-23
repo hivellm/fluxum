@@ -77,8 +77,8 @@ pub fn parse_reducer_counts(metrics: &str) -> ReducerCounts {
 /// body is read to its `Content-Length` rather than to EOF (a `read_to_end`
 /// would block on the kept-open socket until the read timeout).
 pub fn scrape_metrics(http_addr: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(http_addr)
-        .map_err(|e| format!("connect {http_addr}: {e}"))?;
+    let mut stream =
+        TcpStream::connect(http_addr).map_err(|e| format!("connect {http_addr}: {e}"))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| e.to_string())?;

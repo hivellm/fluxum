@@ -166,12 +166,8 @@ impl SyncedCache {
         if self.layers.is_empty() {
             return self.base.rows(table);
         }
-        let mut view: Vec<Option<(Vec<u8>, Vec<u8>)>> = self
-            .base
-            .pk_rows(table)
-            .into_iter()
-            .map(Some)
-            .collect();
+        let mut view: Vec<Option<(Vec<u8>, Vec<u8>)>> =
+            self.base.pk_rows(table).into_iter().map(Some).collect();
         let mut index: HashMap<Vec<u8>, usize> = view
             .iter()
             .enumerate()
@@ -417,7 +413,10 @@ impl SyncedCache {
     }
 
     /// The effective `pk → row` view of each named table.
-    fn snapshot_views(&self, tables: &BTreeSet<String>) -> HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>> {
+    fn snapshot_views(
+        &self,
+        tables: &BTreeSet<String>,
+    ) -> HashMap<String, BTreeMap<Vec<u8>, Vec<u8>>> {
         let mut views = HashMap::new();
         for table in tables {
             let mut view: BTreeMap<Vec<u8>, Vec<u8>> =

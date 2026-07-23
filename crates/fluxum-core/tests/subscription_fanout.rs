@@ -253,7 +253,11 @@ fn unsubscribe_and_disconnect_stop_delivery() {
         tx.insert(sensor_id, sensor(1, 7, 10, 0.0, 0.0)).unwrap();
     });
     let deltas = mgr.on_commit(&diff).unwrap();
-    assert_eq!(deltas[0].connections(), vec![2], "only connection 2 remains");
+    assert_eq!(
+        deltas[0].connections(),
+        vec![2],
+        "only connection 2 remains"
+    );
 
     // Disconnect connection 2: the plan is evicted entirely.
     mgr.disconnect(2);

@@ -90,7 +90,9 @@ pub fn fetch_path(server: &str, path: &str) -> Result<String, CliError> {
     let (head_len, body_start) = loop {
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            return Err(CliError::Response("connection closed before headers".into()));
+            return Err(CliError::Response(
+                "connection closed before headers".into(),
+            ));
         }
         raw.extend_from_slice(&chunk[..n]);
         if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -294,9 +296,7 @@ where
                 Some(text) => match logs::Level::parse(&text) {
                     Some(level) => Some(level),
                     None => {
-                        eprintln!(
-                            "logs: unknown --level `{text}` (trace|debug|info|warn|error)"
-                        );
+                        eprintln!("logs: unknown --level `{text}` (trace|debug|info|warn|error)");
                         return 2;
                     }
                 },

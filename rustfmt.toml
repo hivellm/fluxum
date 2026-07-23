@@ -1,0 +1,9 @@
+# `ignore` is a nightly-only rustfmt option; the workspace pins nightly via
+# rust-toolchain.toml, and CI installs from the same file.
+#
+# Generated code is byte-compared against its generator's output
+# (crates/fluxum-cli/tests/rust_generated_golden.rs): reformatting it breaks
+# the golden equality, so rustfmt must never touch it. With this ignore in
+# place, `cargo fmt --all` is safe to run workspace-wide — which is exactly
+# what the Rust Lint CI checks.
+ignore = ["sdks/rust/tests/generated"]

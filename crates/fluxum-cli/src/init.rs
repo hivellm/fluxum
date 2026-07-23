@@ -299,7 +299,13 @@ mod tests {
         let written = scaffold(&target, &options).unwrap();
         assert_eq!(
             written,
-            ["Cargo.toml", "src/main.rs", "config.yml", ".gitignore", "README.md"]
+            [
+                "Cargo.toml",
+                "src/main.rs",
+                "config.yml",
+                ".gitignore",
+                "README.md"
+            ]
         );
         let manifest = std::fs::read_to_string(target.join("Cargo.toml")).unwrap();
         assert!(manifest.contains("name = \"my-notes\""));

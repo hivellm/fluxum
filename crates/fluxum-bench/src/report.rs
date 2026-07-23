@@ -273,7 +273,10 @@ impl Report {
                 stack.version, stack.durability, stack.config
             );
         }
-        let _ = writeln!(out, "\n## NFR-11 ratios (vs the PostgreSQL parity baseline)\n");
+        let _ = writeln!(
+            out,
+            "\n## NFR-11 ratios (vs the PostgreSQL parity baseline)\n"
+        );
         let _ = writeln!(out, "| ratio | value | target | met |");
         let _ = writeln!(out, "| --- | --- | --- | --- |");
         for (name, value, target, met) in self.ratios.verdicts() {
@@ -473,7 +476,10 @@ pub fn regressions_with_uncertainty(
         .into_iter()
         .filter(|violation| {
             let name = violation.split(':').next().unwrap_or_default();
-            match (ratio_interval(current, name), ratio_interval(published, name)) {
+            match (
+                ratio_interval(current, name),
+                ratio_interval(published, name),
+            ) {
                 // Distinguishable from noise only when the current band sits
                 // entirely below the published one.
                 (Some((_, cur_hi)), Some((pub_lo, _))) => cur_hi < pub_lo,
@@ -795,7 +801,10 @@ mod tests {
         );
         // Dropping the whole block after publishing it is itself a
         // regression; never having published one is not.
-        assert_eq!(competitive_regressions(None, Some(&published), 0.2).len(), 1);
+        assert_eq!(
+            competitive_regressions(None, Some(&published), 0.2).len(),
+            1
+        );
         assert!(competitive_regressions(Some(&current), None, 0.2).is_empty());
         assert!(competitive_regressions(None, None, 0.2).is_empty());
     }
@@ -859,7 +868,10 @@ mod tests {
         // F-010: e2e rows are latency-only; their ops/s is the cap.
         assert!(md.contains("‡ (rate-capped)"));
         assert!(md.contains("latency-only"));
-        assert!(!md.contains("| e2e | 100 ±0 |"), "e2e ops/s must not render");
+        assert!(
+            !md.contains("| e2e | 100 ±0 |"),
+            "e2e ops/s must not render"
+        );
         // F-011: the p99 CI95 column renders from stddev and runs.
         assert!(md.contains("p99 CI95 ± ms"));
         // F-007: no pipelined class → no pipelined footnote.
@@ -893,11 +905,10 @@ mod tests {
         // honesty footnote (throughput row, latency includes queueing,
         // feeds no ratio) and never invents a ratio.
         let mut with_pipelined = with_stdb;
-        with_pipelined
-            .workloads
-            .get_mut("fluxum")
-            .unwrap()
-            .insert("write/pipelined(32)".to_owned(), summary(120_000.0, 2_000_000.0));
+        with_pipelined.workloads.get_mut("fluxum").unwrap().insert(
+            "write/pipelined(32)".to_owned(),
+            summary(120_000.0, 2_000_000.0),
+        );
         let md = with_pipelined.markdown();
         assert!(md.contains("| fluxum | write/pipelined(32) | 120000"));
         assert!(md.contains("fluxum-only NFR-01 evidence row"));

@@ -23,11 +23,14 @@ fn dev_cycles_start_health_check_regenerate_bindings_and_keep_data() {
     // The prebuilt hook: cargo-in-cargo deadlocks on the build-directory
     // lock, so the cycle runs the workspace's already-built server (the
     // build half is pinned by the `parse_artifact`/`cargo_build` units).
-    let exe = workspace.join("target").join("debug").join(if cfg!(windows) {
-        "fluxum-server.exe"
-    } else {
-        "fluxum-server"
-    });
+    let exe = workspace
+        .join("target")
+        .join("debug")
+        .join(if cfg!(windows) {
+            "fluxum-server.exe"
+        } else {
+            "fluxum-server"
+        });
     if !exe.exists() {
         eprintln!("skipping: no server binary — run: cargo build -p fluxum-server");
         return;

@@ -138,7 +138,9 @@ fn write_run(side: &dyn Side, cfg: &RunConfig, run: u64) -> Result<RunResult, St
                 let mut latencies = Vec::new();
                 let mut i = 0u64;
                 let fail = |failed: &Arc<Mutex<Option<String>>>, stop: &Arc<AtomicBool>, e| {
-                    *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                    *failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
                     stop.store(true, Ordering::Relaxed);
                 };
                 start_gate.wait();
@@ -674,11 +676,19 @@ fn mixed_run(side: &dyn Side, cfg: &MixedConfig, run: u64) -> Result<MixedRun, S
 
     let mut write_ns = Vec::new();
     for handle in write_handles {
-        write_ns.extend(handle.join().map_err(|_| "writer thread panicked".to_owned())?);
+        write_ns.extend(
+            handle
+                .join()
+                .map_err(|_| "writer thread panicked".to_owned())?,
+        );
     }
     let mut read_ns = Vec::new();
     for handle in read_handles {
-        read_ns.extend(handle.join().map_err(|_| "reader thread panicked".to_owned())?);
+        read_ns.extend(
+            handle
+                .join()
+                .map_err(|_| "reader thread panicked".to_owned())?,
+        );
     }
     sender_handle
         .join()

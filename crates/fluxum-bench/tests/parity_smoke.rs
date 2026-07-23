@@ -247,7 +247,11 @@ fn baseline_sqlite_runs_all_workloads() {
         runs: 1,
     };
     let runs = e2e_workload(&side, &e2e_cfg).expect("baseline e2e workload");
-    assert_eq!(runs[0].ops, 10 * 3, "every message reaches every subscriber");
+    assert_eq!(
+        runs[0].ops,
+        10 * 3,
+        "every message reaches every subscriber"
+    );
 
     let hot_cfg = HotReadConfig {
         clients: 2,
@@ -298,7 +302,11 @@ fn baseline_postgres_runs_all_workloads() {
         runs: 1,
     };
     let runs = e2e_workload(&side, &e2e_cfg).expect("pg e2e workload");
-    assert_eq!(runs[0].ops, 10 * 3, "every message reaches every subscriber");
+    assert_eq!(
+        runs[0].ops,
+        10 * 3,
+        "every message reaches every subscriber"
+    );
 
     let hot_cfg = HotReadConfig {
         clients: 2,

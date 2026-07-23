@@ -590,7 +590,10 @@ async fn writer_task(
         if write_half.write_all(&frame.bytes).await.is_err() {
             break;
         }
-        metrics.note_fanout_stage(fluxum_core::metrics::FanoutStage::Flush, us(began.elapsed()));
+        metrics.note_fanout_stage(
+            fluxum_core::metrics::FanoutStage::Flush,
+            us(began.elapsed()),
+        );
     }
     let _ = write_half.shutdown().await;
 }

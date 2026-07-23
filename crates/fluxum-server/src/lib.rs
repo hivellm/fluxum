@@ -47,8 +47,8 @@ use fluxum_core::auth::Authenticator;
 use fluxum_core::metrics::FanoutStage;
 use fluxum_core::reducer::{ReducerEngine, ViewRegistry};
 use fluxum_core::store::{MemStore, TxDiff};
-use fluxum_core::txn::CommitMeta;
 use fluxum_core::subscription::SubscriptionManager;
+use fluxum_core::txn::CommitMeta;
 use fluxum_core::types::Identity;
 
 /// One encoded, framed message ready for a connection's socket.

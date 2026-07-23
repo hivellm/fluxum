@@ -196,7 +196,10 @@ fn decoders_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
         .filter_map(|t| t.get("name").and_then(Value::as_str))
         .collect();
     if !names.is_empty() {
-        out.push_str(&format!("import type {{ {} }} from './types.ts';\n", names.join(", ")));
+        out.push_str(&format!(
+            "import type {{ {} }} from './types.ts';\n",
+            names.join(", ")
+        ));
     }
     out.push('\n');
 
@@ -227,7 +230,9 @@ fn decoders_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
                      cannot read it. Model the type or remove the column."
                 ));
             }
-            descriptors.push(format!("{{ name: '{col_name}', type: '{ty}' as FluxType }}"));
+            descriptors.push(format!(
+                "{{ name: '{col_name}', type: '{ty}' as FluxType }}"
+            ));
         }
 
         out.push_str(&doc_comment(
@@ -327,13 +332,7 @@ fn schemas_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
         };
         let pk_end = key_ordinals.iter().copied().max().map_or(0, |m| m + 1);
         let row_plan: Vec<String> = (0..pk_end)
-            .map(|i| {
-                format!(
-                    "['{}', {}]",
-                    column_types[i],
-                    key_ordinals.contains(&i)
-                )
-            })
+            .map(|i| format!("['{}', {}]", column_types[i], key_ordinals.contains(&i)))
             .collect();
         // A delete entry carries the key columns alone, in declaration order.
         let delete_plan: Vec<String> = key_ordinals
@@ -371,10 +370,7 @@ fn schemas_ts(banner: &str, tables: &[Value]) -> Result<String, String> {
         ],
         "",
     ));
-    let calls: Vec<String> = names
-        .iter()
-        .map(|n| format!("tableSchema{n}()"))
-        .collect();
+    let calls: Vec<String> = names.iter().map(|n| format!("tableSchema{n}()")).collect();
     out.push_str(&format!(
         "export function allTableSchemas(): TableSchema[] {{\n\
          \x20 return [{}];\n\
@@ -804,8 +800,14 @@ mod tests {
         // `decodeRow`, so it lives in its own file rather than the tsc-alone set.
         let files = generate(&schema()).unwrap();
         let decoders = &files["decoders.ts"];
-        assert!(decoders.contains("import { decodeRow } from '@hivehub/fluxum';"), "{decoders}");
-        assert!(decoders.contains("import type { Task } from './types.ts';"), "{decoders}");
+        assert!(
+            decoders.contains("import { decodeRow } from '@hivehub/fluxum';"),
+            "{decoders}"
+        );
+        assert!(
+            decoders.contains("import type { Task } from './types.ts';"),
+            "{decoders}"
+        );
         assert!(
             decoders.contains("{ name: 'id', type: 'U64' as FluxType }"),
             "{decoders}"

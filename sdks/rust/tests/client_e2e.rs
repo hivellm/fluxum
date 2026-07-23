@@ -32,7 +32,11 @@ struct Server {
 }
 
 fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 impl Server {
@@ -114,11 +118,15 @@ fn the_client_drives_a_real_session_end_to_end() {
         }),
     );
 
-    db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    db.subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
     assert_eq!(db.cache_size(), 0, "a fresh database starts empty");
 
-    db.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("hello".into())])
-        .expect("send_chat");
+    db.call_reducer(
+        "send_chat",
+        vec![FluxValue::I64(1), FluxValue::Str("hello".into())],
+    )
+    .expect("send_chat");
 
     // The TxUpdate rides the push stream independently of the reducer reply.
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -126,7 +134,11 @@ fn the_client_drives_a_real_session_end_to_end() {
         std::thread::sleep(Duration::from_millis(25));
     }
     assert_eq!(db.cache_size(), 1, "the row reached the local cache");
-    assert_eq!(*seen.lock().unwrap(), vec!["hello".to_owned()], "the callback fired");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec!["hello".to_owned()],
+        "the callback fired"
+    );
 }
 
 #[test]
@@ -140,15 +152,23 @@ fn the_client_drives_a_real_session_over_streamable_http() {
     let db = Connection::connect(&server.http_url, b"", [chat_schema()]).expect("connect");
     assert_ne!(db.identity(), [0u8; 32], "the server derived an identity");
 
-    db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
-    db.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("over http".into())])
-        .expect("send_chat");
+    db.subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
+    db.call_reducer(
+        "send_chat",
+        vec![FluxValue::I64(1), FluxValue::Str("over http".into())],
+    )
+    .expect("send_chat");
 
     let deadline = Instant::now() + Duration::from_secs(5);
     while db.cache_size() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    assert_eq!(db.cache_size(), 1, "the TxUpdate arrived on the push stream");
+    assert_eq!(
+        db.cache_size(),
+        1,
+        "the TxUpdate arrived on the push stream"
+    );
 }
 
 #[test]
@@ -161,7 +181,9 @@ fn an_http_stream_blip_recovers_without_losing_updates() {
     }
     let server = Server::start("http-blip");
     let alice = Connection::connect(&server.http_url, b"alice", [chat_schema()]).expect("alice");
-    alice.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    alice
+        .subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
 
     // Kill the read side as a network outage would — the Connection itself
     // stays open and must recover on its own.
@@ -169,8 +191,11 @@ fn an_http_stream_blip_recovers_without_losing_updates() {
 
     // A second session commits while (or right after) alice's stream is down.
     let bob = Connection::connect(&server.http_url, b"bob", [chat_schema()]).expect("bob");
-    bob.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("missed?".into())])
-        .expect("send_chat");
+    bob.call_reducer(
+        "send_chat",
+        vec![FluxValue::I64(1), FluxValue::Str("missed?".into())],
+    )
+    .expect("send_chat");
 
     let deadline = Instant::now() + Duration::from_secs(10);
     while alice.cache_size() == 0 && Instant::now() < deadline {
@@ -189,7 +214,10 @@ fn a_rejected_reducer_surfaces_as_a_typed_error() {
 
     // The demo module rejects an empty message with REDUCER_USER_ERROR (5001).
     let err = db
-        .call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str(String::new())])
+        .call_reducer(
+            "send_chat",
+            vec![FluxValue::I64(1), FluxValue::Str(String::new())],
+        )
         .unwrap_err();
     match err {
         ClientError::Reducer { code, message, .. } => {
@@ -211,12 +239,17 @@ fn resume_offsets_advance_from_real_server_messages() {
     let server = Server::start("resume");
     let db = Connection::connect(&server.tcp_url, b"", [chat_schema()]).expect("connect");
 
-    let ids = db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    let ids = db
+        .subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
     let qid = ids[0];
     let snapshot = db.applied_offset(qid).expect("an offset after InitialData");
 
-    db.call_reducer("send_chat", vec![FluxValue::I64(1), FluxValue::Str("one".into())])
-        .expect("send_chat");
+    db.call_reducer(
+        "send_chat",
+        vec![FluxValue::I64(1), FluxValue::Str("one".into())],
+    )
+    .expect("send_chat");
 
     // Wait for the TxUpdate to land, then the applied offset must have advanced
     // past the snapshot's.
@@ -224,7 +257,9 @@ fn resume_offsets_advance_from_real_server_messages() {
     while db.cache_size() == 0 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(25));
     }
-    let after = db.applied_offset(qid).expect("an offset after the TxUpdate");
+    let after = db
+        .applied_offset(qid)
+        .expect("an offset after the TxUpdate");
     assert!(
         after > snapshot,
         "the applied offset must advance: {after} !> {snapshot}"
@@ -289,7 +324,9 @@ fn pipelined_calls_resolve_by_id_and_commit_in_submission_order() {
             let mut reader = FluxBinReader::new(row);
             reader.read_u64().unwrap(); // id
             reader.read_identity().unwrap(); // owner
-            sink.lock().unwrap().push(reader.read_str().unwrap().to_owned());
+            sink.lock()
+                .unwrap()
+                .push(reader.read_str().unwrap().to_owned());
         }),
     );
     db.subscribe(&["SELECT * FROM Task"]).expect("subscribe");
@@ -363,7 +400,10 @@ fn an_optimistic_call_renders_immediately_and_converges() {
     let identity = db.identity();
     let key = db
         .call_optimistic("add_task", vec![FluxValue::Str("optimistic".into())], |s| {
-            s.insert("Task", optimistic_task_row(u64::MAX, identity, "optimistic"));
+            s.insert(
+                "Task",
+                optimistic_task_row(u64::MAX, identity, "optimistic"),
+            );
         })
         .expect("call_optimistic");
     assert!(!key.is_empty(), "the submission handle is the minted key");
@@ -407,12 +447,15 @@ fn a_rejected_optimistic_call_rolls_back_and_reports() {
     }
     let server = Server::start("optimistic-reject");
     let db = Connection::connect(&server.tcp_url, b"", [chat_schema()]).expect("connect");
-    db.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    db.subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
 
     let rejections: Arc<Mutex<Vec<(String, String, u16)>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&rejections);
     db.on_rejected(Box::new(move |reducer, key, err| {
-        sink.lock().unwrap().push((reducer.to_owned(), key.to_owned(), err.code));
+        sink.lock()
+            .unwrap()
+            .push((reducer.to_owned(), key.to_owned(), err.code));
     }));
 
     let identity = db.identity();
@@ -449,7 +492,8 @@ fn a_rejected_optimistic_call_rolls_back_and_reports() {
 
 /// A fresh file-backend rooted in a per-test temp directory.
 fn file_backend(label: &str) -> std::sync::Arc<fluxum_sdk::FileBackend> {
-    let dir = std::env::temp_dir().join(format!("fluxum-sdk-persist-{label}-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("fluxum-sdk-persist-{label}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::sync::Arc::new(fluxum_sdk::FileBackend::new(&dir).expect("backend dir"))
 }
@@ -493,8 +537,7 @@ fn persisted_state_hydrates_and_reconciles_across_a_restart() {
     drop(db);
 
     // Someone (same identity) commits while "we" are down.
-    let writer =
-        Connection::connect(&server.tcp_url, b"tok", [task_schema()]).expect("writer");
+    let writer = Connection::connect(&server.tcp_url, b"tok", [task_schema()]).expect("writer");
     writer
         .call_reducer("add_task", vec![FluxValue::Str("while away".into())])
         .expect("add_task while away");
@@ -606,7 +649,9 @@ fn a_different_identity_discards_the_hydrated_queue() {
         "shared-device",
     )
     .expect("alice");
-    alice.subscribe(&["SELECT * FROM ChatMessage"]).expect("subscribe");
+    alice
+        .subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
     let alice_id = alice.identity();
     alice.simulate_stream_loss();
     alice

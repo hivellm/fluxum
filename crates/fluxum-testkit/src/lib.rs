@@ -53,13 +53,13 @@ use std::sync::Arc;
 use fluxum_core::checkpoint::{CheckpointRepo, recover};
 use fluxum_core::commitlog::{CommitLog, CommitLogOptions};
 use fluxum_core::reducer::{
-    LifecycleHooks, RateLimiter, RateLimiterOptions, ReducerCaller, ReducerEngine,
-    ReducerRegistry, StartupReport,
+    LifecycleHooks, RateLimiter, RateLimiterOptions, ReducerCaller, ReducerEngine, ReducerRegistry,
+    StartupReport,
 };
 use fluxum_core::schema::Schema;
 use fluxum_core::store::{MemStore, RowValue};
-use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
+use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_core::{FluxumError, Result};
 
 pub use crash::CrashedShard;
@@ -130,7 +130,10 @@ impl CallReceipt {
 
     /// Names of the tables this call touched, in diff order.
     pub fn touched(&self) -> Vec<&str> {
-        self.tables.iter().map(|(name, _, _)| name.as_str()).collect()
+        self.tables
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect()
     }
 }
 
@@ -300,9 +303,7 @@ impl TestShard {
             timestamp: Timestamp::from_micros(timestamp_us),
             shard_id: SHARD,
         };
-        let receipt = self
-            .rt
-            .block_on(self.engine.call(caller, reducer, args))?;
+        let receipt = self.rt.block_on(self.engine.call(caller, reducer, args))?;
         self.last_tx_id = self.last_tx_id.max(receipt.tx_id);
 
         let mut tables = Vec::new();
@@ -310,8 +311,11 @@ impl TestShard {
             let Some(schema) = self.store.table_schema(diff.table_id) else {
                 continue;
             };
-            let inserts: Vec<Vec<RowValue>> =
-                diff.inserts.iter().map(|row| row.values().to_vec()).collect();
+            let inserts: Vec<Vec<RowValue>> = diff
+                .inserts
+                .iter()
+                .map(|row| row.values().to_vec())
+                .collect();
             let deletes: Vec<Vec<RowValue>> = diff
                 .deletes
                 .iter()
@@ -360,7 +364,9 @@ impl TestShard {
             let Some(id) = self.store.table_id(name) else {
                 continue;
             };
-            let Ok(rows) = snapshot.scan(id) else { continue };
+            let Ok(rows) = snapshot.scan(id) else {
+                continue;
+            };
             let mut printed: Vec<String> = rows.map(|row| format!("{:?}", row.values())).collect();
             printed.sort_unstable();
             for row in printed {

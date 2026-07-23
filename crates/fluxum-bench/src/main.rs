@@ -305,10 +305,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             } else {
                 "write".to_owned()
             };
-            (
-                vec![(class, Summary::from_runs(&runs))],
-                format!("{cfg:?}"),
-            )
+            (vec![(class, Summary::from_runs(&runs))], format!("{cfg:?}"))
         }
         "e2e" => {
             let cfg = E2eConfig {
@@ -448,9 +445,10 @@ fn run_load_command(opts: &Opts) -> Result<(), String> {
         // port for the scrape (defaults to the url's host on the standard
         // admin port would be a guess, so it is required).
         Some(url) => {
-            let http = opts.http.clone().ok_or(
-                "load --url needs --http host:port (the server's admin/metrics port)",
-            )?;
+            let http = opts
+                .http
+                .clone()
+                .ok_or("load --url needs --http host:port (the server's admin/metrics port)")?;
             (FluxumSide::new(url.clone()), http, None)
         }
         None => {

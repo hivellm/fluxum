@@ -353,7 +353,12 @@ impl Session {
                 // conformance corpus: the Chromium runner's timing exposed a
                 // kill landing between the in-memory commit and the log
                 // write, losing an acknowledged row.)
-                if let Err(e) = self.engine().pipeline().log().wait_written(receipt.tx_id).await
+                if let Err(e) = self
+                    .engine()
+                    .pipeline()
+                    .log()
+                    .wait_written(receipt.tx_id)
+                    .await
                 {
                     return Routed::reply(from_error(Some(id), &e));
                 }

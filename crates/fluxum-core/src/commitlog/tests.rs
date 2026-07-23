@@ -500,7 +500,10 @@ async fn the_written_watermark_never_trails_the_durable_one() {
         log.wait_written(tx).await.unwrap();
         let written = log.written_tx_id().unwrap();
         let durable = log.durable_tx_id().unwrap();
-        assert!(written >= Some(tx), "acked tx {tx} not written: {written:?}");
+        assert!(
+            written >= Some(tx),
+            "acked tx {tx} not written: {written:?}"
+        );
         assert!(
             written >= durable,
             "written {written:?} trails durable {durable:?}"

@@ -229,7 +229,9 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Head> {
         }
         let n = stream.read(&mut chunk)?;
         if n == 0 {
-            return Err(std::io::Error::other("connection closed before response head"));
+            return Err(std::io::Error::other(
+                "connection closed before response head",
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
     };

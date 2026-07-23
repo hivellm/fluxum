@@ -1052,7 +1052,7 @@ async fn reducer_call(ctx: &Arc<ShardContext>, name: &str, body: &[u8]) -> Admin
     }
     // F-004: the admin route honors the same client-callable gating a client
     // session does — a schedule-only reducer (`client_callable = false`) is
-    // not invokable over HTTP, even by an operator. A reducer absent from the
+    // not invocable over HTTP, even by an operator. A reducer absent from the
     // registry declaration table is treated as callable (defaults preserved).
     if ctx
         .engine
