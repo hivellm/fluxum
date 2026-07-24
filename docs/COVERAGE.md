@@ -5,12 +5,15 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.08% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
-drivers live), after phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the
-seed path are covered by their suites; the dip from 90.23% is the new CLI glue —
-`migrate.rs`'s cargo-spawn wrapper and the `run()` dispatch arms — the same category-9
-shape as the standing debt). **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08%. The **standing debt items below remain open**: (a) the
+**Current standing:** **90.09% lines** — 2026-07-23, gate command below (PG + SpacetimeDB
+drivers live), after phase6_admin-web-console (the console module, the DEV-031 gate, and
+the `/console/watch` stream are covered by their unit + integration suites; the embedded
+`console.html` is an asset, not instrumented lines). Prior: 90.08% after
+phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are covered
+by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
+wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
+**The floor holds**, recovered from the ~89.8% T6.6 breach:
+90.02% → 90.09% → 90.23% → 90.08% → 90.09%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);

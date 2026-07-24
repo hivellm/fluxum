@@ -538,6 +538,28 @@ async fn serve_connection(
                 handle_logs(&state.ctx, stream, &request, ip, &server_shutdown).await?;
                 return Ok(());
             }
+            // SPEC-024 DEV-030: the built-in admin web console. The watch
+            // stream owns the connection while following, like `/logs`.
+            ("GET", path) if crate::console::is_console_path(path) => {
+                match crate::console::route(path) {
+                    crate::console::Route::Watch(filter) => {
+                        handle_console_watch(
+                            &state.ctx,
+                            stream,
+                            &request,
+                            ip,
+                            filter,
+                            &server_shutdown,
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    route => {
+                        handle_console(&state.ctx, &mut stream, &request, ip, route).await?;
+                        true
+                    }
+                }
+            }
             // The HTTP/JSON admin surface (RPC-050) shares this port.
             (method, path) if crate::admin::is_admin_path(path) => {
                 handle_admin(
@@ -696,6 +718,148 @@ async fn handle_logs(
                     // Honest gap marker: the follower was slower than the
                     // log volume; n lines are not in this stream.
                     let marker = format!("{{\"fluxum_logs_dropped\":{n}}}\n");
+                    if write_chunk(&mut stream, marker.as_bytes()).await.is_err() {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            },
+            _ = keepalive.tick() => {
+                if write_chunk(&mut stream, b"\n").await.is_err() {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    write_last_chunk(&mut stream).await
+}
+
+/// Serve the console's non-streaming routes (SPEC-024 DEV-030): the shell
+/// and the boot-state document. The shell is static and data-free (it is a
+/// login screen until the DEV-031 gate passes), so it rides the SEC-054
+/// *network* guard only; `/console/state` likewise — it reveals just the
+/// gate posture and whether the presented credential is valid, which is
+/// exactly what a login screen must know.
+async fn handle_console(
+    ctx: &Arc<ShardContext>,
+    stream: &mut MaybeTls,
+    request: &Request,
+    client_ip: std::net::IpAddr,
+    route: crate::console::Route,
+) -> io::Result<()> {
+    let operator_token = request.header("fluxum-operator");
+    let admin_req = crate::admin::AdminRequest {
+        method: "GET",
+        path: &request.path,
+        body: &[],
+        client_ip,
+        operator_token: operator_token.as_deref(),
+    };
+    if let Err(deny) = crate::admin::check_access(ctx, &admin_req) {
+        let bytes = serde_json::to_vec(&deny.body).unwrap_or_default();
+        return write_json(stream, deny.status, "application/json", &bytes).await;
+    }
+    match route {
+        crate::console::Route::Shell => {
+            // The page's CSP forbids any non-self origin: the console is
+            // self-contained by contract, not just by construction.
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\
+                 Content-Length: {}\r\n\
+                 X-Content-Type-Options: nosniff\r\n\
+                 Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; \
+                 script-src 'unsafe-inline'; connect-src 'self'; img-src data:; \
+                 form-action 'none'; base-uri 'none'\r\n\
+                 Cache-Control: no-cache\r\n\r\n",
+                crate::console::CONSOLE_HTML.len()
+            );
+            stream.write_all(head.as_bytes()).await?;
+            stream
+                .write_all(crate::console::CONSOLE_HTML.as_bytes())
+                .await?;
+            stream.flush().await
+        }
+        crate::console::Route::State => {
+            let authed = crate::admin::is_operator(ctx, &admin_req);
+            let body = serde_json::json!({
+                "success": true,
+                "payload": crate::console::state_json(ctx.admin_policy().console_open, authed),
+            });
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            write_json(stream, 200, "application/json", &bytes).await
+        }
+        // `Watch` is routed to `handle_console_watch` before this runs.
+        crate::console::Route::Watch(_) | crate::console::Route::NotFound => {
+            write_simple(stream, 404, "Not Found").await
+        }
+    }
+}
+
+/// `GET /console/watch[?table=..]` (SPEC-024 DEV-030): stream committed
+/// diffs as NDJSON chunks over the shard's commit broadcast — the console's
+/// live table viewer. Enforces the full DEV-031 console gate (the network
+/// guard, plus an operator credential outside the development profile), then
+/// reads only the broadcast and the static table catalog: no storage locks,
+/// so an open watch can never violate the RPC-053 `/health` budget.
+async fn handle_console_watch(
+    ctx: &Arc<ShardContext>,
+    mut stream: MaybeTls,
+    request: &Request,
+    client_ip: std::net::IpAddr,
+    table_filter: Option<String>,
+    server_shutdown: &Arc<Notify>,
+) -> io::Result<()> {
+    let operator_token = request.header("fluxum-operator");
+    let admin_req = crate::admin::AdminRequest {
+        method: "GET",
+        path: &request.path,
+        body: &[],
+        client_ip,
+        operator_token: operator_token.as_deref(),
+    };
+    if let Err(deny) = crate::admin::check_console_access(ctx, &admin_req) {
+        let bytes = serde_json::to_vec(&deny.body).unwrap_or_default();
+        return write_json(&mut stream, deny.status, "application/json", &bytes).await;
+    }
+    let mut commits = ctx.subscribe_commits();
+    const HEAD: &str = "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                        Transfer-Encoding: chunked\r\n\
+                        X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\r\n";
+    stream.write_all(HEAD.as_bytes()).await?;
+    stream.flush().await?;
+    // Hello event: confirms the stream (and the filter it resolved) before
+    // the first commit arrives.
+    let hello = serde_json::json!({ "watching": table_filter }).to_string();
+    if write_chunk(&mut stream, format!("{hello}\n").as_bytes())
+        .await
+        .is_err()
+    {
+        return Ok(());
+    }
+    let mut keepalive = tokio::time::interval(std::time::Duration::from_secs(15));
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    keepalive.tick().await; // arm: the first tick fires immediately
+    loop {
+        tokio::select! {
+            _ = server_shutdown.notified() => break,
+            entry = commits.recv() => match entry {
+                Ok((_, diff, meta)) => {
+                    let Some(line) = crate::console::render_commit(
+                        ctx.store(),
+                        &diff,
+                        &meta,
+                        table_filter.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    if write_chunk(&mut stream, format!("{line}\n").as_bytes()).await.is_err() {
+                        return Ok(()); // viewer went away — not an error
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    // Honest gap marker: the viewer was slower than the
+                    // commit volume; n commits are not in this stream.
+                    let marker = format!("{{\"fluxum_watch_dropped\":{n}}}\n");
                     if write_chunk(&mut stream, marker.as_bytes()).await.is_err() {
                         return Ok(());
                     }

@@ -2120,7 +2120,11 @@ fn encode_pk_rows(schema: &TableSchema, rows: &[&Row]) -> Result<RowList> {
 /// Numbers that overflow an IEEE-754 double (`u64`/`i64` extremes,
 /// entity/timestamp micros) are rendered as strings to avoid precision
 /// loss; bytes and identities are hex strings.
-fn row_value_to_json(value: &crate::store::RowValue) -> serde_json::Value {
+///
+/// Public because the admin console's live diff stream (SPEC-024 DEV-030)
+/// renders committed [`TxDiff`] rows with exactly the same JSON currency as
+/// `POST /query` — one converter, so the two surfaces cannot drift.
+pub fn row_value_to_json(value: &crate::store::RowValue) -> serde_json::Value {
     use crate::store::RowValue as V;
     use serde_json::Value as J;
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();

@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; img-src data:; form-action 'none'; base-uri 'none'">
+<title>Fluxum Console</title>
+<style>
+:root {
+  --bg: #0d1117; --panel: #161b22; --edge: #2d333b; --text: #d7dde4;
+  --dim: #8b949e; --accent: #4da3ff; --ok: #3fb950; --warn: #d29922;
+  --err: #f85149; --ins: #1d3325; --del: #3a1d20; --mono: ui-monospace, Consolas, monospace;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: var(--bg); color: var(--text); font: 14px/1.45 system-ui, sans-serif; height: 100vh; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; gap: 14px; padding: 8px 14px; background: var(--panel); border-bottom: 1px solid var(--edge); flex-wrap: wrap; }
+header h1 { font-size: 15px; font-weight: 600; letter-spacing: .3px; }
+header h1 span { color: var(--accent); }
+.stat { color: var(--dim); font-size: 12px; }
+.stat b { color: var(--text); font-weight: 500; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 4px; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.err { background: var(--err); }
+.spacer { flex: 1; }
+nav { display: flex; gap: 2px; padding: 0 10px; background: var(--panel); border-bottom: 1px solid var(--edge); }
+nav button { background: none; border: none; border-bottom: 2px solid transparent; color: var(--dim); padding: 8px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+nav button.on { color: var(--text); border-bottom-color: var(--accent); }
+nav button:hover { color: var(--text); }
+main { flex: 1; overflow: hidden; display: flex; }
+.tab { display: none; flex: 1; overflow: auto; padding: 12px; }
+.tab.on { display: flex; flex-direction: column; gap: 10px; }
+.tab.split { flex-direction: row; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+button.act { background: #21262d; color: var(--text); border: 1px solid var(--edge); border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+button.act:hover { border-color: var(--accent); }
+button.act.primary { background: #1f6feb; border-color: #1f6feb; color: #fff; }
+input[type=text], select, textarea { background: #0d1117; color: var(--text); border: 1px solid var(--edge); border-radius: 6px; padding: 5px 8px; font: inherit; }
+input[type=text]:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+textarea { font-family: var(--mono); font-size: 13px; width: 100%; min-height: 90px; resize: vertical; }
+table.grid { border-collapse: collapse; font-family: var(--mono); font-size: 12.5px; }
+table.grid th, table.grid td { border: 1px solid var(--edge); padding: 3px 8px; text-align: left; white-space: nowrap; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+table.grid th { background: var(--panel); color: var(--dim); position: sticky; top: 0; }
+.scroll { overflow: auto; flex: 1; border: 1px solid var(--edge); border-radius: 6px; background: #10151c; }
+.side { width: 230px; min-width: 170px; overflow: auto; border: 1px solid var(--edge); border-radius: 6px; background: var(--panel); margin-right: 10px; }
+.side div.item { padding: 6px 10px; cursor: pointer; border-bottom: 1px solid var(--edge); font-family: var(--mono); font-size: 12.5px; }
+.side div.item:hover, .side div.item.on { background: #1c2430; color: var(--accent); }
+.side .cols { color: var(--dim); font-size: 11px; display: block; }
+.pane { flex: 1; display: flex; flex-direction: column; gap: 8px; overflow: hidden; }
+.err-box { color: var(--err); font-family: var(--mono); font-size: 12.5px; white-space: pre-wrap; }
+.muted { color: var(--dim); font-size: 12px; }
+.stream { font-family: var(--mono); font-size: 12px; }
+.log-line { padding: 1px 8px; border-bottom: 1px solid #151b23; white-space: pre-wrap; word-break: break-all; }
+.log-line .lvl { font-weight: 600; }
+.lvl-ERROR { color: var(--err); } .lvl-WARN { color: var(--warn); } .lvl-INFO { color: var(--ok); }
+.lvl-DEBUG, .lvl-TRACE { color: var(--dim); }
+.log-line.slow { background: #2d2413; border-left: 3px solid var(--warn); }
+.log-line .tgt { color: var(--dim); }
+.evt { border: 1px solid var(--edge); border-radius: 6px; margin: 6px 8px; background: var(--panel); }
+.evt .hd { padding: 4px 10px; color: var(--dim); font-size: 12px; border-bottom: 1px solid var(--edge); }
+.evt .hd b { color: var(--accent); font-weight: 600; }
+.evt .body { padding: 6px 10px; overflow-x: auto; }
+.rowline { font-family: var(--mono); font-size: 12px; padding: 2px 6px; border-radius: 4px; margin: 2px 0; white-space: pre-wrap; word-break: break-all; }
+.rowline.ins { background: var(--ins); color: #7ee787; }
+.rowline.del { background: var(--del); color: #ffa198; }
+pre.raw { font-family: var(--mono); font-size: 12px; padding: 10px; white-space: pre-wrap; word-break: break-all; }
+#login { position: fixed; inset: 0; background: rgba(4,8,14,.85); display: none; align-items: center; justify-content: center; z-index: 10; }
+#login.on { display: flex; }
+#login .card { background: var(--panel); border: 1px solid var(--edge); border-radius: 8px; padding: 22px; width: 360px; display: flex; flex-direction: column; gap: 10px; }
+#login h2 { font-size: 15px; }
+.badge { font-size: 11px; border: 1px solid var(--edge); border-radius: 10px; padding: 1px 8px; color: var(--dim); }
+</style>
+</head>
+<body>
+<header>
+  <h1><span>Fluxum</span> Console</h1>
+  <span class="stat"><span id="h-dot" class="dot"></span><b id="h-state">–</b></span>
+  <span class="stat">up <b id="h-up">–</b></span>
+  <span class="stat">conns <b id="h-conns">–</b></span>
+  <span class="stat">tx <b id="h-tx">–</b></span>
+  <span class="badge" id="h-tls">tls?</span>
+  <span class="badge" id="h-mode">–</span>
+  <span class="spacer"></span>
+  <button class="act" id="btn-token">operator token</button>
+</header>
+<nav id="tabs">
+  <button data-tab="tables" class="on">Tables</button>
+  <button data-tab="query">Query</button>
+  <button data-tab="live">Live</button>
+  <button data-tab="logs">Logs</button>
+  <button data-tab="metrics">Metrics</button>
+  <button data-tab="schema">Schema</button>
+</nav>
+<main>
+  <section class="tab split on" id="tab-tables">
+    <div class="side" id="tbl-list"></div>
+    <div class="pane">
+      <div class="row">
+        <b id="tbl-name" style="font-family:var(--mono)">–</b>
+        <span class="muted">LIMIT</span>
+        <input type="text" id="tbl-limit" value="50" size="4">
+        <button class="act" id="tbl-refresh">refresh</button>
+        <span class="muted" id="tbl-count"></span>
+      </div>
+      <div class="scroll" id="tbl-grid"></div>
+    </div>
+  </section>
+  <section class="tab" id="tab-query">
+    <textarea id="q-sql" spellcheck="false" placeholder="SELECT * FROM MyTable LIMIT 50"></textarea>
+    <div class="row">
+      <button class="act primary" id="q-run">run (Ctrl+Enter)</button>
+      <span class="muted">read-only — the server rejects INSERT/UPDATE/DELETE</span>
+      <span class="muted" id="q-count"></span>
+    </div>
+    <div class="err-box" id="q-err"></div>
+    <div class="scroll" id="q-grid"></div>
+  </section>
+  <section class="tab" id="tab-live">
+    <div class="row">
+      <select id="w-table"><option value="">(all tables)</option></select>
+      <button class="act primary" id="w-toggle">start</button>
+      <button class="act" id="w-clear">clear</button>
+      <span class="stat"><span id="w-dot" class="dot"></span><span id="w-status">stopped</span></span>
+      <span class="muted" id="w-count"></span>
+    </div>
+    <div class="scroll" id="w-feed"></div>
+  </section>
+  <section class="tab" id="tab-logs">
+    <div class="row">
+      <button class="act primary" id="l-toggle">follow</button>
+      <button class="act" id="l-clear">clear</button>
+      <input type="text" id="l-filter" placeholder="filter…" size="24">
+      <label class="muted"><input type="checkbox" id="l-reducers"> reducer events only</label>
+      <span class="muted">slow-reducer warnings are highlighted</span>
+    </div>
+    <div class="scroll stream" id="l-feed"></div>
+  </section>
+  <section class="tab" id="tab-metrics">
+    <div class="row">
+      <button class="act" id="m-refresh">refresh</button>
+      <input type="text" id="m-filter" placeholder="filter series…" size="28">
+      <span class="muted" id="m-count"></span>
+    </div>
+    <div class="scroll" id="m-grid"></div>
+  </section>
+  <section class="tab" id="tab-schema">
+    <div class="row"><button class="act" id="s-refresh">refresh</button></div>
+    <div class="scroll"><pre class="raw" id="s-json"></pre></div>
+  </section>
+</main>
+<div id="login">
+  <div class="card">
+    <h2>Operator credential required</h2>
+    <p class="muted">This server is not running the <code>development</code> profile, so the
+    console requires a server-peer operator token (SPEC-024 DEV-031).</p>
+    <input type="text" id="login-token" placeholder="operator token" autocomplete="off">
+    <div class="row">
+      <button class="act primary" id="login-save">unlock</button>
+      <span class="err-box" id="login-err"></span>
+    </div>
+  </div>
+</div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let token = sessionStorage.getItem("fluxum_operator") || "";
+let schemaDoc = null;
+
+function headers() {
+  return token ? { "Fluxum-Operator": token } : {};
+}
+async function api(path, init) {
+  const opts = Object.assign({ cache: "no-store" }, init || {});
+  opts.headers = Object.assign({}, headers(), opts.headers || {});
+  return fetch(path, opts);
+}
+async function apiJson(path, init) {
+  const r = await api(path, init);
+  const body = await r.json().catch(() => ({}));
+  if (body && body.success === false) throw new Error(body.error || ("HTTP " + r.status));
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  return body.payload !== undefined ? body.payload : body;
+}
+
+// --- tabs ------------------------------------------------------------------
+$("tabs").addEventListener("click", (e) => {
+  const tab = e.target.dataset && e.target.dataset.tab;
+  if (!tab) return;
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("on", b === e.target));
+  document.querySelectorAll(".tab").forEach((s) => s.classList.toggle("on", s.id === "tab-" + tab));
+});
+
+// --- health header ---------------------------------------------------------
+function fmtUp(s) {
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  if (s < 129600) return Math.round(s / 3600) + "h";
+  return Math.round(s / 86400) + "d";
+}
+async function pollHealth() {
+  try {
+    const r = await api("/health");
+    const h = await r.json();
+    const state = (h.shards && h.shards[0] && h.shards[0].state) || h.status || "?";
+    $("h-state").textContent = state;
+    $("h-dot").className = "dot " + (h.status === "ok" ? "ok" : h.status === "degraded" ? "warn" : "err");
+    $("h-up").textContent = fmtUp(h.uptime_s || 0);
+    $("h-conns").textContent = h.connections != null ? h.connections : "–";
+    $("h-tx").textContent = (h.shards && h.shards[0] && h.shards[0].tx_id) != null ? h.shards[0].tx_id : "–";
+    $("h-tls").textContent = h.tls ? "tls on" : "tls off";
+  } catch { $("h-dot").className = "dot err"; $("h-state").textContent = "unreachable"; }
+}
+
+// --- auth boot (DEV-031) -----------------------------------------------------
+async function boot() {
+  let state = { console_open: true, authed: false };
+  try { state = await apiJson("/console/state"); } catch { /* network gate refusals land here */ }
+  $("h-mode").textContent = state.console_open ? "development" : "production";
+  const locked = !state.console_open && !state.authed;
+  $("login").classList.toggle("on", locked);
+  if (!locked) {
+    pollHealth();
+    setInterval(pollHealth, 5000);
+    loadSchema();
+  }
+}
+$("login-save").addEventListener("click", async () => {
+  token = $("login-token").value.trim();
+  sessionStorage.setItem("fluxum_operator", token);
+  const state = await apiJson("/console/state").catch(() => null);
+  if (state && (state.authed || state.console_open)) { $("login-err").textContent = ""; boot(); }
+  else $("login-err").textContent = "not accepted";
+});
+$("btn-token").addEventListener("click", () => {
+  $("login-token").value = token;
+  $("login").classList.add("on");
+});
+$("login").addEventListener("click", (e) => { if (e.target === $("login")) $("login").classList.remove("on"); });
+
+// --- grid rendering ----------------------------------------------------------
+function renderGrid(el, columns, rows) {
+  el.textContent = "";
+  const t = document.createElement("table");
+  t.className = "grid";
+  const thead = t.createTHead().insertRow();
+  for (const c of columns) { const th = document.createElement("th"); th.textContent = c; thead.appendChild(th); }
+  const tb = t.createTBody();
+  for (const row of rows) {
+    const tr = tb.insertRow();
+    for (const c of columns) {
+      const v = row[c];
+      tr.insertCell().textContent = v === null || v === undefined ? "∅" : typeof v === "object" ? JSON.stringify(v) : String(v);
+    }
+  }
+  el.appendChild(t);
+}
+
+// --- tables tab --------------------------------------------------------------
+let currentTable = null;
+async function loadSchema() {
+  try {
+    schemaDoc = await apiJson("/schema");
+    const list = $("tbl-list");
+    list.textContent = "";
+    const sel = $("w-table");
+    while (sel.options.length > 1) sel.remove(1);
+    for (const t of schemaDoc.tables || []) {
+      const item = document.createElement("div");
+      item.className = "item";
+      item.textContent = t.name;
+      const cols = document.createElement("span");
+      cols.className = "cols";
+      cols.textContent = t.columns.map((c) => c.name).join(", ");
+      item.appendChild(cols);
+      item.addEventListener("click", () => { currentTable = t.name; browse(); });
+      list.appendChild(item);
+      sel.add(new Option(t.name, t.name));
+    }
+    $("s-json").textContent = JSON.stringify(schemaDoc, null, 2);
+    if (!currentTable && schemaDoc.tables && schemaDoc.tables.length) {
+      currentTable = schemaDoc.tables[0].name;
+      browse();
+    }
+  } catch (e) { $("tbl-list").textContent = String(e.message || e); }
+}
+async function browse() {
+  if (!currentTable) return;
+  document.querySelectorAll("#tbl-list .item").forEach((i) => i.classList.toggle("on", i.firstChild.textContent === currentTable));
+  $("tbl-name").textContent = currentTable;
+  const limit = parseInt($("tbl-limit").value, 10) || 50;
+  try {
+    const p = await apiJson("/query", { method: "POST", body: JSON.stringify({ sql: "SELECT * FROM " + currentTable + " LIMIT " + limit }) });
+    renderGrid($("tbl-grid"), p.columns, p.rows);
+    $("tbl-count").textContent = p.rows.length + " row(s)";
+  } catch (e) { $("tbl-grid").textContent = ""; $("tbl-count").textContent = String(e.message || e); }
+}
+$("tbl-refresh").addEventListener("click", browse);
+
+// --- query tab ----------------------------------------------------------------
+async function runQuery() {
+  $("q-err").textContent = ""; $("q-count").textContent = "";
+  try {
+    const p = await apiJson("/query", { method: "POST", body: JSON.stringify({ sql: $("q-sql").value }) });
+    renderGrid($("q-grid"), p.columns, p.rows);
+    $("q-count").textContent = p.rows.length + " row(s)";
+  } catch (e) { $("q-grid").textContent = ""; $("q-err").textContent = String(e.message || e); }
+}
+$("q-run").addEventListener("click", runQuery);
+$("q-sql").addEventListener("keydown", (e) => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") runQuery(); });
+
+// --- NDJSON stream reader -------------------------------------------------------
+async function streamLines(path, signal, onLine) {
+  const r = await api(path, { signal });
+  if (!r.ok) throw new Error("HTTP " + r.status + (r.status === 401 ? " — operator token required" : ""));
+  const reader = r.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const parts = buf.split("\n");
+    buf = parts.pop();
+    for (const line of parts) {
+      const s = line.trim();
+      if (s) onLine(s);
+    }
+  }
+}
+
+// --- live tab (DEV-030 live diff viewer) ----------------------------------------
+let watchCtl = null, watchCount = 0;
+function watchStopped(msg) {
+  watchCtl = null;
+  $("w-toggle").textContent = "start";
+  $("w-dot").className = "dot";
+  $("w-status").textContent = msg || "stopped";
+}
+function addEvent(evt) {
+  const feed = $("w-feed");
+  const card = document.createElement("div");
+  card.className = "evt";
+  const hd = document.createElement("div");
+  hd.className = "hd";
+  const caller = (evt.caller || "").slice(0, 12);
+  hd.innerHTML = "<b>tx " + Number(evt.tx_id) + "</b> · " +
+    (evt.reducer ? "reducer <b>" + escHtml(evt.reducer) + "</b>" : "internal") +
+    (caller ? " · caller " + escHtml(caller) + "…" : "");
+  card.appendChild(hd);
+  const body = document.createElement("div");
+  body.className = "body";
+  for (const t of evt.tables || []) {
+    for (const row of t.inserts || []) {
+      const d = document.createElement("div");
+      d.className = "rowline ins";
+      d.textContent = "+ " + t.table + " " + JSON.stringify(row);
+      body.appendChild(d);
+    }
+    for (const row of t.deletes || []) {
+      const d = document.createElement("div");
+      d.className = "rowline del";
+      d.textContent = "− " + t.table + " " + JSON.stringify(row);
+      body.appendChild(d);
+    }
+  }
+  card.appendChild(body);
+  feed.appendChild(card);
+  while (feed.childElementCount > 300) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+  watchCount += 1;
+  $("w-count").textContent = watchCount + " event(s)";
+}
+function escHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+$("w-toggle").addEventListener("click", async () => {
+  if (watchCtl) { watchCtl.abort(); watchStopped(); return; }
+  watchCtl = new AbortController();
+  $("w-toggle").textContent = "stop";
+  $("w-dot").className = "dot ok";
+  const table = $("w-table").value;
+  $("w-status").textContent = "watching " + (table || "all tables");
+  try {
+    await streamLines("/console/watch" + (table ? "?table=" + encodeURIComponent(table) : ""), watchCtl.signal, (s) => {
+      const evt = JSON.parse(s);
+      if (evt.fluxum_watch_dropped) {
+        const d = document.createElement("div");
+        d.className = "muted";
+        d.style.padding = "4px 10px";
+        d.textContent = "⚠ " + evt.fluxum_watch_dropped + " commit(s) dropped (slow consumer)";
+        $("w-feed").appendChild(d);
+        return;
+      }
+      if (evt.watching !== undefined) return; // hello event
+      addEvent(evt);
+    });
+    watchStopped("stream ended");
+  } catch (e) {
+    if (e.name !== "AbortError") watchStopped(String(e.message || e));
+  }
+});
+$("w-clear").addEventListener("click", () => { $("w-feed").textContent = ""; watchCount = 0; $("w-count").textContent = ""; });
+
+// --- logs tab (DEV-032: reducer invocations + slow-reducer warnings) --------------
+let logCtl = null;
+function logLineMatches(obj, raw) {
+  const filter = $("l-filter").value.toLowerCase();
+  if (filter && !raw.toLowerCase().includes(filter)) return false;
+  if ($("l-reducers").checked) {
+    const f = obj.fields || {};
+    if (f.reducer === undefined && f.reducer_name === undefined) return false;
+  }
+  return true;
+}
+function addLogLine(raw) {
+  let obj = {};
+  try { obj = JSON.parse(raw); } catch { /* keepalive or marker */ }
+  if (obj.fluxum_logs_dropped) {
+    const d = document.createElement("div");
+    d.className = "log-line";
+    d.textContent = "⚠ " + obj.fluxum_logs_dropped + " line(s) dropped";
+    $("l-feed").appendChild(d);
+    return;
+  }
+  if (!logLineMatches(obj, raw)) return;
+  const f = obj.fields || {};
+  const slow = f.event === "slow_reducer";
+  const div = document.createElement("div");
+  div.className = "log-line" + (slow ? " slow" : "");
+  const lvl = document.createElement("span");
+  lvl.className = "lvl lvl-" + (obj.level || "");
+  lvl.textContent = (obj.level || "?").padEnd(5);
+  const tgt = document.createElement("span");
+  tgt.className = "tgt";
+  tgt.textContent = " " + (obj.timestamp || "").slice(11, 23) + " " + (obj.target || "") + " ";
+  const extras = Object.keys(f).filter((k) => k !== "message").map((k) => k + "=" + JSON.stringify(f[k])).join(" ");
+  const msg = document.createElement("span");
+  msg.textContent = (f.message || "") + (extras ? "  " + extras : "");
+  div.append(lvl, tgt, msg);
+  const feed = $("l-feed");
+  feed.appendChild(div);
+  while (feed.childElementCount > 1000) feed.removeChild(feed.firstChild);
+  feed.scrollTop = feed.scrollHeight;
+}
+$("l-toggle").addEventListener("click", async () => {
+  if (logCtl) { logCtl.abort(); logCtl = null; $("l-toggle").textContent = "follow"; return; }
+  logCtl = new AbortController();
+  $("l-toggle").textContent = "stop";
+  try {
+    await streamLines("/logs?follow=1", logCtl.signal, addLogLine);
+  } catch (e) {
+    if (e.name !== "AbortError") addLogLine(JSON.stringify({ level: "ERROR", fields: { message: String(e.message || e) } }));
+  }
+  logCtl = null;
+  $("l-toggle").textContent = "follow";
+});
+$("l-clear").addEventListener("click", () => { $("l-feed").textContent = ""; });
+
+// --- metrics tab -----------------------------------------------------------------
+let metricRows = [];
+function renderMetrics() {
+  const filter = $("m-filter").value.toLowerCase();
+  const rows = metricRows.filter((r) => !filter || r.series.toLowerCase().includes(filter));
+  const el = $("m-grid");
+  el.textContent = "";
+  const t = document.createElement("table");
+  t.className = "grid";
+  const hd = t.createTHead().insertRow();
+  for (const h of ["series", "value"]) { const th = document.createElement("th"); th.textContent = h; hd.appendChild(th); }
+  const tb = t.createTBody();
+  for (const r of rows) {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = r.series;
+    tr.insertCell().textContent = r.value;
+  }
+  el.appendChild(t);
+  $("m-count").textContent = rows.length + " series";
+}
+async function loadMetrics() {
+  try {
+    const r = await api("/metrics");
+    const text = await r.text();
+    metricRows = [];
+    for (const line of text.split("\n")) {
+      if (!line || line.startsWith("#")) continue;
+      const at = line.lastIndexOf(" ");
+      if (at > 0) metricRows.push({ series: line.slice(0, at), value: line.slice(at + 1) });
+    }
+    renderMetrics();
+  } catch (e) { $("m-grid").textContent = String(e.message || e); }
+}
+$("m-refresh").addEventListener("click", loadMetrics);
+$("m-filter").addEventListener("input", renderMetrics);
+document.querySelector("[data-tab=metrics]").addEventListener("click", () => { if (!metricRows.length) loadMetrics(); });
+
+// --- schema tab --------------------------------------------------------------------
+$("s-refresh").addEventListener("click", loadSchema);
+
+boot();
+</script>
+</body>
+</html>

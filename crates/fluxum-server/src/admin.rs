@@ -13,6 +13,9 @@
 //! | POST | `/audit`         | who changed a table/row and when (SPEC-025 OPS-020; server-peer only) |
 //! | GET  | `/plugins`       | active plugins + adopted seams (SPEC-020 PLG-060; never secrets) |
 //! | POST | `/plugins/:name/disable` | hot circuit-break without restart (PLG-061); `/enable` reverts |
+//! | GET  | `/console`       | the built-in admin web console shell (SPEC-024 DEV-030; [`crate::console`]) |
+//! | GET  | `/console/state` | what the console UI needs to boot: gate posture + auth verdict |
+//! | GET  | `/console/watch` | live committed-diff NDJSON stream (`?table=` filters; DEV-030) |
 //!
 //! Every response uses the RPC-052 envelope
 //! (`{ "success": bool, "request_id"?, "payload"|"error" }`); the paths are
@@ -186,6 +189,41 @@ pub(crate) fn check_access(
         Guard::Allow => Ok(()),
         Guard::Deny(response) => Err(response),
     }
+}
+
+/// Whether `req` presents a credential that authenticates to a server peer
+/// (AUTH-062) — the operator identity the SEC-054 and DEV-031 gates accept.
+pub(crate) fn is_operator(ctx: &Arc<ShardContext>, req: &AdminRequest<'_>) -> bool {
+    req.operator_token.is_some_and(|token| {
+        matches!(
+            ctx.authenticator.authenticate(token.as_bytes()),
+            Ok(outcome) if outcome.server_peer.is_some()
+        )
+    })
+}
+
+/// The SPEC-024 DEV-031 console gate: the SEC-054 network guard first, then —
+/// outside the `development` profile — a server-peer operator credential is
+/// required *even from loopback*. A browser surface can be driven by a lured
+/// cross-site request in a way the curl surface cannot, so anonymous console
+/// data access is a development-profile affordance only.
+pub(crate) fn check_console_access(
+    ctx: &Arc<ShardContext>,
+    req: &AdminRequest<'_>,
+) -> Result<(), AdminResponse> {
+    check_access(ctx, req)?;
+    if ctx.admin_policy().console_open || is_operator(ctx, req) {
+        return Ok(());
+    }
+    ctx.metrics()
+        .note_admin_rejected(fluxum_core::metrics::AdminRejectReason::Unauthenticated);
+    fluxum_core::secevent::admin_denied(req.client_ip, req.path, "console_unauthenticated");
+    Err(AdminResponse::err(
+        401,
+        None,
+        "the console requires an operator credential (server-peer token) outside the \
+         development profile (SPEC-024 DEV-031)",
+    ))
 }
 
 /// Whether a route changes state (as opposed to a read) — the routes whose

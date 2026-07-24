@@ -24,6 +24,7 @@ pub mod admin;
 pub mod boot;
 pub mod clientip;
 pub mod connguard;
+pub mod console;
 pub mod http;
 pub mod logging;
 pub mod namespace;
@@ -209,21 +210,31 @@ pub struct AdminPolicy {
     pub require_operator: bool,
     /// Whether `/health` and `/metrics` stay ungated.
     pub open_health_metrics: bool,
+    /// Whether the admin web console's data routes admit anonymous callers
+    /// (SPEC-024 DEV-031). `true` only under the `development` profile;
+    /// outside it every console data/stream request must carry a server-peer
+    /// operator credential, loopback included — a browser surface is exposed
+    /// to lured cross-site requests in a way the curl surface is not.
+    pub console_open: bool,
 }
 
 impl Default for AdminPolicy {
     fn default() -> Self {
-        // Safe by default: loopback only, credential required for remote.
+        // Safe by default: loopback only, credential required for remote,
+        // console gated (a bare assembly is treated as production).
         Self {
             trusted: fluxum_core::net::IpSet::default(),
             require_operator: true,
             open_health_metrics: true,
+            console_open: false,
         }
     }
 }
 
 impl AdminPolicy {
     /// Resolve from config, or fail if `admin.trusted` has a bad entry.
+    /// `console_open` stays at its safe default (`false`); assemblies that
+    /// know the deployment profile use [`AdminPolicy::from_config_with_profile`].
     ///
     /// # Errors
     /// A `server.admin.trusted` entry that is not an IP address or CIDR block.
@@ -232,6 +243,23 @@ impl AdminPolicy {
             trusted: fluxum_core::net::IpSet::parse(&cfg.trusted)?,
             require_operator: cfg.require_operator,
             open_health_metrics: cfg.open_health_metrics,
+            console_open: false,
+        })
+    }
+
+    /// [`AdminPolicy::from_config`], with the DEV-031 console gate derived
+    /// from the deployment profile: anonymous console access is a
+    /// `development`-profile affordance only.
+    ///
+    /// # Errors
+    /// A `server.admin.trusted` entry that is not an IP address or CIDR block.
+    pub fn from_config_with_profile(
+        cfg: &fluxum_core::config::AdminConfig,
+        profile: fluxum_core::config::Profile,
+    ) -> fluxum_core::Result<Self> {
+        Ok(Self {
+            console_open: profile == fluxum_core::config::Profile::Development,
+            ..Self::from_config(cfg)?
         })
     }
 }
@@ -662,7 +690,7 @@ impl ShardContext {
             tracing::warn!(error = %e, "connection_limits block/allowlist not applied");
         }
         guard.set_max_total_conns(config.server.connection_limits.max_total_conns);
-        match AdminPolicy::from_config(&config.server.admin) {
+        match AdminPolicy::from_config_with_profile(&config.server.admin, config.profile) {
             Ok(policy) => self.set_admin_policy(policy),
             Err(e) => tracing::warn!(error = %e, "server.admin policy not applied"),
         }
