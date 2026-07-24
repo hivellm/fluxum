@@ -208,6 +208,15 @@ history: the node boots with a raised fencing epoch (the `pitr.lineage`
 marker) and must seed a new replica set rather than rejoin the old one
 (REP-072). Schedule backups externally (cron / a systemd timer) per REP-065.
 
+**Offsite (S3-compatible) targets** (SPEC-025 OPS-010/011): configure
+`replication.archive.remote` (endpoint, bucket, credentials) and the
+checkpoint worker incrementally uploads checkpoint objects and archived
+segments after each pass — content-addressed, so unchanged artifacts are
+never re-sent, and never on the write path. `fluxum backup create --remote`
+pushes a full verified backup; `restore --remote [--to-…]` restores or PITRs
+from it, re-hashing every download and range-reading only the needed window
+of the target segment (seekable-zstd framing).
+
 ## 8. Upgrades
 
 Deployment is a **fast binary restart** (there is no hot code swap —

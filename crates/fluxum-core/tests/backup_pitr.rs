@@ -158,6 +158,26 @@ async fn verify_names_the_file_a_single_bit_flip_corrupted() {
 }
 
 #[tokio::test]
+async fn a_corrupted_checkpoint_pack_is_named_by_verify() {
+    let world = build(12, 6).await;
+    let out = world.root.path().join("backup");
+    backup::create(&world.source(), &out).unwrap();
+    let manifest: fluxum_core::backup::BackupManifest =
+        rmp_serde::from_slice(&fs::read(out.join("manifest.mpack")).unwrap()).unwrap();
+    let pack_rel = manifest.shards[0].checkpoint_file.clone();
+    let pack = out.join(&pack_rel);
+    let mut bytes = fs::read(&pack).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0x01;
+    fs::write(&pack, &bytes).unwrap();
+
+    let report = backup::verify(&out).unwrap();
+    let errors: Vec<_> = report.errors().collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].file, pack_rel);
+}
+
+#[tokio::test]
 async fn restore_refuses_a_non_empty_target_without_force() {
     let world = build(8, 6).await;
     let out = world.root.path().join("backup");
@@ -401,6 +421,7 @@ async fn archive_retention_sweeps_only_old_segment_copies() {
                 log_dir: world.log_dir(),
                 archive_dir: Some(world.archive_dir()),
                 archive_retention: Some(std::time::Duration::from_millis(50)),
+                remote: None,
             }),
             ..WorkerOptions::default()
         },

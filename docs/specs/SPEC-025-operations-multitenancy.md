@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft; **§2 Object-storage backup & archive shipped** (FR-139, OPS-010/011): [`fluxum_core::backup::{store,seekable,remote}`](../../crates/fluxum-core/src/backup/) — an `ArtifactStore` trait (local-fs + S3-compatible SigV4 backends), seekable-zstd segment framing with a trailing block index, content-addressed push (`fluxum backup create --remote`) whose re-push uploads zero unchanged artifacts, re-hash-on-download restore/PITR (`restore --remote [--to-…]`, a flipped bit names the artifact and refuses it), PITR range-reading only the cut segment's index trailer + covering blocks, and the checkpoint worker's incremental remote pass (`replication.archive.remote.*`) that never touches the write path. §3–§7 status unchanged (audit/drain/reload/namespaces/quotas shipped in phase 5). |
 | **Phase / tasks** | Phase 5 (audit, drain, hot-reload, namespaces, quotas) · Phase 7 (object-storage backup) ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-04, FR-90..FR-93, FR-103, FR-110 (extends); new: FR-139 (object-storage backup), FR-140 (audit trail), FR-141 (graceful drain), FR-142 (config hot-reload), FR-143 (database namespaces), FR-144 (per-tenant quotas) |
 | **Requirement prefix** | `OPS-` |

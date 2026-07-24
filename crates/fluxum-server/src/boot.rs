@@ -183,6 +183,29 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // hook; `POST /checkpoint` and the drain's final checkpoint reach the
     // worker through the context.
     let archive = &config.replication.archive;
+    // SPEC-025 OPS-011: the incremental remote archiver, when configured —
+    // uploads run on the checkpoint worker's own thread, never the writer's.
+    let remote = if archive.remote.enabled {
+        let remote = &archive.remote;
+        let store =
+            fluxum_core::backup::store::S3Store::new(fluxum_core::backup::store::S3Config {
+                endpoint: remote.endpoint.clone(),
+                bucket: remote.bucket.clone(),
+                region: remote.effective_region().to_owned(),
+                access_key: remote.access_key.clone(),
+                secret_key: remote
+                    .secret_key
+                    .as_ref()
+                    .map(|s| s.expose_str().to_owned())
+                    .unwrap_or_default(),
+            });
+        Some(Arc::new(fluxum_core::backup::remote::RemoteArchiver::new(
+            Arc::new(store),
+            remote.effective_prefix(),
+        )))
+    } else {
+        None
+    };
     let worker = fluxum_core::checkpoint::SnapshotWorker::spawn(
         Arc::clone(ctx.store()),
         repo,
@@ -197,6 +220,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
                     .enabled
                     .then(|| archive.retention_duration())
                     .transpose()?,
+                remote,
             }),
             metrics: Some(Arc::clone(ctx.metrics())),
             ..fluxum_core::checkpoint::WorkerOptions::default()

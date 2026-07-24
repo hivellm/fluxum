@@ -33,8 +33,10 @@ hkdf.workspace = true
 sysinfo.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+tempfile.workspace = true
 tracing.workspace = true
 unicode-normalization.workspace = true
+ureq.workspace = true
 uuid.workspace = true
 zstd.workspace = true
 
@@ -42,7 +44,6 @@ zstd.workspace = true
 crc.workspace = true
 criterion.workspace = true
 proptest.workspace = true
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 # Captures the `security`-target trail in secevent unit tests.
 tracing-subscriber.workspace = true

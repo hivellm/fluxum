@@ -42,6 +42,10 @@ pub struct LogCompaction {
     /// retention`): copies older than this are swept after each checkpoint.
     /// `None` retains forever. This window IS the PITR window (§9).
     pub archive_retention: Option<std::time::Duration>,
+    /// Remote incremental archiver (SPEC-025 OPS-011): when set, each
+    /// post-checkpoint pass uploads new checkpoint objects/manifests and
+    /// freshly archived segments — on this worker thread, never the writer.
+    pub remote: Option<std::sync::Arc<crate::backup::remote::RemoteArchiver>>,
 }
 
 /// Tuning knobs for a [`SnapshotWorker`].
@@ -380,6 +384,33 @@ impl Actor {
                 error = %e,
                 "archive retention sweep failed; stale copies remain until the next pass"
             );
+        }
+        // OPS-011: the scheduled incremental remote pass — content-addressed
+        // uploads with existence probes, on this thread, so a slow or down
+        // endpoint delays nothing but its own next attempt.
+        if let Some(remote) = &compaction.remote {
+            match remote.sync(
+                self.repo.dir(),
+                compaction.archive_dir.as_deref(),
+                self.shard_id,
+            ) {
+                Ok(report) if report.uploaded > 0 => {
+                    tracing::info!(
+                        shard_id = self.shard_id,
+                        uploaded = report.uploaded,
+                        skipped = report.skipped,
+                        "remote archival pass uploaded new artifacts (OPS-011)"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        shard_id = self.shard_id,
+                        error = %e,
+                        "remote archival pass failed; retrying at the next checkpoint"
+                    );
+                }
+            }
         }
     }
 }

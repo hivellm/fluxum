@@ -35,6 +35,10 @@
 //! replication's handshake history check is what will refuse partial sync
 //! into the old set once replica sets land (T7.1).
 
+pub mod remote;
+pub mod seekable;
+pub mod store;
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

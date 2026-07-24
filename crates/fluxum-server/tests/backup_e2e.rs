@@ -196,10 +196,49 @@ async fn backup_restore_and_pitr_round_trip_under_sustained_writes() {
     let summary = fluxum_cli::backup::verify(&out).unwrap();
     assert!(summary.contains("all good"), "{summary}");
 
+    // OPS-010/011: a remote push while the writer is STILL writing — the
+    // same hot capture, content-addressed into an object store (the trait
+    // is target-agnostic; FsStore stands in for S3, whose wire client has
+    // its own suite). A second push of the same world uploads nothing new
+    // beyond what the moving head added.
+    let remote_root = root.path().join("object-store");
+    let remote_store = fluxum_core::backup::store::FsStore::open(&remote_root).unwrap();
+    let push = {
+        let source = source.clone();
+        tokio::task::spawn_blocking(move || {
+            fluxum_core::backup::remote::push(&source, &remote_store, "fluxum")
+        })
+        .await
+        .unwrap()
+        .unwrap()
+    };
+    assert!(push.uploaded > 0, "{push:?}");
+    assert!(push.head_tx_id >= report.head_tx_id, "{push:?}");
+
     // Stop the writes, note the head, and shut the server down.
     stop.store(true, Ordering::Relaxed);
     writer.await.unwrap();
     server.shutdown();
+
+    // Remote restore reproduces the push's exact head on a rebooted server.
+    let remote_restored = root.path().join("remote-restored");
+    let dirs = fluxum_core::backup::RestoreDirs {
+        checkpoint_dir: remote_restored.join("checkpoints"),
+        log_dir: remote_restored.join("log"),
+    };
+    let remote_store = fluxum_core::backup::store::FsStore::open(&remote_root).unwrap();
+    let restored =
+        fluxum_core::backup::remote::restore(&remote_store, "fluxum", &dirs, false).unwrap();
+    assert_eq!(restored.head_tx_id, push.head_tx_id);
+    let server_r = boot::serve(config_over(&remote_restored, 10_000))
+        .await
+        .unwrap();
+    assert_eq!(
+        task_count(server_r.http.local_addr).await,
+        push.head_tx_id - base_tx,
+        "remote restore reproduces the push head exactly (OPS-010)"
+    );
+    server_r.shutdown();
 
     // The backup head is a moving snapshot: tasks captured = head - base.
     let tasks_at_head = report.head_tx_id - base_tx;

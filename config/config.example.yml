@@ -114,6 +114,18 @@ replication:
     enabled: true
     dir: ./data/archive
     retention: 7d            # <n>s | <n>m | <n>h | <n>d
+    # S3-compatible remote archival (SPEC-025 OPS-010/011): the checkpoint
+    # worker incrementally uploads checkpoint objects + archived segments
+    # (seekable-zstd, PITR range-readable) after each pass — never on the
+    # write path. `fluxum backup create/restore --remote` uses this target.
+    remote:
+      enabled: false
+      endpoint: ""           # http(s)://host[:port]
+      bucket: ""
+      prefix: fluxum         # key prefix inside the bucket
+      region: us-east-1      # any consistent value for non-AWS services
+      access_key: ""
+      secret_key: ${FLUXUM_ARCHIVE_SECRET_KEY}
 
 simd: auto                   # auto | avx512 | avx2 | neon | scalar (force for debugging)
 

@@ -1033,6 +1033,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "ureq",
  "uuid",
  "x25519-dalek",
  "xxhash-rust",

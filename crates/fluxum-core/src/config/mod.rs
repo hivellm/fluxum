@@ -565,6 +565,8 @@ pub struct ArchiveConfig {
     /// Retention window: `<n>s | <n>m | <n>h | <n>d` (default `7d`). Equals
     /// the PITR window.
     pub retention: String,
+    /// Remote (S3-compatible) archival target (SPEC-025 OPS-010/011).
+    pub remote: RemoteArchiveConfig,
 }
 
 impl Default for ArchiveConfig {
@@ -573,6 +575,53 @@ impl Default for ArchiveConfig {
             enabled: true,
             dir: PathBuf::from("./data/archive"),
             retention: "7d".to_owned(),
+            remote: RemoteArchiveConfig::default(),
+        }
+    }
+}
+
+/// S3-compatible remote archival (SPEC-025 OPS-010/011): when enabled, the
+/// checkpoint worker incrementally uploads checkpoint objects/manifests and
+/// freshly archived segments (seekable-zstd) after each pass — never on the
+/// write path — and `fluxum backup create --remote` / `restore --remote`
+/// use the same target.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RemoteArchiveConfig {
+    /// Whether remote archival is on (default `false`).
+    pub enabled: bool,
+    /// `http(s)://host[:port]` of the S3-compatible endpoint.
+    pub endpoint: String,
+    /// Bucket name.
+    pub bucket: String,
+    /// Key prefix inside the bucket (default `fluxum`).
+    pub prefix: String,
+    /// SigV4 region (any consistent value for non-AWS services).
+    pub region: String,
+    /// Access key id.
+    pub access_key: String,
+    /// Secret access key; supports `${VAR}` env expansion in the YAML file
+    /// (SEC-058: redacted, zeroized).
+    pub secret_key: Option<crate::secret::Secret<String>>,
+}
+
+impl RemoteArchiveConfig {
+    /// Effective prefix (`fluxum` when unset).
+    pub fn effective_prefix(&self) -> &str {
+        if self.prefix.is_empty() {
+            "fluxum"
+        } else {
+            &self.prefix
+        }
+    }
+
+    /// Effective region (`us-east-1` when unset — S3-compatible services
+    /// accept any consistent value).
+    pub fn effective_region(&self) -> &str {
+        if self.region.is_empty() {
+            "us-east-1"
+        } else {
+            &self.region
         }
     }
 }
@@ -1263,6 +1312,33 @@ impl Config {
         // REP-062: the archive retention window must parse (it is the PITR
         // window, so a typo here silently shrinking it would be costly).
         self.replication.archive.retention_duration()?;
+        // OPS-010: an enabled remote target needs a complete address and
+        // credentials — a partial one would fail on the first nightly pass.
+        let remote = &self.replication.archive.remote;
+        if remote.enabled {
+            for (key, value) in [
+                ("endpoint", remote.endpoint.as_str()),
+                ("bucket", remote.bucket.as_str()),
+                ("access_key", remote.access_key.as_str()),
+            ] {
+                if value.is_empty() {
+                    return Err(FluxumError::config(format!(
+                        "replication.archive.remote.{key}: required when remote archival is \
+                         enabled (SPEC-025 OPS-010)"
+                    )));
+                }
+            }
+            if remote
+                .secret_key
+                .as_ref()
+                .is_none_or(|s| s.expose_str().is_empty())
+            {
+                return Err(FluxumError::config(
+                    "replication.archive.remote.secret_key: required when remote archival is \
+                     enabled (SPEC-025 OPS-010)",
+                ));
+            }
+        }
         if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
             return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
         }

@@ -5,8 +5,13 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.14% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
-drivers live), after phase7_backup-pitr (~1,000 new lines: `fluxum_core::backup`
+**Current standing:** **90.01% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
+drivers live), after phase7_backup-object-storage-archive (~1,000 more lines:
+seekable-zstd framing at 90%+, the S3 SigV4 store at 92%, remote push/restore/PITR at
+84%+ via the in-process S3 wire fixture; the margin is thin — the standing debt now
+includes `cli/backup.rs` remote/error plumbing (62%) and remote.rs error arms, which the
+next backup-adjacent task should factor into testable seams). Prior: 90.14% after
+phase7_backup-pitr (~1,000 new lines: `fluxum_core::backup`
 create/verify/restore/PITR at 82%+, the CLI dispatch + wrappers recovered by the
 `backup_cli` dispatch suite after an initial dip to 89.92%; residuals are error-arm
 plumbing in `cli/backup.rs` and the `main.rs` drain-checkpoint glue, category 9).
@@ -20,7 +25,7 @@ phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are
 by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
 wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
 **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14%. The **standing debt items below remain open**: (a) the
+90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);

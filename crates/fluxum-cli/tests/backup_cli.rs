@@ -162,6 +162,67 @@ fn data_layout_resolves_config_data_dir_and_defaults() {
     assert!(DataLayout::resolve(Some(&config), None).is_err());
 }
 
+#[test]
+fn remote_flows_resolve_the_configured_target() {
+    let dir = tempfile::tempdir().unwrap();
+    // No remote block in the config: --remote is a clear refusal, not a
+    // guessing game.
+    let config = dir.path().join("config.yml");
+    std::fs::write(&config, "profile: development\n").unwrap();
+    let err = fluxum_cli::backup::remote_target(Some(&config)).unwrap_err();
+    assert!(err.contains("not enabled"), "{err}");
+    assert_eq!(
+        run(args(&[
+            "backup",
+            "create",
+            "--remote",
+            "--config",
+            config.to_str().unwrap()
+        ])),
+        1
+    );
+
+    // A configured remote target resolves (the store is built without any
+    // network I/O); a dead endpoint then fails the first transfer cleanly.
+    std::fs::write(
+        &config,
+        "profile: development\nreplication:\n  archive:\n    remote:\n      enabled: true\n\
+         \x20     endpoint: http://127.0.0.1:9\n      bucket: b\n      access_key: k\n\
+         \x20     secret_key: s\n      prefix: p\n",
+    )
+    .unwrap();
+    let (_store, prefix) = fluxum_cli::backup::remote_target(Some(&config)).unwrap();
+    assert_eq!(prefix, "p");
+    // restore --remote: the latest-manifest fetch hits the dead endpoint
+    // and surfaces the transport error (exit 1), covering the dispatch.
+    assert_eq!(
+        run(args(&[
+            "backup",
+            "restore",
+            "--remote",
+            "--data-dir",
+            dir.path().join("empty").to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ])),
+        1
+    );
+    // create --remote: the hot capture runs first; an empty layout is the
+    // engine's own refusal before any transfer.
+    assert_eq!(
+        run(args(&[
+            "backup",
+            "create",
+            "--remote",
+            "--data-dir",
+            dir.path().join("empty").to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+        ])),
+        1
+    );
+}
+
 /// `--fresh-checkpoint` posts to the server before creating; the reported
 /// coverage is printed and create proceeds (here into an empty layout, whose
 /// engine error exits 1 — the request path itself is what this pins).

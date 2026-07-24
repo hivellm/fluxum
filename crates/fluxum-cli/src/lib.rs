@@ -239,11 +239,11 @@ USAGE:
     fluxum generate --lang <lang> --schema <url_or_file> --out <dir>
     fluxum seed <file> --server <host:port>
     fluxum migrate --plan [--path <dir>]
-    fluxum backup create --out <dir> [--config <file>|--data-dir <dir>]
+    fluxum backup create (--out <dir> | --remote) [--config <file>|--data-dir <dir>]
                          [--fresh-checkpoint --server <host:port>]
     fluxum backup verify --from <dir>
-    fluxum backup restore --from <dir> [--config <file>|--data-dir <dir>] [--force]
-                          [--to-timestamp <rfc3339|µs> | --to-tx-id <n>]
+    fluxum backup restore (--from <dir> | --remote) [--config <file>|--data-dir <dir>]
+                          [--force] [--to-timestamp <rfc3339|µs> | --to-tx-id <n>]
                           [--archive-dir <dir>]
 
 COMMANDS:
@@ -290,7 +290,10 @@ COMMANDS:
                      plus the covering log segments, zstd-compressed with an
                      integrity manifest — no writer stall, safe against a
                      running server. --fresh-checkpoint asks the server for
-                     a checkpoint first (POST /checkpoint).
+                     a checkpoint first (POST /checkpoint). --remote pushes
+                     to the configured S3-compatible target instead
+                     (SPEC-025 OPS-010): content-addressed and incremental,
+                     segments in seekable-zstd framing.
 
     backup verify    Validate a backup without restoring it (REP-064): CRCs,
                      record decode, and tx-chain contiguity. Exit 0 clean;
@@ -486,6 +489,8 @@ where
                 let data_dir = flag(rest, "--data-dir").map(std::path::PathBuf::from);
                 backup::DataLayout::resolve(config.as_deref(), data_dir.as_deref())
             };
+            let remote = rest.contains(&"--remote");
+            let config_flag = flag(rest, "--config").map(std::path::PathBuf::from);
             let result = match *sub {
                 "create" => {
                     let layout = match resolve_layout() {
@@ -495,25 +500,32 @@ where
                             return 2;
                         }
                     };
-                    let Some(out) = flag(rest, "--out") else {
-                        eprintln!("backup create: --out <dir> is required\n\n{USAGE}");
-                        return 2;
-                    };
-                    let fresh = if rest.contains(&"--fresh-checkpoint") {
-                        match flag(rest, "--server") {
-                            Some(server) => Some(server),
-                            None => {
-                                eprintln!(
-                                    "backup create: --fresh-checkpoint needs --server \
-                                     <host:port> (a running server takes the checkpoint)"
-                                );
-                                return 2;
-                            }
-                        }
+                    if remote {
+                        // OPS-010: push to the configured object store.
+                        backup::create_remote(&layout, config_flag.as_deref())
                     } else {
-                        None
-                    };
-                    backup::create(&layout, std::path::Path::new(&out), fresh.as_deref())
+                        let Some(out) = flag(rest, "--out") else {
+                            eprintln!(
+                                "backup create: --out <dir> (or --remote) is required\n\n{USAGE}"
+                            );
+                            return 2;
+                        };
+                        let fresh = if rest.contains(&"--fresh-checkpoint") {
+                            match flag(rest, "--server") {
+                                Some(server) => Some(server),
+                                None => {
+                                    eprintln!(
+                                        "backup create: --fresh-checkpoint needs --server \
+                                         <host:port> (a running server takes the checkpoint)"
+                                    );
+                                    return 2;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        backup::create(&layout, std::path::Path::new(&out), fresh.as_deref())
+                    }
                 }
                 "verify" => match flag(rest, "--from") {
                     Some(from) => backup::verify(std::path::Path::new(&from)),
@@ -530,10 +542,13 @@ where
                             return 2;
                         }
                     };
-                    let Some(from) = flag(rest, "--from") else {
-                        eprintln!("backup restore: --from <dir> is required\n\n{USAGE}");
+                    let from = flag(rest, "--from");
+                    if from.is_none() && !remote {
+                        eprintln!(
+                            "backup restore: --from <dir> (or --remote) is required\n\n{USAGE}"
+                        );
                         return 2;
-                    };
+                    }
                     let to_tx = flag(rest, "--to-tx-id");
                     let to_ts = flag(rest, "--to-timestamp");
                     let target = match (to_tx, to_ts) {
@@ -562,14 +577,19 @@ where
                         },
                         (None, None) => None,
                     };
-                    let archive = flag(rest, "--archive-dir").map(std::path::PathBuf::from);
-                    backup::restore(
-                        std::path::Path::new(&from),
-                        &layout,
-                        target,
-                        archive.as_deref(),
-                        rest.contains(&"--force"),
-                    )
+                    let force = rest.contains(&"--force");
+                    if remote {
+                        backup::restore_remote(&layout, config_flag.as_deref(), target, force)
+                    } else {
+                        let archive = flag(rest, "--archive-dir").map(std::path::PathBuf::from);
+                        backup::restore(
+                            std::path::Path::new(from.as_deref().unwrap_or_default()),
+                            &layout,
+                            target,
+                            archive.as_deref(),
+                            force,
+                        )
+                    }
                 }
                 _ => unreachable!("guarded by the match arm"),
             };

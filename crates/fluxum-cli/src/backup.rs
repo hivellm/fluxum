@@ -11,6 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
+use fluxum_core::backup::store::{S3Config, S3Store};
 use fluxum_core::backup::{self, BackupSource, PitrTarget, RestoreDirs};
 
 /// Where the data lives, resolved from `--config`, `--data-dir`, or the
@@ -149,6 +150,105 @@ pub fn restore(
                 "PITR complete: last applied tx {} at {} µs (fork epoch {}; the restored node \
                  must seed a new replica set, REP-072)",
                 report.last_tx_id, report.last_timestamp, report.fork_min_epoch
+            ))
+        }
+    }
+}
+
+/// The configured S3-compatible target (SPEC-025 OPS-010): store + prefix
+/// from `replication.archive.remote`, requiring it to be enabled.
+///
+/// # Errors
+/// A config that does not load, or remote archival not configured.
+pub fn remote_target(config_path: Option<&Path>) -> Result<(S3Store, String), String> {
+    let config = fluxum_core::config::Config::load(config_path).map_err(|e| e.to_string())?;
+    let remote = &config.replication.archive.remote;
+    if !remote.enabled {
+        return Err(
+            "replication.archive.remote is not enabled in the configuration — set \
+             endpoint/bucket/credentials there (SPEC-025 OPS-010)"
+                .to_owned(),
+        );
+    }
+    let store = S3Store::new(S3Config {
+        endpoint: remote.endpoint.clone(),
+        bucket: remote.bucket.clone(),
+        region: remote.effective_region().to_owned(),
+        access_key: remote.access_key.clone(),
+        secret_key: remote
+            .secret_key
+            .as_ref()
+            .map(|s| s.expose_str().to_owned())
+            .unwrap_or_default(),
+    });
+    Ok((store, remote.effective_prefix().to_owned()))
+}
+
+/// `fluxum backup create --remote` (OPS-010/011): hot-capture and push to
+/// the configured object store, content-addressed and incremental.
+///
+/// # Errors
+/// Configuration, capture, or transport failures.
+pub fn create_remote(layout: &DataLayout, config_path: Option<&Path>) -> Result<String, String> {
+    let (store, prefix) = remote_target(config_path)?;
+    let report = backup::remote::push(
+        &BackupSource {
+            checkpoint_dir: layout.checkpoint_dir.clone(),
+            log_dir: layout.log_dir.clone(),
+        },
+        &store,
+        &prefix,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "pushed backup {} to the object store\n  manifest: {}\n  uploaded: {} artifact(s) \
+         ({} bytes)  already present: {}  head tx: {}",
+        report.backup_id,
+        report.manifest_key,
+        report.uploaded,
+        report.bytes_uploaded,
+        report.skipped,
+        report.head_tx_id
+    ))
+}
+
+/// `fluxum backup restore --remote` (OPS-010/011): restore — or PITR, with
+/// a target — from the newest remote backup; every download re-hashed.
+///
+/// # Errors
+/// Configuration, integrity, chain-gap, or transport failures.
+pub fn restore_remote(
+    layout: &DataLayout,
+    config_path: Option<&Path>,
+    target: Option<PitrTarget>,
+    force: bool,
+) -> Result<String, String> {
+    let (store, prefix) = remote_target(config_path)?;
+    let dirs = RestoreDirs {
+        checkpoint_dir: layout.checkpoint_dir.clone(),
+        log_dir: layout.log_dir.clone(),
+    };
+    match target {
+        None => {
+            let report = backup::remote::restore(&store, &prefix, &dirs, force)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "restored {} shard(s), {} segment(s) from the object store; state reproduces \
+                 tx {} on next boot",
+                report.shards, report.segments, report.head_tx_id
+            ))
+        }
+        Some(target) => {
+            let (report, stats) = backup::remote::pitr(&store, &prefix, &dirs, target, force)
+                .map_err(|e| e.to_string())?;
+            Ok(format!(
+                "PITR complete: last applied tx {} at {} µs (fork epoch {}); target segment \
+                 fetched via range reads: {} of {} bytes",
+                report.last_tx_id,
+                report.last_timestamp,
+                report.fork_min_epoch,
+                stats.target_segment_bytes_fetched,
+                stats.target_segment_stored_len
             ))
         }
     }

@@ -452,6 +452,7 @@ async fn checkpoint_now_surfaces_write_failures_and_counts_them() {
                 log_dir: dir.path().join("no-such-log-dir"),
                 archive_dir: None,
                 archive_retention: None,
+                remote: None,
             }),
             ..WorkerOptions::default()
         },
@@ -1306,6 +1307,7 @@ async fn worker_prunes_retention_and_compacts_through_the_archive() {
                 log_dir: log_dir.clone(),
                 archive_dir: Some(archive_dir.clone()),
                 archive_retention: None,
+                remote: None,
             }),
             metrics: None,
         },
