@@ -1,0 +1,33 @@
+# Fluxum compose example (deployment guide: docs/DEPLOYMENT.md).
+# Run from the repository root:
+#   docker compose -f deploy/docker-compose.yml up -d
+#   curl http://127.0.0.1:15800/health
+services:
+  fluxum:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: fluxum:latest
+    ports:
+      - "15800:15800"   # HTTP: admin API + console + /rpc
+      - "15801:15801"   # FluxRPC binary TCP
+    environment:
+      # Production profile + token auth need a real secret — generate one:
+      #   openssl rand -hex 32
+      FLUXUM_AUTH_SECRET: change-me-generate-a-real-secret
+      # Plaintext on a non-loopback bind is refused by default (SEC-059).
+      # This opt-out is for links encrypted BELOW Fluxum (compose-internal
+      # networks, a mesh, a TLS-terminating LB). For direct exposure, drop
+      # it and set server.tls.cert/key instead (docs/DEPLOYMENT.md §TLS).
+      FLUXUM_SERVER_ALLOW_PLAINTEXT: "true"
+    volumes:
+      - fluxum-data:/var/lib/fluxum
+    # The FR-05 hardware probe reads these cgroup limits: with 1 CPU and
+    # 512 MB the `auto` keys derive 1 worker thread, 1 shard, and a ~256 MB
+    # memory budget (max(128MiB floor, 0.5 x effective memory), NFR-12).
+    cpus: 1.0
+    mem_limit: 512m
+    restart: unless-stopped
+
+volumes:
+  fluxum-data:

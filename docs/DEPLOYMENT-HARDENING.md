@@ -1,5 +1,8 @@
 # Deployment hardening for a directly exposed Fluxum port
 
+> Install/run/upgrade and sizing live in [DEPLOYMENT.md](DEPLOYMENT.md);
+> this page is the OS-level security pass for exposed ports.
+
 Fluxum's production posture is a **directly exposed port** — no mandatory
 reverse proxy or CDN in front. The in-process defenses (SPEC-026 §4:
 per-IP caps, failed-auth backoff, blocklist/allowlist, global connection

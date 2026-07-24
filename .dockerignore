@@ -1,0 +1,10 @@
+# Keep the docker build context lean: the build stage needs the workspace
+# sources and lockfile, nothing else.
+target/
+data/
+.git/
+.rulebook/
+.playwright-mcp/
+.claude/
+docs/analysis/
+*.profraw

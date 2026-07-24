@@ -154,6 +154,13 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         &config.server.admin,
         config.profile,
     )?);
+    // FR-05 / HWA-012/013: probe the hardware (container-aware — cgroup CPU
+    // and memory limits win over host totals), derive the `auto` keys, and
+    // install the result so `GET /health` reports the probe inputs and every
+    // derived value with its provenance. `main.rs` runs the same derivation
+    // earlier to size the Tokio runtime, which exists before this is reached.
+    let hardware = fluxum_core::hw::HardwareProfile::probe();
+    ctx.set_effective_config(&fluxum_core::hw::derive(&hardware, config)?);
     Ok(ctx)
 }
 

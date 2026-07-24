@@ -86,7 +86,22 @@ fn main() -> ExitCode {
         }
     };
 
+    // FR-05 / HWA-012: size the runtime from the probed hardware —
+    // container-aware, so a cgroup CPU quota (docker --cpus) bounds the
+    // worker count instead of the host's core total. `boot::assemble`
+    // re-derives and installs the same result on the context for /health.
+    let worker_threads = {
+        let hardware = fluxum_core::hw::HardwareProfile::probe();
+        match fluxum_core::hw::derive(&hardware, &config) {
+            Ok(effective) => effective.worker_threads.value,
+            Err(err) => {
+                eprintln!("configuration error: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
         .enable_all()
         .build()
     {

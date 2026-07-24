@@ -1,12 +1,12 @@
 ## 1. Implementation
-- [ ] 1.1 Write the deployment guide (ROADMAP M7 definition-of-done): install, run, upgrade, data-directory layout, ports 15800/15801
-- [ ] 1.2 systemd unit file (hardening options, restart policy) verified to boot the demo config on a clean machine
-- [ ] 1.3 Dockerfile (+ compose example) building the single release binary; container respects cgroup limits via the FR-05 hardware probe
-- [ ] 1.4 Config reference: every config.yml key, default, and FLUXUM_ env override (generated from or checked against the example config from phase0)
-- [ ] 1.5 Droplet profile guidance: recommended settings for 1 vCPU / 512 MB (memory.budget auto, expectations per NFR-12)
-- [ ] 1.6 Verification: clean-machine install run following the guide verbatim (docker and systemd paths both boot and serve /health)
+- [x] 1.1 Write the deployment guide (ROADMAP M7 definition-of-done): install, run, upgrade, data-directory layout, ports 15800/15801 (docs/DEPLOYMENT.md §1–§8, §10; cross-linked with docs/DEPLOYMENT-HARDENING.md)
+- [x] 1.2 systemd unit file (hardening options, restart policy) verified to boot the demo config on a clean machine (deploy/fluxum.service — DynamicUser + StateDirectory + full sandbox set, Restart=on-failure, SIGTERM drain / SIGHUP reload; verified in a clean jrei/systemd-debian:12 container: enable --now → active, /health 200, systemctl reload applied, restart drained and came back)
+- [x] 1.3 Dockerfile (+ compose example) building the single release binary; container respects cgroup limits via the FR-05 hardware probe (deploy/Dockerfile multi-stage + deploy/docker-compose.yml + .dockerignore; probe wired into the REAL boot — boot::assemble now derives+installs the effective config and main.rs sizes the Tokio runtime from it; verified: --cpus 1 --memory 512m → /health shows cgroup_cpu_quota 1.0, mem limit 512 MiB, worker_threads 1, shards 1, budget 256 MiB, container healthy)
+- [x] 1.4 Config reference: every config.yml key, default, and FLUXUM_ env override (config/config.example.yml rewritten complete; pinned by crates/fluxum-core/tests/config_example.rs — strict parse + every-Config-key-present; DEPLOYMENT.md §5 documents layering, ${VAR} expansion, and the reloadable-vs-frozen split)
+- [x] 1.5 Droplet profile guidance: recommended settings for 1 vCPU / 512 MB (memory.budget auto, expectations per NFR-12) (DEPLOYMENT.md §9: auto-derivation table + max_total_conns/compression/swap guidance)
+- [x] 1.6 Verification: clean-machine install run following the guide verbatim (docker and systemd paths both boot and serve /health) (docker: image built from deploy/Dockerfile, run per §4, /health 200 + healthy; systemd: clean debian-12 systemd container, §3 commands verbatim → active + /health 200 + reload + restart. The run caught and fixed two real guide bugs: config mode 640 vs DynamicUser, and /bin/kill absent on minimal systems)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation
-- [ ] 2.2 Write tests covering the new behavior
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Update or create documentation covering the implementation (docs/DEPLOYMENT.md is the deliverable; DEPLOYMENT-HARDENING cross-link; example config is the reference of record)
+- [x] 2.2 Write tests covering the new behavior (config_example.rs: strict parse + key completeness; boot_probe.rs: the real boot installs the probe-derived effective config)
+- [x] 2.3 Run tests and confirm they pass (both suites green; full workspace gates run before commit)

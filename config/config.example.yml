@@ -1,23 +1,34 @@
 # Fluxum configuration — every key with its built-in default.
 #
+# This file is the config reference of record: a test
+# (crates/fluxum-core/tests/config_example.rs) fails the build if a Config
+# key is missing here, so what you read below is complete for this build.
+#
 # Layering (SPEC-012 OBS-080): FLUXUM_* env var > this file > profile
 # defaults > built-in default. Every key maps to an env var by upper-casing
 # its path and joining with "_": server.tcp_port -> FLUXUM_SERVER_TCP_PORT.
 # Values of the exact form ${VAR} are expanded from the environment.
 #
 # Keys accepting "auto" are derived from the boot-time hardware probe
-# (SPEC-016); an explicit value always wins over the derivation.
+# (SPEC-016, container-aware: cgroup CPU/memory limits win over host
+# totals); an explicit value always wins over the derivation.
+#
+# Reloadable keys (SPEC-025 OPS-040) apply on SIGHUP / POST /config/reload
+# without a restart; everything else needs a restart. The reloadable set is
+# listed in `fluxum_core::config::RELOADABLE_KEYS` and echoed by /health.
 
 # Deployment profile: production | development (SPEC-012 OBS-081).
-# development = single shard, auth "none", pretty logs.
+# development = single shard, auth "none", pretty logs, open admin console.
 profile: production
 
 server:
   tcp_host: "127.0.0.1"      # bind address for both listeners
-  http_port: 15800           # HTTP: admin API + /rpc (FluxRPC over Streamable HTTP)
+  http_port: 15800           # HTTP: admin API + console + /rpc (FluxRPC over Streamable HTTP)
   tcp_port: 15801            # FluxRPC binary TCP
-  # Pre-auth connection-abuse protection (SPEC-026 SEC-030/031). Every knob
-  # defaults permissively; a value of 0 disables that one limit.
+  idle_timeout_secs: 60      # idle-connection expiry (RPC-060); 0 = off
+  max_frame_bytes: 16777216  # max inbound frame body, 16 MiB (RPC-061)
+  # Pre-auth connection-abuse protection (SPEC-026 SEC-030..034, SEC-040/041).
+  # Every knob defaults permissively; a value of 0 disables that one limit.
   connection_limits:
     max_conns_per_ip: 1024           # concurrent connections per peer IP (0 = uncapped)
     accept_rate_per_sec: 512         # connection accept rate/sec per IP, equal burst (0 = off)
@@ -26,6 +37,35 @@ server:
     failed_auth_threshold: 10        # consecutive bad Authenticate before backoff (0 = off)
     failed_auth_backoff_base_ms: 100 # base backoff, doubles per failure past the threshold
     failed_auth_backoff_max_ms: 30000
+    blocklist: []                    # IP/CIDR refused outright (SEC-033); runtime bans merge in
+    allowlist: []                    # non-empty = ONLY these may connect (SEC-033)
+    max_total_conns: 0               # global connection ceiling (SEC-034); 0 = uncapped — SET on exposed ports
+    max_tracked_ips: 100000          # guard-memory bound under distinct-IP floods (SEC-040)
+    overload_shed_fraction: 0.90     # load fraction that sheds pre-auth connections (SEC-041)
+    overload_shed_all_fraction: 0.98 # load fraction that sheds ALL new connections (SEC-041)
+  # Streamable HTTP session-token security (SPEC-026 SEC-050..053).
+  session:
+    bind_client_ip: false        # bind each session to the IP that authenticated it (SEC-051)
+    rotate_interval_secs: 0      # rotate the session token this often; 0 = re-auth only (SEC-052)
+    rotate_grace_secs: 30        # just-rotated tokens stay valid this long for in-flight requests
+    absolute_lifetime_secs: 0    # hard session lifetime on top of idle expiry; 0 = none
+  # HTTP admin-surface access control (SPEC-026 SEC-054): loopback always
+  # passes; any other client IP must be listed in `trusted` AND present a
+  # server-peer operator token when `require_operator` is on.
+  admin:
+    trusted: []                # IP/CIDR ranges allowed beyond loopback
+    require_operator: true     # remote trusted IPs must present an operator credential
+    open_health_metrics: true  # keep /health + /metrics ungated for LBs and Prometheus
+  # Built-in TLS termination (SPEC-026 SEC-059); both listeners. Empty = off.
+  tls:
+    cert:                      # PEM certificate chain file (leaf first)
+    key:                       # PEM private key file (PKCS#8 or RSA)
+  allow_plaintext: false       # permit non-loopback bind with real auth and no TLS (SEC-059)
+  accept_backlog: 0            # listen(2) backlog for both listeners; 0 = built-in 1024 (SEC-042)
+  tcp_keepalive_secs: 0        # TCP keepalive probe time on accepted sockets; 0 = off (SEC-042)
+  tcp_defer_accept_secs: 0     # Linux TCP_DEFER_ACCEPT window; 0 = off (SEC-042)
+  trusted_proxies: []          # proxies whose X-Forwarded-For / PROXY v2 is honored (SEC-035)
+  static_dir:                  # directory served on unmatched GET paths; empty = none
 
 runtime:
   worker_threads: auto       # auto = effective cores (min 1)
@@ -40,14 +80,28 @@ memory:
                              # explicit values below 128MiB are rejected
   auto_fraction: 0.5         # fraction of effective memory used by "auto"
   auto_floor_bytes: 134217728 # 128 MiB floor for the "auto" derivation
+  bufferpool_fraction: 0.8   # fraction of the budget handed to the buffer pool (TIER-003)
+  budget_tolerance_bytes: 67108864 # RSS tolerance above budget; effective = max(this, 10% of budget)
 
 storage:
   data_dir: ./data
   commit_log_dir: ./data/log
   checkpoint_dir: ./data/checkpoints
+  page_dir: ./data/pages           # cold-tier page files (TIER-023)
+  page_size: 8192                  # logical page size: 4096 | 8192 | 16384
   checkpoint_interval_tx: 10000    # checkpoint cadence in committed transactions
   page_compression: lz4            # lz4 | zstd | none
+  compression_min_bytes: 1024      # payloads smaller than this stay raw (TIER-040)
+  checkpoint_compression_level: 3  # zstd level for checkpoint/backup artifacts (TIER-042)
+  evictor_high_watermark: 0.95     # pool occupancy that wakes eviction (TIER-031)
+  evictor_low_watermark: 0.90      # occupancy eviction reclaims down to (TIER-031)
   commit_log_write_buffer_bytes: auto  # auto = clamp(memory / 1024, 64KiB, 4MiB)
+  # At-rest encryption for cold pages + checkpoint/backup artifacts
+  # (SPEC-026 SEC-010/012). Enabling with no usable key is a hard error.
+  encryption:
+    enabled: false
+    active_key_id: ""              # label of the key fresh writes seal under
+    keys: []                       # [{ id, key_hex: 64-hex (256-bit) }, ...]; retired keys stay readable
 
 replication:
   role: primary              # primary | replica (auto after election)
@@ -57,8 +111,11 @@ replication:
 simd: auto                   # auto | avx512 | avx2 | neon | scalar (force for debugging)
 
 auth:
-  provider: token            # token | jwt | none (dev only)
+  provider: token            # token | jwt | none (dev only, loopback only)
   secret: ${FLUXUM_AUTH_SECRET}  # required for token/jwt
+  jwt_algorithm: hs256       # hs256 | rs256 | es256 | ed25519 (asymmetric = verify-only, SEC-061)
+  jwt_public_key:            # PEM public key file; required for asymmetric jwt_algorithm
+  max_permissive_identities: 10000 # cap on identities the `none` provider mints (SEC-062); 0 = unbounded
   server_peers: []           # trusted peers; identity = SHA-256("SERVER:" + name)
   # server_peers:
   #   - name: "ingest_service"
@@ -68,9 +125,32 @@ subscriptions:
   send_buffer_bytes: 2097152 # 2 MiB per client
   fanout_concurrency: auto   # auto = clamp(2 × effective_cores, 2, 64)
 
+reducer:
+  shard_max_reducers_per_sec: 200000 # global admission bound (SEC-046); 0 is rejected — always on
+  max_execution_ms: 10000            # cooperative per-call deadline; breach rolls back (SEC-046)
+  max_tx_bytes: 536870912            # 512 MiB ceiling one transaction may buffer (SEC-046)
+
+query:
+  default_limit: 0                     # LIMIT applied when a query carries none; 0 = none (SEC-045)
+  max_limit: 1000000                   # ceiling on any effective LIMIT; 0 = unbounded
+  max_limit_action: clamp              # clamp | reject a LIMIT above max_limit
+  row_scan_budget: 10000000            # rows one query may touch before aborting (3031); 0 = none
+  deadline_ms: 5000                    # per-query wall-clock deadline (3032); 0 = none
+  max_queries_per_sec_per_identity: 500  # SEC-047 per-identity admission; 0 = off
+  max_queries_per_sec_per_source: 2000   # SEC-047 per-source (IP) admission; 0 = off
+
 observability:
   slow_reducer_threshold_us: 5000  # WARN threshold for slow reducers
 
 logging:
   level: info                # error|warn|info|debug|trace or an env-filter directive
   format: json               # json | pretty
+
+# Field-level crypto keys for column transforms (SPEC-017 §5): named X25519
+# (encrypted columns) / Ed25519 (signed columns) keys the schema references.
+transforms:
+  keys: []                   # [{ id, scheme: x25519|ed25519, secret: 64-hex, previous: [] }, ...]
+
+# Plugin manifest (SPEC-020 PLG-032): validated at startup — unknown
+# capability, illegal placement, or a missing in-proc feature aborts boot.
+plugins: []                  # [{ name, capability, host: { kind: in_process|sidecar, ... } }, ...]

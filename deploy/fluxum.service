@@ -1,0 +1,76 @@
+# Fluxum systemd unit (deployment guide: docs/DEPLOYMENT.md).
+#
+# Install:
+#   install -m 755 fluxum-server /usr/local/bin/fluxum-server
+#   install -m 644 deploy/fluxum.service /etc/systemd/system/fluxum.service
+#   install -d /etc/fluxum && install -m 644 config/config.example.yml /etc/fluxum/config.yml
+#   (644: the service runs under DynamicUser; secrets live in fluxum.env, not here)
+#   echo 'FLUXUM_AUTH_SECRET=<generated>' > /etc/fluxum/fluxum.env && chmod 600 /etc/fluxum/fluxum.env
+#   systemctl daemon-reload && systemctl enable --now fluxum
+#
+# Reload config (SPEC-025 OPS-040): systemctl reload fluxum   (SIGHUP)
+# Logs: journalctl -u fluxum -f                               (JSON lines)
+
+[Unit]
+Description=Fluxum realtime database
+Documentation=file:///usr/share/doc/fluxum/DEPLOYMENT.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/fluxum-server --config /etc/fluxum/config.yml
+# `kill` as a shell builtin: minimal systems (containers, slim images) ship
+# no /bin/kill binary, and ReloadSignal= needs systemd >= 253.
+ExecReload=/bin/sh -c 'kill -HUP $MAINPID'
+
+# The service account and its state directory are managed by systemd:
+# DynamicUser allocates an ephemeral UID; StateDirectory provides
+# /var/lib/fluxum owned by it. WorkingDirectory points there so the config's
+# relative ./data default lands in /var/lib/fluxum/data.
+DynamicUser=yes
+StateDirectory=fluxum
+ConfigurationDirectory=fluxum
+WorkingDirectory=/var/lib/fluxum
+EnvironmentFile=-/etc/fluxum/fluxum.env
+
+# Restart policy: a crash restarts promptly; a clean stop stays stopped.
+# SIGTERM triggers the graceful drain (SPEC-025 OPS-030) — give it time to
+# quiesce in-flight transactions and cut a final checkpoint before SIGKILL.
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+
+# File-descriptor budget: every connection costs one fd. Keep this
+# comfortably above server.connection_limits.max_total_conns
+# (docs/DEPLOYMENT-HARDENING.md §2).
+LimitNOFILE=131072
+
+# Hardening: the process needs the network, its state directory, and
+# nothing else. Ports 15800/15801 are unprivileged, so no capabilities.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
