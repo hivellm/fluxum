@@ -56,7 +56,12 @@ fn flag_validation_exits_2_before_touching_anything() {
     // restore: malformed targets.
     assert_eq!(
         run(with_data(&[
-            "backup", "restore", "--from", "x", "--to-tx-id", "soon"
+            "backup",
+            "restore",
+            "--from",
+            "x",
+            "--to-tx-id",
+            "soon"
         ])),
         2
     );
