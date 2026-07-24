@@ -451,6 +451,7 @@ async fn checkpoint_now_surfaces_write_failures_and_counts_them() {
                 // successful write fails and is counted, never fatal.
                 log_dir: dir.path().join("no-such-log-dir"),
                 archive_dir: None,
+                archive_retention: None,
             }),
             ..WorkerOptions::default()
         },
@@ -1256,6 +1257,7 @@ async fn worker_checkpoints_on_cadence_and_recovery_matches() {
             retention: 2,
             epoch: EPOCH,
             compaction: None,
+            metrics: None,
         },
     )
     .unwrap();
@@ -1303,7 +1305,9 @@ async fn worker_prunes_retention_and_compacts_through_the_archive() {
             compaction: Some(LogCompaction {
                 log_dir: log_dir.clone(),
                 archive_dir: Some(archive_dir.clone()),
+                archive_retention: None,
             }),
+            metrics: None,
         },
     )
     .unwrap();
@@ -1352,6 +1356,7 @@ async fn worker_prunes_retention_and_compacts_through_the_archive() {
             retention: 2,
             epoch: EPOCH,
             compaction: None,
+            metrics: None,
         },
     )
     .unwrap();

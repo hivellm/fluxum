@@ -55,7 +55,7 @@
 //!   derivation ([`adaptive_interval_tx`]) scales the STG-020 default of
 //!   10,000 with effective memory from the [`crate::hw::HardwareProfile`].
 
-mod manifest;
+pub(crate) mod manifest;
 
 pub mod compact;
 pub mod recover;

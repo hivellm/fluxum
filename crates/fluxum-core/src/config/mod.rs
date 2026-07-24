@@ -545,6 +545,66 @@ pub struct ReplicationConfig {
     pub mode: ReplicationMode,
     /// Replica-set member addresses.
     pub peers: Vec<String>,
+    /// Commit-log segment archival (SPEC-014 REP-062) — the PITR source.
+    pub archive: ArchiveConfig,
+}
+
+/// Commit-log segment archival (SPEC-014 REP-062): with `enabled`, a segment
+/// is copied durably to `dir` **before** checkpoint-driven truncation may
+/// delete it, and archived copies are retained for `retention` — which is
+/// therefore the PITR window (§9). Archival is asynchronous off the
+/// checkpoint worker; a failed copy blocks segment deletion, never writes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ArchiveConfig {
+    /// Whether segments are archived before truncation (default `true` —
+    /// backups and PITR depend on it).
+    pub enabled: bool,
+    /// The archive directory.
+    pub dir: PathBuf,
+    /// Retention window: `<n>s | <n>m | <n>h | <n>d` (default `7d`). Equals
+    /// the PITR window.
+    pub retention: String,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: PathBuf::from("./data/archive"),
+            retention: "7d".to_owned(),
+        }
+    }
+}
+
+impl ArchiveConfig {
+    /// The parsed retention window.
+    ///
+    /// # Errors
+    /// A retention string not of the form `<n>s|<n>m|<n>h|<n>d`.
+    pub fn retention_duration(&self) -> Result<std::time::Duration> {
+        parse_retention(&self.retention).ok_or_else(|| {
+            FluxumError::config(format!(
+                "replication.archive.retention: `{}` is not <n>s, <n>m, <n>h, or <n>d",
+                self.retention
+            ))
+        })
+    }
+}
+
+/// Parse a retention window: an integer followed by `s`, `m`, `h`, or `d`.
+fn parse_retention(text: &str) -> Option<std::time::Duration> {
+    let text = text.trim();
+    let (number, unit) = text.split_at(text.len().checked_sub(1)?);
+    let n: u64 = number.parse().ok()?;
+    let seconds = match unit {
+        "s" => n,
+        "m" => n.checked_mul(60)?,
+        "h" => n.checked_mul(3_600)?,
+        "d" => n.checked_mul(86_400)?,
+        _ => return None,
+    };
+    Some(std::time::Duration::from_secs(seconds))
 }
 
 /// SIMD tier forcing (SPEC-016 HWA-032).
@@ -1200,6 +1260,9 @@ impl Config {
                  guard, which is mandatory (SPEC-026 SEC-046); raise the value instead",
             ));
         }
+        // REP-062: the archive retention window must parse (it is the PITR
+        // window, so a typo here silently shrinking it would be costly).
+        self.replication.archive.retention_duration()?;
         if let Err(e) = crate::net::IpSet::parse(&self.server.trusted_proxies) {
             return Err(FluxumError::config(format!("server.trusted_proxies: {e}")));
         }

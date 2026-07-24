@@ -13,6 +13,7 @@
 //! | POST | `/audit`         | who changed a table/row and when (SPEC-025 OPS-020; server-peer only) |
 //! | GET  | `/plugins`       | active plugins + adopted seams (SPEC-020 PLG-060; never secrets) |
 //! | POST | `/plugins/:name/disable` | hot circuit-break without restart (PLG-061); `/enable` reverts |
+//! | POST | `/checkpoint`    | checkpoint now, bypassing the cadence (REP-060 `--fresh-checkpoint`) |
 //! | GET  | `/console`       | the built-in admin web console shell (SPEC-024 DEV-030; [`crate::console`]) |
 //! | GET  | `/console/state` | what the console UI needs to boot: gate posture + auth verdict |
 //! | GET  | `/console/watch` | live committed-diff NDJSON stream (`?table=` filters; DEV-030) |
@@ -233,6 +234,7 @@ fn is_mutating_route(method: &str, path: &str) -> bool {
         (method, split_path(path).as_slice()),
         ("POST", ["reducer", _])
             | ("POST", ["drain"])
+            | ("POST", ["checkpoint"])
             | ("POST", ["config", "reload"])
             | ("POST", ["plugins", _, "disable" | "enable"])
             | ("POST", ["bans"])
@@ -274,6 +276,7 @@ pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminRe
         ("POST", ["plugins", name, "disable"]) => plugin_set_disabled(ctx, name, true),
         ("POST", ["plugins", name, "enable"]) => plugin_set_disabled(ctx, name, false),
         ("POST", ["drain"]) => drain(ctx),
+        ("POST", ["checkpoint"]) => checkpoint_now(ctx).await,
         ("POST", ["config", "reload"]) => config_reload(ctx),
         ("GET", ["bans"]) => bans_list(ctx),
         ("POST", ["bans"]) => ban_create(ctx, body),
@@ -334,10 +337,60 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["plugins"]
             | ["plugins", _, "disable" | "enable"]
             | ["drain"]
+            | ["checkpoint"]
             | ["config", "reload"]
             | ["bans", ..]
             | ["sessions", ..]
     )
+}
+
+// --- POST /checkpoint (SPEC-014 REP-060: `--fresh-checkpoint`) --------------------
+
+/// Checkpoint at the durable log head right now, bypassing the cadence —
+/// what `fluxum backup create --fresh-checkpoint` calls so the backup's
+/// base is as fresh as the moment it started.
+///
+/// The worker is told the durable tail explicitly (its commit feed is an
+/// accelerator, not a guarantee), mirroring the drain's final checkpoint.
+/// An already-covering checkpoint ("nothing to checkpoint") is success with
+/// `fresh: false` — the operator asked for coverage, and coverage exists.
+async fn checkpoint_now(ctx: &Arc<ShardContext>) -> AdminResponse {
+    let Some(service) = ctx.checkpoint_service() else {
+        return AdminResponse::err(
+            404,
+            None,
+            "no checkpoint worker is installed in this assembly",
+        );
+    };
+    let log = ctx.engine.pipeline().log();
+    let durable = match log.durable_tx_id() {
+        Ok(durable) => durable.unwrap_or(0),
+        Err(e) => return AdminResponse::err(500, None, e.to_string()),
+    };
+    if durable > 0 {
+        service.observe_commit(durable);
+    }
+    // The write runs on the worker's own OS thread; this call only *waits*,
+    // so hop off the async runtime for the wait.
+    let service = Arc::clone(service);
+    let result = tokio::task::spawn_blocking(move || service.checkpoint_now())
+        .await
+        .unwrap_or_else(|e| {
+            Err(fluxum_core::FluxumError::Storage(format!(
+                "checkpoint task panicked: {e}"
+            )))
+        });
+    match result {
+        Ok(stats) => AdminResponse::ok(
+            None,
+            json!({ "fresh": true, "last_tx_id": stats.last_tx_id }),
+        ),
+        // The worker's explicit no-op: everything durable is already covered.
+        Err(e) if e.to_string().contains("nothing to checkpoint") => {
+            AdminResponse::ok(None, json!({ "fresh": false, "last_tx_id": durable }))
+        }
+        Err(e) => AdminResponse::err(500, None, e.to_string()),
+    }
 }
 
 // --- /sessions (SPEC-026 SEC-053: session revocation) ----------------------------

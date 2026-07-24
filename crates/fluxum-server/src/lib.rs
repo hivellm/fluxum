@@ -264,6 +264,50 @@ impl AdminPolicy {
     }
 }
 
+/// The shard's checkpoint worker behind a lock (STG-020): the worker's
+/// notification channel is single-consumer state, but the observe path (one
+/// call per commit, from the commit hook) and the operator paths
+/// (`POST /checkpoint`, drain) share it across threads. The lock is
+/// uncontended in steady state — observe holds it for one non-blocking
+/// `send`.
+pub struct CheckpointService {
+    worker: std::sync::Mutex<fluxum_core::checkpoint::SnapshotWorker>,
+}
+
+impl CheckpointService {
+    /// Wrap a spawned worker.
+    pub fn new(worker: fluxum_core::checkpoint::SnapshotWorker) -> Arc<Self> {
+        Arc::new(Self {
+            worker: std::sync::Mutex::new(worker),
+        })
+    }
+
+    /// Feed one committed `tx_id` to the worker's cadence (never blocks the
+    /// commit path: the queue is unbounded).
+    pub fn observe_commit(&self, tx_id: u64) {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .observe_commit(tx_id);
+    }
+
+    /// Checkpoint at the highest observed commit right now, bypassing the
+    /// cadence (REP-060 `--fresh-checkpoint`; the drain's final checkpoint).
+    /// Blocks until the worker finishes the write.
+    ///
+    /// # Errors
+    /// The worker stopped, the write failed, or no commit has landed past
+    /// the newest checkpoint ("nothing to checkpoint").
+    pub fn checkpoint_now(
+        &self,
+    ) -> Result<fluxum_core::checkpoint::CheckpointStats, fluxum_core::FluxumError> {
+        self.worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .checkpoint_now()
+    }
+}
+
 /// What a hot reload re-reads and republishes through (OPS-040).
 struct ConfigSource {
     /// The YAML file the running config was loaded from, if any. A reload
@@ -320,6 +364,11 @@ pub struct ShardContext {
     fanout_started: std::sync::atomic::AtomicBool,
     /// The shard's blob store (SPEC-023 DMX-040), once installed.
     blob_store: std::sync::OnceLock<Arc<fluxum_core::commitlog::BlobStore>>,
+    /// The shard's checkpoint worker (STG-020), once installed by the
+    /// assembly: feeds it every commit (its cadence input) and serves
+    /// `POST /checkpoint` (REP-060 `--fresh-checkpoint`) and the final
+    /// drain checkpoint.
+    checkpoint: std::sync::OnceLock<Arc<CheckpointService>>,
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
@@ -463,6 +512,7 @@ impl ShardContext {
             ttl_sweeper_started: std::sync::atomic::AtomicBool::new(false),
             fanout_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
+            checkpoint: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
             namespaces: std::sync::RwLock::new(HashMap::new()),
@@ -493,10 +543,28 @@ impl ShardContext {
             .pipeline()
             .set_commit_hook(Box::new(move |diff, meta| {
                 if let Some(ctx) = hook_ctx.upgrade() {
+                    // STG-020: the checkpoint cadence sees every commit —
+                    // an unbounded non-blocking send, never a stall.
+                    if let Some(checkpoint) = ctx.checkpoint.get() {
+                        checkpoint.observe_commit(diff.tx_id);
+                    }
                     ctx.publish_commit_meta(diff.clone(), meta.clone());
                 }
             }));
         ctx
+    }
+
+    /// Install the shard's checkpoint service (STG-020) — the assembly calls
+    /// this after spawning the worker so every commit feeds its cadence and
+    /// `POST /checkpoint` / the drain's final checkpoint can reach it. A
+    /// second call is ignored.
+    pub fn set_checkpoint_service(&self, service: Arc<CheckpointService>) {
+        let _ = self.checkpoint.set(service);
+    }
+
+    /// The installed checkpoint service, if any.
+    pub fn checkpoint_service(&self) -> Option<&Arc<CheckpointService>> {
+        self.checkpoint.get()
     }
 
     /// The SEC-045 query-bounds handle (shared with every hosted manager).

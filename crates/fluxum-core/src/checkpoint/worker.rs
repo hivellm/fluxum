@@ -38,6 +38,10 @@ pub struct LogCompaction {
     /// set (log archival enabled, the PITR source); deleted outright when
     /// `None`.
     pub archive_dir: Option<PathBuf>,
+    /// Archived-copy retention (SPEC-014 REP-062, `replication.archive.
+    /// retention`): copies older than this are swept after each checkpoint.
+    /// `None` retains forever. This window IS the PITR window (§9).
+    pub archive_retention: Option<std::time::Duration>,
 }
 
 /// Tuning knobs for a [`SnapshotWorker`].
@@ -54,6 +58,9 @@ pub struct WorkerOptions {
     pub epoch: u64,
     /// Optional checkpoint-driven log truncation (STG-013 / FR-104).
     pub compaction: Option<LogCompaction>,
+    /// The shard's metrics registry, for the REP-081 pending-archival gauge.
+    /// `None` (tests, embedded use) skips gauge publication.
+    pub metrics: Option<Arc<crate::metrics::Metrics>>,
 }
 
 impl Default for WorkerOptions {
@@ -63,6 +70,7 @@ impl Default for WorkerOptions {
             retention: 3,
             epoch: 0,
             compaction: None,
+            metrics: None,
         }
     }
 }
@@ -336,13 +344,79 @@ impl Actor {
             }
         };
         let hook = self.archive.as_ref().map(|a| a as &dyn SegmentArchive);
-        if let Err(e) = compact_covered(&compaction.log_dir, self.shard_id, oldest, None, hook) {
-            self.report.failures += 1;
-            tracing::error!(
+        match compact_covered(&compaction.log_dir, self.shard_id, oldest, None, hook) {
+            Ok(_removed) => {
+                if let Some(metrics) = &self.options.metrics {
+                    metrics.set_archive_segments_pending(0);
+                }
+            }
+            Err(e) => {
+                // REP-062: a failed archival blocks segment DELETION, never
+                // writes — so this is a WARN plus the pending gauge, not a
+                // fatal error. The segments stay in the live log and the
+                // next checkpoint retries.
+                self.report.failures += 1;
+                let pending = covered_pending(&compaction.log_dir, self.shard_id, oldest);
+                if let Some(metrics) = &self.options.metrics {
+                    metrics.set_archive_segments_pending(pending);
+                }
+                tracing::warn!(
+                    shard_id = self.shard_id,
+                    error = %e,
+                    segments_pending = pending,
+                    "segment archival failed; covered segments retained until it succeeds \
+                     (REP-062: deletion blocks, writes never do)"
+                );
+            }
+        }
+        // REP-062 retention: archived copies older than the window leave the
+        // archive — which is exactly the PITR window shrinking forward.
+        if let (Some(dir), Some(retention)) =
+            (&compaction.archive_dir, compaction.archive_retention)
+            && let Err(e) = sweep_archive(dir, retention)
+        {
+            tracing::warn!(
                 shard_id = self.shard_id,
                 error = %e,
-                "checkpoint-driven log compaction failed"
+                "archive retention sweep failed; stale copies remain until the next pass"
             );
         }
     }
+}
+
+/// How many fully covered segments are still awaiting archival in the live
+/// log (the REP-081 `fluxum_archive_segments_pending` gauge after a failed
+/// archival pass). Best-effort: an unreadable directory reports 0.
+fn covered_pending(log_dir: &std::path::Path, shard_id: u32, covered_up_to_tx: u64) -> u64 {
+    let Ok(segments) = crate::commitlog::segment::list_segments(log_dir, shard_id) else {
+        return 0;
+    };
+    segments
+        .windows(2)
+        .filter(|pair| pair[1].first_tx_id <= covered_up_to_tx.saturating_add(1))
+        .count() as u64
+}
+
+/// Delete archived segment copies older than `retention` (by modification
+/// time — the archival copy instant, which is when the copy became durable).
+fn sweep_archive(
+    dir: &std::path::Path,
+    retention: std::time::Duration,
+) -> crate::error::Result<()> {
+    let now = std::time::SystemTime::now();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only segment copies are swept — never lineage markers, sidecars,
+        // or anything else an operator parked in the directory.
+        if !(name.starts_with("shard-") && name.ends_with(".log")) {
+            continue;
+        }
+        let modified = entry.metadata()?.modified()?;
+        if now.duration_since(modified).unwrap_or_default() > retention {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
 }

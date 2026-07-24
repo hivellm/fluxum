@@ -20,6 +20,7 @@
 //! runtime dependencies — a full HTTP stack would be a large dependency for
 //! one request.
 
+pub mod backup;
 pub mod dev;
 pub mod generate;
 pub mod init;
@@ -238,6 +239,12 @@ USAGE:
     fluxum generate --lang <lang> --schema <url_or_file> --out <dir>
     fluxum seed <file> --server <host:port>
     fluxum migrate --plan [--path <dir>]
+    fluxum backup create --out <dir> [--config <file>|--data-dir <dir>]
+                         [--fresh-checkpoint --server <host:port>]
+    fluxum backup verify --from <dir>
+    fluxum backup restore --from <dir> [--config <file>|--data-dir <dir>] [--force]
+                          [--to-timestamp <rfc3339|µs> | --to-tx-id <n>]
+                          [--archive-dir <dir>]
 
 COMMANDS:
     init             Scaffold a runnable Fluxum application (schema +
@@ -278,6 +285,24 @@ COMMANDS:
                      safe/additive vs [BLOCKS] requires an explicit
                      #[fluxum::migration] — changing nothing. Exit 0 when
                      the boot proceeds, 3 when it would refuse.
+
+    backup create    Hot backup (SPEC-014 REP-060): the latest checkpoint
+                     plus the covering log segments, zstd-compressed with an
+                     integrity manifest — no writer stall, safe against a
+                     running server. --fresh-checkpoint asks the server for
+                     a checkpoint first (POST /checkpoint).
+
+    backup verify    Validate a backup without restoring it (REP-064): CRCs,
+                     record decode, and tx-chain contiguity. Exit 0 clean;
+                     non-zero with a per-file report otherwise.
+
+    backup restore   Restore into the data layout (REP-063; refuses non-empty
+                     targets without --force). With --to-timestamp/--to-tx-id
+                     it becomes PITR (REP-070): archived segments extend the
+                     chain and the log is cut at the inclusive target; the
+                     boundary tx and its timestamp are reported. The restored
+                     node forks history and must seed a new replica set
+                     (REP-072).
 ";
 
 /// Run the CLI over `args` (without the program name). Returns the process
@@ -448,6 +473,113 @@ where
                 }
                 Err(e) => {
                     eprintln!("seed failed: {e}");
+                    1
+                }
+            }
+        }
+        ["backup", sub @ ("create" | "verify" | "restore"), rest @ ..] => {
+            // Resolved only where needed: `verify` inspects the backup
+            // directory alone and must work on a machine with no server
+            // config or data layout at all.
+            let resolve_layout = || {
+                let config = flag(rest, "--config").map(std::path::PathBuf::from);
+                let data_dir = flag(rest, "--data-dir").map(std::path::PathBuf::from);
+                backup::DataLayout::resolve(config.as_deref(), data_dir.as_deref())
+            };
+            let result = match *sub {
+                "create" => {
+                    let layout = match resolve_layout() {
+                        Ok(layout) => layout,
+                        Err(e) => {
+                            eprintln!("backup create: {e}");
+                            return 2;
+                        }
+                    };
+                    let Some(out) = flag(rest, "--out") else {
+                        eprintln!("backup create: --out <dir> is required\n\n{USAGE}");
+                        return 2;
+                    };
+                    let fresh = if rest.contains(&"--fresh-checkpoint") {
+                        match flag(rest, "--server") {
+                            Some(server) => Some(server),
+                            None => {
+                                eprintln!(
+                                    "backup create: --fresh-checkpoint needs --server \
+                                     <host:port> (a running server takes the checkpoint)"
+                                );
+                                return 2;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    backup::create(&layout, std::path::Path::new(&out), fresh.as_deref())
+                }
+                "verify" => match flag(rest, "--from") {
+                    Some(from) => backup::verify(std::path::Path::new(&from)),
+                    None => {
+                        eprintln!("backup verify: --from <dir> is required\n\n{USAGE}");
+                        return 2;
+                    }
+                },
+                "restore" => {
+                    let layout = match resolve_layout() {
+                        Ok(layout) => layout,
+                        Err(e) => {
+                            eprintln!("backup restore: {e}");
+                            return 2;
+                        }
+                    };
+                    let Some(from) = flag(rest, "--from") else {
+                        eprintln!("backup restore: --from <dir> is required\n\n{USAGE}");
+                        return 2;
+                    };
+                    let to_tx = flag(rest, "--to-tx-id");
+                    let to_ts = flag(rest, "--to-timestamp");
+                    let target = match (to_tx, to_ts) {
+                        (Some(_), Some(_)) => {
+                            eprintln!(
+                                "backup restore: --to-tx-id and --to-timestamp are mutually \
+                                 exclusive (REP-070)"
+                            );
+                            return 2;
+                        }
+                        (Some(n), None) => match n.parse::<u64>() {
+                            Ok(n) => Some(fluxum_core::backup::PitrTarget::TxId(n)),
+                            Err(_) => {
+                                eprintln!("backup restore: --to-tx-id `{n}` is not a number");
+                                return 2;
+                            }
+                        },
+                        (None, Some(t)) => match backup::parse_timestamp(&t) {
+                            Ok(micros) => {
+                                Some(fluxum_core::backup::PitrTarget::TimestampMicros(micros))
+                            }
+                            Err(e) => {
+                                eprintln!("backup restore: --to-timestamp {e}");
+                                return 2;
+                            }
+                        },
+                        (None, None) => None,
+                    };
+                    let archive = flag(rest, "--archive-dir").map(std::path::PathBuf::from);
+                    backup::restore(
+                        std::path::Path::new(&from),
+                        &layout,
+                        target,
+                        archive.as_deref(),
+                        rest.contains(&"--force"),
+                    )
+                }
+                _ => unreachable!("guarded by the match arm"),
+            };
+            match result {
+                Ok(report) => {
+                    println!("{report}");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("backup {sub} failed: {e}");
                     1
                 }
             }

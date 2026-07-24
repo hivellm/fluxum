@@ -389,6 +389,9 @@ pub struct Metrics {
     tx_commits: AtomicU64,
     tx_rollbacks: AtomicU64,
     queue_depth: AtomicU64,
+    /// SPEC-014 REP-081: covered segments awaiting archival before deletion
+    /// (non-zero only while an archival failure is blocking truncation).
+    archive_segments_pending: AtomicU64,
     slow_reducer_threshold_us: AtomicU64,
     shard_state: AtomicU8,
     recovered_tx_id: AtomicU64,
@@ -498,6 +501,7 @@ impl Metrics {
             tx_commits: AtomicU64::new(0),
             tx_rollbacks: AtomicU64::new(0),
             queue_depth: AtomicU64::new(0),
+            archive_segments_pending: AtomicU64::new(0),
             slow_reducer_threshold_us: AtomicU64::new(DEFAULT_SLOW_REDUCER_THRESHOLD_US),
             shard_state: AtomicU8::new(ShardState::Ready as u8),
             recovered_tx_id: AtomicU64::new(0),
@@ -570,6 +574,19 @@ impl Metrics {
     /// OBS-012: publish the shard's pending-`ReducerCall` queue depth.
     pub fn set_queue_depth(&self, depth: u64) {
         self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// REP-081: covered segments awaiting archival before deletion — set by
+    /// the checkpoint worker; non-zero means an archival failure is blocking
+    /// log truncation (REP-062: deletion blocks, writes never do).
+    pub fn set_archive_segments_pending(&self, pending: u64) {
+        self.archive_segments_pending
+            .store(pending, Ordering::Relaxed);
+    }
+
+    /// The current REP-081 pending-archival gauge (tests, /health surfaces).
+    pub fn archive_segments_pending(&self) -> u64 {
+        self.archive_segments_pending.load(Ordering::Relaxed)
     }
 
     /// The OBS-072 slow-reducer WARN threshold (µs).
@@ -893,10 +910,15 @@ impl Metrics {
              fluxum_tx_rollbacks_total{{shard=\"{shard}\"}} {}\n\
              # HELP fluxum_reducer_queue_depth Pending ReducerCall messages.\n\
              # TYPE fluxum_reducer_queue_depth gauge\n\
-             fluxum_reducer_queue_depth{{shard=\"{shard}\"}} {}",
+             fluxum_reducer_queue_depth{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_archive_segments_pending Covered segments awaiting archival \
+             before deletion (REP-062/REP-081).\n\
+             # TYPE fluxum_archive_segments_pending gauge\n\
+             fluxum_archive_segments_pending{{shard=\"{shard}\"}} {}",
             self.tx_commits.load(Ordering::Relaxed),
             self.tx_rollbacks.load(Ordering::Relaxed),
             self.queue_depth.load(Ordering::Relaxed),
+            self.archive_segments_pending.load(Ordering::Relaxed),
         );
 
         // --- subscription / fan-out (OBS-020/021/022) ---

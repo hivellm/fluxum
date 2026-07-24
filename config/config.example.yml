@@ -107,6 +107,13 @@ replication:
   role: primary              # primary | replica (auto after election)
   mode: async                # async | semi_sync
   peers: []                  # replica-set member addresses
+  # Commit-log segment archival (SPEC-014 REP-062): segments are copied here
+  # durably BEFORE checkpoint-driven truncation may delete them — the PITR
+  # source. The retention window IS the PITR window.
+  archive:
+    enabled: true
+    dir: ./data/archive
+    retention: 7d            # <n>s | <n>m | <n>h | <n>d
 
 simd: auto                   # auto | avx512 | avx2 | neon | scalar (force for debugging)
 

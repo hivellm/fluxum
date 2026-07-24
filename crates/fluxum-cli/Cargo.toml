@@ -15,6 +15,9 @@ name = "fluxum"
 path = "src/main.rs"
 
 [dependencies]
+# The T7.3 backup engine (create/verify/restore/PITR) and the config loader
+# the data-layout resolution shares with the server.
+fluxum-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 

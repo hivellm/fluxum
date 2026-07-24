@@ -166,6 +166,13 @@ impl CheckpointRepo {
         &self.dir
     }
 
+    /// The on-disk path of a content-addressed object by its 64-hex name —
+    /// how the T7.3 backup packs a checkpoint's objects without re-reading
+    /// them through a full [`CheckpointRepo::load`].
+    pub fn object_path(&self, hash_hex: &str) -> PathBuf {
+        self.objects.join(hash_hex)
+    }
+
     /// Write a checkpoint of `snapshot` covering every transaction
     /// `<= last_tx_id` (STG-020/STG-021).
     ///

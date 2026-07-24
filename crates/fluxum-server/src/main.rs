@@ -211,6 +211,26 @@ async fn run(
     // (SPEC-025 OPS-030).
     tracing::info!("shutting down; draining");
     server.ctx.begin_drain();
+    // Final checkpoint at the durable tail (bounded, best-effort): restart
+    // replays little or nothing. "Nothing to checkpoint" is the good case —
+    // the newest checkpoint already covers the tail.
+    if let Some(service) = server.ctx.checkpoint_service() {
+        let log = server.ctx.engine.pipeline().log();
+        if let Ok(Some(durable)) = log.durable_tx_id()
+            && durable > 0
+        {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                log.wait_durable(durable),
+            )
+            .await;
+            service.observe_commit(durable);
+            match service.checkpoint_now() {
+                Ok(stats) => tracing::info!(last_tx_id = stats.last_tx_id, "final checkpoint"),
+                Err(e) => tracing::debug!(reason = %e, "no final checkpoint"),
+            }
+        }
+    }
     server.shutdown();
     ExitCode::SUCCESS
 }

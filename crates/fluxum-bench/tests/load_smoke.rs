@@ -57,6 +57,13 @@ impl Server {
             .env("FLUXUM_SERVER_TCP_PORT", tcp.to_string())
             .env("FLUXUM_STORAGE_DATA_DIR", &dir)
             .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", dir.join("log"))
+            // Every durable dir must leave the shared checkout: the boot
+            // now spawns the checkpoint worker (T7.3), and a checkpoint
+            // written under a RELATIVE default (./data next to this crate)
+            // would poison later runs with cross-binary state.
+            .env("FLUXUM_STORAGE_CHECKPOINT_DIR", dir.join("checkpoints"))
+            .env("FLUXUM_STORAGE_PAGE_DIR", dir.join("pages"))
+            .env("FLUXUM_REPLICATION_ARCHIVE_DIR", dir.join("archive"))
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()

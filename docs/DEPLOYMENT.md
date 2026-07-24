@@ -178,11 +178,35 @@ data/
 
 - **Boot** = load the latest checkpoint, replay the commit log after it
   (SPEC-002). Recovery time is bounded by `storage.checkpoint_interval_tx`.
-- **Backup** = copy a checkpoint plus the log segments after it, or use the
-  backup tooling (SPEC-015/SPEC-025). Copying `data/` of a *stopped* server
-  is always a consistent backup.
 - The directories may live on different volumes (each key is independent);
   the commit log is the fsync-latency-critical one.
+- `archive/` (`replication.archive.dir`) holds byte-identical copies of
+  truncated log segments (SPEC-014 REP-062) — the PITR source. Its
+  `retention` window (default `7d`) IS the PITR window.
+
+### Backup and point-in-time recovery
+
+Hot backups take no lock and never stall writers (SPEC-014 REP-060):
+
+```sh
+fluxum backup create --out /backups/nightly --config /etc/fluxum/config.yml \
+    --fresh-checkpoint --server 127.0.0.1:15800   # optional: checkpoint first
+fluxum backup verify --from /backups/nightly       # CRCs + record decode + tx chain
+```
+
+Restore and PITR (`--to-timestamp`/`--to-tx-id`, inclusive; the boundary tx
+and timestamp are reported):
+
+```sh
+fluxum backup restore --from /backups/nightly --data-dir /var/lib/fluxum/data
+fluxum backup restore --from /backups/nightly --data-dir /var/lib/fluxum/data \
+    --to-timestamp "2026-07-24T13:37:09Z" --archive-dir /var/lib/fluxum/data/archive
+```
+
+The next boot's normal recovery reconstructs the state. A PITR restore forks
+history: the node boots with a raised fencing epoch (the `pitr.lineage`
+marker) and must seed a new replica set rather than rejoin the old one
+(REP-072). Schedule backups externally (cron / a systemd timer) per REP-065.
 
 ## 8. Upgrades
 

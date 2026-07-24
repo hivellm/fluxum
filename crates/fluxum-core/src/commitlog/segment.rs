@@ -119,12 +119,24 @@ pub(crate) enum ScanOutcome {
 pub(crate) fn scan_segment(
     path: &Path,
     shard_id: u32,
+    prev_tx: Option<u64>,
+    min_epoch: u64,
+    visit: &mut dyn FnMut(u64, TxRecord) -> Result<()>,
+) -> Result<ScanOutcome> {
+    scan_segment_bytes(&fs::read(path)?, shard_id, prev_tx, min_epoch, visit)
+}
+
+/// [`scan_segment`] over an in-memory buffer — the shape backup verification
+/// (SPEC-014 REP-064) needs, where the segment bytes were just decompressed
+/// from an archive artifact and never touch the filesystem.
+pub(crate) fn scan_segment_bytes(
+    buf: &[u8],
+    shard_id: u32,
     mut prev_tx: Option<u64>,
     min_epoch: u64,
     visit: &mut dyn FnMut(u64, TxRecord) -> Result<()>,
 ) -> Result<ScanOutcome> {
-    let buf = fs::read(path)?;
-    let header_epoch = match decode_segment_header(&buf) {
+    let header_epoch = match decode_segment_header(buf) {
         Ok(epoch) => epoch,
         Err(reason) => return Ok(ScanOutcome::HeaderCorrupt(reason)),
     };
@@ -150,7 +162,7 @@ pub(crate) fn scan_segment(
                 reason,
             })
         };
-        match scan_entry(&buf, offset) {
+        match scan_entry(buf, offset) {
             ScannedEntry::CleanEof => break,
             ScannedEntry::Torn(reason) => {
                 scan.fault = fault(offset, format!("torn write: {reason}"));

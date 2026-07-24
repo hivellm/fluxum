@@ -98,7 +98,9 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // not an empty log.
     std::fs::create_dir_all(&config.storage.commit_log_dir)
         .map_err(fluxum_core::FluxumError::from)?;
-    let repo = fluxum_core::checkpoint::CheckpointRepo::open(&config.storage.checkpoint_dir)?;
+    let repo = Arc::new(fluxum_core::checkpoint::CheckpointRepo::open(
+        &config.storage.checkpoint_dir,
+    )?);
     let recovery =
         fluxum_core::checkpoint::recover(&store, &repo, &config.storage.commit_log_dir, shard)?;
     if recovery.last_tx_id.is_some() || !recovery.rejected.is_empty() {
@@ -112,10 +114,23 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         );
     }
 
+    // SPEC-014 REP-072: a data directory produced by a PITR restore carries
+    // a lineage marker naming the minimum fencing epoch this boot must
+    // adopt — strictly greater than any epoch in the restored (forked) log.
+    let epoch = fluxum_core::backup::pitr_lineage_min_epoch(&config.storage.commit_log_dir)?
+        .unwrap_or(0)
+        .max(1);
+    if epoch > 1 {
+        tracing::info!(
+            target: "fluxum::server",
+            epoch,
+            "PITR lineage marker found; booting with a forked-history fencing epoch (REP-072)"
+        );
+    }
     let log = Arc::new(CommitLog::open(
         &config.storage.commit_log_dir,
         shard,
-        1,
+        epoch,
         CommitLogOptions::default(),
     )?);
 
@@ -161,6 +176,33 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // earlier to size the Tokio runtime, which exists before this is reached.
     let hardware = fluxum_core::hw::HardwareProfile::probe();
     ctx.set_effective_config(&fluxum_core::hw::derive(&hardware, config)?);
+    // STG-020: the periodic checkpoint worker, wired for REP-062 archival —
+    // covered segments are copied durably to the archive (the PITR source)
+    // before truncation may delete them, and archived copies age out with
+    // the retention window. Every commit feeds the cadence via the commit
+    // hook; `POST /checkpoint` and the drain's final checkpoint reach the
+    // worker through the context.
+    let archive = &config.replication.archive;
+    let worker = fluxum_core::checkpoint::SnapshotWorker::spawn(
+        Arc::clone(ctx.store()),
+        repo,
+        shard,
+        fluxum_core::checkpoint::WorkerOptions {
+            interval_tx: config.storage.checkpoint_interval_tx,
+            epoch,
+            compaction: Some(fluxum_core::checkpoint::LogCompaction {
+                log_dir: config.storage.commit_log_dir.clone(),
+                archive_dir: archive.enabled.then(|| archive.dir.clone()),
+                archive_retention: archive
+                    .enabled
+                    .then(|| archive.retention_duration())
+                    .transpose()?,
+            }),
+            metrics: Some(Arc::clone(ctx.metrics())),
+            ..fluxum_core::checkpoint::WorkerOptions::default()
+        },
+    )?;
+    ctx.set_checkpoint_service(crate::CheckpointService::new(worker));
     Ok(ctx)
 }
 

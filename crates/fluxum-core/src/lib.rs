@@ -52,6 +52,7 @@
 //!   and the durable `__schedule__` deferred-reducer worker (T3.4)
 
 pub mod auth;
+pub mod backup;
 pub mod checkpoint;
 pub mod commitlog;
 pub mod config;

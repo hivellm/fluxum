@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft |
+| **Status** | Draft; **§8 Backup + §9 PITR shipped** (T7.3, FR-103/FR-104): `fluxum backup create/verify/restore` over [`fluxum_core::backup`](../../crates/fluxum-core/src/backup/mod.rs) — hot create (REP-060/061), REP-062 archival wired into the boot-spawned checkpoint worker (`replication.archive.*` config, retention sweep, `fluxum_archive_segments_pending`), bit-flip-precise verify (REP-064), exact-head restore (REP-063), PITR to `--to-tx-id`/`--to-timestamp` with boundary report, chain-gap refusal, roll-forward guard, and the REP-072 `pitr.lineage` fencing-epoch marker the next boot adopts (`POST /checkpoint` serves `--fresh-checkpoint`). §2–§7 replication remain open (T7.1/T7.2). |
 | **Phase / tasks** | Phase 7 · T7.1–T7.3 ([DAG](../DAG.md)) |
 | **PRD requirements** | FR-100, FR-101, FR-102, FR-103, FR-104, FR-105; NFR-08 |
 | **Requirement prefix** | `REP-` |

@@ -5,10 +5,14 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.16% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
-drivers live), after phase6_deployment-guide (the FR-05 probe is now wired into the real
+**Current standing:** **90.14% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
+drivers live), after phase7_backup-pitr (~1,000 new lines: `fluxum_core::backup`
+create/verify/restore/PITR at 82%+, the CLI dispatch + wrappers recovered by the
+`backup_cli` dispatch suite after an initial dip to 89.92%; residuals are error-arm
+plumbing in `cli/backup.rs` and the `main.rs` drain-checkpoint glue, category 9).
+Prior: 90.16% after phase6_deployment-guide (the FR-05 probe wired into the real
 boot path and covered by `boot_probe.rs`; `config_example.rs` pins the config reference;
-the new `main.rs` runtime-sizing lines are category-9 binary glue). Prior: 90.09% after
+the new `main.rs` runtime-sizing lines are category-9 binary glue); 90.09% after
 phase6_admin-web-console (the console module, the DEV-031 gate, and
 the `/console/watch` stream are covered by their unit + integration suites; the embedded
 `console.html` is an asset, not instrumented lines); 90.08% after
@@ -16,7 +20,7 @@ phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are
 by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
 wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
 **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16%. The **standing debt items below remain open**: (a) the
+90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);

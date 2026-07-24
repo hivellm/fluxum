@@ -52,7 +52,7 @@
 //! [`replay`] yields every valid [`TxRecord`] in order and reports where and
 //! why it stopped.
 
-mod format;
+pub(crate) mod format;
 
 pub(crate) mod segment;
 
