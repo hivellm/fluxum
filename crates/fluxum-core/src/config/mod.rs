@@ -1407,6 +1407,17 @@ impl Config {
                 self.replication.semi_sync.on_quorum_loss
             )));
         }
+        if let Ok(count) = self.replication.semi_sync.quorum.parse::<u32>() {
+            // REP-021: an explicit count must be satisfiable by the
+            // configured replica set (members = peers + this node).
+            let members = u32::try_from(self.replication.peers.len()).unwrap_or(u32::MAX - 1) + 1;
+            if count == 0 || count > members {
+                return Err(FluxumError::config(format!(
+                    "replication.semi_sync.quorum: {count} is outside 1..={members} \
+                     (peers + this member, REP-021)"
+                )));
+            }
+        }
         if self.replication.semi_sync.quorum != "majority"
             && self.replication.semi_sync.quorum.parse::<u32>().is_err()
         {
@@ -2053,6 +2064,23 @@ mod tests {
         let zero_shards = write_config("sharding:\n  shards: 0\nauth:\n  provider: none\n");
         let err = Config::load_with(Some(zero_shards.path()), &no_env).unwrap_err();
         assert!(err.to_string().contains("sharding.shards"), "{err}");
+
+        // REP-021: an explicit quorum count must be satisfiable by the
+        // configured set — 3 of a 2-member set (1 peer + this node) is not.
+        let bad_quorum = write_config(
+            "replication:\n  peers: [\"h:1\"]\n  member_name: a\n  peer_token: t\n\
+             \x20 semi_sync:\n    quorum: \"3\"\nauth:\n  provider: none\n",
+        );
+        let err = Config::load_with(Some(bad_quorum.path()), &no_env).unwrap_err();
+        assert!(
+            err.to_string().contains("replication.semi_sync.quorum"),
+            "{err}"
+        );
+        let zero_quorum = write_config(
+            "replication:\n  semi_sync:\n    quorum: \"0\"\nauth:\n  provider: none\n",
+        );
+        let err = Config::load_with(Some(zero_quorum.path()), &no_env).unwrap_err();
+        assert!(err.to_string().contains("outside 1..="), "{err}");
     }
 
     #[test]

@@ -208,6 +208,35 @@ history: the node boots with a raised fencing epoch (the `pitr.lineage`
 marker) and must seed a new replica set rather than rejoin the old one
 (REP-072). Schedule backups externally (cron / a systemd timer) per REP-065.
 
+### Replication (SPEC-014 §3/§4, T7.1)
+
+A replica is the same binary with `replication.role: replica` and the
+primary in `replication.peers`; it authenticates as a **server peer**
+(`replication.member_name` + `replication.peer_token`, listed under
+`auth.server_peers` on the primary — REP-005), then syncs and follows the
+primary's commit log byte-identically (REP-010). An empty or too-far-behind
+replica full-syncs via a checkpoint transfer; a rejoining one streams from
+its offset (REP-012/REP-013). Elections and automatic failover are T7.2 —
+today the roles are fixed by config, and a fenced primary (one that has
+seen a higher epoch) stops acknowledging writes until an operator
+intervenes (REP-031).
+
+Acknowledgment modes (`replication.mode`):
+
+- `async` (default): callers are acked at local commit; replication lag is
+  observable (`fluxum_replication_lag_tx{peer}`) and the unreplicated tail
+  MAY be lost on failover (REP-020).
+- `semi_sync`: **nothing a client can observe precedes quorum** — the
+  ReducerResult, the admin `committed` reply, and every TxUpdate hold until
+  `semi_sync.quorum` members (counting the primary) have the entry durably
+  (REP-021). If quorum is not reached within `semi_sync.ack_timeout_ms`:
+  `on_quorum_loss: block` (default) refuses the ack with a retryable
+  `CLUSTER_SHARD_UNAVAILABLE` — the commit itself stays durable locally and
+  replicates when peers return; `degrade` acks anyway and raises
+  `fluxum_replication_degraded` — **the zero-loss guarantee is suspended
+  while that gauge is 1** (REP-022); alert on it. Barrier cost is visible
+  as `fluxum_replication_semi_sync_wait_us` (mean = sum/count).
+
 **Offsite (S3-compatible) targets** (SPEC-025 OPS-010/011): configure
 `replication.archive.remote` (endpoint, bucket, credentials) and the
 checkpoint worker incrementally uploads checkpoint objects and archived

@@ -16,12 +16,25 @@
 //! in chunks, then the log tail (REP-012). Election/consensus is T7.2; the
 //! epoch here is persisted, carried on every envelope, and fenced
 //! mechanically (REP-004/REP-031): a member that sees a higher epoch adopts
-//! it, and a primary whose session partner presents a higher epoch stops
-//! streaming and reports itself stale.
+//! it, a replica rejects stale-epoch batches, and a primary that observes a
+//! higher epoch on ANY channel (hello or ack) stops acknowledging writes —
+//! [`ReplicationPrimary::visibility_barrier`] refuses once fenced. The
+//! demote-to-replica + diverged-suffix truncation flow needs the T7.2
+//! election machinery (only a deposed primary can diverge); until then a
+//! replica offering a future offset is refused loudly.
+//!
+//! Acknowledgment modes (REP-020/021/022): `async` acks at local commit;
+//! `semi_sync` withholds every client-visible acknowledgment — the
+//! `ReducerResult`, the admin `committed` reply, and the `TxUpdate`
+//! fan-out — behind [`ReplicationPrimary::visibility_barrier`] until a
+//! quorum of members (counting the primary) holds the entry durably.
+//! On `ack_timeout_ms` without quorum: `block` refuses the ack with a
+//! retryable `CLUSTER_SHARD_UNAVAILABLE`; `degrade` acks anyway and raises
+//! `fluxum_replication_degraded` until quorum returns.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,10 +42,11 @@ use tokio::sync::{Notify, mpsc};
 
 use fluxum_core::FluxumError;
 use fluxum_core::commitlog::{self, TxRecord};
+use fluxum_core::metrics::Metrics;
 use fluxum_core::txn::CommitMeta;
 use fluxum_protocol::{
     ClientMessage, Frame, FrameCodec, PrimaryHello, ReplAck, ReplBatch, ReplCheckpoint,
-    ReplHeartbeat, ReplicaHello, ServerMessage,
+    ReplHeartbeat, ReplicaHello, ServerMessage, codes,
 };
 
 use crate::{OutFrame, ShardContext};
@@ -88,6 +102,10 @@ pub struct PrimaryOptions {
     pub heartbeat_interval: Duration,
     /// `replication.window_bytes` (REP-017).
     pub window_bytes: u64,
+    /// The REP-021 semi-sync barrier; `None` = `async` mode (REP-020).
+    /// Populated only on the primary role — a replica's local fan-out is
+    /// not quorum-gated in T7.1 (it needs the T7.2 consensus watermark).
+    pub semi_sync: Option<SemiSyncRuntime>,
 }
 
 impl Default for PrimaryOptions {
@@ -95,8 +113,44 @@ impl Default for PrimaryOptions {
         Self {
             heartbeat_interval: Duration::from_millis(500),
             window_bytes: 8 << 20,
+            semi_sync: None,
         }
     }
+}
+
+/// The resolved `replication.semi_sync` block (REP-021/REP-022).
+#[derive(Debug, Clone)]
+pub struct SemiSyncRuntime {
+    /// Members that must hold the entry durably, INCLUDING the primary.
+    pub quorum_total: usize,
+    /// `semi_sync.ack_timeout_ms` (REP-022).
+    pub ack_timeout: Duration,
+    /// `on_quorum_loss: degrade` (true) vs `block` (false).
+    pub degrade: bool,
+}
+
+/// Resolve `semi_sync.quorum` against the member count (REP-021):
+/// `majority` = ⌈(members + 1) / 2⌉; an explicit count is used as-is
+/// (config validation bounds it to `1..=members`).
+pub fn quorum_total(quorum: &str, members: usize) -> usize {
+    match quorum.parse::<usize>() {
+        Ok(count) => count,
+        Err(_) => members / 2 + 1,
+    }
+}
+
+/// REP-031: a batch whose envelope epoch is older than the highest epoch
+/// this member has persisted must be rejected, never applied.
+///
+/// # Errors
+/// The stale-epoch rejection itself.
+fn admit_batch_epoch(batch_epoch: u64, persisted: u64) -> Result<(), FluxumError> {
+    if batch_epoch < persisted {
+        return Err(FluxumError::Storage(format!(
+            "stale-epoch batch rejected: {batch_epoch} < persisted {persisted} (REP-031)"
+        )));
+    }
+    Ok(())
 }
 
 /// One live replica session's shared state (acks + flow control).
@@ -119,6 +173,14 @@ pub struct ReplicationPrimary {
     epoch: AtomicU64,
     options: PrimaryOptions,
     sessions: std::sync::Mutex<std::collections::HashMap<String, Arc<ReplicaSession>>>,
+    /// REP-031: a higher epoch was observed on some channel — this member
+    /// is a deposed primary and stops acknowledging writes. Cleared only
+    /// by the T7.2 demote/re-election flow (i.e. never, in T7.1).
+    fenced: AtomicBool,
+    /// REP-022 `degrade`: quorum currently lost (drives the gauge edge).
+    degraded: AtomicBool,
+    /// Wakes barrier waiters when any replica ack lands (REP-021).
+    quorum_notify: Notify,
 }
 
 impl std::fmt::Debug for ReplicationPrimary {
@@ -146,6 +208,9 @@ impl ReplicationPrimary {
             epoch: AtomicU64::new(epoch),
             options,
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fenced: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
+            quorum_notify: Notify::new(),
         })
     }
 
@@ -154,9 +219,34 @@ impl ReplicationPrimary {
         self.epoch.load(Ordering::SeqCst)
     }
 
+    /// REP-031: whether a higher epoch was observed — a fenced member no
+    /// longer acknowledges writes (the barrier refuses).
+    pub fn fenced(&self) -> bool {
+        self.fenced.load(Ordering::SeqCst)
+    }
+
+    /// REP-031: a higher epoch reached us via `channel` — stop
+    /// acknowledging writes. Demote + resync is the T7.2 election flow.
+    fn fence(&self, metrics: &Metrics, theirs: u64, channel: &str) {
+        metrics.note_replication_fenced();
+        if !self.fenced.swap(true, Ordering::SeqCst) {
+            tracing::warn!(target: "fluxum::repl",
+                ours = self.epoch(), theirs, channel,
+                "higher epoch observed; this primary is stale and stops \
+                 acknowledging writes (REP-031)");
+        }
+        // Wake barrier waiters so blocked acks fail fast, not on timeout.
+        self.quorum_notify.notify_waiters();
+    }
+
     /// Record a replica's acknowledgment (REP-017; quorum input for
-    /// REP-021). Unknown members are ignored (a late ack after drop).
-    pub fn ack(&self, member: &str, ack: &ReplAck) {
+    /// REP-021). Unknown members are ignored (a late ack after drop). An
+    /// ack carrying a HIGHER epoch fences this primary (REP-031: any
+    /// channel counts).
+    pub fn ack(&self, metrics: &Metrics, member: &str, ack: &ReplAck) {
+        if ack.epoch > self.epoch() {
+            self.fence(metrics, ack.epoch, "ack");
+        }
         let sessions = self
             .sessions
             .lock()
@@ -169,6 +259,90 @@ impl ReplicationPrimary {
                 .durable
                 .fetch_max(ack.durable_tx_id, Ordering::SeqCst);
             session.ack_notify.notify_waiters();
+            self.quorum_notify.notify_waiters();
+        }
+    }
+
+    /// The REP-021 visibility barrier: hold a client-visible acknowledgment
+    /// of `tx_id` (ReducerResult, admin reply, TxUpdate fan-out) until the
+    /// quorum holds it durably. `async` mode returns immediately; a fenced
+    /// member refuses (REP-031).
+    ///
+    /// # Errors
+    /// `CLUSTER_SHARD_UNAVAILABLE` (retryable) when fenced, or when the
+    /// quorum is not reached within `ack_timeout_ms` under
+    /// `on_quorum_loss: block` (REP-022).
+    pub async fn visibility_barrier(
+        &self,
+        metrics: &Metrics,
+        tx_id: u64,
+    ) -> Result<(), FluxumError> {
+        let fenced_err = || {
+            FluxumError::query_retryable(
+                codes::CLUSTER_SHARD_UNAVAILABLE,
+                "fenced: a higher epoch exists — this member no longer \
+                 acknowledges writes (REP-031)",
+                Some(1_000),
+            )
+        };
+        if self.fenced() {
+            return Err(fenced_err());
+        }
+        let Some(semi) = &self.options.semi_sync else {
+            return Ok(()); // REP-020: async acks at local commit.
+        };
+        let needed_replicas = semi.quorum_total.saturating_sub(1);
+        if needed_replicas == 0 {
+            return Ok(());
+        }
+        let started = tokio::time::Instant::now();
+        let deadline = started + semi.ack_timeout;
+        loop {
+            // Register for the wake-up BEFORE counting, so an ack landing
+            // between the count and the await is never missed.
+            let notified = self.quorum_notify.notified();
+            let have = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .values()
+                .filter(|s| s.durable.load(Ordering::SeqCst) >= tx_id)
+                .count();
+            if have >= needed_replicas {
+                metrics.note_semi_sync_wait(elapsed_us(started));
+                if self.degraded.swap(false, Ordering::SeqCst) {
+                    metrics.set_replication_degraded(false);
+                    tracing::info!(target: "fluxum::repl",
+                        "semi-sync quorum restored; zero-loss guarantee back (REP-022)");
+                }
+                return Ok(());
+            }
+            if self.fenced() {
+                return Err(fenced_err());
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                if semi.degrade {
+                    if !self.degraded.swap(true, Ordering::SeqCst) {
+                        metrics.set_replication_degraded(true);
+                        tracing::warn!(target: "fluxum::repl", tx_id,
+                            "semi-sync quorum lost; DEGRADED to async — the \
+                             zero-loss guarantee is suspended (REP-022)");
+                    }
+                    metrics.note_semi_sync_wait(elapsed_us(started));
+                    return Ok(());
+                }
+                return Err(FluxumError::query_retryable(
+                    codes::CLUSTER_SHARD_UNAVAILABLE,
+                    format!(
+                        "semi-sync quorum of {} members (incl. this primary) \
+                         not reached within {} ms for tx {tx_id} \
+                         (REP-022 on_quorum_loss: block)",
+                        semi.quorum_total,
+                        semi.ack_timeout.as_millis(),
+                    ),
+                    Some(u32::try_from(semi.ack_timeout.as_millis()).unwrap_or(1_000)),
+                ));
+            }
         }
     }
 
@@ -212,10 +386,8 @@ impl ReplicationPrimary {
         let epoch = self.epoch();
         if hello.epoch > epoch {
             // REP-031: the caller has seen a newer epoch — WE are stale.
-            // Mechanical fencing here; the demote/step-down flow is T7.2.
-            ctx.metrics().note_replication_fenced();
-            tracing::warn!(target: "fluxum::repl", ours = epoch, theirs = hello.epoch,
-                "replica presented a higher epoch; this primary is stale (REP-031)");
+            // The barrier stops acknowledging; demote/step-down is T7.2.
+            self.fence(ctx.metrics(), hello.epoch, "hello");
             let fence = ServerMessage::ReplFence(fluxum_protocol::ReplFence { epoch: hello.epoch });
             if let Ok(frame) = frame(&codec, &fence) {
                 let _ = out.try_send(frame);
@@ -234,6 +406,17 @@ impl ReplicationPrimary {
             .ok()
             .flatten()
             .unwrap_or(0);
+        if hello.last_applied_tx_id > latest {
+            // REP-013: a replica AHEAD of its primary holds a diverged
+            // suffix — only a deposed primary can be (T7.2). Refuse loudly
+            // rather than stream past a divergence; the truncate + rebuild
+            // repair lands with the T7.2 demote flow.
+            tracing::warn!(target: "fluxum::repl",
+                theirs = hello.last_applied_tx_id, ours = latest,
+                "replica offers a FUTURE offset (diverged suffix); session \
+                 refused until the T7.2 demote/truncate flow (REP-013)");
+            return false;
+        }
         // REP-011: partial when the replica's next entry is still on disk.
         let next_needed = hello.last_applied_tx_id.saturating_add(1);
         let sync_full = match first_available {
@@ -407,6 +590,11 @@ impl ReplicationPrimary {
             }
         }
     }
+}
+
+/// Elapsed µs since `started`, saturating.
+fn elapsed_us(started: tokio::time::Instant) -> u64 {
+    u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 fn frame(codec: &FrameCodec, message: &ServerMessage) -> Result<OutFrame, FluxumError> {
@@ -601,6 +789,10 @@ async fn replica_session(
                 }
             }
             ServerMessage::ReplBatch(batch) => {
+                // REP-031: a batch from a deposed primary (older epoch than
+                // this member has persisted) ends the session; the reconnect
+                // hello then carries the higher epoch and fences the sender.
+                admit_batch_epoch(batch.epoch, load_epoch(&options.log_dir)?)?;
                 for raw in &batch.frames {
                     let (envelope_epoch, record) = commitlog::decode_entry_frame(raw)?;
                     if envelope_epoch > log.epoch() {
@@ -771,7 +963,9 @@ mod tests {
         assert_eq!(primary.epoch(), 4);
         assert_eq!(primary.connected(), 0);
         // An ack for a member with no session is a no-op, never a panic.
+        let metrics = Metrics::new(3);
         primary.ack(
+            &metrics,
             "ghost",
             &ReplAck {
                 epoch: 4,
@@ -780,6 +974,20 @@ mod tests {
             },
         );
         assert!(primary.durable_offsets().is_empty());
+        assert!(!primary.fenced());
+        // A ghost ack carrying a HIGHER epoch still fences (REP-031: any
+        // channel counts) — the member no longer acknowledges writes.
+        primary.ack(
+            &metrics,
+            "ghost",
+            &ReplAck {
+                epoch: 9,
+                applied_tx_id: 1,
+                durable_tx_id: 1,
+            },
+        );
+        assert!(primary.fenced());
+        assert_eq!(metrics.replication_fenced_total(), 1);
     }
 
     #[test]
@@ -849,5 +1057,175 @@ mod tests {
         let mut reader = FrameReader::new(FrameCodec::default());
         let err = reader.next_message(&mut stream).await.unwrap_err();
         assert!(err.to_string().contains("decode"), "{err}");
+    }
+
+    // --- the REP-021/022 visibility barrier ---------------------------------
+
+    fn semi_primary(
+        quorum_total: usize,
+        ack_timeout_ms: u64,
+        degrade: bool,
+    ) -> Arc<ReplicationPrimary> {
+        ReplicationPrimary::new(
+            0,
+            PathBuf::new(),
+            PathBuf::new(),
+            1,
+            PrimaryOptions {
+                semi_sync: Some(SemiSyncRuntime {
+                    quorum_total,
+                    ack_timeout: Duration::from_millis(ack_timeout_ms),
+                    degrade,
+                }),
+                ..PrimaryOptions::default()
+            },
+        )
+    }
+
+    /// Register a live replica session at `durable` (what `accept` does
+    /// after the hello).
+    fn register(primary: &ReplicationPrimary, member: &str, durable: u64) {
+        primary.sessions.lock().unwrap().insert(
+            member.to_owned(),
+            Arc::new(ReplicaSession {
+                applied: AtomicU64::new(durable),
+                durable: AtomicU64::new(durable),
+                ack_notify: Notify::new(),
+            }),
+        );
+    }
+
+    #[test]
+    fn quorum_math_matches_rep_021() {
+        // majority = ⌈(members + 1) / 2⌉ — a strict majority.
+        assert_eq!(quorum_total("majority", 1), 1);
+        assert_eq!(quorum_total("majority", 2), 2);
+        assert_eq!(quorum_total("majority", 3), 2);
+        assert_eq!(quorum_total("majority", 4), 3);
+        assert_eq!(quorum_total("majority", 5), 3);
+        // An explicit count is used as-is (config validation bounds it).
+        assert_eq!(quorum_total("2", 5), 2);
+        assert_eq!(quorum_total("5", 5), 5);
+    }
+
+    #[test]
+    fn stale_epoch_batches_are_rejected() {
+        assert!(admit_batch_epoch(3, 3).is_ok());
+        assert!(admit_batch_epoch(4, 3).is_ok());
+        let err = admit_batch_epoch(2, 3).unwrap_err();
+        assert!(err.to_string().contains("REP-031"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn the_barrier_is_a_no_op_in_async_mode_and_for_a_solo_quorum() {
+        let metrics = Metrics::new(0);
+        // REP-020: async acks at local commit — no wait, no sample.
+        let plain = ReplicationPrimary::new(
+            0,
+            PathBuf::new(),
+            PathBuf::new(),
+            1,
+            PrimaryOptions::default(),
+        );
+        plain.visibility_barrier(&metrics, 42).await.unwrap();
+        // Quorum 1 = the primary alone (single-member set): no wait either.
+        let solo = semi_primary(1, 10, false);
+        solo.visibility_barrier(&metrics, 42).await.unwrap();
+        assert_eq!(metrics.semi_sync_waits(), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn the_barrier_releases_when_the_quorum_ack_lands() {
+        let metrics = Arc::new(Metrics::new(0));
+        let primary = semi_primary(2, 5_000, false);
+        register(&primary, "replica-1", 0);
+        let p = Arc::clone(&primary);
+        let m = Arc::clone(&metrics);
+        let waiter = tokio::spawn(async move { p.visibility_barrier(&m, 3).await });
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiter.is_finished(), "the barrier must hold pre-quorum");
+        primary.ack(
+            &metrics,
+            "replica-1",
+            &ReplAck {
+                epoch: 1,
+                applied_tx_id: 3,
+                durable_tx_id: 3,
+            },
+        );
+        waiter.await.unwrap().unwrap();
+        let (_, waits) = metrics.semi_sync_waits();
+        assert_eq!(waits, 1, "one barrier wait recorded (REP-021)");
+    }
+
+    #[tokio::test]
+    async fn quorum_loss_blocks_with_a_retryable_unavailable() {
+        let metrics = Metrics::new(0);
+        let primary = semi_primary(2, 40, false);
+        register(&primary, "replica-1", 0); // never reaches tx 7
+        let err = primary.visibility_barrier(&metrics, 7).await.unwrap_err();
+        assert_eq!(err.to_wire().code, codes::CLUSTER_SHARD_UNAVAILABLE);
+        assert!(err.to_string().contains("REP-022"), "{err}");
+        assert!(!metrics.replication_degraded());
+    }
+
+    #[tokio::test]
+    async fn quorum_loss_degrades_when_configured_and_recovers_on_ack() {
+        let metrics = Metrics::new(0);
+        let primary = semi_primary(2, 30, true);
+        register(&primary, "replica-1", 0);
+        // Degrade: the ack goes through anyway, with the gauge raised.
+        primary.visibility_barrier(&metrics, 5).await.unwrap();
+        assert!(metrics.replication_degraded(), "REP-022 degrade gauge");
+        // The replica catches up — the next barrier passes AND clears it.
+        primary.ack(
+            &metrics,
+            "replica-1",
+            &ReplAck {
+                epoch: 1,
+                applied_tx_id: 5,
+                durable_tx_id: 5,
+            },
+        );
+        primary.visibility_barrier(&metrics, 5).await.unwrap();
+        assert!(!metrics.replication_degraded(), "quorum restored");
+        assert_eq!(metrics.semi_sync_waits().1, 2);
+    }
+
+    #[tokio::test]
+    async fn a_fenced_member_refuses_every_ack_in_both_modes() {
+        let metrics = Metrics::new(0);
+        // Fencing arrives over the ACK channel (REP-031: any channel).
+        let semi = semi_primary(1, 40, false);
+        semi.ack(
+            &metrics,
+            "any",
+            &ReplAck {
+                epoch: 8,
+                applied_tx_id: 0,
+                durable_tx_id: 0,
+            },
+        );
+        let err = semi.visibility_barrier(&metrics, 1).await.unwrap_err();
+        assert_eq!(err.to_wire().code, codes::CLUSTER_SHARD_UNAVAILABLE);
+        assert!(err.to_string().contains("REP-031"), "{err}");
+        // An async-mode member stops acknowledging too.
+        let plain = ReplicationPrimary::new(
+            0,
+            PathBuf::new(),
+            PathBuf::new(),
+            1,
+            PrimaryOptions::default(),
+        );
+        plain.ack(
+            &metrics,
+            "any",
+            &ReplAck {
+                epoch: 8,
+                applied_tx_id: 0,
+                durable_tx_id: 0,
+            },
+        );
+        assert!(plain.visibility_barrier(&metrics, 1).await.is_err());
     }
 }

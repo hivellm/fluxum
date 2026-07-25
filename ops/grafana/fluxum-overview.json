@@ -647,6 +647,34 @@
           "refId": "D"
         }
       ]
+    },
+    {
+      "id": 36,
+      "type": "timeseries",
+      "title": "Replication: semi-sync barrier",
+      "description": "SPEC-014 REP-021/REP-022: mean time client-visible acks wait on the quorum barrier (sum/count over the window), and the degraded flag (1 = quorum lost under on_quorum_loss: degrade — the zero-loss guarantee is suspended; alert immediately).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 0,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "rate(fluxum_replication_semi_sync_wait_us_sum{shard=~\"$shard\"}[5m]) / rate(fluxum_replication_semi_sync_wait_us_count{shard=~\"$shard\"}[5m])",
+          "legendFormat": "mean wait µs {{shard}}",
+          "refId": "A"
+        },
+        {
+          "expr": "fluxum_replication_degraded{shard=~\"$shard\"}",
+          "legendFormat": "degraded {{shard}}",
+          "refId": "B"
+        }
+      ]
     }
   ]
 }

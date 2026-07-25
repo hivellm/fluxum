@@ -523,7 +523,7 @@ async fn route_frame(
             }
             ClientMessage::ReplAck(ack) => {
                 if let Some(primary) = ctx.replication_primary() {
-                    primary.ack(&peer, ack);
+                    primary.ack(ctx.metrics(), &peer, ack);
                     return true;
                 }
             }

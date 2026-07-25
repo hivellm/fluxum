@@ -399,6 +399,13 @@ pub struct Metrics {
     /// REP-081: per-peer `(acked offset, lag in txs)` — replicas as seen by
     /// the primary, or the primary as seen by a replica.
     replication_peers: Mutex<BTreeMap<String, (u64, u64)>>,
+    /// REP-021: cumulative µs client-visible acks waited on the semi-sync
+    /// quorum barrier, plus the number of waits (avg = sum / count).
+    replication_semi_sync_wait_us: AtomicU64,
+    replication_semi_sync_waits: AtomicU64,
+    /// REP-022: 1 while `on_quorum_loss: degrade` has suspended the
+    /// zero-loss guarantee (quorum lost); 0 once quorum returns.
+    replication_degraded: AtomicU64,
     slow_reducer_threshold_us: AtomicU64,
     shard_state: AtomicU8,
     recovered_tx_id: AtomicU64,
@@ -512,6 +519,9 @@ impl Metrics {
             replication_fenced_total: AtomicU64::new(0),
             replication_connected: AtomicU64::new(0),
             replication_peers: Mutex::new(BTreeMap::new()),
+            replication_semi_sync_wait_us: AtomicU64::new(0),
+            replication_semi_sync_waits: AtomicU64::new(0),
+            replication_degraded: AtomicU64::new(0),
             slow_reducer_threshold_us: AtomicU64::new(DEFAULT_SLOW_REDUCER_THRESHOLD_US),
             shard_state: AtomicU8::new(ShardState::Ready as u8),
             recovered_tx_id: AtomicU64::new(0),
@@ -631,6 +641,35 @@ impl Metrics {
             .unwrap_or_else(PoisonError::into_inner)
             .get(peer)
             .copied()
+    }
+
+    /// REP-021: one client-visible ack waited `wait_us` on the quorum
+    /// barrier (recorded per waiter — the caller ack and the fan-out gate
+    /// wait independently).
+    pub fn note_semi_sync_wait(&self, wait_us: u64) {
+        self.replication_semi_sync_wait_us
+            .fetch_add(wait_us, Ordering::Relaxed);
+        self.replication_semi_sync_waits
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The REP-021 barrier-wait `(sum_us, count)` (tests, /health).
+    pub fn semi_sync_waits(&self) -> (u64, u64) {
+        (
+            self.replication_semi_sync_wait_us.load(Ordering::Relaxed),
+            self.replication_semi_sync_waits.load(Ordering::Relaxed),
+        )
+    }
+
+    /// REP-022: raise/clear the degraded flag (`on_quorum_loss: degrade`).
+    pub fn set_replication_degraded(&self, degraded: bool) {
+        self.replication_degraded
+            .store(u64::from(degraded), Ordering::Relaxed);
+    }
+
+    /// The REP-022 degraded flag (tests, /health).
+    pub fn replication_degraded(&self) -> bool {
+        self.replication_degraded.load(Ordering::Relaxed) != 0
     }
 
     /// Drop a peer's series when its session ends.
@@ -974,13 +1013,25 @@ impl Metrics {
              # HELP fluxum_replication_connected_replicas Connected replica sessions \
              (REP-081).\n\
              # TYPE fluxum_replication_connected_replicas gauge\n\
-             fluxum_replication_connected_replicas{{shard=\"{shard}\"}} {}",
+             fluxum_replication_connected_replicas{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_semi_sync_wait_us Client-visible ack time spent \
+             waiting on the semi-sync quorum barrier (REP-021).\n\
+             # TYPE fluxum_replication_semi_sync_wait_us summary\n\
+             fluxum_replication_semi_sync_wait_us_sum{{shard=\"{shard}\"}} {}\n\
+             fluxum_replication_semi_sync_wait_us_count{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_degraded 1 while quorum loss has degraded \
+             semi-sync to async (REP-022 on_quorum_loss: degrade).\n\
+             # TYPE fluxum_replication_degraded gauge\n\
+             fluxum_replication_degraded{{shard=\"{shard}\"}} {}",
             self.tx_commits.load(Ordering::Relaxed),
             self.tx_rollbacks.load(Ordering::Relaxed),
             self.queue_depth.load(Ordering::Relaxed),
             self.archive_segments_pending.load(Ordering::Relaxed),
             self.replication_fenced_total.load(Ordering::Relaxed),
             self.replication_connected.load(Ordering::Relaxed),
+            self.replication_semi_sync_wait_us.load(Ordering::Relaxed),
+            self.replication_semi_sync_waits.load(Ordering::Relaxed),
+            self.replication_degraded.load(Ordering::Relaxed),
         );
         {
             let peers = self

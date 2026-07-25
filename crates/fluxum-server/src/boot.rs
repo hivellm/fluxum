@@ -241,6 +241,19 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // SPEC-014 T7.1: the primary-side replication service is always
     // installed — a single node simply never receives a ReplicaHello. The
     // replica CLIENT (dialing out) is spawned by `serve` per the role.
+    // REP-021: the quorum barrier arms only on a semi-sync PRIMARY — a
+    // replica's local fan-out is not quorum-gated in T7.1 (it needs the
+    // T7.2 consensus watermark to know cluster-wide durability).
+    let semi_sync = (config.replication.role == fluxum_core::config::ReplicationRole::Primary
+        && config.replication.mode == fluxum_core::config::ReplicationMode::SemiSync)
+        .then(|| crate::replication::SemiSyncRuntime {
+            quorum_total: crate::replication::quorum_total(
+                &config.replication.semi_sync.quorum,
+                config.replication.peers.len() + 1,
+            ),
+            ack_timeout: Duration::from_millis(config.replication.semi_sync.ack_timeout_ms),
+            degrade: config.replication.semi_sync.on_quorum_loss == "degrade",
+        });
     ctx.set_replication_primary(crate::replication::ReplicationPrimary::new(
         shard,
         config.storage.commit_log_dir.clone(),
@@ -249,6 +262,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         crate::replication::PrimaryOptions {
             heartbeat_interval: Duration::from_millis(config.replication.heartbeat_interval_ms),
             window_bytes: config.replication.window_bytes.as_u64(),
+            semi_sync,
         },
     ));
     Ok(ctx)

@@ -44,6 +44,25 @@ fn primary_config(dir: &Path) -> Config {
     config
 }
 
+/// POST one task and return the HTTP status line (no assertion).
+async fn post_task(addr: std::net::SocketAddr, name: &str) -> String {
+    let body = format!("[\"{name}\"]");
+    let request = format!(
+        "POST /reducer/add_task HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .unwrap();
+    let mut buf = [0u8; 512];
+    let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
+}
+
 async fn write_tasks(addr: std::net::SocketAddr, from: u64, to: u64) {
     for i in from..=to {
         let body = format!("[\"task-{i}\"]");
@@ -338,6 +357,234 @@ async fn a_higher_epoch_hello_fences_the_stale_primary() {
         "a fenced hello must not register a session"
     );
     client.stop();
+    primary.shutdown();
+}
+
+/// REP-021/REP-022 (the DAG exit's semi-sync ack leg): with
+/// `mode: semi_sync` and members = 2 (quorum 2), every client-visible ack
+/// requires the replica's durable ack. With no replica attached the write
+/// COMMITS locally but the ack is refused after `ack_timeout_ms`
+/// (`on_quorum_loss: block`, retryable); once the replica attaches, HTTP
+/// and TCP acks flow; when it detaches, acks block again.
+#[tokio::test(flavor = "multi_thread")]
+async fn semi_sync_holds_every_client_ack_until_the_quorum_is_durable() {
+    use fluxum_protocol::{ClientMessage, Frame, FrameCodec, ServerMessage};
+
+    fluxum_demo::link();
+    let root = tempfile::tempdir().unwrap();
+    let primary_dir = root.path().join("primary");
+    let mut config = primary_config(&primary_dir);
+    config.replication.mode = fluxum_core::config::ReplicationMode::SemiSync;
+    // One peer ⇒ members = 2 ⇒ majority quorum = 2 (this primary + 1 ack).
+    config.replication.peers = vec!["127.0.0.1:1".into()];
+    config.replication.member_name = "primary".into();
+    config.replication.peer_token = Some(fluxum_core::secret::Secret::new(PEER_TOKEN.to_owned()));
+    config.replication.semi_sync.ack_timeout_ms = 400;
+    let primary = boot::serve(config).await.unwrap();
+    let http = primary.http.local_addr;
+
+    // No replica yet: the commit lands locally, the ACK is withheld and
+    // refused (REP-022 block) — a retryable, never a 200.
+    let head = post_task(http, "unacked").await;
+    assert!(
+        !head.starts_with("HTTP/1.1 200"),
+        "quorum-less semi-sync write must not ack: {head}"
+    );
+    assert_eq!(task_count(&primary.ctx), 1, "the commit itself landed");
+
+    // A replica attaches and drains the backlog; acks flow again.
+    let replica_dir = root.path().join("replica");
+    let mut replica_config = base_config(&replica_dir);
+    replica_config.replication.role = ReplicationRole::Replica;
+    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let client = spawn_replica(
+        std::sync::Arc::clone(&replica_ctx),
+        ReplicaOptions {
+            primary: primary.tcp.local_addr.to_string(),
+            member_name: "replica-1".into(),
+            token: PEER_TOKEN.as_bytes().to_vec(),
+            log_dir: replica_config.storage.commit_log_dir.clone(),
+            checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
+            ack_interval: Duration::from_millis(25),
+        },
+    );
+    wait_for_count(&replica_ctx, 1, "unacked commit still replicates").await;
+    let head = post_task(http, "acked").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "quorum ack: {head}");
+    wait_for_count(&replica_ctx, 2, "semi-sync tail").await;
+
+    // The TCP ReducerResult holds at the same barrier (REP-021): a plain
+    // client's call acks once the replica's durable ack lands.
+    let codec = FrameCodec::default();
+    let mut stream = tokio::net::TcpStream::connect(primary.tcp.local_addr)
+        .await
+        .unwrap();
+    let send = |m: &ClientMessage| codec.encode(&m.encode().unwrap()).unwrap();
+    let auth = ClientMessage::Authenticate(fluxum_protocol::Authenticate {
+        id: 1,
+        token: b"just-a-client".to_vec(),
+        compression: None,
+        tx_updates: None,
+        namespace: None,
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &send(&auth))
+        .await
+        .unwrap();
+    let call = ClientMessage::ReducerCall(fluxum_protocol::ReducerCall {
+        id: 2,
+        reducer: "add_task".into(),
+        version: None,
+        args: vec![fluxum_protocol::FluxValue::Str("via-tcp".into())],
+        idempotency_key: None,
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &send(&call))
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut acked = false;
+    'tcp: while tokio::time::Instant::now() < deadline {
+        let n = tokio::time::timeout_at(
+            deadline,
+            tokio::io::AsyncReadExt::read(&mut stream, &mut chunk),
+        )
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Some((frame, consumed))) = codec.decode(&buf) {
+            if let Frame::Body(body) = frame
+                && let Ok(ServerMessage::ReducerResult(r)) = ServerMessage::decode(body)
+            {
+                assert_eq!(r.id, 2);
+                assert!(r.outcome.is_ok(), "{:?}", r.outcome);
+                acked = true;
+                buf.drain(..consumed);
+                break 'tcp;
+            }
+            buf.drain(..consumed);
+        }
+    }
+    assert!(
+        acked,
+        "the TCP ReducerResult must ack under quorum (REP-021)"
+    );
+    wait_for_count(&replica_ctx, 3, "tcp write replicated").await;
+
+    // The barrier accounted its waits; the zero-loss guarantee never
+    // degraded (mode is block).
+    let (_, waits) = primary.ctx.metrics().semi_sync_waits();
+    assert!(waits >= 1, "semi_sync_wait_us must have samples");
+    assert!(!primary.ctx.metrics().replication_degraded());
+
+    // The replica detaches: acks block again (the session unregisters when
+    // its connection drops).
+    client.stop();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if primary
+            .ctx
+            .replication_primary()
+            .unwrap()
+            .durable_offsets()
+            .is_empty()
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stopped replica's session never unregistered"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let head = post_task(http, "unacked-again").await;
+    assert!(
+        !head.starts_with("HTTP/1.1 200"),
+        "quorum lost again: {head}"
+    );
+    primary.shutdown();
+}
+
+/// REP-013 divergence guard: a replica offering a FUTURE offset (a
+/// diverged suffix — only a deposed primary can be ahead, T7.2) is refused
+/// outright: no `PrimaryHello`, no session, and the connection closes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_ahead_of_the_primary_is_refused() {
+    use fluxum_protocol::{ClientMessage, Frame, FrameCodec, ServerMessage};
+
+    fluxum_demo::link();
+    let root = tempfile::tempdir().unwrap();
+    let primary = boot::serve(primary_config(&root.path().join("primary")))
+        .await
+        .unwrap();
+
+    let codec = FrameCodec::default();
+    let mut stream = tokio::net::TcpStream::connect(primary.tcp.local_addr)
+        .await
+        .unwrap();
+    let send = |m: &ClientMessage| codec.encode(&m.encode().unwrap()).unwrap();
+    // A REAL server peer this time — the refusal under test is the
+    // divergence check, not auth.
+    let auth = ClientMessage::Authenticate(fluxum_protocol::Authenticate {
+        id: 1,
+        token: PEER_TOKEN.as_bytes().to_vec(),
+        compression: None,
+        tx_updates: None,
+        namespace: None,
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &send(&auth))
+        .await
+        .unwrap();
+    let hello = ClientMessage::ReplicaHello(fluxum_protocol::ReplicaHello {
+        shard_id: 0,
+        member_name: "deposed".into(),
+        epoch: 1,
+        last_applied_tx_id: 999, // far beyond the primary's head (0)
+    });
+    tokio::io::AsyncWriteExt::write_all(&mut stream, &send(&hello))
+        .await
+        .unwrap();
+
+    // The primary must close the connection WITHOUT a PrimaryHello.
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let n = tokio::time::timeout_at(
+            deadline,
+            tokio::io::AsyncReadExt::read(&mut stream, &mut chunk),
+        )
+        .await
+        .unwrap_or(Ok(0))
+        .unwrap_or(0);
+        if n == 0 {
+            break; // closed — the refusal
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        while let Ok(Some((frame, consumed))) = codec.decode(&buf) {
+            if let Frame::Body(body) = frame {
+                let message = ServerMessage::decode(body).unwrap();
+                assert!(
+                    !matches!(message, ServerMessage::PrimaryHello(_)),
+                    "a diverged replica must never get a stream (REP-013)"
+                );
+            }
+            buf.drain(..consumed);
+        }
+    }
+    assert!(
+        primary
+            .ctx
+            .replication_primary()
+            .unwrap()
+            .durable_offsets()
+            .is_empty(),
+        "no session may register for a diverged replica"
+    );
     primary.shutdown();
 }
 

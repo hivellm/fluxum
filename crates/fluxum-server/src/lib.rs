@@ -1215,6 +1215,26 @@ pub(crate) fn spawn_fanout_for(
             ctx.metrics()
                 .note_fanout_stage(FanoutStage::RecvLag, us(committed_at.elapsed()));
 
+            // REP-021: the TxUpdate fan-out is client-visible — in
+            // semi_sync mode each commit holds at the quorum barrier before
+            // evaluation (same watermark as the ReducerResult). Quorum loss
+            // under `block` keeps withholding: nothing observable may
+            // precede quorum, and commits stay ordered behind the barrier.
+            // A fenced primary still delivers what it already committed —
+            // the T7.2 demote flow owns divergence repair. Namespace
+            // commits ride their own logs, outside the shard stream (T7.1).
+            if namespace.is_none()
+                && let Some(primary) = ctx.replication_primary()
+            {
+                while let Err(e) = primary.visibility_barrier(ctx.metrics(), diff.tx_id).await {
+                    if primary.fenced() {
+                        break;
+                    }
+                    tracing::debug!(target: "fluxum::fanout", error = %e,
+                        "TxUpdate fan-out withheld awaiting quorum (REP-021)");
+                }
+            }
+
             // …then evaluate once (SUB-041: mutex held only across
             // evaluation), against this namespace's subscriptions only.
             let eval_started = Instant::now();

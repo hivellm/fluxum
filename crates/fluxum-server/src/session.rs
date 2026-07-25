@@ -386,6 +386,19 @@ impl Session {
                 {
                     return Routed::reply(from_error(Some(id), &e));
                 }
+                // REP-021: in semi_sync mode nothing a client can observe
+                // precedes quorum — hold the ReducerResult until the quorum
+                // holds the entry durably (the fan-out holds at the same
+                // barrier). Namespace commits ride their own logs and are
+                // outside the shard's replication stream (T7.1).
+                if self.namespace.is_none()
+                    && let Some(primary) = self.ctx.replication_primary()
+                    && let Err(e) = primary
+                        .visibility_barrier(self.ctx.metrics(), receipt.tx_id)
+                        .await
+                {
+                    return Routed::reply(from_error(Some(id), &e));
+                }
                 // The single writer already published the diff at commit
                 // visibility (P0-A 1.3) — this ack only reports the outcome.
                 Routed::reply(ServerMessage::ReducerResult(ReducerResult {
