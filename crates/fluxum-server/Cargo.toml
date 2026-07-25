@@ -17,6 +17,7 @@ fluxum-core.workspace = true
 fluxum-demo.workspace = true
 fluxum-protocol.workspace = true
 rmp-serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 socket2.workspace = true

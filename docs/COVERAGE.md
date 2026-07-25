@@ -5,8 +5,12 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.01% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
-drivers live), after phase7_backup-object-storage-archive (~1,000 more lines:
+**Current standing:** **90.00% lines** — 2026-07-24, gate command below (PG + SpacetimeDB
+drivers live), after phase7_replication-streaming phases A+B (~1,600 more lines: the
+replica apply path and stream helpers are pinned by oracle-exact suites; the wire module
+sits at ~87% — its remaining misses are async streamer arms that the phase-C semi-sync
+and demote tests will exercise; the margin is ±2 lines, so phase C MUST create slack
+first). Prior: 90.01% after phase7_backup-object-storage-archive (~1,000 more lines:
 seekable-zstd framing at 90%+, the S3 SigV4 store at 92%, remote push/restore/PITR at
 84%+ via the in-process S3 wire fixture; the margin is thin — the standing debt now
 includes `cli/backup.rs` remote/error plumbing (62%) and remote.rs error arms, which the
@@ -25,7 +29,7 @@ phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are
 by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
 wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
 **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01%. The **standing debt items below remain open**: (a) the
+90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01% → 90.00%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);

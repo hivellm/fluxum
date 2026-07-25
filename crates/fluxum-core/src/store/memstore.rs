@@ -629,6 +629,150 @@ impl MemStore {
         Ok(())
     }
 
+    /// SPEC-014 REP-014 step 4: apply one replicated commit-log record to
+    /// this replica's `CommittedState` — every table, atomically, with the
+    /// same index/unique/spatial/fulltext maintenance as a commit merge —
+    /// consuming the record's own `tx_id` (strict monotonicity, STG-015) and
+    /// resuming auto-inc high-water marks (STG-040). Returns the applied
+    /// [`TxDiff`] so the replica evaluates its local subscriptions and fans
+    /// out `TxUpdate`s identical to the primary's (REP-014 step 5, REP-043).
+    ///
+    /// The caller is the replica's single apply loop; the writer lock is
+    /// held for the merge, exactly like a local commit.
+    ///
+    /// # Errors
+    /// A `tx_id` that is not exactly `next_tx_id` (gap or repeat — the
+    /// session must abort and resync, REP-014 step 2), an unknown table, or
+    /// an index-maintenance invariant failure.
+    pub fn apply_replica_record(
+        &self,
+        record: &crate::commitlog::record::TxRecord,
+    ) -> Result<TxDiff> {
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        if record.tx_id != writer.next_tx_id {
+            return Err(FluxumError::Storage(format!(
+                "replicated tx_id {} does not continue the replica's log at {} \
+                 (STG-015 — abort the session and resync, REP-014)",
+                record.tx_id, writer.next_tx_id
+            )));
+        }
+        let mut tables = self.committed.load_full().tables.clone();
+        let mut diffs: Vec<TableDiff> = Vec::with_capacity(record.mutations.len());
+        for mutation in &record.mutations {
+            let table_id = mutation.table();
+            let schema = self.schema_of(table_id)?;
+            let slot = tables.get_mut(&table_id).ok_or_else(|| {
+                FluxumError::Storage(format!(
+                    "replicated record references table {table_id} missing from CommittedState"
+                ))
+            })?;
+            let table = Arc::make_mut(slot);
+            let mut diff = TableDiff {
+                table_id,
+                inserts: Vec::new(),
+                deletes: Vec::new(),
+            };
+            for pk in mutation.delete_pks() {
+                let pk = PkBytes::from_bytes(pk);
+                if let Some(existing) = table.rows.remove(&pk) {
+                    for constraint in &mut table.unique {
+                        constraint.remove(&existing, &pk)?;
+                    }
+                    for index in table.indexes.values_mut() {
+                        index.remove(&existing, &pk)?;
+                    }
+                    if let Some(spatial) = &mut table.spatial {
+                        spatial.remove_row(&existing, &pk)?;
+                    }
+                    for fulltext in &mut table.fulltext {
+                        fulltext.remove_row(&existing, &pk)?;
+                    }
+                    diff.deletes.push((pk, existing));
+                }
+            }
+            for row in mutation.insert_rows()? {
+                let pk = encode_pk_of_row(schema, row.values())?;
+                // An in-place replacement arrives as delete+insert of the
+                // same pk; a bare insert over an existing key (convergent
+                // replays) removes first, mirroring recovery semantics.
+                if let Some(existing) = table.rows.remove(&pk) {
+                    for constraint in &mut table.unique {
+                        constraint.remove(&existing, &pk)?;
+                    }
+                    for index in table.indexes.values_mut() {
+                        index.remove(&existing, &pk)?;
+                    }
+                    if let Some(spatial) = &mut table.spatial {
+                        spatial.remove_row(&existing, &pk)?;
+                    }
+                    for fulltext in &mut table.fulltext {
+                        fulltext.remove_row(&existing, &pk)?;
+                    }
+                }
+                for index in table.indexes.values_mut() {
+                    index.insert(&row, pk.clone())?;
+                }
+                for constraint in &mut table.unique {
+                    constraint.insert(&row, pk.clone())?;
+                }
+                if let Some(spatial) = &mut table.spatial {
+                    spatial.insert_row(&row, pk.clone())?;
+                }
+                for fulltext in &mut table.fulltext {
+                    fulltext.insert_row(&row, pk.clone())?;
+                }
+                table.rows.insert(pk, row.clone());
+                diff.inserts.push(row);
+            }
+            diffs.push(diff);
+        }
+
+        // STG-040: resume auto-inc generation from the primary's published
+        // high-water marks — a later promotion continues without id reuse.
+        let mut auto_inc = Vec::with_capacity(record.auto_inc.len());
+        for (raw_id, high_water) in &record.auto_inc {
+            let table_id = TableId::from_raw(*raw_id);
+            writer.counters.insert(
+                table_id,
+                AutoIncCounter {
+                    next: high_water.saturating_add(1),
+                    high_water: *high_water,
+                },
+            );
+            if let Some(slot) = tables.get_mut(&table_id) {
+                Arc::make_mut(slot).auto_inc_high_water = *high_water;
+            }
+            auto_inc.push((table_id, *high_water));
+        }
+
+        // Consume the record's tx id and swap — atomic for readers, exactly
+        // like a local commit (REP-014 step 4).
+        writer.next_tx_id = record.tx_id.saturating_add(1);
+        let published = Arc::new(CommittedState { tables });
+        self.committed.store(Arc::clone(&published));
+
+        // SPEC-022 RV-020: replicas retain the same temporal window, so
+        // `AS OF` reads answer identically on primary and replica.
+        if self.options.temporal_window > 0 {
+            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+            history.push_back((record.tx_id, record.timestamp, published));
+            while history.len() > self.options.temporal_window {
+                history.pop_front();
+            }
+        }
+
+        let diff = TxDiff {
+            tx_id: record.tx_id,
+            tables: diffs,
+            auto_inc,
+        };
+        // DMX-040: replicated rows hold blob references too.
+        if let Some(blobs) = self.blobs.get() {
+            apply_blob_refcounts(&self.catalog, blobs, &diff.tables);
+        }
+        Ok(diff)
+    }
+
     /// SPEC-022 RV-021: the committed state at an earlier point — the
     /// newest retained snapshot at or before `point`. `AS OF` a point newer
     /// than every retained commit answers with the LIVE snapshot (the state

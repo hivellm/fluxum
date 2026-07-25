@@ -114,24 +114,32 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         );
     }
 
-    // SPEC-014 REP-072: a data directory produced by a PITR restore carries
-    // a lineage marker naming the minimum fencing epoch this boot must
-    // adopt — strictly greater than any epoch in the restored (forked) log.
+    // SPEC-014 REP-004/REP-072: the fencing epoch this boot acts under is
+    // the highest of the persisted replication epoch and any PITR lineage
+    // marker (a forked history must start above everything it forked from).
+    // It is persisted before the member acts under it.
     let epoch = fluxum_core::backup::pitr_lineage_min_epoch(&config.storage.commit_log_dir)?
         .unwrap_or(0)
+        .max(crate::replication::load_epoch(
+            &config.storage.commit_log_dir,
+        )?)
         .max(1);
+    crate::replication::persist_epoch(&config.storage.commit_log_dir, epoch)?;
     if epoch > 1 {
         tracing::info!(
             target: "fluxum::server",
             epoch,
-            "PITR lineage marker found; booting with a forked-history fencing epoch (REP-072)"
+            "booting under persisted fencing epoch (REP-004)"
         );
     }
     let log = Arc::new(CommitLog::open(
         &config.storage.commit_log_dir,
         shard,
         epoch,
-        CommitLogOptions::default(),
+        CommitLogOptions {
+            segment_max_bytes: config.storage.segment_max_bytes.as_u64(),
+            ..CommitLogOptions::default()
+        },
     )?);
 
     let (pipeline, worker) =
@@ -149,9 +157,12 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     );
 
     let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    // AUTH-062 / REP-005: the configured server peers — operators, ingest
+    // services, and replica-set members all authenticate through this
+    // registry. (It was silently empty before T7.1 wired replication in.)
     let auth = Authenticator::with_provider(
         provider_from_config(&config.auth)?,
-        ServerPeerRegistry::empty(),
+        ServerPeerRegistry::from_config(&config.auth.server_peers)?,
     );
 
     let ctx = ShardContext::new(engine, subs, auth, shard, COMMIT_BROADCAST_CAPACITY);
@@ -227,6 +238,19 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         },
     )?;
     ctx.set_checkpoint_service(crate::CheckpointService::new(worker));
+    // SPEC-014 T7.1: the primary-side replication service is always
+    // installed — a single node simply never receives a ReplicaHello. The
+    // replica CLIENT (dialing out) is spawned by `serve` per the role.
+    ctx.set_replication_primary(crate::replication::ReplicationPrimary::new(
+        shard,
+        config.storage.commit_log_dir.clone(),
+        config.storage.checkpoint_dir.clone(),
+        epoch,
+        crate::replication::PrimaryOptions {
+            heartbeat_interval: Duration::from_millis(config.replication.heartbeat_interval_ms),
+            window_bytes: config.replication.window_bytes.as_u64(),
+        },
+    ));
     Ok(ctx)
 }
 
@@ -367,6 +391,29 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             source,
         }
     })?;
+
+    // SPEC-014 REP-003: a configured replica dials the primary and keeps
+    // itself converged (T7.1; endpoint discovery via election is T7.2).
+    if config.replication.role == fluxum_core::config::ReplicationRole::Replica
+        && let Some(primary) = config.replication.peers.first()
+    {
+        crate::replication::spawn_replica(
+            Arc::clone(&ctx),
+            crate::replication::ReplicaOptions {
+                primary: primary.clone(),
+                member_name: config.replication.member_name.clone(),
+                token: config
+                    .replication
+                    .peer_token
+                    .as_ref()
+                    .map(|t| t.expose_str().as_bytes().to_vec())
+                    .unwrap_or_default(),
+                log_dir: config.storage.commit_log_dir.clone(),
+                checkpoint_dir: config.storage.checkpoint_dir.clone(),
+                ack_interval: Duration::from_millis(config.replication.ack_interval_ms),
+            },
+        );
+    }
 
     Ok(Server { http, tcp, ctx })
 }

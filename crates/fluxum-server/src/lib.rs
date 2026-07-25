@@ -29,6 +29,7 @@ pub mod http;
 pub mod logging;
 pub mod namespace;
 pub mod quota;
+pub mod replication;
 pub mod session;
 pub mod session_sec;
 pub mod shard;
@@ -369,6 +370,10 @@ pub struct ShardContext {
     /// `POST /checkpoint` (REP-060 `--fresh-checkpoint`) and the final
     /// drain checkpoint.
     checkpoint: std::sync::OnceLock<Arc<CheckpointService>>,
+    /// The primary-side replication service (SPEC-014 T7.1), once
+    /// installed: the TCP transport hands server-peer `ReplicaHello`
+    /// sessions to it.
+    replication: std::sync::OnceLock<Arc<crate::replication::ReplicationPrimary>>,
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
@@ -513,6 +518,7 @@ impl ShardContext {
             fanout_started: std::sync::atomic::AtomicBool::new(false),
             blob_store: std::sync::OnceLock::new(),
             checkpoint: std::sync::OnceLock::new(),
+            replication: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
             namespaces: std::sync::RwLock::new(HashMap::new()),
@@ -565,6 +571,17 @@ impl ShardContext {
     /// The installed checkpoint service, if any.
     pub fn checkpoint_service(&self) -> Option<&Arc<CheckpointService>> {
         self.checkpoint.get()
+    }
+
+    /// Install the primary-side replication service (SPEC-014 T7.1). A
+    /// second call is ignored.
+    pub fn set_replication_primary(&self, primary: Arc<crate::replication::ReplicationPrimary>) {
+        let _ = self.replication.set(primary);
+    }
+
+    /// The installed replication service, if any.
+    pub fn replication_primary(&self) -> Option<&Arc<crate::replication::ReplicationPrimary>> {
+        self.replication.get()
     }
 
     /// The SEC-045 query-bounds handle (shared with every hosted manager).

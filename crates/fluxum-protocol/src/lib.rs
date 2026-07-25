@@ -26,8 +26,9 @@ pub mod value;
 pub use fluxbin::{FluxBinError, FluxBinReader, FluxBinWriter};
 pub use frame::{DEFAULT_MAX_FRAME_BYTES, FRAME_HEADER_LEN, Frame, FrameCodec, FrameError};
 pub use messages::{
-    AuthResult, Authenticate, ClientMessage, ErrorMessage, InitialData, OneOffQuery, ReducerCall,
-    ReducerError, ReducerResult, Resume, ServerMessage, Subscribe, SubscribeSingle, TableUpdate,
+    AuthResult, Authenticate, ClientMessage, ErrorMessage, InitialData, OneOffQuery, PrimaryHello,
+    ReducerCall, ReducerError, ReducerResult, ReplAck, ReplBatch, ReplCheckpoint, ReplFence,
+    ReplHeartbeat, ReplicaHello, Resume, ServerMessage, Subscribe, SubscribeSingle, TableUpdate,
     TxUpdate, TxUpdateLight, Unsubscribe,
 };
 pub use rowlist::{RowList, RowListBuilder, RowListError, RowSizeHint};

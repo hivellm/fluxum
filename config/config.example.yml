@@ -89,6 +89,7 @@ storage:
   checkpoint_dir: ./data/checkpoints
   page_dir: ./data/pages           # cold-tier page files (TIER-023)
   page_size: 8192                  # logical page size: 4096 | 8192 | 16384
+  segment_max_bytes: 134217728     # commit-log segment rotation size, 128 MiB (STG-013)
   checkpoint_interval_tx: 10000    # checkpoint cadence in committed transactions
   page_compression: lz4            # lz4 | zstd | none
   compression_min_bytes: 1024      # payloads smaller than this stay raw (TIER-040)
@@ -104,9 +105,20 @@ storage:
     keys: []                       # [{ id, key_hex: 64-hex (256-bit) }, ...]; retired keys stay readable
 
 replication:
-  role: primary              # primary | replica (auto after election)
-  mode: async                # async | semi_sync
-  peers: []                  # replica-set member addresses
+  role: primary              # primary | replica (bootstrap hint; auto after election)
+  mode: async                # async | semi_sync (REP-020/021)
+  peers: []                  # replica-set member addresses, host:port (FluxRPC TCP)
+  member_name: ""            # this member's name (REP-005); required with peers
+  peer_token: ${FLUXUM_PEER_TOKEN}  # server-peer credential this member dials with
+  heartbeat_interval_ms: 500 # primary liveness/lag beacon cadence (REP-016)
+  election_timeout_ms: 3000  # heartbeat loss before an election (REP-016; T7.2)
+  window_bytes: 8388608      # 8 MiB per-replica flow-control window (REP-017)
+  ack_interval_ms: 100       # replica acknowledgment cadence (REP-017)
+  max_staleness_ms: 5000     # read-replica admission bound (REP-041)
+  semi_sync:
+    quorum: majority         # majority | <count> (REP-021)
+    ack_timeout_ms: 1000     # quorum wait bound per transaction (REP-022)
+    on_quorum_loss: block    # block | degrade (REP-022)
   # Commit-log segment archival (SPEC-014 REP-062): segments are copied here
   # durably BEFORE checkpoint-driven truncation may delete them — the PITR
   # source. The retention window IS the PITR window.

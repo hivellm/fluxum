@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicI64, AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// OBS-011 reducer-latency histogram bucket upper bounds, in microseconds.
 /// Exactly the boundaries SPEC-012 acceptance 3 pins.
@@ -392,6 +392,13 @@ pub struct Metrics {
     /// SPEC-014 REP-081: covered segments awaiting archival before deletion
     /// (non-zero only while an archival failure is blocking truncation).
     archive_segments_pending: AtomicU64,
+    /// REP-081: writes rejected by epoch fencing (REP-031).
+    replication_fenced_total: AtomicU64,
+    /// REP-081: currently connected replica sessions (primary side).
+    replication_connected: AtomicU64,
+    /// REP-081: per-peer `(acked offset, lag in txs)` — replicas as seen by
+    /// the primary, or the primary as seen by a replica.
+    replication_peers: Mutex<BTreeMap<String, (u64, u64)>>,
     slow_reducer_threshold_us: AtomicU64,
     shard_state: AtomicU8,
     recovered_tx_id: AtomicU64,
@@ -502,6 +509,9 @@ impl Metrics {
             tx_rollbacks: AtomicU64::new(0),
             queue_depth: AtomicU64::new(0),
             archive_segments_pending: AtomicU64::new(0),
+            replication_fenced_total: AtomicU64::new(0),
+            replication_connected: AtomicU64::new(0),
+            replication_peers: Mutex::new(BTreeMap::new()),
             slow_reducer_threshold_us: AtomicU64::new(DEFAULT_SLOW_REDUCER_THRESHOLD_US),
             shard_state: AtomicU8::new(ShardState::Ready as u8),
             recovered_tx_id: AtomicU64::new(0),
@@ -587,6 +597,48 @@ impl Metrics {
     /// The current REP-081 pending-archival gauge (tests, /health surfaces).
     pub fn archive_segments_pending(&self) -> u64 {
         self.archive_segments_pending.load(Ordering::Relaxed)
+    }
+
+    /// REP-031: one write/batch rejected by epoch fencing.
+    pub fn note_replication_fenced(&self) {
+        self.replication_fenced_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The REP-081 fencing counter (tests).
+    pub fn replication_fenced_total(&self) -> u64 {
+        self.replication_fenced_total.load(Ordering::Relaxed)
+    }
+
+    /// REP-081: connected replica sessions (primary side).
+    pub fn set_replication_connected(&self, connected: u64) {
+        self.replication_connected
+            .store(connected, Ordering::Relaxed);
+    }
+
+    /// REP-081: publish one peer's acked offset + tx lag.
+    pub fn set_replication_peer(&self, peer: &str, offset: u64, lag_tx: u64) {
+        self.replication_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(peer.to_owned(), (offset, lag_tx));
+    }
+
+    /// One peer's `(offset, lag)`, if published (tests, /health).
+    pub fn replication_peer(&self, peer: &str) -> Option<(u64, u64)> {
+        self.replication_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer)
+            .copied()
+    }
+
+    /// Drop a peer's series when its session ends.
+    pub fn remove_replication_peer(&self, peer: &str) {
+        self.replication_peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(peer);
     }
 
     /// The OBS-072 slow-reducer WARN threshold (µs).
@@ -914,12 +966,51 @@ impl Metrics {
              # HELP fluxum_archive_segments_pending Covered segments awaiting archival \
              before deletion (REP-062/REP-081).\n\
              # TYPE fluxum_archive_segments_pending gauge\n\
-             fluxum_archive_segments_pending{{shard=\"{shard}\"}} {}",
+             fluxum_archive_segments_pending{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_fenced_total Writes rejected by epoch fencing \
+             (REP-031/REP-081).\n\
+             # TYPE fluxum_replication_fenced_total counter\n\
+             fluxum_replication_fenced_total{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_connected_replicas Connected replica sessions \
+             (REP-081).\n\
+             # TYPE fluxum_replication_connected_replicas gauge\n\
+             fluxum_replication_connected_replicas{{shard=\"{shard}\"}} {}",
             self.tx_commits.load(Ordering::Relaxed),
             self.tx_rollbacks.load(Ordering::Relaxed),
             self.queue_depth.load(Ordering::Relaxed),
             self.archive_segments_pending.load(Ordering::Relaxed),
+            self.replication_fenced_total.load(Ordering::Relaxed),
+            self.replication_connected.load(Ordering::Relaxed),
         );
+        {
+            let peers = self
+                .replication_peers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !peers.is_empty() {
+                out.push_str(
+                    "# HELP fluxum_replication_offset Last acked tx id per peer (REP-081).\n\
+                     # TYPE fluxum_replication_offset gauge\n",
+                );
+                for (peer, (offset, _)) in peers.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_replication_offset{{shard=\"{shard}\",peer=\"{peer}\"}} {offset}"
+                    );
+                }
+                out.push_str(
+                    "# HELP fluxum_replication_lag_tx Head minus acked tx id per peer \
+                     (REP-081).\n\
+                     # TYPE fluxum_replication_lag_tx gauge\n",
+                );
+                for (peer, (_, lag)) in peers.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_replication_lag_tx{{shard=\"{shard}\",peer=\"{peer}\"}} {lag}"
+                    );
+                }
+            }
+        }
 
         // --- subscription / fan-out (OBS-020/021/022) ---
         let _ = writeln!(

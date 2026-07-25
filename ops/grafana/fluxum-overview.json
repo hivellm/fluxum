@@ -609,6 +609,44 @@
           "refId": "A"
         }
       ]
+    },
+    {
+      "id": 35,
+      "type": "timeseries",
+      "title": "Replication: peers, offsets & fencing",
+      "description": "SPEC-014 REP-081: connected replica sessions, per-peer acked offset and tx lag, and epoch-fenced write rejections (alert on any fenced increase and on sustained lag growth).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 37
+      },
+      "targets": [
+        {
+          "expr": "fluxum_replication_connected_replicas{shard=~\"$shard\"}",
+          "legendFormat": "connected {{shard}}",
+          "refId": "A"
+        },
+        {
+          "expr": "fluxum_replication_lag_tx{shard=~\"$shard\"}",
+          "legendFormat": "lag {{peer}}",
+          "refId": "B"
+        },
+        {
+          "expr": "fluxum_replication_offset{shard=~\"$shard\"}",
+          "legendFormat": "offset {{peer}}",
+          "refId": "C"
+        },
+        {
+          "expr": "rate(fluxum_replication_fenced_total{shard=~\"$shard\"}[5m])",
+          "legendFormat": "fenced/s {{shard}}",
+          "refId": "D"
+        }
+      ]
     }
   ]
 }

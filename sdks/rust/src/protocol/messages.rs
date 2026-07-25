@@ -425,6 +425,96 @@ impl ErrorMessage {
 }
 
 // ---------------------------------------------------------------------------
+// Replication (SPEC-014 §3) — server-peer traffic on the same TCP port.
+// ---------------------------------------------------------------------------
+
+/// SPEC-014 REP-011 — opens a replication session (replica → primary),
+/// after an ordinary server-peer `Authenticate` (REP-005).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaHello {
+    /// The shard whose log the replica wants.
+    pub shard_id: u32,
+    /// The replica's configured member name.
+    pub member_name: String,
+    /// Highest epoch the replica has persisted (REP-004).
+    pub epoch: u64,
+    /// Highest tx id applied to its `CommittedState` (0 = empty).
+    pub last_applied_tx_id: u64,
+}
+
+/// SPEC-014 REP-017/REP-021 — the replica's applied/durable acknowledgment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplAck {
+    /// The epoch the replica is acknowledging under.
+    pub epoch: u64,
+    /// Highest tx id applied to `CommittedState`.
+    pub applied_tx_id: u64,
+    /// Highest tx id durably appended to the replica's local log — what
+    /// semi-sync quorum counts (REP-021).
+    pub durable_tx_id: u64,
+}
+
+/// SPEC-014 REP-011 — the primary's session answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrimaryHello {
+    /// The shard.
+    pub shard_id: u32,
+    /// The primary's current epoch.
+    pub epoch: u64,
+    /// Oldest tx id still covered by retained log segments.
+    pub first_available_tx_id: u64,
+    /// The primary's head tx id.
+    pub latest_tx_id: u64,
+    /// `true` = full sync (checkpoint chunks precede the stream, REP-012);
+    /// `false` = partial sync from `from_tx_id` (REP-013).
+    pub sync_full: bool,
+    /// First tx id the entry stream will carry.
+    pub from_tx_id: u64,
+}
+
+/// SPEC-014 REP-012 — one chunk of the packed checkpoint (the T7.3
+/// `checkpoint.pack` bytes, streamed in bounded pieces).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplCheckpoint {
+    /// The checkpoint's covering tx id.
+    pub last_tx_id: u64,
+    /// The next pack bytes.
+    #[serde(with = "serde_bytes")]
+    pub chunk: Vec<u8>,
+    /// `true` on the final chunk.
+    pub done: bool,
+}
+
+/// SPEC-014 REP-010 — a batch of raw STG-011 entry frames, byte-identical
+/// to the primary's on-disk log. `reducer_name`/`caller` ride inside each
+/// record (tail-additive since OPS-020), so no side-band metadata is needed
+/// for REP-043 fan-out equivalence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplBatch {
+    /// The primary's epoch when this batch was sent (REP-004 fencing).
+    pub epoch: u64,
+    /// Raw entry frames (`len | epoch | body | crc32c`), in `tx_id` order.
+    pub frames: Vec<serde_bytes::ByteBuf>,
+}
+
+/// SPEC-014 REP-016 — the primary's liveness/lag beacon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplHeartbeat {
+    /// The primary's current epoch.
+    pub epoch: u64,
+    /// The primary's head tx id.
+    pub latest_tx_id: u64,
+}
+
+/// SPEC-014 REP-031 — a fencing rejection: the receiver has persisted a
+/// higher epoch than the sender's envelope. The sender must demote/resync.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplFence {
+    /// The higher epoch the receiver holds.
+    pub epoch: u64,
+}
+
+// ---------------------------------------------------------------------------
 // Envelopes
 // ---------------------------------------------------------------------------
 
@@ -445,6 +535,10 @@ tagged_enum! {
         "OneOffQuery" => OneOffQuery(OneOffQuery),
         /// RPC-026 / SPEC-021 CS-021.
         "Resume" => Resume(Resume),
+        /// SPEC-014 REP-011 (server-peer only).
+        "ReplicaHello" => ReplicaHello(ReplicaHello),
+        /// SPEC-014 REP-017 (server-peer only).
+        "ReplAck" => ReplAck(ReplAck),
     }
 }
 
@@ -463,5 +557,15 @@ tagged_enum! {
         "TxUpdateLight" => TxUpdateLight(TxUpdateLight),
         /// RPC-034.
         "Error" => Error(ErrorMessage),
+        /// SPEC-014 REP-011 (replication sessions only).
+        "PrimaryHello" => PrimaryHello(PrimaryHello),
+        /// SPEC-014 REP-012 (replication sessions only).
+        "ReplCheckpoint" => ReplCheckpoint(ReplCheckpoint),
+        /// SPEC-014 REP-010 (replication sessions only).
+        "ReplBatch" => ReplBatch(ReplBatch),
+        /// SPEC-014 REP-016 (replication sessions only).
+        "ReplHeartbeat" => ReplHeartbeat(ReplHeartbeat),
+        /// SPEC-014 REP-031 (replication sessions only).
+        "ReplFence" => ReplFence(ReplFence),
     }
 }

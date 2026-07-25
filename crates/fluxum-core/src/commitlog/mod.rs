@@ -71,6 +71,101 @@ pub use writer::{CommitLog, DurableState, RecoveryReport};
 
 use crate::error::{FluxumError, Result};
 
+/// Encode one record as an STG-011 entry frame under `epoch` — the exact
+/// on-disk (and therefore SPEC-014 REP-010 replication-stream) bytes.
+///
+/// # Errors
+/// Record encoding failures or a body over the frame limit.
+pub fn encode_entry_frame(epoch: u64, record: &TxRecord) -> Result<Vec<u8>> {
+    format::encode_entry(epoch, &record.encode()?).map_err(FluxumError::Storage)
+}
+
+/// The oldest `first_tx_id` still covered by retained segments in `dir` —
+/// what a primary reports as `first_available_tx_id` (SPEC-014 REP-011) to
+/// decide full vs partial sync. `None` = no segments.
+///
+/// # Errors
+/// Directory read failures.
+pub fn first_available_tx_id(dir: &std::path::Path, shard_id: u32) -> Result<Option<u64>> {
+    Ok(segment::list_segments(dir, shard_id)?
+        .first()
+        .map(|s| s.first_tx_id))
+}
+
+/// Read raw STG-011 entry frames with `tx_id > after_tx` from the log in
+/// `dir`, up to `max_bytes` of frame data — the SPEC-014 REP-010 stream
+/// source: the durable log IS the replication stream, byte-identically.
+/// Returns the frames in order plus the last `tx_id` included.
+///
+/// # Errors
+/// I/O failures or a corrupt segment (the stream source must be clean —
+/// recovery owns quarantine, not replication).
+pub fn read_frames_after(
+    dir: &std::path::Path,
+    shard_id: u32,
+    after_tx: u64,
+    max_bytes: usize,
+) -> Result<(Vec<Vec<u8>>, u64)> {
+    let mut frames = Vec::new();
+    let mut last_tx = after_tx;
+    let mut budget = max_bytes;
+    for seg in segment::list_segments(dir, shard_id)? {
+        let bytes = std::fs::read(&seg.path)?;
+        let mut offset = format::SEGMENT_HEADER_LEN;
+        loop {
+            match format::scan_entry(&bytes, offset) {
+                format::ScannedEntry::Entry { body, end, .. } => {
+                    let record = TxRecord::decode(body).map_err(FluxumError::Storage)?;
+                    if record.tx_id > after_tx && record.tx_id == last_tx + 1 {
+                        let frame = bytes[offset..end].to_vec();
+                        if !frames.is_empty() && frame.len() > budget {
+                            return Ok((frames, last_tx));
+                        }
+                        budget = budget.saturating_sub(frame.len());
+                        frames.push(frame);
+                        last_tx = record.tx_id;
+                    }
+                    offset = end;
+                }
+                format::ScannedEntry::CleanEof => break,
+                // The active tail may end torn mid-append; everything valid
+                // before it streams — the writer finishes the entry later.
+                format::ScannedEntry::Torn(_) => break,
+                format::ScannedEntry::Corrupt(reason) => {
+                    return Err(FluxumError::Storage(format!(
+                        "corrupt entry while streaming {}: {reason}",
+                        seg.path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok((frames, last_tx))
+}
+
+/// Decode and CRC-verify one STG-011 entry frame: the envelope epoch and
+/// the record. The whole buffer must be exactly one frame — the shape a
+/// replication batch entry arrives in (REP-014 step 1).
+///
+/// # Errors
+/// A torn/corrupt frame, trailing bytes, or an undecodable record body.
+pub fn decode_entry_frame(frame: &[u8]) -> Result<(u64, TxRecord)> {
+    match format::scan_entry(frame, 0) {
+        format::ScannedEntry::Entry { epoch, body, end } if end == frame.len() => {
+            let record = TxRecord::decode(body).map_err(FluxumError::Storage)?;
+            Ok((epoch, record))
+        }
+        format::ScannedEntry::Entry { end, .. } => Err(FluxumError::Storage(format!(
+            "entry frame has {} trailing byte(s) past the record",
+            frame.len() - end
+        ))),
+        format::ScannedEntry::CleanEof => Err(FluxumError::Storage("empty entry frame".into())),
+        format::ScannedEntry::Torn(reason) | format::ScannedEntry::Corrupt(reason) => Err(
+            FluxumError::Storage(format!("invalid entry frame: {reason}")),
+        ),
+    }
+}
+
 /// Tuning knobs for a [`CommitLog`] (SPEC-002 §8; wired into `config.yml`
 /// with the server assembly).
 #[derive(Debug, Clone, Copy)]

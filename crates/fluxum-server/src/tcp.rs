@@ -510,6 +510,27 @@ async fn route_frame(
         }
     };
 
+    // SPEC-014 REP-011: replication frames from an authenticated server
+    // peer are handed to the replication service instead of the session
+    // router — the session's outbound queue becomes the stream channel.
+    // From anyone else they fall through to the router's refusal.
+    if let Some(peer) = session.server_peer().map(str::to_owned) {
+        match &message {
+            ClientMessage::ReplicaHello(hello) => {
+                if let Some(primary) = ctx.replication_primary() {
+                    return primary.accept(ctx, hello, peer, out_tx.clone(), *codec);
+                }
+            }
+            ClientMessage::ReplAck(ack) => {
+                if let Some(primary) = ctx.replication_primary() {
+                    primary.ack(&peer, ack);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
     let was_authed = session.is_authenticated();
     // SEC-031: track the outcome of a pre-auth `Authenticate` so the guard
     // can throttle a brute-force. A success clears the peer's failure streak;

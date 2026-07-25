@@ -80,6 +80,9 @@ pub struct Session {
     /// key of the SEC-047 source bucket that token rotation cannot refill.
     /// `None` (embedded/in-process) falls back to the connection id.
     source_ip: Option<std::net::IpAddr>,
+    /// The authenticated server peer's name (SPEC-014 REP-005), when the
+    /// credential mapped to one — what admits replication frames.
+    peer_name: Option<String>,
 }
 
 impl Session {
@@ -90,7 +93,14 @@ impl Session {
             state: SessionState::Unauthenticated,
             namespace: None,
             source_ip: None,
+            peer_name: None,
         }
+    }
+
+    /// The authenticated server peer's name, if this session authenticated
+    /// with a `auth.server_peers` credential (SPEC-014 REP-005).
+    pub fn server_peer(&self) -> Option<&str> {
+        self.peer_name.as_deref()
     }
 
     /// Record the transport-resolved client IP (SEC-035) so the SEC-047
@@ -108,6 +118,7 @@ impl Session {
             state,
             namespace: None,
             source_ip: None,
+            peer_name: None,
         }
     }
 
@@ -124,6 +135,7 @@ impl Session {
             state,
             namespace,
             source_ip: None,
+            peer_name: None,
         }
     }
 
@@ -239,6 +251,15 @@ impl Session {
                 self.resume(resume.id, resume.query_id, resume.from_offset)
                     .await
             }
+            // SPEC-014 REP-011: replication frames are intercepted by the
+            // TCP transport (server-peer sessions) before this router runs.
+            // Reaching here means the wrong transport or a non-peer caller.
+            ClientMessage::ReplicaHello(_) | ClientMessage::ReplAck(_) => Routed::reply(error(
+                None,
+                codes::AUTH_FAILED,
+                "replication runs over TCP between authenticated server peers \
+                 (SPEC-014 REP-005/REP-011)",
+            )),
         }
     }
 
@@ -279,6 +300,9 @@ impl Session {
                 return Routed::reply(from_error(Some(id), &e));
             }
         };
+        // SPEC-014 REP-005: remember the authenticated peer's name so the
+        // TCP transport can admit replication frames from it.
+        self.peer_name = outcome.server_peer.clone();
         self.namespace = requested;
         // OBS-040: a successful authentication; a first auth is a new
         // connection (re-auth on an existing session keeps its id).
@@ -607,6 +631,9 @@ fn request_id(message: &ClientMessage) -> u32 {
         ClientMessage::Unsubscribe(m) => m.id,
         ClientMessage::OneOffQuery(m) => m.id,
         ClientMessage::Resume(m) => m.id,
+        // Replication frames carry no request id (REP-011 sessions are
+        // streaming, not request/response).
+        ClientMessage::ReplicaHello(_) | ClientMessage::ReplAck(_) => 0,
     }
 }
 

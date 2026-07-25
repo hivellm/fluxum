@@ -474,6 +474,10 @@ pub struct StorageConfig {
     pub page_dir: PathBuf,
     /// Logical page size in bytes: 4096 | 8192 | 16384 (TIER-022, OQ-7).
     pub page_size: u32,
+    /// Commit-log segment rotation size (STG-013): the active segment
+    /// rotates once it reaches this many bytes. Rotation granularity is
+    /// also the truncation/archival granularity.
+    pub segment_max_bytes: ByteSize,
     /// Checkpoint cadence in committed transactions.
     pub checkpoint_interval_tx: u64,
     /// Page compression codec.
@@ -501,6 +505,7 @@ impl Default for StorageConfig {
             checkpoint_dir: PathBuf::from("./data/checkpoints"),
             page_dir: PathBuf::from("./data/pages"),
             page_size: 8192,
+            segment_max_bytes: ByteSize(128 << 20),
             checkpoint_interval_tx: 10_000,
             page_compression: PageCompression::default(),
             compression_min_bytes: 1024,
@@ -535,18 +540,80 @@ pub enum ReplicationMode {
     SemiSync,
 }
 
-/// Replica-set membership.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Replica-set membership and streaming behavior (SPEC-014 §11).
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ReplicationConfig {
-    /// This node's role.
+    /// This node's role (bootstrap hint; consensus owns it after the first
+    /// election, REP-003).
     pub role: ReplicationRole,
-    /// Acknowledgment mode.
+    /// Acknowledgment mode (REP-020/021).
     pub mode: ReplicationMode,
-    /// Replica-set member addresses.
+    /// Replica-set member addresses, `host:port` (FluxRPC TCP, REP-005).
     pub peers: Vec<String>,
+    /// This member's name (REP-005: identity = SHA-256("SERVER:" + name)).
+    /// Required when `peers` is non-empty.
+    pub member_name: String,
+    /// The server-peer token this member presents when dialing peers
+    /// (REP-005; must be in every peer's `auth.server_peers`). Supports
+    /// `${VAR}` expansion (SEC-058: redacted, zeroized).
+    pub peer_token: Option<crate::secret::Secret<String>>,
+    /// Heartbeat cadence, milliseconds (REP-016).
+    pub heartbeat_interval_ms: u64,
+    /// Election timeout, milliseconds (REP-016; consensus lands with T7.2).
+    pub election_timeout_ms: u64,
+    /// Per-replica flow-control window (REP-017).
+    pub window_bytes: ByteSize,
+    /// Replica acknowledgment cadence, milliseconds (REP-017).
+    pub ack_interval_ms: u64,
+    /// Read-replica admission bound, milliseconds (REP-041).
+    pub max_staleness_ms: u64,
+    /// Semi-sync quorum behavior (REP-021/022).
+    pub semi_sync: SemiSyncConfig,
     /// Commit-log segment archival (SPEC-014 REP-062) — the PITR source.
     pub archive: ArchiveConfig,
+}
+
+impl Default for ReplicationConfig {
+    fn default() -> Self {
+        Self {
+            role: ReplicationRole::default(),
+            mode: ReplicationMode::default(),
+            peers: Vec::new(),
+            member_name: String::new(),
+            peer_token: None,
+            heartbeat_interval_ms: 500,
+            election_timeout_ms: 3_000,
+            window_bytes: ByteSize(8 << 20),
+            ack_interval_ms: 100,
+            max_staleness_ms: 5_000,
+            semi_sync: SemiSyncConfig::default(),
+            archive: ArchiveConfig::default(),
+        }
+    }
+}
+
+/// Semi-sync quorum tuning (SPEC-014 REP-021/REP-022).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SemiSyncConfig {
+    /// `majority` or an explicit member count.
+    pub quorum: String,
+    /// Quorum wait bound per transaction, milliseconds (REP-022).
+    pub ack_timeout_ms: u64,
+    /// `block` (default; zero-loss preserved) or `degrade` (fall back to
+    /// async with a WARN + gauge until quorum returns).
+    pub on_quorum_loss: String,
+}
+
+impl Default for SemiSyncConfig {
+    fn default() -> Self {
+        Self {
+            quorum: "majority".to_owned(),
+            ack_timeout_ms: 1_000,
+            on_quorum_loss: "block".to_owned(),
+        }
+    }
 }
 
 /// Commit-log segment archival (SPEC-014 REP-062): with `enabled`, a segment
@@ -1312,6 +1379,42 @@ impl Config {
         // REP-062: the archive retention window must parse (it is the PITR
         // window, so a typo here silently shrinking it would be costly).
         self.replication.archive.retention_duration()?;
+        // REP-005: a member of a replica set must be able to identify and
+        // authenticate itself to its peers.
+        if !self.replication.peers.is_empty() {
+            if self.replication.member_name.is_empty() {
+                return Err(FluxumError::config(
+                    "replication.member_name: required when replication.peers is set (REP-005)",
+                ));
+            }
+            if self
+                .replication
+                .peer_token
+                .as_ref()
+                .is_none_or(|t| t.expose_str().is_empty())
+            {
+                return Err(FluxumError::config(
+                    "replication.peer_token: required when replication.peers is set (REP-005)",
+                ));
+            }
+        }
+        if !matches!(
+            self.replication.semi_sync.on_quorum_loss.as_str(),
+            "block" | "degrade"
+        ) {
+            return Err(FluxumError::config(format!(
+                "replication.semi_sync.on_quorum_loss: `{}` is not block|degrade (REP-022)",
+                self.replication.semi_sync.on_quorum_loss
+            )));
+        }
+        if self.replication.semi_sync.quorum != "majority"
+            && self.replication.semi_sync.quorum.parse::<u32>().is_err()
+        {
+            return Err(FluxumError::config(format!(
+                "replication.semi_sync.quorum: `{}` is not `majority` or a count (REP-021)",
+                self.replication.semi_sync.quorum
+            )));
+        }
         // OPS-010: an enabled remote target needs a complete address and
         // credentials — a partial one would fail on the first nightly pass.
         let remote = &self.replication.archive.remote;

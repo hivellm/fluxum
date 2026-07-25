@@ -373,6 +373,55 @@ fn discover_shards(source: &BackupSource) -> Result<BTreeSet<u32>> {
     Ok(shards)
 }
 
+/// Pack the NEWEST checkpoint of `shard_id` under `checkpoint_dir` into one
+/// transferable blob (`checkpoint.pack` bytes) with its covering tx id —
+/// the SPEC-014 REP-012 full-sync payload. `None` when no checkpoint exists.
+///
+/// # Errors
+/// Repository or pack encoding failures.
+pub fn pack_latest_checkpoint(
+    checkpoint_dir: &Path,
+    shard_id: u32,
+) -> Result<Option<(Vec<u8>, u64)>> {
+    let repo = CheckpointRepo::open(checkpoint_dir)?;
+    let Some(newest) = repo.list(shard_id)?.pop() else {
+        return Ok(None);
+    };
+    let last_tx_id = newest.last_tx_id;
+    let (bytes, _schema_version) = pack_checkpoint(&repo, &newest)?;
+    Ok(Some((bytes, last_tx_id)))
+}
+
+/// Install a transferred checkpoint pack into an EMPTY replica (SPEC-014
+/// REP-012): unpack into the replica's checkpoint directory, then run the
+/// normal STG-030 recovery over it (the replica's log directory is empty at
+/// this point, so recovery installs exactly the checkpoint state). Returns
+/// the covering tx id.
+///
+/// # Errors
+/// A corrupt pack, or recovery refusing (a non-virgin store).
+pub fn install_checkpoint_pack(
+    store: &crate::store::MemStore,
+    checkpoint_dir: &Path,
+    log_dir: &Path,
+    shard_id: u32,
+    pack_bytes: &[u8],
+) -> Result<u64> {
+    let pack = unpack_checkpoint_bytes(pack_bytes)?;
+    let objects_dir = checkpoint_dir.join("objects");
+    fs::create_dir_all(&objects_dir)?;
+    for (name, bytes) in &pack.objects {
+        write_file(&objects_dir.join(name), bytes)?;
+    }
+    write_file(&checkpoint_dir.join(&pack.manifest_name), &pack.manifest)?;
+    fs::create_dir_all(log_dir)?;
+    let repo = CheckpointRepo::open(checkpoint_dir)?;
+    let outcome = crate::checkpoint::recover(store, &repo, log_dir, shard_id)?;
+    outcome.checkpoint_tx_id.ok_or_else(|| {
+        FluxumError::Storage("transferred checkpoint failed verification on install".into())
+    })
+}
+
 /// Pack one checkpoint (manifest + referenced objects, all byte-identical to
 /// their stored form) and extract the `__schema_meta__` schema version.
 fn pack_checkpoint(repo: &CheckpointRepo, checkpoint: &CheckpointRef) -> Result<(Vec<u8>, u32)> {
