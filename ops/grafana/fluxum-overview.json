@@ -706,6 +706,11 @@
           "expr": "rate(fluxum_replication_elections_total{shard=~\"$shard\"}[15m])",
           "legendFormat": "elections/s {{shard}}",
           "refId": "C"
+        },
+        {
+          "expr": "rate(fluxum_replication_full_syncs_total{shard=~\"$shard\"}[15m])",
+          "legendFormat": "full-syncs/s {{shard}}",
+          "refId": "D"
         }
       ]
     }

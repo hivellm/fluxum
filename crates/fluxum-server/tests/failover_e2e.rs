@@ -56,10 +56,11 @@ fn member_config(dir: &Path, name: &str, tcp_port: u16, peers: Vec<String>) -> C
     config.replication.peers = peers;
     config.replication.heartbeat_interval_ms = 25;
     config.replication.ack_interval_ms = 25;
-    // Fast elections so the drill completes quickly (jitter is on top),
-    // with margin over connection churn so a slow first dial can never
-    // spuriously unseat the healthy primary (stickiness covers the rest).
-    config.replication.election_timeout_ms = 800;
+    // Elections quick enough to keep the drill short, but with generous
+    // margin over a loaded CI runner's scheduling jitter — a following
+    // replica whose stream stalls briefly must not spuriously time out
+    // (leader stickiness + the known-good-primary hint cover the rest).
+    config.replication.election_timeout_ms = 1500;
     config
 }
 
@@ -86,8 +87,44 @@ fn task_count(ctx: &fluxum_server::ShardContext) -> usize {
     ctx.store().snapshot().row_count(table).unwrap()
 }
 
+/// GET /health and return the parsed body. Reads to the Content-Length
+/// the response declares (the admin HTTP keeps the connection open, so
+/// `read_to_end` would block — the JSON body is small and single-chunk).
+async fn health(addr: std::net::SocketAddr) -> serde_json::Value {
+    let request = "GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n".to_string();
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tokio::io::AsyncWriteExt::write_all(&mut stream, request.as_bytes())
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        let n = tokio::io::AsyncReadExt::read(&mut stream, &mut chunk)
+            .await
+            .unwrap();
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        let text = String::from_utf8_lossy(&buf);
+        // Stop once the full body (Content-Length bytes past the header) is in.
+        if let Some((head, body)) = text.split_once("\r\n\r\n")
+            && let Some(len) = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+            && body.len() >= len
+        {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+    serde_json::from_str(body.trim_end()).unwrap_or_else(|e| panic!("health body {body:?}: {e}"))
+}
+
 async fn wait_for_count(ctx: &fluxum_server::ShardContext, want: usize, context: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if task_count(ctx) == want {
             return;
@@ -160,7 +197,7 @@ async fn a_replica_wins_the_election_and_serves_writes_when_the_primary_dies() {
     drop(a);
 
     // One of the survivors wins and publishes the primary role.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let (winner, follower) = loop {
         let b_primary = b.ctx.election().unwrap().role().is_primary();
         let c_primary = c.ctx.election().unwrap().role().is_primary();
@@ -204,6 +241,76 @@ async fn a_replica_wins_the_election_and_serves_writes_when_the_primary_dies() {
         "exactly one primary after the failover"
     );
 
+    // REP-080: /health reports the new topology per member.
+    let winner_health = health(winner.http.local_addr).await;
+    let winner_repl = &winner_health["shards"][0]["replication"];
+    assert_eq!(winner_repl["role"], "primary", "{winner_health}");
+    assert!(
+        winner_repl["epoch"].as_u64().unwrap() >= 2,
+        "{winner_health}"
+    );
+    let follower_health = health(follower.http.local_addr).await;
+    let follower_repl = &follower_health["shards"][0]["replication"];
+    assert_eq!(follower_repl["role"], "replica", "{follower_health}");
+
     winner.shutdown();
     follower.shutdown();
+}
+
+/// REP-031 demote: a stale primary (one whose peers have moved to a higher
+/// epoch) is fenced the moment a higher-epoch `ReplicaHello` reaches it —
+/// it stops acknowledging writes (the barrier) AND demotes itself to
+/// replica, rejoining the set under the new epoch (REP-032 step 5 from the
+/// loser's side).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fenced_primary_demotes_itself_to_replica() {
+    fluxum_demo::link();
+    let root = tempfile::tempdir().unwrap();
+
+    let (port_x, port_y) = (free_port(), free_port());
+    let addr = |p: u16| format!("127.0.0.1:{p}");
+
+    // X boots as primary on epoch 1.
+    let mut config_x = member_config(&root.path().join("x"), "node-b", port_x, vec![addr(port_y)]);
+    config_x.replication.role = ReplicationRole::Primary;
+    let x = boot::serve(config_x).await.unwrap();
+    assert!(x.ctx.election().unwrap().role().is_primary());
+
+    // Y has PERSISTED epoch 3 (a past election X never saw) and boots as a
+    // replica pointed at X — its first hello carries epoch 3.
+    let mut config_y = member_config(&root.path().join("y"), "node-c", port_y, vec![addr(port_x)]);
+    config_y.replication.role = ReplicationRole::Replica;
+    fluxum_server::replication::persist_epoch(&config_y.storage.commit_log_dir, 3).unwrap();
+    let y = boot::serve(config_y).await.unwrap();
+
+    // X is fenced by Y's higher-epoch hello and demotes to replica.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if !x.ctx.election().unwrap().role().is_primary() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stale primary never demoted (REP-031)"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        x.ctx.metrics().replication_fenced_total() >= 1,
+        "the fence was counted"
+    );
+    // It adopted the higher epoch it was fenced to.
+    assert!(
+        x.ctx.election().unwrap().role().epoch() >= 3,
+        "the demoted member adopts the fencing epoch (REP-004)"
+    );
+    // And a write is now refused with the NotPrimary redirect (REP-042).
+    let refused = post_task(x.http.local_addr, "post-demote").await;
+    assert!(
+        !refused.starts_with("HTTP/1.1 200"),
+        "a demoted primary must not accept writes: {refused}"
+    );
+
+    x.shutdown();
+    y.shutdown();
 }

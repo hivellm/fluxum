@@ -413,6 +413,8 @@ pub struct Metrics {
     replication_epoch: AtomicU64,
     /// REP-081: elections started by this member (REP-030).
     replication_elections_total: AtomicU64,
+    /// REP-081: full syncs served by this member as primary (REP-012).
+    replication_full_syncs_total: AtomicU64,
     slow_reducer_threshold_us: AtomicU64,
     shard_state: AtomicU8,
     recovered_tx_id: AtomicU64,
@@ -532,6 +534,7 @@ impl Metrics {
             replication_role: AtomicU64::new(1),
             replication_epoch: AtomicU64::new(1),
             replication_elections_total: AtomicU64::new(0),
+            replication_full_syncs_total: AtomicU64::new(0),
             slow_reducer_threshold_us: AtomicU64::new(DEFAULT_SLOW_REDUCER_THRESHOLD_US),
             shard_state: AtomicU8::new(ShardState::Ready as u8),
             recovered_tx_id: AtomicU64::new(0),
@@ -696,6 +699,17 @@ impl Metrics {
     /// The election counter (tests).
     pub fn replication_elections_total(&self) -> u64 {
         self.replication_elections_total.load(Ordering::Relaxed)
+    }
+
+    /// REP-081: one full sync served (REP-012 checkpoint transfer).
+    pub fn note_full_sync(&self) {
+        self.replication_full_syncs_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The full-sync counter (tests).
+    pub fn replication_full_syncs_total(&self) -> u64 {
+        self.replication_full_syncs_total.load(Ordering::Relaxed)
     }
 
     /// REP-022: raise/clear the degraded flag (`on_quorum_loss: degrade`).
@@ -1070,7 +1084,11 @@ impl Metrics {
              # HELP fluxum_replication_elections_total Elections started by this \
              member (REP-030/REP-081).\n\
              # TYPE fluxum_replication_elections_total counter\n\
-             fluxum_replication_elections_total{{shard=\"{shard}\"}} {}",
+             fluxum_replication_elections_total{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_full_syncs_total Full syncs served as primary \
+             (REP-012/REP-081).\n\
+             # TYPE fluxum_replication_full_syncs_total counter\n\
+             fluxum_replication_full_syncs_total{{shard=\"{shard}\"}} {}",
             self.tx_commits.load(Ordering::Relaxed),
             self.tx_rollbacks.load(Ordering::Relaxed),
             self.queue_depth.load(Ordering::Relaxed),
@@ -1083,6 +1101,7 @@ impl Metrics {
             self.replication_role.load(Ordering::Relaxed),
             self.replication_epoch.load(Ordering::Relaxed),
             self.replication_elections_total.load(Ordering::Relaxed),
+            self.replication_full_syncs_total.load(Ordering::Relaxed),
         );
         {
             let peers = self

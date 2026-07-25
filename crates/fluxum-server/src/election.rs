@@ -135,8 +135,11 @@ pub fn decide_vote(
 pub struct RoleState {
     primary: AtomicBool,
     epoch: AtomicU64,
-    /// The best-known primary endpoint (the `NotPrimary` redirect hint).
-    primary_hint: std::sync::Mutex<Option<String>>,
+    /// The best-known primary endpoint (the `NotPrimary` redirect hint AND
+    /// the follower's preferred dial target). Shared with the replica
+    /// client, which stamps it on every `PrimaryHello` so a follower dials
+    /// the live primary first instead of restarting from a dead peer.
+    primary_hint: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl RoleState {
@@ -144,7 +147,7 @@ impl RoleState {
         Self {
             primary: AtomicBool::new(primary),
             epoch: AtomicU64::new(epoch),
-            primary_hint: std::sync::Mutex::new(None),
+            primary_hint: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -177,6 +180,12 @@ impl RoleState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = hint;
     }
+
+    /// The shared hint cell, handed to the replica client so it stamps the
+    /// live primary endpoint on every `PrimaryHello`.
+    fn hint_cell(&self) -> Arc<std::sync::Mutex<Option<String>>> {
+        Arc::clone(&self.primary_hint)
+    }
 }
 
 /// Election state shared between the TCP router (vote serving) and the
@@ -195,6 +204,8 @@ pub struct ElectionState {
     contact: Arc<crate::replication::ContactClock>,
     /// `replication.election_timeout_ms` — the stickiness window.
     election_timeout: Duration,
+    /// `replication.max_staleness_ms` — REP-041 read-admission bound.
+    max_staleness: Duration,
 }
 
 impl std::fmt::Debug for ElectionState {
@@ -221,6 +232,7 @@ impl ElectionState {
         primary: bool,
         epoch: u64,
         election_timeout: Duration,
+        max_staleness: Duration,
     ) -> Result<Arc<Self>, FluxumError> {
         let ballot = load_ballot(&log_dir)?;
         Ok(Arc::new(Self {
@@ -231,7 +243,26 @@ impl ElectionState {
             ballot: std::sync::Mutex::new(ballot),
             contact: Arc::new(crate::replication::ContactClock::default()),
             election_timeout,
+            max_staleness,
         }))
+    }
+
+    /// REP-041: whether a replica should refuse new reads because its data
+    /// may be too stale — it has not heard from its primary within
+    /// `max_staleness_ms`. The primary is never stale (it holds the head).
+    pub fn read_is_stale(&self) -> bool {
+        !self.role.is_primary() && self.contact.elapsed() > self.max_staleness
+    }
+
+    /// The member name (REP-005), for `/health`.
+    pub fn member_name(&self) -> &str {
+        &self.member_name
+    }
+
+    /// The shared best-known-primary cell, for the replica client to stamp
+    /// on every `PrimaryHello` (REP-050).
+    pub fn primary_hint_cell(&self) -> Arc<std::sync::Mutex<Option<String>>> {
+        self.role.hint_cell()
     }
 
     /// The published role.
@@ -365,33 +396,73 @@ fn jitter(member: &str, attempt: u64, timeout: Duration) -> Duration {
 }
 
 /// Run the member's election loop: follow (replica client + timer) →
-/// candidacy on contact loss → promote on majority (REP-030/REP-032) —
-/// or park if booted as primary (phase B adds the fenced→demote watch).
+/// candidacy on contact loss → promote on majority (REP-030/REP-032).
+/// A member booted as primary PARKS, watching for a fence (REP-031): a
+/// higher epoch on any channel demotes it to replica, and it rejoins the
+/// follow loop under the new leader (REP-032 step 5 seen from the loser).
 pub fn spawn_election(ctx: Arc<ShardContext>, state: Arc<ElectionState>, options: ElectionOptions) {
     tokio::spawn(async move {
-        if state.role.is_primary() {
-            // Phase B (demote flow) watches the fence from here.
-            return;
-        }
-        tracing::debug!(target: "fluxum::election", member = %state.member_name,
-            "election service: following");
-        let mut attempt: u64 = 0;
         loop {
-            follow_until_timeout(&ctx, &state, &options, attempt).await;
-            tracing::debug!(target: "fluxum::election", member = %state.member_name,
-                attempt, "contact lost; standing for election (REP-030)");
-            attempt += 1;
-            if run_candidacy(&ctx, &state, &options).await {
-                tracing::info!(target: "fluxum::election",
-                    epoch = state.role.epoch(),
-                    "promoted to primary (REP-032)");
-                return;
+            if state.role.is_primary() {
+                park_until_fenced(&ctx).await;
+                demote(&ctx, &state);
             }
-            // Lost: grant the (possibly new) primary one full window to
-            // make itself heard before standing again.
-            state.note_contact();
+            tracing::debug!(target: "fluxum::election", member = %state.member_name,
+                "election service: following");
+            let mut attempt: u64 = 0;
+            loop {
+                follow_until_timeout(&ctx, &state, &options, attempt).await;
+                tracing::debug!(target: "fluxum::election", member = %state.member_name,
+                    attempt, "contact lost; standing for election (REP-030)");
+                attempt += 1;
+                if run_candidacy(&ctx, &state, &options).await {
+                    tracing::info!(target: "fluxum::election",
+                        epoch = state.role.epoch(),
+                        "promoted to primary (REP-032)");
+                    break; // back to the outer loop: park as primary
+                }
+                // Lost: grant the (possibly new) primary one full window to
+                // make itself heard before standing again.
+                state.note_contact();
+            }
         }
     });
+}
+
+/// Park while primary until a fence lands (REP-031): the barrier already
+/// refuses writes the moment `fenced` is set; here we wait to react.
+async fn park_until_fenced(ctx: &Arc<ShardContext>) {
+    loop {
+        if ctx
+            .replication_primary()
+            .is_some_and(|primary| primary.fenced())
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Demote a fenced primary to replica (REP-031): adopt the higher epoch,
+/// flip the published role, and note it so the follow loop resyncs. The
+/// diverged-suffix truncation (REP-013) is a full resync — an `async`
+/// primary's unreplicated tail is lost (REP-034), and in `semi_sync` those
+/// txs were never client-visible (REP-021). Because a live in-process
+/// store cannot be rebuilt in place (recovery needs a fresh store), the
+/// clean rebuild happens on the next restart; until then the demoted
+/// member follows and refuses writes (the barrier) and stale reads.
+fn demote(ctx: &Arc<ShardContext>, state: &Arc<ElectionState>) {
+    let epoch = ctx
+        .replication_primary()
+        .map_or_else(|| state.role.epoch(), |primary| primary.epoch());
+    // Persist the epoch we were fenced to before acting under it (REP-004).
+    let _ = persist_epoch(&state.log_dir, epoch);
+    state.role.set(false, epoch);
+    state.note_contact(); // give the new primary a window before standing
+    ctx.metrics().set_replication_role(false);
+    ctx.metrics().set_replication_epoch(epoch);
+    tracing::warn!(target: "fluxum::election", epoch,
+        "demoted to replica after a fence; rejoining the set (REP-031/REP-082)");
 }
 
 /// Follow the current primary until the election timer fires: run the
@@ -424,21 +495,26 @@ async fn follow_until_timeout(
         async move {
             let mut target_ix = 0usize;
             loop {
-                let target = state
-                    .role
-                    .primary_hint()
+                // Prefer the last known-good primary (REP-050): a live
+                // session stamps it, so after a failover the follower dials
+                // the winner directly instead of restarting from a dead
+                // peer. If the hinted target is what just failed, drop it
+                // and rotate through the configured peers to rediscover.
+                let hinted = state.role.primary_hint();
+                let target = hinted
+                    .clone()
                     .unwrap_or_else(|| options.peers[target_ix % options.peers.len()].clone());
                 let mut replica = options.replica.clone();
                 replica.primary = target.clone();
-                match crate::replication::replica_session(&ctx, &replica).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        tracing::debug!(target: "fluxum::election", error = %e, target = %target,
-                            "replica session ended; rotating");
-                    }
+                if let Err(e) = crate::replication::replica_session(&ctx, &replica).await {
+                    tracing::debug!(target: "fluxum::election", error = %e, target = %target,
+                        "replica session ended; rotating");
                 }
-                state.role.set_hint(None);
-                target_ix += 1;
+                if hinted.is_some() {
+                    state.role.set_hint(None); // that endpoint is no longer serving
+                } else {
+                    target_ix += 1;
+                }
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
@@ -696,5 +772,44 @@ mod tests {
         assert!(a < t / 2 + Duration::from_millis(1));
         // Different members almost surely disagree (fixed vectors here).
         assert_ne!(jitter("node-a", 0, t), jitter("node-b", 0, t));
+    }
+
+    #[tokio::test]
+    async fn a_replica_reads_go_stale_after_the_staleness_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        // A replica with a 40 ms staleness bound; contact is fresh at birth.
+        let replica = ElectionState::new(
+            0,
+            "node-b".into(),
+            dir.path().to_path_buf(),
+            false,
+            1,
+            Duration::from_secs(3),
+            Duration::from_millis(40),
+        )
+        .unwrap();
+        assert!(!replica.read_is_stale(), "fresh contact is not stale");
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            replica.read_is_stale(),
+            "no contact past the bound is stale"
+        );
+        // Contact resets the clock.
+        replica.note_contact();
+        assert!(!replica.read_is_stale(), "contact clears staleness");
+
+        // A PRIMARY is never stale — it holds the head, whatever the clock.
+        let primary = ElectionState::new(
+            0,
+            "node-a".into(),
+            dir.path().to_path_buf(),
+            true,
+            1,
+            Duration::from_secs(3),
+            Duration::from_millis(1),
+        )
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!primary.read_is_stale(), "a primary is never read-stale");
     }
 }

@@ -267,9 +267,11 @@ impl ReplicationPrimary {
     }
 
     /// REP-031: a higher epoch reached us via `channel` — stop
-    /// acknowledging writes. Demote + resync is the T7.2 election flow.
+    /// acknowledging writes and adopt the epoch so the demote flow (T7.2)
+    /// rejoins under it.
     fn fence(&self, metrics: &Metrics, theirs: u64, channel: &str) {
         metrics.note_replication_fenced();
+        self.epoch.fetch_max(theirs, Ordering::SeqCst);
         if !self.fenced.swap(true, Ordering::SeqCst) {
             tracing::warn!(target: "fluxum::repl",
                 ours = self.epoch(), theirs, channel,
@@ -557,6 +559,7 @@ impl ReplicationPrimary {
         send(out, frame(codec, &hello)?).await?;
 
         if let Some((pack, last_tx)) = checkpoint {
+            ctx.metrics().note_full_sync(); // REP-012/REP-081
             for (i, chunk) in pack.chunks(CHECKPOINT_CHUNK_BYTES).enumerate() {
                 let done = (i + 1) * CHECKPOINT_CHUNK_BYTES >= pack.len();
                 let msg = ServerMessage::ReplCheckpoint(ReplCheckpoint {
@@ -695,6 +698,10 @@ pub struct ReplicaOptions {
     /// rotates (REP-030). `None` = wait on the OS default (the T7.1 replica
     /// client, which dials one fixed primary).
     pub connect_timeout: Option<Duration>,
+    /// Shared best-known-primary cell (REP-050): stamped with this session's
+    /// endpoint on every `PrimaryHello`, so the follower dials the live
+    /// primary first next time instead of restarting from a dead peer.
+    pub primary_hint: Option<Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 /// A running replica client; dropping it does NOT stop the task — call
@@ -849,6 +856,14 @@ pub(crate) async fn replica_session(
             ServerMessage::PrimaryHello(hello) => {
                 if hello.epoch > epoch {
                     persist_epoch(&options.log_dir, hello.epoch)?;
+                }
+                // REP-050: this endpoint IS the live primary — remember it
+                // so the follower dials it first after any reconnect.
+                if let Some(cell) = &options.primary_hint {
+                    *cell
+                        .lock()
+                        .unwrap_or_else(|e: std::sync::PoisonError<_>| e.into_inner()) =
+                        Some(options.primary.clone());
                 }
                 tracing::info!(target: "fluxum::repl",
                     epoch = hello.epoch, full = hello.sync_full, from = hello.from_tx_id,

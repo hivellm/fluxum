@@ -243,6 +243,19 @@ impl Session {
                 self.reducer_call(call.id, call.reducer, call.args, call.idempotency_key)
                     .await
             }
+            // SPEC-014 REP-041: a replica lagging past max_staleness_ms stops
+            // admitting NEW reads and subscriptions (already-attached ones
+            // keep streaming) — the SDK retries against the primary. Writes
+            // took the REP-042 path in `reducer_call`.
+            ClientMessage::Subscribe(sub) if self.read_is_stale() => {
+                Routed::reply(from_error(Some(sub.id), &self.replica_stale()))
+            }
+            ClientMessage::SubscribeSingle(sub) if self.read_is_stale() => {
+                Routed::reply(from_error(Some(sub.id), &self.replica_stale()))
+            }
+            ClientMessage::OneOffQuery(query) if self.read_is_stale() => {
+                Routed::reply(from_error(Some(query.id), &self.replica_stale()))
+            }
             ClientMessage::Subscribe(sub) => self.subscribe(sub.id, sub.queries).await,
             ClientMessage::SubscribeSingle(sub) => self.subscribe(sub.id, vec![sub.query]).await,
             ClientMessage::Unsubscribe(unsub) => self.unsubscribe(unsub.query_ids).await,
@@ -658,6 +671,28 @@ fn request_id(message: &ClientMessage) -> u32 {
         ClientMessage::ReplicaHello(_)
         | ClientMessage::ReplAck(_)
         | ClientMessage::VoteRequest(_) => 0,
+    }
+}
+
+impl Session {
+    /// REP-041: whether this member should refuse new reads (a replica
+    /// lagging past `max_staleness_ms`). A standalone node is never stale.
+    fn read_is_stale(&self) -> bool {
+        self.ctx.election().is_some_and(|e| e.read_is_stale())
+    }
+
+    /// The REP-041 `ReplicaStale` refusal: retryable, naming the primary.
+    fn replica_stale(&self) -> FluxumError {
+        let hint = self
+            .ctx
+            .election()
+            .and_then(|e| e.role().primary_hint())
+            .unwrap_or_else(|| "unknown; consult /health on the peers".to_owned());
+        FluxumError::query_retryable(
+            fluxum_protocol::codes::CLUSTER_REPLICA_STALE,
+            format!("replica beyond max_staleness_ms; read the primary: {hint} (REP-041)"),
+            Some(500),
+        )
     }
 }
 

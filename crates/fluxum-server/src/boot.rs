@@ -278,6 +278,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
             primary,
             epoch,
             Duration::from_millis(config.replication.election_timeout_ms),
+            Duration::from_millis(config.replication.max_staleness_ms),
         )
         .map_err(BootError::Core)?;
         ctx.metrics().set_replication_role(primary);
@@ -458,6 +459,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
                     connect_timeout: Some(Duration::from_millis(
                         (config.replication.election_timeout_ms / 4).max(100),
                     )),
+                    primary_hint: Some(election.primary_hint_cell()),
                 },
             },
         );

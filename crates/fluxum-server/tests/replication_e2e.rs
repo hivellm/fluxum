@@ -157,6 +157,7 @@ async fn a_cold_replica_full_syncs_through_a_checkpoint_transfer() {
             ack_interval: Duration::from_millis(50),
             contact: None,
             connect_timeout: None,
+            primary_hint: None,
         },
     );
     wait_for_count(&replica_ctx, 30, "full sync").await;
@@ -292,6 +293,7 @@ async fn a_bad_peer_credential_never_opens_a_session() {
             ack_interval: Duration::from_millis(50),
             contact: None,
             connect_timeout: None,
+            primary_hint: None,
         },
     );
     // Give it a refusal + one backoff retry, then stop.
@@ -339,6 +341,7 @@ async fn a_higher_epoch_hello_fences_the_stale_primary() {
             ack_interval: Duration::from_millis(50),
             contact: None,
             connect_timeout: None,
+            primary_hint: None,
         },
     );
     // The primary counts the fenced hello and never registers the session.
@@ -414,6 +417,7 @@ async fn semi_sync_holds_every_client_ack_until_the_quorum_is_durable() {
             ack_interval: Duration::from_millis(25),
             contact: None,
             connect_timeout: None,
+            primary_hint: None,
         },
     );
     wait_for_count(&replica_ctx, 1, "unacked commit still replicates").await;
@@ -627,6 +631,7 @@ async fn a_replica_converges_cold_and_resumes_from_its_offset() {
         ack_interval: Duration::from_millis(50),
         contact: None,
         connect_timeout: None,
+        primary_hint: None,
     };
 
     // COLD convergence: empty replica → identical state.

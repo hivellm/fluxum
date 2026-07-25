@@ -522,16 +522,48 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
         ShardState::Recovering => ("degraded", 503),
         ShardState::Starting | ShardState::ShuttingDown => ("error", 503),
     };
+    let mut shard = json!({
+        "id": health.shard_id.to_string(),
+        "state": health.state.as_str(),
+        "tx_id": health.last_tx_id,
+        "queue_depth": health.queue_depth,
+    });
+    // SPEC-014 REP-080: the per-shard replication object, from pre-computed
+    // published state (no storage lock — OBS-061). A shard in `semi_sync`
+    // that has lost quorum is `degraded` overall.
+    let mut status = status;
+    let mut code = code;
+    if let Some(election) = ctx.election() {
+        let role = election.role();
+        let metrics = ctx.metrics();
+        let mut repl = json!({
+            "role": if role.is_primary() { "primary" } else { "replica" },
+            "epoch": role.epoch(),
+        });
+        if role.is_primary() {
+            repl["connected_replicas"] =
+                json!(ctx.replication_primary().map_or(0, |p| p.connected()));
+            if metrics.replication_degraded() {
+                // Still serving (reads/writes proceed), but the zero-loss
+                // guarantee is suspended — flag it without failing /health.
+                status = "degraded";
+            }
+            repl["degraded"] = json!(metrics.replication_degraded());
+        } else {
+            if let Some(hint) = role.primary_hint() {
+                repl["primary"] = json!(hint);
+            }
+            if let Some((offset, lag_tx)) = metrics.replication_peer("primary") {
+                repl["acked_tx_id"] = json!(offset);
+                repl["lag_tx"] = json!(lag_tx);
+            }
+            repl["stale"] = json!(election.read_is_stale());
+        }
+        shard["replication"] = repl;
+    }
     let mut body = json!({
         "status": status,
-        "shards": [
-            {
-                "id": health.shard_id.to_string(),
-                "state": health.state.as_str(),
-                "tx_id": health.last_tx_id,
-                "queue_depth": health.queue_depth,
-            }
-        ],
+        "shards": [shard],
         "connections": ctx.metrics().connections_active(),
         "uptime_s": ctx.uptime_s(),
         // SEC-059: transport-encryption posture — a boolean, never key material.
@@ -1223,6 +1255,11 @@ async fn query(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
         Ok(pair) => pair,
         Err(e) => return AdminResponse::err(400, None, e),
     };
+    // SPEC-014 REP-041: a replica lagging past max_staleness_ms stops
+    // admitting new reads — the SDK retries against the primary.
+    if let Some(stale) = replica_stale_error(ctx) {
+        return AdminResponse::err(status_of(&stale), request_id.as_deref(), stale.to_string());
+    }
     let sql = match payload.get("sql").and_then(Value::as_str) {
         Some(sql) => sql.to_owned(),
         None => {
@@ -1455,6 +1492,10 @@ fn uint(v: &Value) -> Option<u64> {
 // --- GET /view/:name -----------------------------------------------------------
 
 async fn view(ctx: &Arc<ShardContext>, name: &str) -> AdminResponse {
+    // SPEC-014 REP-041: a stale replica refuses new reads (views included).
+    if let Some(stale) = replica_stale_error(ctx) {
+        return AdminResponse::err(status_of(&stale), None, stale.to_string());
+    }
     if !ctx.views.contains(name) {
         return AdminResponse::err(404, None, format!("unknown view `{name}`"));
     }
@@ -1466,6 +1507,25 @@ async fn view(ctx: &Arc<ShardContext>, name: &str) -> AdminResponse {
 }
 
 // --- helpers -------------------------------------------------------------------
+
+/// SPEC-014 REP-041: the `ReplicaStale` error when this member is a replica
+/// lagging past `max_staleness_ms`, else `None` (a primary/standalone node
+/// always serves reads).
+fn replica_stale_error(ctx: &Arc<ShardContext>) -> Option<FluxumError> {
+    let election = ctx.election()?;
+    if !election.read_is_stale() {
+        return None;
+    }
+    let hint = election
+        .role()
+        .primary_hint()
+        .unwrap_or_else(|| "unknown; consult /health on the peers".to_owned());
+    Some(FluxumError::query_retryable(
+        fluxum_protocol::codes::CLUSTER_REPLICA_STALE,
+        format!("replica beyond max_staleness_ms; read the primary: {hint} (REP-041)"),
+        Some(500),
+    ))
+}
 
 /// Parse an RPC-051 request envelope; a bare (non-enveloped) JSON body is
 /// accepted too, with its whole value taken as the payload.
