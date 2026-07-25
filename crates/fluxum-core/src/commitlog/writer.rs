@@ -532,13 +532,17 @@ impl SyncShared {
     }
 
     /// Advance the durable watermark; never regress, and `Failed` sticks.
+    /// Subscribers wake only on actual advancement (`send_if_modified`) —
+    /// a re-sync covering no new txs must not re-publish the same mark.
     fn publish_durable(&self, mark: Option<u64>) {
-        self.watch.send_modify(|state| {
+        self.watch.send_if_modified(|state| {
             if let DurableState::Durable(current) = state
                 && mark > *current
             {
                 *state = DurableState::Durable(mark);
+                return true;
             }
+            false
         });
     }
 

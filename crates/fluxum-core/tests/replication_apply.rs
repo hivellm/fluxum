@@ -290,16 +290,24 @@ async fn stream_source_and_transfer_helpers_surface_errors() {
 
     let (root, _primary, log_dir) = primary_world(4).await;
 
-    // Corrupt one mid-segment byte: the reader errors instead of streaming.
-    let segment = fs::read_dir(&log_dir)
+    // Corrupt the trailing CRC byte of tx 1's frame — a COMPLETE frame in
+    // the first segment, so the scan classifies it Corrupt (never Torn,
+    // which the tail-tolerant reader would skip) on every platform,
+    // independent of `read_dir` ordering.
+    let frame_one = frames_of(&log_dir)[0].clone();
+    let mut segments: Vec<PathBuf> = fs::read_dir(&log_dir)
         .unwrap()
         .map(|e| e.unwrap().path())
-        .find(|p| p.extension().is_some_and(|x| x == "log"))
-        .unwrap();
-    let mut bytes = fs::read(&segment).unwrap();
-    let mid = bytes.len() / 2;
-    bytes[mid] ^= 0xFF;
-    fs::write(&segment, &bytes).unwrap();
+        .filter(|p| p.extension().is_some_and(|x| x == "log"))
+        .collect();
+    segments.sort();
+    let mut bytes = fs::read(&segments[0]).unwrap();
+    let at = bytes
+        .windows(frame_one.len())
+        .position(|w| w == frame_one)
+        .expect("tx 1's frame opens the first segment");
+    bytes[at + frame_one.len() - 1] ^= 0xFF;
+    fs::write(&segments[0], &bytes).unwrap();
     assert!(read_frames_after(&log_dir, SHARD, 0, usize::MAX).is_err());
 
     // No checkpoint yet → None (the primary then full-syncs nothing and
