@@ -156,6 +156,14 @@ async fn a_replica_wins_the_election_and_serves_writes_when_the_primary_dies() {
         vec![addr(port_b), addr(port_c)],
     );
     config_a.replication.role = ReplicationRole::Primary;
+    // REP-021: semi_sync so an acked write is DURABLE on a quorum (the
+    // primary + ≥1 replica) before its 200 returns — the zero-loss
+    // contract this drill verifies (checklist 1.7). Quorum of 3 members is
+    // 2, so one replica ack suffices.
+    config_a.replication.mode = fluxum_core::config::ReplicationMode::SemiSync;
+    // A generous quorum-wait so a write never spuriously blocks out under
+    // load before a replica's ack lands.
+    config_a.replication.semi_sync.ack_timeout_ms = 5_000;
     let mut config_b = member_config(
         &root.path().join("b"),
         "node-b",
@@ -175,7 +183,19 @@ async fn a_replica_wins_the_election_and_serves_writes_when_the_primary_dies() {
     let b = boot::serve(config_b).await.unwrap();
     let c = boot::serve(config_c).await.unwrap();
 
-    // Seed writes on the primary; both replicas converge.
+    // Wait for a replica to attach so the semi_sync barrier has a quorum
+    // partner (else the first write would block on the ack timeout).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while a.ctx.replication_primary().unwrap().connected() == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no replica attached to the semi_sync primary"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // Seed writes on the primary; under semi_sync each 200 means the write
+    // is already durable on a quorum, so nothing acked can be lost.
     for i in 1..=5 {
         let head = post_task(a.http.local_addr, &format!("pre-{i}")).await;
         assert!(head.starts_with("HTTP/1.1 200"), "{head}");

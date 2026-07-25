@@ -5,12 +5,17 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.09% lines** — 2026-07-25, gate command below (PG + SpacetimeDB
-drivers live), after phase7_replication-streaming COMPLETE (phase C — the REP-021
+**Current standing:** **90.05% lines** — 2026-07-25, gate command below (PG + SpacetimeDB
+drivers live), after phase7_replica-sets-failover COMPLETE (T7.2 — the custom Raft-style
+election, demote-on-fence, ReplicaStale admission, the /health replication object, the
+SDK replica-set failover, and the replication DST; ~2,300 more lines). The floor holds:
+election.rs is covered by its pure-function unit suites (decide_vote/majority/quorum/
+staleness/jitter) plus the failover/demote e2e; the election TASK's async reconnect arms
+(follow/candidacy timing, peer rotation) are the honest residual — timing-driven loops the
+deterministic suites cannot pin without production seams (category 8), exercised live by
+the drill. Prior: 90.09% after phase7_replication-streaming COMPLETE (phase C — the REP-021
 semi-sync visibility barrier, REP-022 quorum-loss block/degrade, REP-031 fencing on any
-channel + stale-batch rejection, divergence refusal — recovered the ±2-line margin left
-by phases A+B to +9 bp: the barrier/fence/quorum unit suites plus the two new e2e legs
-cover the wire module's formerly-missed async arms). Prior: 90.00% after T7.1 phases A+B
+channel + stale-batch rejection, divergence refusal). Prior: 90.00% after T7.1 phases A+B
 (~1,600 more lines: the replica apply path and stream helpers pinned by oracle-exact
 suites). Prior: 90.01% after phase7_backup-object-storage-archive (~1,000 more lines:
 seekable-zstd framing at 90%+, the S3 SigV4 store at 92%, remote push/restore/PITR at
@@ -31,7 +36,7 @@ phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are
 by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
 wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
 **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01% → 90.00% → 90.09%. The **standing debt items below remain open**: (a) the
+90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01% → 90.00% → 90.09% → 90.05%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);

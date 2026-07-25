@@ -211,15 +211,36 @@ marker) and must seed a new replica set rather than rejoin the old one
 ### Replication (SPEC-014 §3/§4, T7.1)
 
 A replica is the same binary with `replication.role: replica` and the
-primary in `replication.peers`; it authenticates as a **server peer**
+other members in `replication.peers`; it authenticates as a **server peer**
 (`replication.member_name` + `replication.peer_token`, listed under
-`auth.server_peers` on the primary — REP-005), then syncs and follows the
+`auth.server_peers` on every member — REP-005), then syncs and follows the
 primary's commit log byte-identically (REP-010). An empty or too-far-behind
 replica full-syncs via a checkpoint transfer; a rejoining one streams from
-its offset (REP-012/REP-013). Elections and automatic failover are T7.2 —
-today the roles are fixed by config, and a fenced primary (one that has
-seen a higher epoch) stops acknowledging writes until an operator
-intervenes (REP-031).
+its offset (REP-012/REP-013).
+
+**Automatic failover (SPEC-014 §5).** Every member with peers runs a
+consensus election (a minimal Raft-style vote — majority, persisted ballots,
+log up-to-dateness; REP-030). `replication.role` is a **bootstrap hint
+only** — after the first election consensus owns the role, reported at
+`/health` under `shards[].replication.role`. On primary loss the followers
+time out (`election_timeout_ms`), one wins and promotes, and the survivors
+find it by peer rotation; in `semi_sync` no committed-and-acknowledged
+transaction is lost. A deposed primary that rejoins is fenced (it saw a
+higher epoch), stops acknowledging writes, and demotes to replica (REP-031);
+its diverged suffix, if any, is discarded on the resync (in `async` that
+tail is the documented loss window, REP-034; in `semi_sync` it was never
+client-visible). Deploy **odd member counts (≥ 3)** — a two-member set
+cannot elect automatically and needs manual promotion.
+
+**Clients** (SPEC-011 SDKs) point at the whole set — e.g. Rust's
+`Connection::connect_replica_set([url_a, url_b, url_c], …)`. A write to a
+replica returns a retryable `CLUSTER_NOT_PRIMARY` naming the primary
+(REP-042), and on failover the SDK reconnects, re-authenticates,
+resubscribes, and reconciles — the application sees only the net change
+across the outage, never a cache wipe (REP-033/SDK-047). Reads and
+subscription fan-out run on replicas (REP-043); a replica lagging past
+`max_staleness_ms` refuses NEW reads with a retryable `CLUSTER_REPLICA_STALE`
+(REP-041) while already-attached subscribers keep streaming.
 
 Acknowledgment modes (`replication.mode`):
 

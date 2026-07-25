@@ -37,9 +37,17 @@
 //! one failing seed.
 
 pub mod model;
+pub mod repl;
 pub mod rng;
 pub mod sim;
 
 pub use model::{Model, ModelState};
+pub use repl::ReplReport;
 pub use rng::SimRng;
 pub use sim::{SimReport, run_seed, run_seed_checked};
+
+/// The replication simulation entry points (SPEC-014 TST-134), namespaced
+/// to avoid clashing with the storage sim's [`run_seed`]/[`run_seed_checked`].
+pub mod replication {
+    pub use crate::repl::{ReplReport, run_seed, run_seed_checked};
+}

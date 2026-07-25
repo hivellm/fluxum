@@ -263,9 +263,6 @@ impl ReadHalf {
 }
 
 struct Shared {
-    /// `host:port` of the TCP endpoint, kept for reconnecting. Unused (empty)
-    /// on the HTTP transport. The first entry of [`Shared::endpoints`].
-    addr: String,
     /// The replica-set endpoints to try on reconnect (SPEC-014 REP-033):
     /// on failover the old primary is dead, so the reconnect loop rotates
     /// through these to find the new one. A single-endpoint connect stores
@@ -522,7 +519,6 @@ impl Connection {
         };
 
         let shared = Arc::new(Shared {
-            addr,
             endpoints,
             endpoint_ix: AtomicUsize::new(0),
             http,
