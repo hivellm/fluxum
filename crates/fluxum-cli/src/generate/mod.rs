@@ -8,6 +8,7 @@
 //! acceptance 11) — which is what lets a repository commit its bindings and
 //! diff them in review.
 
+pub mod go;
 pub mod python;
 pub mod rust;
 pub mod typescript;
@@ -26,6 +27,8 @@ pub enum Lang {
     Rust,
     /// Python (asyncio-first), SDK-061.
     Python,
+    /// Go (context-aware), SDK-062.
+    Go,
 }
 
 impl Lang {
@@ -35,6 +38,7 @@ impl Lang {
             "typescript" | "ts" => Some(Self::TypeScript),
             "rust" | "rs" => Some(Self::Rust),
             "python" | "py" => Some(Self::Python),
+            "go" | "golang" => Some(Self::Go),
             _ => None,
         }
     }
@@ -45,6 +49,7 @@ impl Lang {
             Self::TypeScript => "typescript",
             Self::Rust => "rust",
             Self::Python => "python",
+            Self::Go => "go",
         }
     }
 }
@@ -78,6 +83,7 @@ pub fn generate(
         Lang::TypeScript => typescript::generate(schema).map_err(CliError::Response),
         Lang::Rust => rust::generate(schema).map_err(CliError::Response),
         Lang::Python => python::generate(schema).map_err(CliError::Response),
+        Lang::Go => go::generate(schema).map_err(CliError::Response),
     }
 }
 
@@ -112,6 +118,8 @@ mod tests {
         assert_eq!(Lang::parse("rs"), Some(Lang::Rust));
         assert_eq!(Lang::parse("python"), Some(Lang::Python));
         assert_eq!(Lang::parse("py"), Some(Lang::Python));
+        assert_eq!(Lang::parse("go"), Some(Lang::Go));
+        assert_eq!(Lang::parse("golang"), Some(Lang::Go));
         assert_eq!(Lang::parse("cobol"), None);
     }
 

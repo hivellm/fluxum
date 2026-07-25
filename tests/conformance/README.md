@@ -93,7 +93,8 @@ belong in the corpus.
 | TypeScript (Chromium) | `sdks/typescript/tests/conformance.chromium.test.ts` | green |
 | Rust | `sdks/rust/tests/conformance.rs` | green |
 | Python (asyncio) | `sdks/python/tests/test_conformance.py` | green |
-| Go / C# | with T7.5–T7.6 | pending |
+| Go (context-aware) | `sdks/go/conformance_test.go` | green |
+| C# | with T7.6 | pending |
 
 The two TypeScript runners share one interpreter (`sdks/typescript/tests/support/interpreter.ts`);
 the Chromium runner bundles it into a page served **by the fluxum server under test**
