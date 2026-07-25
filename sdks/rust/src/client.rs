@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -264,8 +264,16 @@ impl ReadHalf {
 
 struct Shared {
     /// `host:port` of the TCP endpoint, kept for reconnecting. Unused (empty)
-    /// on the HTTP transport.
+    /// on the HTTP transport. The first entry of [`Shared::endpoints`].
     addr: String,
+    /// The replica-set endpoints to try on reconnect (SPEC-014 REP-033):
+    /// on failover the old primary is dead, so the reconnect loop rotates
+    /// through these to find the new one. A single-endpoint connect stores
+    /// exactly one entry, preserving the original behavior.
+    endpoints: Vec<String>,
+    /// The endpoint the reconnect loop is currently trying (index into
+    /// [`Shared::endpoints`]); advanced on each failed attempt.
+    endpoint_ix: AtomicUsize,
     /// The `/rpc` endpoint when the transport is Streamable HTTP.
     http: Option<HttpEndpoint>,
     /// The auth token, replayed on every re-authentication (SPEC-009).
@@ -332,6 +340,25 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = socket;
     }
 
+    /// REP-042: the current endpoint answered `NotPrimary` — advance to the
+    /// next replica-set member and drop the socket so the reconnect loop
+    /// re-establishes against it (which locates the current primary). A
+    /// single-endpoint client has nowhere to redirect, so this is a no-op.
+    fn redirect_to_next_primary(&self) {
+        if self.endpoints.len() <= 1 {
+            return;
+        }
+        self.endpoint_ix.fetch_add(1, Ordering::SeqCst);
+        if let Some(socket) = self
+            .push_socket
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            let _ = socket.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
     fn set_writer(&self, half: Option<WriteHalf>) {
         *self
             .writer
@@ -391,7 +418,31 @@ impl Connection {
         schemas: impl IntoIterator<Item = TableSchema>,
         policy: ReconnectPolicy,
     ) -> Result<Self, Error> {
-        Self::connect_impl(url, token, schemas, policy, None)
+        Self::connect_impl(url, token, schemas, policy, None, &[])
+    }
+
+    /// Connect to a **replica set** (SPEC-014 REP-033): the first URL is
+    /// tried first, and on reconnect the client rotates through all of
+    /// `urls` to find the current primary after a failover. Every URL must
+    /// use the same transport (all `tcp://` or all `http://`).
+    ///
+    /// The reconnect is otherwise identical to [`Connection::connect_with`]:
+    /// re-authenticate (same token ⇒ same identity), resubscribe every
+    /// active query, and reconcile — the application observes only the net
+    /// change across the failover, never a cache wipe (SDK-047).
+    ///
+    /// # Errors
+    /// An empty `urls`, mixed transports, or the initial connect failing.
+    pub fn connect_replica_set(
+        urls: &[&str],
+        token: &[u8],
+        schemas: impl IntoIterator<Item = TableSchema>,
+        policy: ReconnectPolicy,
+    ) -> Result<Self, Error> {
+        let first = urls
+            .first()
+            .ok_or_else(|| Error::Url("connect_replica_set needs at least one endpoint".into()))?;
+        Self::connect_impl(first, token, schemas, policy, None, &urls[1..])
     }
 
     /// [`Connection::connect_with`] with **durable local persistence**
@@ -421,7 +472,7 @@ impl Connection {
     ) -> Result<Self, Error> {
         let client_id = client_id.into();
         let store = ClientStore::new(backend, url, &client_id);
-        Self::connect_impl(url, token, schemas, policy, Some((store, client_id)))
+        Self::connect_impl(url, token, schemas, policy, Some((store, client_id)), &[])
     }
 
     fn connect_impl(
@@ -430,12 +481,27 @@ impl Connection {
         schemas: impl IntoIterator<Item = TableSchema>,
         policy: ReconnectPolicy,
         persistence: Option<(ClientStore, String)>,
+        extra_endpoints: &[&str],
     ) -> Result<Self, Error> {
         let target = parse_url(url)?;
         let (addr, http) = match &target {
             Target::Tcp(addr) => (addr.clone(), None),
             Target::Http(addr) => (String::new(), Some(HttpEndpoint { addr: addr.clone() })),
         };
+        // REP-033: the replica-set endpoints the reconnect loop rotates
+        // through. Each must parse to the same transport as the first.
+        let mut endpoints = vec![addr.clone()];
+        for extra in extra_endpoints {
+            match parse_url(extra)? {
+                Target::Tcp(a) if http.is_none() => endpoints.push(a),
+                Target::Http(a) if http.is_some() => endpoints.push(a),
+                _ => {
+                    return Err(Error::Url(
+                        "replica-set endpoints must all use the same transport".into(),
+                    ));
+                }
+            }
+        }
 
         // Hydrate the meta blob first (CS-041): the queue must exist —
         // restored, keys intact — before anything can transmit.
@@ -457,6 +523,8 @@ impl Connection {
 
         let shared = Arc::new(Shared {
             addr,
+            endpoints,
+            endpoint_ix: AtomicUsize::new(0),
             http,
             token: token.to_vec(),
             policy,
@@ -524,7 +592,31 @@ impl Connection {
             // is kept as-is.
             Target::Tcp(_) if hydrated => try_tcp_session(&shared)?,
             Target::Tcp(_) => {
-                let stream = TcpStream::connect(&shared.addr)?;
+                // REP-033: try the replica-set endpoints in order — the
+                // first may be a stale/known primary that is already down.
+                let mut stream = None;
+                let mut last_err = None;
+                for (ix, endpoint) in shared.endpoints.iter().enumerate() {
+                    match TcpStream::connect(endpoint) {
+                        Ok(s) => {
+                            shared.endpoint_ix.store(ix, Ordering::SeqCst);
+                            stream = Some(s);
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                let stream = match stream {
+                    Some(s) => s,
+                    None => {
+                        return Err(Error::Io(last_err.unwrap_or_else(|| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::AddrNotAvailable,
+                                "no replica-set endpoint reachable",
+                            )
+                        })));
+                    }
+                };
                 // Reducer calls are small request/response frames; Nagle
                 // would hold each one behind the previous frame's ACK.
                 let _ = stream.set_nodelay(true);
@@ -1008,7 +1100,14 @@ impl PendingReducer {
                 }),
             },
             Ok(Ok(_)) => Ok(()),
-            Ok(Err(err)) => Err(Error::from(err)),
+            Ok(Err(err)) => {
+                // REP-042: this member is a replica — redirect to the
+                // primary so the (retryable) retry lands on it.
+                if err.code == crate::protocol::codes::CLUSTER_NOT_PRIMARY {
+                    self.shared.redirect_to_next_primary();
+                }
+                Err(Error::from(err))
+            }
             Err(_) => Err(Error::Disconnected),
         }
     }
@@ -1511,7 +1610,15 @@ fn reestablish_tcp(shared: &Arc<Shared>) -> Option<ReadHalf> {
         }
         match try_tcp_session(shared) {
             Ok(messages) => return Some(messages),
-            Err(_) => attempt += 1,
+            Err(_) => {
+                attempt += 1;
+                // REP-033: that endpoint did not yield a session — rotate to
+                // the next replica-set member so the next attempt discovers
+                // the new primary after a failover.
+                if shared.endpoints.len() > 1 {
+                    shared.endpoint_ix.fetch_add(1, Ordering::SeqCst);
+                }
+            }
         }
     }
 }
@@ -1607,7 +1714,13 @@ fn sleep_unless_closed(shared: &Shared, delay: Duration) -> bool {
 /// One TCP reconnect attempt: a full session bring-up. Any failure aborts the
 /// attempt; the loop backs off and tries again.
 fn try_tcp_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
-    let stream = TcpStream::connect(&shared.addr)?;
+    // REP-033: dial the endpoint the reconnect loop currently points at —
+    // after a failover this rotates until it lands on the new primary.
+    let endpoint = {
+        let ix = shared.endpoint_ix.load(Ordering::SeqCst) % shared.endpoints.len();
+        &shared.endpoints[ix]
+    };
+    let stream = TcpStream::connect(endpoint)?;
     let _ = stream.set_nodelay(true);
     // A half-dead handshake must not wedge `Drop`: bound reads until the
     // session is live, then go back to blocking indefinitely.

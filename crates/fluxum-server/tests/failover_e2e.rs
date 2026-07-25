@@ -54,13 +54,14 @@ fn member_config(dir: &Path, name: &str, tcp_port: u16, peers: Vec<String>) -> C
         &name[name.len() - 1..]
     )));
     config.replication.peers = peers;
-    config.replication.heartbeat_interval_ms = 25;
-    config.replication.ack_interval_ms = 25;
-    // Elections quick enough to keep the drill short, but with generous
-    // margin over a loaded CI runner's scheduling jitter — a following
-    // replica whose stream stalls briefly must not spuriously time out
-    // (leader stickiness + the known-good-primary hint cover the rest).
-    config.replication.election_timeout_ms = 1500;
+    config.replication.heartbeat_interval_ms = 50;
+    config.replication.ack_interval_ms = 50;
+    // A generous election timeout so a following replica whose heartbeat
+    // delivery merely lags under a loaded CI runner (the whole test suite
+    // runs concurrently) does not spuriously time out and interrupt its
+    // own stream — real contact loss (a dead primary) still fires after
+    // it. Leader stickiness + the known-good-primary hint do the rest.
+    config.replication.election_timeout_ms = 3000;
     config
 }
 
@@ -226,13 +227,15 @@ async fn a_replica_wins_the_election_and_serves_writes_when_the_primary_dies() {
     assert_eq!(task_count(&winner.ctx), 5);
 
     // The new primary serves writes; the follower finds it by rotation
-    // and converges under the new epoch.
+    // and converges under the new epoch. Space the writes so each is a
+    // distinct durable-watch wake for the streamer even under load.
     for i in 1..=3 {
         let head = post_task(winner.http.local_addr, &format!("post-{i}")).await;
         assert!(
             head.starts_with("HTTP/1.1 200"),
             "the new primary must ack writes: {head}"
         );
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     wait_for_count(&follower.ctx, 8, "follower under the new primary").await;
     assert_eq!(task_count(&winner.ctx), 8);

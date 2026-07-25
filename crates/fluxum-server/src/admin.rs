@@ -532,7 +532,6 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
     // published state (no storage lock — OBS-061). A shard in `semi_sync`
     // that has lost quorum is `degraded` overall.
     let mut status = status;
-    let mut code = code;
     if let Some(election) = ctx.election() {
         let role = election.role();
         let metrics = ctx.metrics();

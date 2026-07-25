@@ -141,6 +141,44 @@ fn the_client_drives_a_real_session_end_to_end() {
     );
 }
 
+/// SPEC-014 REP-033: a replica-set client whose FIRST endpoint is down (a
+/// dead ex-primary) transparently rotates to a live member and drives a
+/// full session — the failover discovery on the client side.
+#[test]
+fn a_replica_set_client_rotates_past_a_dead_endpoint() {
+    if skip() {
+        return;
+    }
+    let server = Server::start("replica-set");
+    // A bogus first URL (nothing listening) followed by the real server.
+    let dead = format!("fluxum://127.0.0.1:{}", free_port());
+    let db = Connection::connect_replica_set(
+        &[&dead, &server.tcp_url],
+        b"",
+        [chat_schema()],
+        fluxum_sdk::ReconnectPolicy::default(),
+    )
+    .expect("the client must rotate past the dead endpoint (REP-033)");
+    assert_ne!(db.identity(), [0u8; 32], "a live session was established");
+
+    db.subscribe(&["SELECT * FROM ChatMessage"])
+        .expect("subscribe");
+    db.call_reducer(
+        "send_chat",
+        vec![FluxValue::I64(1), FluxValue::Str("failover".into())],
+    )
+    .expect("the reachable member serves writes");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while db.cache_size() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert_eq!(
+        db.cache_size(),
+        1,
+        "the row reached the cache via the live member"
+    );
+}
+
 #[test]
 fn the_client_drives_a_real_session_over_streamable_http() {
     // The SAME client surface over `http://` (RPC-004..007): auth via POST,
