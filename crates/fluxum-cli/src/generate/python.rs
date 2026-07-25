@@ -143,7 +143,7 @@ pub fn generate(schema: &Value) -> Result<BTreeMap<String, String>, String> {
     Ok(files)
 }
 
-fn column_name<'a>(column: &'a Value) -> Result<&'a str, String> {
+fn column_name(column: &Value) -> Result<&str, String> {
     column
         .get("name")
         .and_then(Value::as_str)
@@ -157,7 +157,7 @@ fn column_flux<'a>(column: &'a Value, table: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("table `{table}` has an untyped column"))
 }
 
-fn table_name<'a>(table: &'a Value) -> Result<&'a str, String> {
+fn table_name(table: &Value) -> Result<&str, String> {
     table
         .get("name")
         .and_then(Value::as_str)
