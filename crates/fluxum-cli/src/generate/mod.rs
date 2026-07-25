@@ -8,6 +8,7 @@
 //! acceptance 11) — which is what lets a repository commit its bindings and
 //! diff them in review.
 
+pub mod python;
 pub mod rust;
 pub mod typescript;
 
@@ -23,6 +24,8 @@ pub enum Lang {
     TypeScript,
     /// Rust (the `fluxum-sdk` client crate), SDK-050.
     Rust,
+    /// Python (asyncio-first), SDK-061.
+    Python,
 }
 
 impl Lang {
@@ -31,6 +34,7 @@ impl Lang {
         match name.to_ascii_lowercase().as_str() {
             "typescript" | "ts" => Some(Self::TypeScript),
             "rust" | "rs" => Some(Self::Rust),
+            "python" | "py" => Some(Self::Python),
             _ => None,
         }
     }
@@ -40,6 +44,7 @@ impl Lang {
         match self {
             Self::TypeScript => "typescript",
             Self::Rust => "rust",
+            Self::Python => "python",
         }
     }
 }
@@ -72,6 +77,7 @@ pub fn generate(
     match lang {
         Lang::TypeScript => typescript::generate(schema).map_err(CliError::Response),
         Lang::Rust => rust::generate(schema).map_err(CliError::Response),
+        Lang::Python => python::generate(schema).map_err(CliError::Response),
     }
 }
 
@@ -104,6 +110,8 @@ mod tests {
         assert_eq!(Lang::parse("ts"), Some(Lang::TypeScript));
         assert_eq!(Lang::parse("rust"), Some(Lang::Rust));
         assert_eq!(Lang::parse("rs"), Some(Lang::Rust));
+        assert_eq!(Lang::parse("python"), Some(Lang::Python));
+        assert_eq!(Lang::parse("py"), Some(Lang::Python));
         assert_eq!(Lang::parse("cobol"), None);
     }
 

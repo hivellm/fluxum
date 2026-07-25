@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fluxum"
+version = "0.2.0"
+description = "Asyncio-first Python client for the Fluxum realtime database"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "HiveLLM" }]
+keywords = ["fluxum", "realtime", "database", "asyncio", "spacetimedb"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: AsyncIO",
+    "Programming Language :: Python :: 3",
+    "Typing :: Typed",
+]
+# Zero runtime dependencies (SDK-080): the SDK carries its own minimal
+# MessagePack codec and FluxBIN reader.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/hivellm/fluxum"
+Documentation = "https://github.com/hivellm/fluxum/tree/main/sdks/python"
+
+[tool.setuptools]
+packages = ["fluxum"]
+
+[tool.setuptools.package-data]
+fluxum = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-p no:cacheprovider"

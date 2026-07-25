@@ -272,7 +272,7 @@ COMMANDS:
                      both produce identical bytes, so bindings can be
                      committed and diffed in review.
 
-                     --lang    typescript | ts | rust | rs
+                     --lang    typescript | ts | rust | rs | python | py
 
     seed             Apply a JSON fixture to a running instance (DEV-040):
                      an ordered list of reducer calls, each POSTed through
@@ -353,7 +353,9 @@ where
                 Some(text) => match generate::Lang::parse(&text) {
                     Some(lang) => lang,
                     None => {
-                        eprintln!("dev: unknown --lang `{text}` (supported: typescript, rust)");
+                        eprintln!(
+                            "dev: unknown --lang `{text}` (supported: typescript, rust, python)"
+                        );
                         return 2;
                     }
                 },
@@ -441,7 +443,9 @@ where
                 return 2;
             };
             let Some(lang) = generate::Lang::parse(&lang) else {
-                eprintln!("generate: unknown --lang `{lang}` (supported: typescript, rust)");
+                eprintln!(
+                    "generate: unknown --lang `{lang}` (supported: typescript, rust, python)"
+                );
                 return 2;
             };
             match generate::load_schema(&schema)
