@@ -514,6 +514,33 @@ pub struct ReplFence {
     pub epoch: u64,
 }
 
+/// SPEC-014 REP-030 — a candidate asks a peer for its vote in an election
+/// (server-peer only). The vote is granted only to a candidate whose log
+/// is at least as up-to-date (`(last_log_epoch, last_applied_tx_id)`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteRequest {
+    /// The shard whose replica set is electing.
+    pub shard_id: u32,
+    /// The candidate's member name (REP-005).
+    pub member_name: String,
+    /// The epoch the candidate proposes to win (current + 1).
+    pub epoch: u64,
+    /// The envelope epoch of the candidate's newest log entry.
+    pub last_log_epoch: u64,
+    /// The candidate's durable log head.
+    pub last_applied_tx_id: u64,
+}
+
+/// SPEC-014 REP-030 — the peer's answer to a [`VoteRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoteResponse {
+    /// The responder's highest persisted epoch — a candidate seeing a
+    /// higher epoch than it proposed abandons the candidacy and adopts it.
+    pub epoch: u64,
+    /// Whether the vote was granted (persisted before answering, REP-004).
+    pub granted: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Envelopes
 // ---------------------------------------------------------------------------
@@ -539,6 +566,8 @@ tagged_enum! {
         "ReplicaHello" => ReplicaHello(ReplicaHello),
         /// SPEC-014 REP-017 (server-peer only).
         "ReplAck" => ReplAck(ReplAck),
+        /// SPEC-014 REP-030 (server-peer only).
+        "VoteRequest" => VoteRequest(VoteRequest),
     }
 }
 
@@ -567,5 +596,7 @@ tagged_enum! {
         "ReplHeartbeat" => ReplHeartbeat(ReplHeartbeat),
         /// SPEC-014 REP-031 (replication sessions only).
         "ReplFence" => ReplFence(ReplFence),
+        /// SPEC-014 REP-030 (answer to a server-peer `VoteRequest`).
+        "VoteResponse" => VoteResponse(VoteResponse),
     }
 }

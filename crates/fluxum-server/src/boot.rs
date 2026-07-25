@@ -265,6 +265,25 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
             semi_sync,
         },
     ));
+    // SPEC-014 §5 (T7.2): the election state serves votes and publishes
+    // the role the moment the member has peers — REP-003: the config role
+    // is a bootstrap hint; consensus owns it after the first election. A
+    // standalone node (no peers) skips it and is always the primary.
+    if !config.replication.peers.is_empty() {
+        let primary = config.replication.role == fluxum_core::config::ReplicationRole::Primary;
+        let election = crate::election::ElectionState::new(
+            shard,
+            config.replication.member_name.clone(),
+            config.storage.commit_log_dir.clone(),
+            primary,
+            epoch,
+            Duration::from_millis(config.replication.election_timeout_ms),
+        )
+        .map_err(BootError::Core)?;
+        ctx.metrics().set_replication_role(primary);
+        ctx.metrics().set_replication_epoch(epoch);
+        ctx.set_election(election);
+    }
     Ok(ctx)
 }
 
@@ -406,25 +425,40 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         }
     })?;
 
-    // SPEC-014 REP-003: a configured replica dials the primary and keeps
-    // itself converged (T7.1; endpoint discovery via election is T7.2).
-    if config.replication.role == fluxum_core::config::ReplicationRole::Replica
-        && let Some(primary) = config.replication.peers.first()
+    // SPEC-014 §5 (T7.2): every member with peers runs the election task —
+    // a follower runs the replica client (rotating through peers to find
+    // the primary) under an election timer and stands for election on
+    // contact loss (REP-030); a primary parks (the fenced→demote watch).
+    if let Some(election) = ctx.election().cloned()
+        && let Some(first_peer) = config.replication.peers.first()
     {
-        crate::replication::spawn_replica(
+        let token = config
+            .replication
+            .peer_token
+            .as_ref()
+            .map(|t| t.expose_str().as_bytes().to_vec())
+            .unwrap_or_default();
+        crate::election::spawn_election(
             Arc::clone(&ctx),
-            crate::replication::ReplicaOptions {
-                primary: primary.clone(),
-                member_name: config.replication.member_name.clone(),
-                token: config
-                    .replication
-                    .peer_token
-                    .as_ref()
-                    .map(|t| t.expose_str().as_bytes().to_vec())
-                    .unwrap_or_default(),
-                log_dir: config.storage.commit_log_dir.clone(),
-                checkpoint_dir: config.storage.checkpoint_dir.clone(),
-                ack_interval: Duration::from_millis(config.replication.ack_interval_ms),
+            Arc::clone(&election),
+            crate::election::ElectionOptions {
+                peers: config.replication.peers.clone(),
+                token: token.clone(),
+                election_timeout: Duration::from_millis(config.replication.election_timeout_ms),
+                replica: crate::replication::ReplicaOptions {
+                    primary: first_peer.clone(),
+                    member_name: config.replication.member_name.clone(),
+                    token,
+                    log_dir: config.storage.commit_log_dir.clone(),
+                    checkpoint_dir: config.storage.checkpoint_dir.clone(),
+                    ack_interval: Duration::from_millis(config.replication.ack_interval_ms),
+                    contact: Some(election.contact_clock()),
+                    // A dead peer must fail well within one election window
+                    // so rotation reaches the live primary before the timer.
+                    connect_timeout: Some(Duration::from_millis(
+                        (config.replication.election_timeout_ms / 4).max(100),
+                    )),
+                },
             },
         );
     }

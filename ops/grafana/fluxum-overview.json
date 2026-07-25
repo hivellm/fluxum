@@ -675,6 +675,39 @@
           "refId": "B"
         }
       ]
+    },
+    {
+      "id": 37,
+      "type": "timeseries",
+      "title": "Replication: role, epoch & elections",
+      "description": "SPEC-014 REP-030/REP-081: this member's role (1 = primary), the epoch it acts under, and elections started (alert on any election burst — it means heartbeat loss; a role flap means failover happened).",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 12,
+        "x": 12,
+        "y": 44
+      },
+      "targets": [
+        {
+          "expr": "fluxum_replication_role{shard=~\"$shard\"}",
+          "legendFormat": "role {{shard}}",
+          "refId": "A"
+        },
+        {
+          "expr": "fluxum_replication_epoch{shard=~\"$shard\"}",
+          "legendFormat": "epoch {{shard}}",
+          "refId": "B"
+        },
+        {
+          "expr": "rate(fluxum_replication_elections_total{shard=~\"$shard\"}[15m])",
+          "legendFormat": "elections/s {{shard}}",
+          "refId": "C"
+        }
+      ]
     }
   ]
 }

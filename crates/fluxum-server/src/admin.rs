@@ -1141,6 +1141,14 @@ async fn reducer_call(ctx: &Arc<ShardContext>, name: &str, body: &[u8]) -> Admin
             "shard draining for restart; retry",
         );
     }
+    // SPEC-014 REP-042: replicas reject writes with the primary redirect —
+    // the admin surface reaches the engine directly, so it gates here too.
+    if let Some(election) = ctx.election()
+        && !election.role().is_primary()
+    {
+        let e = crate::session::not_primary(election.role());
+        return AdminResponse::err(status_of(&e), request_id.as_deref(), e.to_string());
+    }
     // F-004: the admin route honors the same client-callable gating a client
     // session does — a schedule-only reducer (`client_callable = false`) is
     // not invocable over HTTP, even by an operator. A reducer absent from the

@@ -29,7 +29,7 @@ pub use messages::{
     AuthResult, Authenticate, ClientMessage, ErrorMessage, InitialData, OneOffQuery, PrimaryHello,
     ReducerCall, ReducerError, ReducerResult, ReplAck, ReplBatch, ReplCheckpoint, ReplFence,
     ReplHeartbeat, ReplicaHello, Resume, ServerMessage, Subscribe, SubscribeSingle, TableUpdate,
-    TxUpdate, TxUpdateLight, Unsubscribe,
+    TxUpdate, TxUpdateLight, Unsubscribe, VoteRequest, VoteResponse,
 };
 pub use rowlist::{RowList, RowListBuilder, RowListError, RowSizeHint};
 pub use value::FluxValue;

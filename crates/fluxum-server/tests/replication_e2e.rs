@@ -155,6 +155,8 @@ async fn a_cold_replica_full_syncs_through_a_checkpoint_transfer() {
             log_dir: replica_config.storage.commit_log_dir.clone(),
             checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
             ack_interval: Duration::from_millis(50),
+            contact: None,
+            connect_timeout: None,
         },
     );
     wait_for_count(&replica_ctx, 30, "full sync").await;
@@ -288,6 +290,8 @@ async fn a_bad_peer_credential_never_opens_a_session() {
             log_dir: replica_config.storage.commit_log_dir.clone(),
             checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
             ack_interval: Duration::from_millis(50),
+            contact: None,
+            connect_timeout: None,
         },
     );
     // Give it a refusal + one backoff retry, then stop.
@@ -333,6 +337,8 @@ async fn a_higher_epoch_hello_fences_the_stale_primary() {
             log_dir: replica_config.storage.commit_log_dir.clone(),
             checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
             ack_interval: Duration::from_millis(50),
+            contact: None,
+            connect_timeout: None,
         },
     );
     // The primary counts the fenced hello and never registers the session.
@@ -406,6 +412,8 @@ async fn semi_sync_holds_every_client_ack_until_the_quorum_is_durable() {
             log_dir: replica_config.storage.commit_log_dir.clone(),
             checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
             ack_interval: Duration::from_millis(25),
+            contact: None,
+            connect_timeout: None,
         },
     );
     wait_for_count(&replica_ctx, 1, "unacked commit still replicates").await;
@@ -617,6 +625,8 @@ async fn a_replica_converges_cold_and_resumes_from_its_offset() {
         log_dir: replica_config.storage.commit_log_dir.clone(),
         checkpoint_dir: replica_config.storage.checkpoint_dir.clone(),
         ack_interval: Duration::from_millis(50),
+        contact: None,
+        connect_timeout: None,
     };
 
     // COLD convergence: empty replica → identical state.

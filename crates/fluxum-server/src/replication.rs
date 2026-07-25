@@ -153,6 +153,41 @@ fn admit_batch_epoch(batch_epoch: u64, persisted: u64) -> Result<(), FluxumError
     Ok(())
 }
 
+/// Last-contact clock shared between the replica client and the election
+/// timer (REP-016/REP-030): `touch()`ed on every message from the primary.
+/// Creation counts as contact — a freshly booted member grants the primary
+/// a full election timeout to make itself heard before any candidacy.
+#[derive(Debug)]
+pub struct ContactClock {
+    last: std::sync::Mutex<std::time::Instant>,
+}
+
+impl Default for ContactClock {
+    fn default() -> Self {
+        Self {
+            last: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
+}
+
+impl ContactClock {
+    /// Record contact now.
+    pub fn touch(&self) {
+        *self
+            .last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = std::time::Instant::now();
+    }
+
+    /// Time since the last contact.
+    pub fn elapsed(&self) -> Duration {
+        self.last
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .elapsed()
+    }
+}
+
 /// One live replica session's shared state (acks + flow control).
 #[derive(Debug)]
 struct ReplicaSession {
@@ -217,6 +252,12 @@ impl ReplicationPrimary {
     /// The current epoch.
     pub fn epoch(&self) -> u64 {
         self.epoch.load(Ordering::SeqCst)
+    }
+
+    /// Adopt a higher epoch (a won election, REP-032 step 2) — envelopes
+    /// and fencing decisions use it from the next batch on. Never regresses.
+    pub fn adopt_epoch(&self, epoch: u64) {
+        self.epoch.fetch_max(epoch, Ordering::SeqCst);
     }
 
     /// REP-031: whether a higher epoch was observed — a fenced member no
@@ -377,6 +418,7 @@ impl ReplicationPrimary {
         member: String,
         out: mpsc::Sender<OutFrame>,
         codec: FrameCodec,
+        conn_closed: Arc<AtomicBool>,
     ) -> bool {
         if hello.shard_id != self.shard_id {
             tracing::warn!(target: "fluxum::repl", got = hello.shard_id, have = self.shard_id,
@@ -442,7 +484,15 @@ impl ReplicationPrimary {
         let replica_applied = hello.last_applied_tx_id;
         tokio::spawn(async move {
             let result = this
-                .stream_session(&ctx, sync_full, replica_applied, &session, &out, &codec)
+                .stream_session(
+                    &ctx,
+                    sync_full,
+                    replica_applied,
+                    &session,
+                    &out,
+                    &codec,
+                    &conn_closed,
+                )
                 .await;
             if let Err(e) = result {
                 tracing::warn!(target: "fluxum::repl", member = %member, error = %e,
@@ -462,6 +512,7 @@ impl ReplicationPrimary {
     /// The streaming loop of one session: hello, optional checkpoint
     /// transfer (REP-012), then batches + heartbeats under flow control
     /// (REP-016/REP-017).
+    #[allow(clippy::too_many_arguments)]
     async fn stream_session(
         &self,
         ctx: &Arc<ShardContext>,
@@ -470,6 +521,7 @@ impl ReplicationPrimary {
         session: &Arc<ReplicaSession>,
         out: &mpsc::Sender<OutFrame>,
         codec: &FrameCodec,
+        conn_closed: &AtomicBool,
     ) -> Result<(), FluxumError> {
         let epoch = self.epoch();
         let log = ctx.engine.pipeline().log();
@@ -524,6 +576,12 @@ impl ReplicationPrimary {
         // REP-017 window accounting: bytes sent but not yet applied.
         let mut in_flight: std::collections::VecDeque<(u64, usize)> = Default::default();
         loop {
+            // The connection's read loop is gone — stop streaming so the
+            // writer (and the socket) can actually close. Every wait below
+            // is bounded by the heartbeat interval, so this exit is too.
+            if conn_closed.load(Ordering::SeqCst) {
+                return Ok(());
+            }
             // Release the window as acks land.
             let acked = session.applied.load(Ordering::SeqCst);
             while in_flight.front().is_some_and(|(tx, _)| *tx <= acked) {
@@ -630,6 +688,13 @@ pub struct ReplicaOptions {
     pub checkpoint_dir: PathBuf,
     /// `replication.ack_interval_ms` (REP-017).
     pub ack_interval: Duration,
+    /// Touched on every message from the primary — the election timer's
+    /// contact signal (REP-016/REP-030). `None` outside an election setup.
+    pub contact: Option<Arc<ContactClock>>,
+    /// Connect timeout so a dead endpoint fails fast and the election loop
+    /// rotates (REP-030). `None` = wait on the OS default (the T7.1 replica
+    /// client, which dials one fixed primary).
+    pub connect_timeout: Option<Duration>,
 }
 
 /// A running replica client; dropping it does NOT stop the task — call
@@ -679,14 +744,28 @@ pub fn spawn_replica(ctx: Arc<ShardContext>, options: ReplicaOptions) -> Replica
 
 /// One replica session: authenticate, hello, sync, apply until the
 /// connection drops.
-async fn replica_session(
+pub(crate) async fn replica_session(
     ctx: &Arc<ShardContext>,
     options: &ReplicaOptions,
 ) -> Result<(), FluxumError> {
     let io_err = |e: std::io::Error| FluxumError::Storage(format!("replication io: {e}"));
-    let mut stream = tokio::net::TcpStream::connect(&options.primary)
-        .await
-        .map_err(io_err)?;
+    // A bounded connect so a dead peer fails FAST and the election loop
+    // rotates on to the next endpoint — an OS SYN timeout (seconds, on
+    // some platforms) would otherwise stall a whole election window on a
+    // dead primary and starve failover (REP-030).
+    let mut stream = match options.connect_timeout {
+        Some(bound) => {
+            tokio::time::timeout(bound, tokio::net::TcpStream::connect(&options.primary))
+                .await
+                .map_err(|_| {
+                    FluxumError::Storage(format!("connect to {} timed out", options.primary))
+                })?
+                .map_err(io_err)?
+        }
+        None => tokio::net::TcpStream::connect(&options.primary)
+            .await
+            .map_err(io_err)?,
+    };
     let codec = FrameCodec::default();
 
     let auth = ClientMessage::Authenticate(fluxum_protocol::Authenticate {
@@ -747,7 +826,15 @@ async fn replica_session(
     ack_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let message = tokio::select! {
-            message = reader.next_message(&mut stream) => message?,
+            message = reader.next_message(&mut stream) => {
+                let message = message?;
+                // Any frame from the primary is proof of life (REP-016) —
+                // the election timer resets on it.
+                if let Some(contact) = &options.contact {
+                    contact.touch();
+                }
+                message
+            }
             _ = ack_tick.tick() => {
                 let ack = ClientMessage::ReplAck(ReplAck {
                     epoch: load_epoch(&options.log_dir)?,
@@ -871,20 +958,20 @@ async fn write_message(
 }
 
 /// Buffered frame reader over the replica's client socket.
-struct FrameReader {
+pub(crate) struct FrameReader {
     codec: FrameCodec,
     buf: Vec<u8>,
 }
 
 impl FrameReader {
-    fn new(codec: FrameCodec) -> Self {
+    pub(crate) fn new(codec: FrameCodec) -> Self {
         Self {
             codec,
             buf: Vec::new(),
         }
     }
 
-    async fn next_message(
+    pub(crate) async fn next_message(
         &mut self,
         stream: &mut tokio::net::TcpStream,
     ) -> Result<ServerMessage, FluxumError> {

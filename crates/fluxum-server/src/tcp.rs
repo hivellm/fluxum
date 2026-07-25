@@ -353,6 +353,11 @@ async fn drive_connection(
     // The per-connection outbound queue (SUB-042 send buffer) + its writer.
     let (out_tx, out_rx) = mpsc::channel::<OutFrame>(options.send_queue_depth);
     let conn_shutdown = Arc::new(Notify::new());
+    // Set when this connection's read loop exits, for ancillary tasks that
+    // hold an `out_tx` clone (the replication streamer): without it they
+    // keep the writer — and the socket — alive after the server "died",
+    // and a killed primary would keep heartbeating through it forever.
+    let conn_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let writer = tokio::spawn(writer_task(write_half, out_rx, Arc::clone(ctx.metrics())));
 
     let mut session = Session::new(Arc::clone(&ctx));
@@ -362,6 +367,16 @@ async fn drive_connection(
     let mut buf: Vec<u8> = initial;
     let mut read_chunk = [0u8; 8192];
     let mut detect_preamble = detect_preamble;
+
+    // `notify_waiters` wakes only ALREADY-CREATED `Notified` futures — a
+    // fresh `.notified()` per select iteration misses a shutdown that
+    // lands while a frame is being processed, and the connection then
+    // outlives the server forever (a "killed" primary kept streaming
+    // heartbeats through it, so no failover election ever fired). One
+    // pinned future per source, created before the loop, catches it.
+    let server_shutdown_seen = server_shutdown.notified();
+    let conn_shutdown_seen = conn_shutdown.notified();
+    tokio::pin!(server_shutdown_seen, conn_shutdown_seen);
 
     let result = 'conn: loop {
         let authed = session.is_authenticated();
@@ -404,6 +419,7 @@ async fn drive_connection(
                                 &body,
                                 &out_tx,
                                 &conn_shutdown,
+                                &conn_closed,
                             )
                             .await
                         {
@@ -442,8 +458,8 @@ async fn drive_connection(
             handshake_deadline
         };
         let read = tokio::select! {
-            _ = server_shutdown.notified() => break Ok(()),
-            _ = conn_shutdown.notified() => break Ok(()),
+            _ = &mut server_shutdown_seen => break Ok(()),
+            _ = &mut conn_shutdown_seen => break Ok(()),
             read = read_with_deadline(&mut read_half, &mut read_chunk, options.idle_timeout, handshake_timeout) => read,
         };
         match read {
@@ -465,7 +481,10 @@ async fn drive_connection(
         }
     };
 
-    // Cleanup: deregister and stop the writer.
+    // Cleanup: deregister and stop the writer. The closed flag ends any
+    // replication streamer holding an `out_tx` clone (bounded by its
+    // heartbeat interval), so `writer.await` cannot hang on it.
+    conn_closed.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(conn_id) = session.connection_id() {
         ctx.metrics().note_disconnect(); // OBS-040
         ctx.connections.remove(conn_id).await;
@@ -487,6 +506,7 @@ async fn drive_connection(
 /// Decode one message body, route it, and forward every response frame to
 /// the writer. Registers the connection's fan-out handle the moment it
 /// authenticates. Returns `false` to close the connection.
+#[allow(clippy::too_many_arguments)]
 async fn route_frame(
     ctx: &Arc<ShardContext>,
     session: &mut Session,
@@ -495,6 +515,7 @@ async fn route_frame(
     body: &[u8],
     out_tx: &mpsc::Sender<OutFrame>,
     conn_shutdown: &Arc<Notify>,
+    conn_closed: &Arc<std::sync::atomic::AtomicBool>,
 ) -> bool {
     let message = match ClientMessage::decode(body) {
         Ok(message) => message,
@@ -517,14 +538,49 @@ async fn route_frame(
     if let Some(peer) = session.server_peer().map(str::to_owned) {
         match &message {
             ClientMessage::ReplicaHello(hello) => {
+                // A non-primary member must not serve the stream (its
+                // heartbeats would keep the dialer's election timer alive
+                // and no failover would ever fire) — close, so the dialer
+                // rotates on to the real primary (REP-030/REP-042).
+                if let Some(election) = ctx.election()
+                    && !election.role().is_primary()
+                {
+                    tracing::debug!(target: "fluxum::repl", from = %peer,
+                        "hello refused: this member is not the primary");
+                    return false;
+                }
                 if let Some(primary) = ctx.replication_primary() {
-                    return primary.accept(ctx, hello, peer, out_tx.clone(), *codec);
+                    return primary.accept(
+                        ctx,
+                        hello,
+                        peer,
+                        out_tx.clone(),
+                        *codec,
+                        Arc::clone(conn_closed),
+                    );
                 }
             }
             ClientMessage::ReplAck(ack) => {
                 if let Some(primary) = ctx.replication_primary() {
                     primary.ack(ctx.metrics(), &peer, ack);
                     return true;
+                }
+            }
+            // SPEC-014 REP-030: a peer's election ballot request. Answered
+            // inline — the grant is persisted before the response leaves.
+            ClientMessage::VoteRequest(request) => {
+                if let Some(election) = ctx.election() {
+                    let response = election.answer(ctx, request);
+                    let message = fluxum_protocol::ServerMessage::VoteResponse(response);
+                    if let Ok(body) = message.encode()
+                        && let Ok(framed) = codec.encode(&body)
+                    {
+                        return out_tx
+                            .send(OutFrame::now(std::sync::Arc::new(framed)))
+                            .await
+                            .is_ok();
+                    }
+                    return false;
                 }
             }
             _ => {}

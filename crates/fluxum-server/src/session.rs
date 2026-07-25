@@ -254,7 +254,9 @@ impl Session {
             // SPEC-014 REP-011: replication frames are intercepted by the
             // TCP transport (server-peer sessions) before this router runs.
             // Reaching here means the wrong transport or a non-peer caller.
-            ClientMessage::ReplicaHello(_) | ClientMessage::ReplAck(_) => Routed::reply(error(
+            ClientMessage::ReplicaHello(_)
+            | ClientMessage::ReplAck(_)
+            | ClientMessage::VoteRequest(_) => Routed::reply(error(
                 None,
                 codes::AUTH_FAILED,
                 "replication runs over TCP between authenticated server peers \
@@ -347,6 +349,13 @@ impl Session {
         idempotency_key: Option<String>,
     ) -> Routed {
         let (caller, _, _) = self.authed();
+        // SPEC-014 REP-042: a replica rejects writes without executing —
+        // the retryable redirect names the primary; no hidden proxy hop.
+        if let Some(election) = self.ctx.election()
+            && !election.role().is_primary()
+        {
+            return Routed::reply(from_error(Some(id), &not_primary(election.role())));
+        }
         // SPEC-025 OPS-060: the tenant's own ceilings, above the
         // per-(Identity, reducer) limiter. Checked at admission, so a
         // refused call costs no transaction and never touches another
@@ -646,8 +655,26 @@ fn request_id(message: &ClientMessage) -> u32 {
         ClientMessage::Resume(m) => m.id,
         // Replication frames carry no request id (REP-011 sessions are
         // streaming, not request/response).
-        ClientMessage::ReplicaHello(_) | ClientMessage::ReplAck(_) => 0,
+        ClientMessage::ReplicaHello(_)
+        | ClientMessage::ReplAck(_)
+        | ClientMessage::VoteRequest(_) => 0,
     }
+}
+
+/// The REP-042 `NotPrimary` refusal: retryable, naming the best-known
+/// primary endpoint and the epoch this member acts under.
+pub(crate) fn not_primary(role: &crate::election::RoleState) -> FluxumError {
+    let hint = role
+        .primary_hint()
+        .unwrap_or_else(|| "unknown; consult /health on the peers".to_owned());
+    FluxumError::query_retryable(
+        fluxum_protocol::codes::CLUSTER_NOT_PRIMARY,
+        format!(
+            "not the primary (epoch {}); primary: {hint} (REP-042)",
+            role.epoch()
+        ),
+        Some(500),
+    )
 }
 
 /// An `Error` server message.

@@ -25,6 +25,7 @@ pub mod boot;
 pub mod clientip;
 pub mod connguard;
 pub mod console;
+pub mod election;
 pub mod http;
 pub mod logging;
 pub mod namespace;
@@ -374,6 +375,10 @@ pub struct ShardContext {
     /// installed: the TCP transport hands server-peer `ReplicaHello`
     /// sessions to it.
     replication: std::sync::OnceLock<Arc<crate::replication::ReplicationPrimary>>,
+    /// The member's election state (SPEC-014 §5, T7.2), once installed:
+    /// vote serving (TCP router), the published role (REP-042 admission,
+    /// REP-080 health) and the election task share it.
+    election: std::sync::OnceLock<Arc<crate::election::ElectionState>>,
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
@@ -519,6 +524,7 @@ impl ShardContext {
             blob_store: std::sync::OnceLock::new(),
             checkpoint: std::sync::OnceLock::new(),
             replication: std::sync::OnceLock::new(),
+            election: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
             namespaces: std::sync::RwLock::new(HashMap::new()),
@@ -582,6 +588,17 @@ impl ShardContext {
     /// The installed replication service, if any.
     pub fn replication_primary(&self) -> Option<&Arc<crate::replication::ReplicationPrimary>> {
         self.replication.get()
+    }
+
+    /// Install the member's election state (once, at assembly).
+    pub fn set_election(&self, election: Arc<crate::election::ElectionState>) {
+        let _ = self.election.set(election);
+    }
+
+    /// The member's election state, if any. `None` = a standalone node,
+    /// which is always the primary (REP-042 admission passes).
+    pub fn election(&self) -> Option<&Arc<crate::election::ElectionState>> {
+        self.election.get()
     }
 
     /// The SEC-045 query-bounds handle (shared with every hosted manager).

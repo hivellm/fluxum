@@ -171,6 +171,12 @@ pub const STORAGE_FULLTEXT_REBUILDING: u16 = 7004;
 pub const CLUSTER_SHARD_UNAVAILABLE: u16 = 8000;
 /// 8001 — entity mid-handoff between shards (SPEC-007; reserved).
 pub const CLUSTER_ENTITY_HANDOFF: u16 = 8001;
+/// 8002 — this member is not the primary; the write must go to the
+/// primary endpoint carried in the details (SPEC-014 REP-042).
+pub const CLUSTER_NOT_PRIMARY: u16 = 8002;
+/// 8003 — replica lag exceeds `max_staleness_ms`; new reads are not
+/// admitted here until it catches up (SPEC-014 REP-041).
+pub const CLUSTER_REPLICA_STALE: u16 = 8003;
 
 // --- 9xxx SYS_ --------------------------------------------------------------
 
@@ -599,6 +605,26 @@ pub const CATALOG: &[CatalogEntry] = &[
         sqlstate: None,
         details_keys: &[],
         message_template: "entity is mid-handoff between shards; retry shortly",
+        http_status: 503,
+    },
+    CatalogEntry {
+        code: CLUSTER_NOT_PRIMARY,
+        name: "CLUSTER_NOT_PRIMARY",
+        severity: Severity::Error,
+        retryable: true,
+        sqlstate: None,
+        details_keys: &["primary", "epoch"],
+        message_template: "this member is not the primary; retry against the primary",
+        http_status: 503,
+    },
+    CatalogEntry {
+        code: CLUSTER_REPLICA_STALE,
+        name: "CLUSTER_REPLICA_STALE",
+        severity: Severity::Error,
+        retryable: true,
+        sqlstate: None,
+        details_keys: &["primary", "lag_ms"],
+        message_template: "replica is beyond max_staleness_ms; retry against the primary",
         http_status: 503,
     },
     CatalogEntry {

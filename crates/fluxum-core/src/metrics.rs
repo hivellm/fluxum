@@ -406,6 +406,13 @@ pub struct Metrics {
     /// REP-022: 1 while `on_quorum_loss: degrade` has suspended the
     /// zero-loss guarantee (quorum lost); 0 once quorum returns.
     replication_degraded: AtomicU64,
+    /// REP-081: 1 = primary, 0 = replica (consensus-owned after the first
+    /// election, REP-003).
+    replication_role: AtomicU64,
+    /// REP-081: the epoch this member acts under (REP-004).
+    replication_epoch: AtomicU64,
+    /// REP-081: elections started by this member (REP-030).
+    replication_elections_total: AtomicU64,
     slow_reducer_threshold_us: AtomicU64,
     shard_state: AtomicU8,
     recovered_tx_id: AtomicU64,
@@ -522,6 +529,9 @@ impl Metrics {
             replication_semi_sync_wait_us: AtomicU64::new(0),
             replication_semi_sync_waits: AtomicU64::new(0),
             replication_degraded: AtomicU64::new(0),
+            replication_role: AtomicU64::new(1),
+            replication_epoch: AtomicU64::new(1),
+            replication_elections_total: AtomicU64::new(0),
             slow_reducer_threshold_us: AtomicU64::new(DEFAULT_SLOW_REDUCER_THRESHOLD_US),
             shard_state: AtomicU8::new(ShardState::Ready as u8),
             recovered_tx_id: AtomicU64::new(0),
@@ -659,6 +669,33 @@ impl Metrics {
             self.replication_semi_sync_wait_us.load(Ordering::Relaxed),
             self.replication_semi_sync_waits.load(Ordering::Relaxed),
         )
+    }
+
+    /// REP-081: publish this member's role (1 = primary).
+    pub fn set_replication_role(&self, primary: bool) {
+        self.replication_role
+            .store(u64::from(primary), Ordering::Relaxed);
+    }
+
+    /// The published role (tests, /health).
+    pub fn replication_role_primary(&self) -> bool {
+        self.replication_role.load(Ordering::Relaxed) != 0
+    }
+
+    /// REP-081: publish the acting epoch.
+    pub fn set_replication_epoch(&self, epoch: u64) {
+        self.replication_epoch.store(epoch, Ordering::Relaxed);
+    }
+
+    /// REP-081: one election started (REP-030).
+    pub fn note_election(&self) {
+        self.replication_elections_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The election counter (tests).
+    pub fn replication_elections_total(&self) -> u64 {
+        self.replication_elections_total.load(Ordering::Relaxed)
     }
 
     /// REP-022: raise/clear the degraded flag (`on_quorum_loss: degrade`).
@@ -1022,7 +1059,18 @@ impl Metrics {
              # HELP fluxum_replication_degraded 1 while quorum loss has degraded \
              semi-sync to async (REP-022 on_quorum_loss: degrade).\n\
              # TYPE fluxum_replication_degraded gauge\n\
-             fluxum_replication_degraded{{shard=\"{shard}\"}} {}",
+             fluxum_replication_degraded{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_role 1 = primary, 0 = replica (REP-081).\n\
+             # TYPE fluxum_replication_role gauge\n\
+             fluxum_replication_role{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_epoch The epoch this member acts under \
+             (REP-004/REP-081).\n\
+             # TYPE fluxum_replication_epoch gauge\n\
+             fluxum_replication_epoch{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_replication_elections_total Elections started by this \
+             member (REP-030/REP-081).\n\
+             # TYPE fluxum_replication_elections_total counter\n\
+             fluxum_replication_elections_total{{shard=\"{shard}\"}} {}",
             self.tx_commits.load(Ordering::Relaxed),
             self.tx_rollbacks.load(Ordering::Relaxed),
             self.queue_depth.load(Ordering::Relaxed),
@@ -1032,6 +1080,9 @@ impl Metrics {
             self.replication_semi_sync_wait_us.load(Ordering::Relaxed),
             self.replication_semi_sync_waits.load(Ordering::Relaxed),
             self.replication_degraded.load(Ordering::Relaxed),
+            self.replication_role.load(Ordering::Relaxed),
+            self.replication_epoch.load(Ordering::Relaxed),
+            self.replication_elections_total.load(Ordering::Relaxed),
         );
         {
             let peers = self

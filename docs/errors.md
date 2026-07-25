@@ -298,6 +298,20 @@ entity is mid-handoff between shards; retry shortly
 
 - severity: `error` · retryable: `true` · HTTP 503
 
+## 8002 `CLUSTER_NOT_PRIMARY`
+
+this member is not the primary; retry against the primary
+
+- severity: `error` · retryable: `true` · HTTP 503
+- details keys: `primary`, `epoch`
+
+## 8003 `CLUSTER_REPLICA_STALE`
+
+replica is beyond max_staleness_ms; retry against the primary
+
+- severity: `error` · retryable: `true` · HTTP 503
+- details keys: `primary`, `lag_ms`
+
 ## 9000 `SYS_INTERNAL`
 
 unexpected internal error
