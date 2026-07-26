@@ -817,3 +817,171 @@ where
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use fluxum_core::schema::{ColumnSchema, TableAccess, TableSchema, VisibilityRule};
+
+    static I64_TY: FluxType = FluxType::I64;
+    static COLS: &[ColumnSchema] = &[ColumnSchema {
+        name: "id",
+        ty: FluxType::U64,
+    }];
+    static TBL: TableSchema = TableSchema {
+        name: "T",
+        columns: COLS,
+        primary_key: &[0],
+        auto_inc: None,
+        access: TableAccess::Public,
+        partition_by: None,
+        unique: &[],
+        indexes: &[],
+        visibility: VisibilityRule::PublicAll,
+    };
+
+    #[test]
+    fn classify_routes_reads_catalog_noops_and_rejections() {
+        assert!(matches!(classify("   "), Stmt::Empty));
+        assert!(matches!(classify("SELECT * FROM Item"), Stmt::Read));
+        assert!(matches!(classify("with x as (..) select 1"), Stmt::Read));
+        // Catalog markers win regardless of leading verb.
+        assert!(matches!(
+            classify("SELECT table_name FROM information_schema.tables"),
+            Stmt::Catalog(Catalog::Tables)
+        ));
+        assert!(matches!(
+            classify("select * from information_schema.columns"),
+            Stmt::Catalog(Catalog::Columns)
+        ));
+        assert!(matches!(
+            classify("SELECT version()"),
+            Stmt::Catalog(Catalog::Version)
+        ));
+        assert!(matches!(
+            classify("select current_schema()"),
+            Stmt::Catalog(Catalog::CurrentSchema)
+        ));
+        assert!(matches!(
+            classify("SHOW server_version;"),
+            Stmt::Catalog(Catalog::Show(s)) if s == "server_version"
+        ));
+        // No-ops (accepted, enable nothing).
+        for (sql, tag) in [
+            ("SET x = 1", "SET"),
+            ("reset all", "RESET"),
+            ("BEGIN", "BEGIN"),
+            ("start transaction", "BEGIN"),
+            ("commit", "COMMIT"),
+            ("END", "COMMIT"),
+            ("rollback", "ROLLBACK"),
+            ("abort", "ROLLBACK"),
+            ("discard all", "DISCARD ALL"),
+        ] {
+            assert!(matches!(classify(sql), Stmt::NoOp(t) if t == tag), "{sql}");
+        }
+        // Rejections (read-only).
+        for sql in [
+            "INSERT INTO Item VALUES (1)",
+            "UPDATE Item SET x=1",
+            "DELETE FROM Item",
+            "TRUNCATE Item",
+            "CREATE TABLE t (id int)",
+            "DROP TABLE Item",
+            "ALTER TABLE Item ADD c int",
+            "GRANT ALL",
+        ] {
+            assert!(matches!(classify(sql), Stmt::Reject(_)), "{sql}");
+        }
+    }
+
+    #[test]
+    fn flux_type_maps_to_honest_oids() {
+        assert_eq!(flux_oid(&FluxType::Bool), (proto::OID_BOOL, 1));
+        assert_eq!(flux_oid(&FluxType::I16), (proto::OID_INT2, 2));
+        assert_eq!(flux_oid(&FluxType::I32), (proto::OID_INT4, 4));
+        assert_eq!(flux_oid(&FluxType::U16), (proto::OID_INT4, 4));
+        assert_eq!(flux_oid(&FluxType::I64), (proto::OID_INT8, 8));
+        assert_eq!(flux_oid(&FluxType::Timestamp), (proto::OID_INT8, 8));
+        assert_eq!(flux_oid(&FluxType::EntityId), (proto::OID_INT8, 8));
+        assert_eq!(flux_oid(&FluxType::U64), (proto::OID_NUMERIC, -1));
+        assert_eq!(flux_oid(&FluxType::Decimal), (proto::OID_NUMERIC, -1));
+        assert_eq!(flux_oid(&FluxType::F32), (proto::OID_FLOAT4, 4));
+        assert_eq!(flux_oid(&FluxType::F64), (proto::OID_FLOAT8, 8));
+        assert_eq!(flux_oid(&FluxType::Str), (proto::OID_TEXT, -1));
+        assert_eq!(flux_oid(&FluxType::Bytes), (proto::OID_TEXT, -1));
+        // Option unwraps to the inner type's OID.
+        assert_eq!(flux_oid(&FluxType::Option(&I64_TY)), (proto::OID_INT8, 8));
+    }
+
+    #[test]
+    fn column_type_handles_synthetic_and_schema_columns() {
+        assert_eq!(column_type(None, "_score"), (proto::OID_FLOAT8, 8));
+        assert_eq!(column_type(None, "name_verified"), (proto::OID_BOOL, 1));
+        assert_eq!(column_type(None, "whatever"), (proto::OID_TEXT, -1));
+        assert_eq!(column_type(Some(&TBL), "id"), (proto::OID_NUMERIC, -1));
+        // A column absent from the table falls back to text.
+        assert_eq!(column_type(Some(&TBL), "ghost"), (proto::OID_TEXT, -1));
+    }
+
+    #[test]
+    fn json_scalars_render_to_pg_text() {
+        use serde_json::json;
+        assert_eq!(json_to_text(&json!(null)), None);
+        assert_eq!(json_to_text(&json!(true)), Some(b"t".to_vec()));
+        assert_eq!(json_to_text(&json!(false)), Some(b"f".to_vec()));
+        assert_eq!(json_to_text(&json!(42)), Some(b"42".to_vec()));
+        assert_eq!(json_to_text(&json!("hi")), Some(b"hi".to_vec()));
+        assert_eq!(json_to_text(&json!([1, 2])), Some(b"[1,2]".to_vec()));
+    }
+
+    #[test]
+    fn catalog_fields_and_type_names() {
+        assert_eq!(catalog_fields(&Catalog::Tables).len(), 4);
+        assert_eq!(catalog_fields(&Catalog::Columns).len(), 8);
+        assert_eq!(catalog_fields(&Catalog::Version).len(), 1);
+        assert_eq!(catalog_fields(&Catalog::CurrentSchema).len(), 1);
+        assert_eq!(catalog_fields(&Catalog::Show(String::new())).len(), 1);
+        assert_eq!(pg_type_name(&FluxType::Bool), "boolean");
+        assert_eq!(pg_type_name(&FluxType::I64), "bigint");
+        assert_eq!(pg_type_name(&FluxType::U64), "numeric");
+        assert_eq!(pg_type_name(&FluxType::F64), "double precision");
+        assert_eq!(pg_type_name(&FluxType::Option(&I64_TY)), "bigint");
+        assert_eq!(pg_type_name(&FluxType::Str), "text");
+    }
+
+    #[test]
+    fn show_values_cover_the_connect_probes() {
+        assert_eq!(show_value("server_version"), "14.0");
+        assert_eq!(show_value("transaction_isolation"), "read committed");
+        assert_eq!(show_value("transaction_read_only"), "on");
+        assert_eq!(show_value("TimeZone"), "UTC");
+        assert_eq!(show_value("nonsense"), "");
+    }
+
+    #[test]
+    fn flux_error_maps_to_a_sqlstate() {
+        use fluxum_core::FluxumError;
+        assert_eq!(
+            flux_err(&FluxumError::Storage("unknown table X".into())).code,
+            "42P01"
+        );
+        assert_eq!(
+            flux_err(&FluxumError::Storage("table X is not public".into())).code,
+            "42P01"
+        );
+        assert_eq!(
+            flux_err(&FluxumError::Storage("parse error near '('".into())).code,
+            "42601"
+        );
+        assert_eq!(
+            flux_err(&FluxumError::Storage("expected a table name".into())).code,
+            "42601"
+        );
+        assert_eq!(
+            flux_err(&FluxumError::Storage("a random failure".into())).code,
+            "22000"
+        );
+    }
+}

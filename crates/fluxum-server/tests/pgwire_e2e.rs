@@ -304,6 +304,24 @@ async fn information_schema_lists_the_tables() {
         .await;
     assert!(tags(&reply).contains(&b'T'));
     assert!(body_contains(&reply, b'D', b"Item"), "Item discoverable");
+
+    // The column catalog reflects Item's columns with a pg type name.
+    let cols = client
+        .query("SELECT * FROM information_schema.columns WHERE table_name='Item'")
+        .await;
+    assert!(body_contains(&cols, b'D', b"name"), "column discoverable");
+    assert!(
+        body_contains(&cols, b'D', b"numeric"),
+        "u64 → numeric type name"
+    );
+
+    // The scalar connect probes tools issue.
+    let version = client.query("SELECT version()").await;
+    assert!(body_contains(&version, b'D', b"Fluxum"), "version string");
+    let schema = client.query("SELECT current_schema()").await;
+    assert!(body_contains(&schema, b'D', b"public"));
+    let show = client.query("SHOW transaction_read_only").await;
+    assert!(body_contains(&show, b'D', b"on"));
 }
 
 #[tokio::test]
