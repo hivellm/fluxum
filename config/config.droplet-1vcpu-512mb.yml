@@ -1,0 +1,31 @@
+# Small-droplet soak / validation profile (T7.7, NFR-12; SPEC-013 TST-110/111,
+# SPEC-015 tiered storage): a 1 vCPU / 512 MB instance.
+#
+# Run the server against it, then the full functional profile / soak driver:
+#   fluxum-server --config config/config.droplet-1vcpu-512mb.yml
+#   fluxum-bench soak --rows 5000000 --duration-secs 3600 --shards 1 \
+#     --memory-budget 384MiB --out docs/reports
+#
+# It constrains Fluxum to the tiny instance so a dataset >= 10x RAM exercises
+# the cold tier (SPEC-015) and the memory budget is enforced end to end; idle
+# RSS should stay < 100 MB (TST-111). Every key here can also be supplied via a
+# FLUXUM_* env var (e.g. FLUXUM_MEMORY_BUDGET=384MiB), which the soak driver
+# uses when it self-hosts the server.
+
+profile: development
+
+runtime:
+  worker_threads: 1          # a single vCPU
+
+sharding:
+  shards: 1                  # one shard fits a 512 MB box
+
+memory:
+  budget: 384MiB             # headroom under 512 MB for the OS + page cache
+  bufferpool_fraction: 0.8   # most of the budget to the buffer pool (TIER-003)
+
+storage:
+  page_compression: lz4      # squeeze cold pages (FR-19)
+
+logging:
+  level: info

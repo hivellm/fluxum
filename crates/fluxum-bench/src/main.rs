@@ -105,6 +105,8 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--current" => opts.current = Some(PathBuf::from(value("--current")?)),
             "--published" => opts.published = Some(PathBuf::from(value("--published")?)),
             "--tolerance" => opts.tolerance = parse(&value("--tolerance")?)?,
+            "--duration-secs" => opts.duration_secs = parse(&value("--duration-secs")?)?,
+            "--shards" => opts.shards = parse(&value("--shards")?)?,
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
     }
@@ -170,6 +172,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
     }
     if workload == "fanout" {
         return run_fanout_command(&opts);
+    }
+    // T7.7 (NFR-12/NFR-13): the billion-row + small-droplet soak — fluxum-only,
+    // self-booting sharded + tiered server; samples the server's RSS and
+    // asserts it stays within the memory budget throughout.
+    if workload == "soak" {
+        return run_soak_command(&opts);
     }
 
     // Cold reads own their server lifecycle (seed → restart → measure), so
@@ -527,6 +535,108 @@ fn run_fanout_command(opts: &Opts) -> Result<(), String> {
         if result.met { "MET" } else { "NOT MET" }
     );
     Ok(())
+}
+
+/// T7.7 (NFR-12/NFR-13; SPEC-013 TST-110/111/112, SPEC-015): the billion-row
+/// and small-droplet soak. Boots a sharded, tiered server, loads `--rows`, then
+/// sustains writes and live subscriptions for `--duration-secs` while sampling
+/// the server's RSS, and writes the soak report artifact. Self-hosts the
+/// server (the memory assertion needs the child PID), so `--url` is rejected.
+///
+/// The launch-defining runs are the operator's: a billion rows for an hour on a
+/// large box, and the droplet profile
+/// (`--memory-budget 512MiB --shards 1` on a 1 vCPU / 512 MB instance). The
+/// driver + report here are validated at small scale by `tests/soak_smoke.rs`.
+fn run_soak_command(opts: &Opts) -> Result<(), String> {
+    use fluxum_bench::soak::{SoakConfig, parse_bytesize, run_soak};
+
+    if opts.url.is_some() {
+        return Err(
+            "soak self-hosts the server (RSS sampling needs the server child PID); omit --url"
+                .to_owned(),
+        );
+    }
+    let budget_str = opts
+        .memory_budget
+        .clone()
+        .unwrap_or_else(|| "512MiB".to_owned());
+    let budget_bytes = parse_bytesize(&budget_str)?;
+
+    let server = BenchServer::start_soak(Some(budget_str.clone()), opts.shards)?;
+    let side = FluxumSide::new(server.url.clone());
+    let pid = server.child.id();
+
+    let duration = Duration::from_secs(opts.duration_secs.max(1));
+    let cfg = SoakConfig {
+        rows: u64::from(opts.rows),
+        duration,
+        connections: opts.clients.max(1),
+        pipeline: if opts.pipeline > 1 { opts.pipeline } else { 32 },
+        subscribers: if opts.subscribers > 0 {
+            opts.subscribers
+        } else {
+            8
+        },
+        budget_bytes,
+        tolerance_bytes: 0,
+        // ~60 samples over the window, at least one per second.
+        sample_interval: Duration::from_secs((opts.duration_secs / 60).max(1)),
+    };
+    println!(
+        "== soak: {} rows into {} shard(s), budget {budget_str}, sustain {}s \
+         ({} writers, {} subscriptions) ==",
+        cfg.rows,
+        opts.shards.max(1),
+        duration.as_secs(),
+        cfg.connections,
+        cfg.subscribers
+    );
+
+    let sampler = rss_sampler(pid);
+    let date = opts.date.clone().unwrap_or_else(default_date);
+    let report = run_soak(
+        &side,
+        &cfg,
+        &sampler,
+        hardware(opts.disk_note.as_deref()),
+        env!("CARGO_PKG_VERSION"),
+        &date,
+    )?;
+
+    let out = opts
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("docs/reports"));
+    report.write_artifacts(&out, "soak-report")?;
+    let mib = |b: u64| b as f64 / (1024.0 * 1024.0);
+    println!(
+        "soak {}: peak RSS {:.1} MiB vs budget {:.0} MiB (+{:.0} tol) | idle {:.1} MiB | \
+         writes {:.0}/s | {} sub deliveries — report at {}/soak-report.json",
+        if report.pass { "PASS" } else { "FAIL" },
+        mib(report.peak_rss_bytes),
+        mib(report.budget_bytes),
+        mib(report.tolerance_bytes),
+        mib(report.idle_rss_bytes),
+        report.write.throughput_mean,
+        report.subscription_deliveries,
+        out.display()
+    );
+    if !report.pass {
+        return Err("soak did not pass its budget/liveness criteria (see the report)".to_owned());
+    }
+    Ok(())
+}
+
+/// A closure reading the RSS (bytes) of the server child `pid`, cross-platform
+/// via `sysinfo` (Linux + Windows). A fresh `System` per sample is fine at the
+/// soak's ~minute cadence.
+fn rss_sampler(pid: u32) -> impl Fn() -> u64 + Send + Sync {
+    move || {
+        let mut sys = sysinfo::System::new();
+        let target = sysinfo::Pid::from_u32(pid);
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[target]), true);
+        sys.process(target).map_or(0, sysinfo::Process::memory)
+    }
 }
 
 /// TST-094/TST-096: run the full TST-092 matrix on both sides with one
@@ -1174,6 +1284,10 @@ struct Opts {
     current: Option<PathBuf>,
     published: Option<PathBuf>,
     tolerance: f64,
+    /// `soak`: sustain-phase length in seconds (T7.7).
+    duration_secs: u64,
+    /// `soak`: shard count for the sharded + tiered deployment.
+    shards: u32,
 }
 
 impl Default for Opts {
@@ -1211,6 +1325,8 @@ impl Default for Opts {
             current: None,
             published: None,
             tolerance: 0.2,
+            duration_secs: 3600,
+            shards: 4,
         }
     }
 }
@@ -1236,6 +1352,8 @@ fn usage() -> String {
      [--warmup-secs N] [--measure-secs N]   (NFR-01/TST-060: fluxum-only, sustained)\n\
      \x20      fluxum-bench fanout [--url URL] [--subscribers N] [--messages N] [--rate N]   \
      (NFR-04/TST-061: commit->receipt p99)\n\
+     \x20      fluxum-bench soak [--rows N] [--duration-secs N] [--shards N] [--memory-budget SIZE] \
+     [--clients N] [--subscribers N] [--out DIR]   (T7.7/NFR-12-13: sharded+tiered soak, RSS vs budget)\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()
@@ -1316,16 +1434,28 @@ struct BenchServer {
     tcp_port: u16,
     data_dir: PathBuf,
     memory_budget: Option<String>,
+    shards: Option<u32>,
 }
 
 impl BenchServer {
     fn start() -> Result<Self, String> {
-        Self::start_with(None)
+        Self::start_inner(None, None)
     }
 
     /// Start with an explicit `memory.budget` (the cold-read knob: a budget
     /// smaller than the seeded dataset forces the cold tier into play).
     fn start_with(memory_budget: Option<String>) -> Result<Self, String> {
+        Self::start_inner(memory_budget, None)
+    }
+
+    /// Start a sharded + tiered server for a soak (T7.7): `shards` partitions
+    /// plus the cold-tier page file, under a small `memory_budget` so a
+    /// >10×-RAM dataset actually exercises eviction.
+    fn start_soak(memory_budget: Option<String>, shards: u32) -> Result<Self, String> {
+        Self::start_inner(memory_budget, Some(shards.max(1)))
+    }
+
+    fn start_inner(memory_budget: Option<String>, shards: Option<u32>) -> Result<Self, String> {
         let name = if cfg!(windows) {
             "fluxum-server.exe"
         } else {
@@ -1363,6 +1493,7 @@ impl BenchServer {
             tcp_port,
             &data_dir,
             memory_budget.as_deref(),
+            shards,
         )?;
         Ok(BenchServer {
             url: format!("fluxum://127.0.0.1:{tcp_port}"),
@@ -1372,6 +1503,7 @@ impl BenchServer {
             tcp_port,
             data_dir,
             memory_budget,
+            shards,
         })
     }
 
@@ -1386,6 +1518,7 @@ impl BenchServer {
             self.tcp_port,
             &self.data_dir,
             self.memory_budget.as_deref(),
+            self.shards,
         )?;
         Ok(())
     }
@@ -1397,6 +1530,7 @@ fn launch_fluxum(
     tcp_port: u16,
     data_dir: &std::path::Path,
     memory_budget: Option<&str>,
+    shards: Option<u32>,
 ) -> Result<Child, String> {
     let mut command = Command::new(binary);
     command
@@ -1405,10 +1539,21 @@ fn launch_fluxum(
         .env("FLUXUM_SERVER_TCP_PORT", tcp_port.to_string())
         .env("FLUXUM_STORAGE_DATA_DIR", data_dir)
         .env("FLUXUM_STORAGE_COMMIT_LOG_DIR", data_dir.join("log"))
+        // Keep every durable dir under the per-instance temp data dir — the
+        // cold tier's page file (TIER-023) and checkpoints must not land in
+        // the checkout, and a 10×-RAM soak writes a lot of both.
+        .env("FLUXUM_STORAGE_PAGE_DIR", data_dir.join("pages"))
+        .env(
+            "FLUXUM_STORAGE_CHECKPOINT_DIR",
+            data_dir.join("checkpoints"),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(budget) = memory_budget {
         command.env("FLUXUM_MEMORY_BUDGET", budget);
+    }
+    if let Some(shards) = shards {
+        command.env("FLUXUM_SHARDING_SHARDS", shards.to_string());
     }
     let child = command
         .spawn()

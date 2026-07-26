@@ -31,6 +31,25 @@ fn leaf_keys(value: &serde_yaml::Value, prefix: &str, out: &mut Vec<String>) {
 }
 
 #[test]
+fn the_droplet_soak_profile_loads_and_validates() {
+    // T7.7: the small-droplet soak profile must load through the real loader
+    // (strict parse + profile defaults + validation) — `development` supplies
+    // auth "none", so it is a complete, runnable config, not just a reference.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../config/config.droplet-1vcpu-512mb.yml");
+    let config = Config::load(Some(&path)).expect("droplet profile must load + validate");
+    assert_eq!(
+        config
+            .memory
+            .budget
+            .explicit()
+            .map(fluxum_core::config::ByteSize::as_u64),
+        Some(384 * 1024 * 1024)
+    );
+    assert_eq!(config.runtime.worker_threads.explicit(), Some(&1));
+}
+
+#[test]
 fn the_example_config_parses_with_the_strict_deserializer() {
     let text = std::fs::read_to_string(example_path()).unwrap();
     // Every struct is `deny_unknown_fields`, so a typo or a removed key in
