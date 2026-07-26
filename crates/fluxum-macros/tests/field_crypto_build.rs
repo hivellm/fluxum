@@ -90,6 +90,7 @@ fn build_wires_encryption_end_to_end() {
         .snapshot()
         .scan(table)
         .unwrap()
+        .into_iter()
         .next()
         .unwrap()
         .clone();

@@ -252,11 +252,7 @@ pub fn fingerprint(store: &MemStore) -> Vec<(u32, Vec<Row>, u64)> {
         .map(|id| {
             (
                 id.as_u32(),
-                snapshot
-                    .scan(id)
-                    .unwrap_or_else(|e| panic!("{e}"))
-                    .cloned()
-                    .collect(),
+                snapshot.scan(id).unwrap_or_else(|e| panic!("{e}")),
                 snapshot
                     .auto_inc_high_water(id)
                     .unwrap_or_else(|e| panic!("{e}")),

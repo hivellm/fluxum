@@ -367,12 +367,7 @@ fn hooks_never_touch_stored_state_or_diffs() {
     );
     let rows = |store: &MemStore| -> Vec<_> {
         let item = store.table_id("Item").unwrap();
-        store
-            .snapshot()
-            .scan(item)
-            .unwrap()
-            .cloned()
-            .collect::<Vec<_>>()
+        store.snapshot().scan(item).unwrap()
     };
     assert_eq!(
         rows(&store_plain),

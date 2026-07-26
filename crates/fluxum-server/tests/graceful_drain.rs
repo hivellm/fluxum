@@ -289,7 +289,7 @@ async fn an_in_flight_call_commits_and_the_drain_checkpoints_it() {
             .snapshot()
             .scan(h.store.table_id("Note").unwrap())
             .unwrap()
-            .count(),
+            .len(),
         1,
         "the write survived the drain"
     );

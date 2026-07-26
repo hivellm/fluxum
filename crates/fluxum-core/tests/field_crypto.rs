@@ -139,7 +139,13 @@ fn encrypted_column_stores_ciphertext_and_reads_back_plaintext() {
     // The committed row at rest carries ciphertext, not the plaintext.
     let snapshot = store.snapshot();
     let table = store.table_id("Vote").unwrap();
-    let raw = snapshot.scan(table).unwrap().next().unwrap().clone();
+    let raw = snapshot
+        .scan(table)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+        .clone();
     match raw.value(1) {
         Some(RowValue::Bytes(env)) => {
             assert!(
@@ -194,6 +200,7 @@ fn signed_column_round_trips_through_the_store() {
         .snapshot()
         .scan(table)
         .unwrap()
+        .into_iter()
         .next()
         .unwrap()
         .value(1)

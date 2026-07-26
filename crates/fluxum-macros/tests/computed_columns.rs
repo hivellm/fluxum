@@ -173,6 +173,7 @@ fn computed_column_usable_in_sql_where_and_order_by() {
     let matched: usize = snapshot
         .scan(table)
         .unwrap()
+        .iter()
         .filter(|row| plan.matches(row))
         .count();
     assert_eq!(matched, 2, "WHERE filtered on the derived column");

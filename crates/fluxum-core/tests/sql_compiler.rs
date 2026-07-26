@@ -108,7 +108,7 @@ fn message_row(channel: u32, sender: &str, sent_at: i64, priority: Option<i32>) 
     .unwrap();
     tx.commit().unwrap();
     let snapshot = store.snapshot();
-    let rows: Vec<Row> = snapshot.scan(table).unwrap().cloned().collect();
+    let rows: Vec<Row> = snapshot.scan(table).unwrap();
     rows.into_iter().next().unwrap()
 }
 
@@ -378,9 +378,9 @@ fn owner_only_tables_compile_a_caller_parameterized_rls_slot() {
         .unwrap();
     tx.commit().unwrap();
     let snapshot = store.snapshot();
-    let row = snapshot.scan(owned_id).unwrap().next().unwrap();
-    assert!(rls(row, &owner), "owner sees their row");
-    assert!(!rls(row, &other), "another identity does not");
+    let row = snapshot.scan(owned_id).unwrap().into_iter().next().unwrap();
+    assert!(rls(&row, &owner), "owner sees their row");
+    assert!(!rls(&row, &other), "another identity does not");
 }
 
 #[test]

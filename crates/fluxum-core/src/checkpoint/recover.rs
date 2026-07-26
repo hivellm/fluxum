@@ -11,7 +11,8 @@ use crate::commitlog::replay::{ReplayReport, replay};
 use crate::error::{FluxumError, Result};
 use crate::schema::TableSchema;
 use crate::store::committed::{CommittedState, TableState};
-use crate::store::row::{Row, encode_pk_of_row};
+use crate::store::pager::PagedTree;
+use crate::store::row::{PkBytes, Row, encode_pk_of_row, encode_row_paged};
 use crate::store::{MemStore, TableId};
 
 /// A checkpoint that failed verification during recovery and was skipped
@@ -143,13 +144,17 @@ pub fn recover(
     let mut tables = HashMap::with_capacity(working.len());
     for (id, table) in working {
         let empty = base.state.table(id)?;
-        let mut rows: imbl::OrdMap<_, Row> = imbl::OrdMap::new();
         let mut indexes = empty.indexes.clone();
         let mut spatial = empty.spatial.clone();
         let mut fulltext = empty.fulltext.clone();
         let mut unique = empty.unique.clone();
-        for row in table.rows.into_values() {
-            let pk = encode_pk_of_row(table.schema, row.values())?;
+        // The working rows are already keyed by encoded PK in byte order
+        // (`BTreeMap`), exactly what the paged primary tree bulk-loads.
+        let mut paged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(table.rows.len());
+        let mut row_count = 0u64;
+        for (pk_bytes, row) in table.rows {
+            let pk = PkBytes::from_bytes(pk_bytes.clone());
+            debug_assert_eq!(pk, encode_pk_of_row(table.schema, row.values())?);
             for index in indexes.values_mut() {
                 index.insert(&row, pk.clone())?;
             }
@@ -162,13 +167,17 @@ pub fn recover(
             for constraint in &mut unique {
                 constraint.insert(&row, pk.clone())?;
             }
-            rows.insert(pk, row);
+            paged.push((pk_bytes, encode_row_paged(table.schema, row.values())?));
+            row_count += 1;
         }
+        let mut rows = PagedTree::create(store.pager(), id, false)?;
+        rows.bulk_load(paged)?;
         tables.insert(
             id,
             Arc::new(TableState {
                 schema: table.schema,
                 rows,
+                row_count,
                 indexes,
                 spatial,
                 fulltext,
@@ -180,7 +189,7 @@ pub fn recover(
 
     let last_tx_id = report.last_tx_id.max(adopted);
     let next_tx_id = last_tx_id.map_or(1, |tx| tx.saturating_add(1));
-    store.install_recovered(CommittedState { tables }, next_tx_id)?;
+    store.install_recovered(CommittedState::detached(tables), next_tx_id)?;
 
     Ok(RecoveryOutcome {
         checkpoint_tx_id: adopted,

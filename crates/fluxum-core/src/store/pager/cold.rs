@@ -27,7 +27,8 @@ use crate::schema::{IndexSchema, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::Snapshot;
 use crate::store::row::{
-    Row, RowValue, check_row, decode_row, encode_pk_of_row, encode_pk_values, encode_row,
+    Row, RowValue, check_row, decode_row_paged, encode_pk_of_row, encode_pk_values,
+    encode_row_paged,
 };
 
 use super::{PagedTree, Pager};
@@ -63,10 +64,14 @@ impl ColdTable {
         let schema = state.schema();
 
         let mut primary = PagedTree::create(pager, table_id, false)?;
-        let mut rows = Vec::with_capacity(state.rows.len());
-        for (pk, row) in &state.rows {
-            rows.push((pk.as_bytes().to_vec(), encode_row(row.values())?));
-        }
+        // The live primary tree already stores `pk bytes → FluxBIN row`; copy
+        // the raw leaf payloads straight across (no decode/re-encode), in key
+        // order, into the spill target.
+        let mut rows = Vec::with_capacity(state.row_count());
+        state.rows.scan(&[], None, &mut |key, value| {
+            rows.push((key.to_vec(), value.to_vec()));
+            Ok(true)
+        })?;
         primary.bulk_load(rows)?;
 
         let mut indexes = Vec::with_capacity(schema.indexes.len());
@@ -80,12 +85,11 @@ impl ColdTable {
             };
             let id = index_id_of(schema, columns)?;
             let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-            for (pk, row) in &state.rows {
-                entries.insert(
-                    index_key(schema, columns, row.values(), pk.as_bytes())?,
-                    pk.as_bytes().to_vec(),
-                );
-            }
+            state.rows.scan(&[], None, &mut |key, value| {
+                let row = decode_row_paged(schema, value)?;
+                entries.insert(index_key(schema, columns, row.values(), key)?, key.to_vec());
+                Ok(true)
+            })?;
             let mut tree = PagedTree::create(pager, table_id, true)?;
             tree.bulk_load(entries)?;
             indexes.push(ColdIndex { id, columns, tree });
@@ -124,7 +128,7 @@ impl ColdTable {
     pub fn get(&self, pk_values: &[RowValue]) -> Result<Option<Row>> {
         let pk = encode_pk_values(self.schema, pk_values)?;
         match self.primary.get(pk.as_bytes())? {
-            Some(bytes) => Ok(Some(decode_row(self.schema, &bytes)?)),
+            Some(bytes) => Ok(Some(decode_row_paged(self.schema, &bytes)?)),
             None => Ok(None),
         }
     }
@@ -134,7 +138,7 @@ impl ColdTable {
     pub fn scan_all(&self) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         self.primary.scan(&[], None, &mut |_, value| {
-            rows.push(decode_row(self.schema, value)?);
+            rows.push(decode_row_paged(self.schema, value)?);
             Ok(true)
         })?;
         Ok(rows)
@@ -223,7 +227,7 @@ impl ColdTable {
                     self.schema.name
                 ))
             })?;
-            rows.push(decode_row(self.schema, &bytes)?);
+            rows.push(decode_row_paged(self.schema, &bytes)?);
         }
         Ok(rows)
     }
@@ -241,13 +245,13 @@ impl ColdTable {
         let pk = encode_pk_of_row(self.schema, &values)?;
         // Replacement: retire the old row's index entries first.
         if let Some(old_bytes) = self.primary.get(pk.as_bytes())? {
-            let old = decode_row(self.schema, &old_bytes)?;
+            let old = decode_row_paged(self.schema, &old_bytes)?;
             for index in &mut self.indexes {
                 let key = index_key(self.schema, index.columns, old.values(), pk.as_bytes())?;
                 index.tree.delete(&key)?;
             }
         }
-        let row_bytes = encode_row(&values)?;
+        let row_bytes = encode_row_paged(self.schema, &values)?;
         self.primary.insert(pk.as_bytes(), &row_bytes)?;
         for index in &mut self.indexes {
             let key = index_key(self.schema, index.columns, &values, pk.as_bytes())?;
@@ -262,7 +266,7 @@ impl ColdTable {
         let Some(old_bytes) = self.primary.get(pk.as_bytes())? else {
             return Ok(false);
         };
-        let old = decode_row(self.schema, &old_bytes)?;
+        let old = decode_row_paged(self.schema, &old_bytes)?;
         for index in &mut self.indexes {
             let key = index_key(self.schema, index.columns, old.values(), pk.as_bytes())?;
             index.tree.delete(&key)?;

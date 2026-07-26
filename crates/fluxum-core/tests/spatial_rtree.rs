@@ -216,6 +216,7 @@ fn region_queries_use_intersection_semantics_for_boxes() {
         let mut want: Vec<u64> = snap
             .scan(ids.zone)
             .unwrap()
+            .iter()
             .filter(|row| zone_box(row).intersects(&query))
             .map(row_id)
             .collect();

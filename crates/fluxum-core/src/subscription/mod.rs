@@ -696,7 +696,7 @@ impl SubscriptionManager {
         for spec in &self.membership_specs {
             let mut set = HashSet::new();
             for row in snapshot.scan(spec.member_table)? {
-                if let Some(entry) = Self::membership_entry(spec, row) {
+                if let Some(entry) = Self::membership_entry(spec, &row) {
                     set.insert(entry);
                 }
             }
@@ -1339,8 +1339,8 @@ impl SubscriptionManager {
                     if !guard.admit() {
                         break;
                     }
-                    if keep(row) {
-                        out.push(row.clone());
+                    if keep(&row) {
+                        out.push(row);
                     }
                 }
                 out
@@ -1994,14 +1994,13 @@ impl SubscriptionManager {
         'probes: for probe in &scan.probes {
             let lower = bound_ref(&scan.lower);
             let upper = bound_ref(&scan.upper);
-            let iter = snapshot.index_scan(table_id, scan.index_id, probe, lower, upper)?;
+            let range = snapshot.index_scan(table_id, scan.index_id, probe, lower, upper)?;
             if descending {
                 // DESC is served by walking the bounded range in reverse: the
                 // range itself stays bounded, so the read cost is unchanged.
-                let range: Vec<&Row> = iter.collect();
                 for row in range.into_iter().rev() {
-                    if residual_keep(row) {
-                        rows.push(row.clone());
+                    if residual_keep(&row) {
+                        rows.push(row);
                         if early_stop.is_some_and(|n| rows.len() >= n) {
                             break 'probes;
                         }
@@ -2010,9 +2009,9 @@ impl SubscriptionManager {
                     }
                 }
             } else {
-                for row in iter {
-                    if residual_keep(row) {
-                        rows.push(row.clone());
+                for row in range {
+                    if residual_keep(&row) {
+                        rows.push(row);
                         if early_stop.is_some_and(|n| rows.len() >= n) {
                             break 'probes;
                         }

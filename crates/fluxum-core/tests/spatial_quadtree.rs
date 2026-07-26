@@ -185,6 +185,7 @@ fn region_radius_and_point_queries_match_the_full_scan_oracle() {
         let want = ids(snap
             .scan(table)
             .unwrap()
+            .iter()
             .map(triple)
             .filter(|&(_, x, y)| region.contains_point(x, y))
             .collect());
@@ -208,6 +209,7 @@ fn region_radius_and_point_queries_match_the_full_scan_oracle() {
         let want = ids(snap
             .scan(table)
             .unwrap()
+            .iter()
             .map(triple)
             .filter(|&(_, x, y)| {
                 let (dx, dy) = (x - cx, y - cy);

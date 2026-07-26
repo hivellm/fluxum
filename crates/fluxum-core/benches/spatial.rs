@@ -196,6 +196,7 @@ fn bench_in_region(c: &mut Criterion) {
                 let count = snap
                     .scan(table)
                     .expect("scan")
+                    .iter()
                     .filter(|row| {
                         let (Some(RowValue::F64(px)), Some(RowValue::F64(py))) =
                             (row.value(1), row.value(2))
@@ -242,6 +243,7 @@ fn bench_in_region_rtree(c: &mut Criterion) {
             let count = snap
                 .scan(table)
                 .expect("scan")
+                .iter()
                 .filter(|row| {
                     let (
                         Some(RowValue::F64(a)),

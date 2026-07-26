@@ -59,7 +59,7 @@ impl<'a> ReadOnlyTxHandle<'a> {
 
     /// Full scan of the committed state, in encoded-PK byte order.
     pub fn scan<T: Table>(&self) -> Result<Vec<T>> {
-        let rows: Vec<crate::store::Row> = self.snapshot.scan(table_of::<T>())?.cloned().collect();
+        let rows = self.snapshot.scan(table_of::<T>())?;
         decode_rows(&rows)
     }
 

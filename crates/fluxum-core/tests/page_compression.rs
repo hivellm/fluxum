@@ -143,7 +143,7 @@ fn corpus_round_trips_bit_identically_through_compressed_fault_ins() {
         // Every row is served back identical to the hot-tier oracle after
         // the pool was emptied (all reads decompress on fault-in).
         pager.evict_all().expect("evict");
-        let hot: Vec<Row> = snap.scan(table_id).expect("hot scan").cloned().collect();
+        let hot: Vec<Row> = snap.scan(table_id).expect("hot scan");
         let cold_rows = cold.scan_all().expect("cold scan");
         assert_eq!(cold_rows, hot, "{compression:?} scan diverged");
         for id in [0u64, 1, 999, 5_998, 5_999] {

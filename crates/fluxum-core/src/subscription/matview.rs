@@ -115,7 +115,7 @@ impl MatViewEngine {
         let mut states: Vec<ViewState> = views.iter().map(|_| ViewState::default()).collect();
         for (view, state) in views.iter().zip(&mut states) {
             for row in snapshot.scan(view.table)? {
-                apply_row(view, state, row, 1)?;
+                apply_row(view, state, &row, 1)?;
             }
         }
         Ok(Self {
@@ -245,7 +245,7 @@ impl MatViewEngine {
         let mut states: Vec<ViewState> = views.iter().map(|_| ViewState::default()).collect();
         for (view, state) in views.iter().zip(&mut states) {
             for row in snapshot.scan(view.table)? {
-                apply_row(view, state, row, 1)?;
+                apply_row(view, state, &row, 1)?;
             }
         }
         Ok(states)

@@ -321,7 +321,7 @@ async fn reducer_call_commits_and_returns_reducerresult() {
     }
     // Exactly one row committed.
     let table = h.store.table_id("Chat").unwrap();
-    assert_eq!(h.store.snapshot().scan(table).unwrap().count(), 1);
+    assert_eq!(h.store.snapshot().scan(table).unwrap().len(), 1);
     h.server.shutdown();
 }
 

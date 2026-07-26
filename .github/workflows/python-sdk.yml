@@ -1,0 +1,65 @@
+name: Python SDK
+
+# The Python SDK's conformance runner (SPEC-013 TST-052, SDK-064): the shared
+# corpus must be green in the Python client before release. Runs when the SDK,
+# the corpus, or the server (which the runner boots) changes.
+on:
+  push:
+    branches: [ master, main, develop ]
+    paths:
+      - 'sdks/python/**'
+      - 'tests/conformance/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/python-sdk.yml'
+  pull_request:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+concurrency:
+  group: python-sdk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install toolchain from rust-toolchain.toml
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install mold
+      uses: rui314/setup-mold@v1
+
+    - name: Configure mold linker
+      run: |
+        mkdir -p .cargo
+        echo "[target.x86_64-unknown-linux-gnu]" >> .cargo/config.toml
+        echo "linker = \"clang\"" >> .cargo/config.toml
+        echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=/usr/local/bin/mold\"]" >> .cargo/config.toml
+
+    - name: Build the reference server (the runner boots it)
+      run: cargo build -p fluxum-server
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Install pytest
+      # The SDK itself ships zero runtime dependencies (SDK-080); only the
+      # test harness needs pytest.
+      run: python -m pip install --upgrade pytest
+
+    - name: Run the conformance corpus + unit suite
+      working-directory: sdks/python
+      run: python -m pytest -q

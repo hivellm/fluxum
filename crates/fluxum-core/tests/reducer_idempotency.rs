@@ -299,7 +299,7 @@ async fn a_failed_call_records_nothing_so_its_retry_re_executes() {
     // The window holds nothing for the rolled-back call.
     let window = h.store.snapshot();
     assert_eq!(
-        window.scan(TableId::of("__idempotency__")).unwrap().count(),
+        window.scan(TableId::of("__idempotency__")).unwrap().len(),
         0,
         "a rollback leaves no dedup record"
     );
@@ -385,6 +385,7 @@ async fn a_pruned_key_is_executed_again() {
         let records: Vec<(Vec<RowValue>, i64)> = snapshot
             .scan(idem)
             .unwrap()
+            .iter()
             .map(|row| {
                 let values = row.values();
                 let created_us = match values[3] {

@@ -240,6 +240,7 @@ impl Shard {
         let rows: Vec<Vec<RowValue>> = snapshot
             .scan(id)
             .unwrap()
+            .iter()
             .map(|row| row.values().to_vec())
             .collect();
         rows

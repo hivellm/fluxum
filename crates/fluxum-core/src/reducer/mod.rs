@@ -802,7 +802,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     pub fn scan_all<T: Table>(&self) -> Result<Vec<T>> {
         let rows: Vec<Row> = {
             let tx = self.shared()?;
-            tx.scan_all(table_of::<T>())?.cloned().collect()
+            tx.scan_all(table_of::<T>())?
         };
         self.decode_rows_plain::<T>(rows)
     }
@@ -835,8 +835,6 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
         let rows: Vec<Row> = {
             let tx = self.shared()?;
             tx.index_eq(table, index, std::slice::from_ref(&from))?
-                .cloned()
-                .collect()
         };
         self.decode_rows_plain::<E>(rows)
     }
@@ -926,7 +924,7 @@ impl<'e, 't, 's> TxHandle<'e, 't, 's> {
     /// transaction borrow is released before predicates or decoding run.
     fn committed_rows<T: Table>(&self) -> Result<Vec<Row>> {
         let tx = self.shared()?;
-        Ok(tx.scan(table_of::<T>())?.cloned().collect())
+        tx.scan(table_of::<T>())
     }
 
     /// Decrypt a stored row's `#[encrypted]` columns for the reducer

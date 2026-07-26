@@ -16,6 +16,7 @@ use crate::index::{
 use crate::schema::{IndexSchema, Schema, SpatialKind, TableSchema};
 use crate::store::TableId;
 use crate::store::committed::{CommittedState, Snapshot, TableState};
+use crate::store::pager::{PagedTree, Pager, PagerOptions, Reclaimer, VersionGuard};
 use crate::store::row::{
     PkBytes, Row, RowValue, check_row, display_pk_of_row, encode_pk_of_row, encode_pk_values,
 };
@@ -117,6 +118,10 @@ struct WriterState {
     /// The id the next *committed* transaction receives (TXN-030: rollbacks
     /// do not consume ids).
     next_tx_id: u64,
+    /// The version the next published [`CommittedState`] receives (SPEC-015
+    /// TIER-061): monotonic, assigned under the writer lock, and the key the
+    /// page reclaimer scopes superseded-page frees to.
+    next_version: u64,
     /// Live auto-inc counters (STG-040). Persist across rollback — gaps.
     counters: HashMap<TableId, AutoIncCounter>,
     /// Tables whose high-water mark advanced since the last commit; the
@@ -131,6 +136,19 @@ struct WriterState {
 pub struct MemStore {
     /// `TableId` → link-time schema, fixed at construction.
     catalog: HashMap<TableId, &'static TableSchema>,
+    /// The per-shard paged cold tier: every table's primary row tree (and, as
+    /// TIER-050/051 lands, its index trees) faults in and evicts through this
+    /// pager's buffer pool under `memory.budget` (SPEC-015). Shared (`Arc`)
+    /// with every [`TableState`]'s [`PagedTree`].
+    pager: Arc<crate::store::pager::Pager>,
+    /// Version-scoped page reclaimer (TIER-061): frees the pages a commit
+    /// superseded once no live snapshot pins the version that still reaches
+    /// them. Pinned by each [`CommittedState`]'s guard.
+    reclaimer: Arc<crate::store::pager::Reclaimer>,
+    /// Keeps the auto-created default page directory alive for the store's
+    /// lifetime (`None` when the caller supplied its own pager via
+    /// [`MemStore::with_pager`]).
+    _page_dir: Option<tempfile::TempDir>,
     /// The stable snapshot, swapped atomically on commit (STG-005).
     committed: ArcSwap<CommittedState>,
     /// Single-writer guarantee (STG-003): `begin` holds this for the whole
@@ -209,11 +227,52 @@ impl MemStore {
         Self::with_options(schema, StoreOptions::default())
     }
 
-    /// Build a store over an assembled [`Schema`].
+    /// Build a store over an assembled [`Schema`] with a paged cold tier
+    /// rooted at a private temporary directory and a generous default buffer
+    /// pool — the convenience constructor for tests and tooling. A server
+    /// deployment threads its configured page directory and budget-sized pool
+    /// in through [`MemStore::with_pager`].
     ///
     /// Fails on invalid options or a `TableId` collision (two table names
     /// hashing to the same CRC32, STG-050 — must be renamed).
     pub fn with_options(schema: &Schema, options: StoreOptions) -> Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("fluxum-memstore-")
+            .tempdir()
+            .map_err(|e| FluxumError::Storage(format!("open default page directory: {e}")))?;
+        // A default pool large enough that tests stay resident (nothing spills
+        // until the working set exceeds it); real deployments size it from
+        // `memory.budget` via `with_pager`.
+        let pager = Pager::open(
+            dir.path(),
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 256 << 20,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: crate::config::PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )?;
+        Self::build(schema, options, pager, Some(dir))
+    }
+
+    /// Build a store over `schema` serving through `pager` — the server-assembly
+    /// constructor: the pager is opened over the configured `storage.page_dir`
+    /// with a pool sized from the effective `memory.budget` (SPEC-015), so the
+    /// live store's steady-state RSS is bounded by the budget (TIER-004).
+    pub fn with_pager(schema: &Schema, options: StoreOptions, pager: Arc<Pager>) -> Result<Self> {
+        Self::build(schema, options, pager, None)
+    }
+
+    /// Shared construction over an already-open `pager`.
+    fn build(
+        schema: &Schema,
+        options: StoreOptions,
+        pager: Arc<Pager>,
+        page_dir: Option<tempfile::TempDir>,
+    ) -> Result<Self> {
         if options.auto_inc_allocation_step == 0 {
             return Err(FluxumError::Storage(
                 "auto_inc_allocation_step must be >= 1 (STG-040)".into(),
@@ -235,6 +294,7 @@ impl MemStore {
                 b.x, b.y, b.w, b.h
             )));
         }
+        let reclaimer = Reclaimer::new(Arc::clone(&pager));
         let mut catalog: HashMap<TableId, &'static TableSchema> = HashMap::new();
         let mut tables: HashMap<TableId, Arc<TableState>> = HashMap::new();
         let mut counters: HashMap<TableId, AutoIncCounter> = HashMap::new();
@@ -251,7 +311,8 @@ impl MemStore {
                 id,
                 Arc::new(TableState {
                     schema: table,
-                    rows: imbl::OrdMap::new(),
+                    rows: PagedTree::create(&pager, id, false)?,
+                    row_count: 0,
                     indexes: build_btree_indexes(table)?,
                     spatial: build_spatial_index(table, &options)?,
                     fulltext: build_fulltext_indexes(table),
@@ -266,8 +327,14 @@ impl MemStore {
         let computed = build_computed(&catalog);
         let (checks, not_null) = build_checks(&catalog);
         let (fks_out, fks_in) = build_foreign_keys(&catalog)?;
+        // Version 0 is the initial empty state; its guard pins it until the
+        // first commit's state supersedes it.
+        let guard0 = Arc::new(VersionGuard::new(&reclaimer, 0));
         Ok(Self {
             catalog,
+            pager,
+            reclaimer,
+            _page_dir: page_dir,
             blobs: std::sync::OnceLock::new(),
             transforms: std::sync::OnceLock::new(),
             computed,
@@ -277,14 +344,50 @@ impl MemStore {
             fks_in,
             history: Mutex::new(std::collections::VecDeque::new()),
             global_writes_allowed: std::sync::atomic::AtomicBool::new(true),
-            committed: ArcSwap::from_pointee(CommittedState { tables }),
+            committed: ArcSwap::from_pointee(CommittedState::new(tables, 0, guard0)),
             writer: Mutex::new(WriterState {
                 next_tx_id: 1,
+                next_version: 1,
                 counters,
                 high_water_dirty: BTreeSet::new(),
             }),
             options,
         })
+    }
+
+    /// The per-shard pager backing this store's paged cold tier (SPEC-015) —
+    /// the checkpoint/recovery seam and buffer-pool diagnostics reach it here.
+    pub fn pager(&self) -> &Arc<Pager> {
+        &self.pager
+    }
+
+    /// Assign the next version under the writer lock, pin it, and swap it in as
+    /// the new committed state (STG-005). Infallible — used by publishes that
+    /// supersede no pages (spatial/full-text rebuilds share the row trees).
+    fn publish_versioned(
+        &self,
+        writer: &mut WriterState,
+        tables: HashMap<TableId, Arc<TableState>>,
+    ) -> Arc<CommittedState> {
+        let version = writer.next_version;
+        writer.next_version = version.saturating_add(1);
+        let guard = Arc::new(VersionGuard::new(&self.reclaimer, version));
+        let published = Arc::new(CommittedState::new(tables, version, guard));
+        self.committed.store(Arc::clone(&published));
+        published
+    }
+
+    /// Publish `tables`, then retire the pages this commit `superseded` against
+    /// the new version (TIER-061 — freed once no older snapshot pins them).
+    fn publish(
+        &self,
+        writer: &mut WriterState,
+        tables: HashMap<TableId, Arc<TableState>>,
+        superseded: Vec<(TableId, u64)>,
+    ) -> Result<Arc<CommittedState>> {
+        let published = self.publish_versioned(writer, tables);
+        self.reclaimer.retire(published.version(), superseded)?;
+        Ok(published)
     }
 
     /// The [`TableId`] of a registered table name.
@@ -383,7 +486,7 @@ impl MemStore {
     /// recovery path when spatial state must be reconstructed asynchronously
     /// (spatial indexes are not persisted).
     pub fn mark_spatial_rebuilding(&self) {
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             if let Some(spatial) = &slot.spatial {
@@ -391,26 +494,24 @@ impl MemStore {
                 Arc::make_mut(slot).spatial = Some(rebuilding);
             }
         }
-        self.committed.store(Arc::new(CommittedState { tables }));
+        self.publish_versioned(&mut writer, tables);
     }
 
     /// SPX-031, step 2: rebuild every spatial index from the committed rows
     /// and publish the ready state atomically. After this returns, spatial
     /// query results are identical to a never-crashed store's.
     pub fn rebuild_spatial_indexes(&self) -> Result<()> {
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             let Some(spatial) = &slot.spatial else {
                 continue;
             };
             let mut rebuilt = spatial.fresh_like();
-            for (pk, row) in &slot.rows {
-                rebuilt.insert_row(row, pk.clone())?;
-            }
+            slot.for_each_row(|pk, row| rebuilt.insert_row(&row, pk))?;
             Arc::make_mut(slot).spatial = Some(rebuilt);
         }
-        self.committed.store(Arc::new(CommittedState { tables }));
+        self.publish_versioned(&mut writer, tables);
         Ok(())
     }
 
@@ -419,7 +520,7 @@ impl MemStore {
     ///
     /// [`mark_spatial_rebuilding`]: Self::mark_spatial_rebuilding
     pub fn mark_fulltext_rebuilding(&self) {
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             if slot.fulltext.is_empty() {
@@ -428,28 +529,29 @@ impl MemStore {
             let rebuilding = slot.fulltext.iter().map(|f| f.rebuilding_like()).collect();
             Arc::make_mut(slot).fulltext = rebuilding;
         }
-        self.committed.store(Arc::new(CommittedState { tables }));
+        self.publish_versioned(&mut writer, tables);
     }
 
     /// FTS-022, step 2: rebuild every full-text index from the committed rows
     /// and publish the ready state atomically. After this returns, full-text
     /// query results are identical to a never-crashed store's.
     pub fn rebuild_fulltext_indexes(&self) -> Result<()> {
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             if slot.fulltext.is_empty() {
                 continue;
             }
             let mut rebuilt: Vec<_> = slot.fulltext.iter().map(|f| f.fresh_like()).collect();
-            for (pk, row) in &slot.rows {
+            slot.for_each_row(|pk, row| {
                 for index in &mut rebuilt {
-                    index.insert_row(row, pk.clone())?;
+                    index.insert_row(&row, pk.clone())?;
                 }
-            }
+                Ok(())
+            })?;
             Arc::make_mut(slot).fulltext = rebuilt;
         }
-        self.committed.store(Arc::new(CommittedState { tables }));
+        self.publish_versioned(&mut writer, tables);
         Ok(())
     }
 
@@ -531,7 +633,7 @@ impl MemStore {
             }
         }
         writer.next_tx_id = next_tx_id;
-        self.committed.store(Arc::new(state));
+        self.publish_versioned(&mut writer, state.tables);
         Ok(())
     }
 
@@ -559,8 +661,9 @@ impl MemStore {
     /// shard's log is the durable record). Only global tables in `diff` are
     /// applied; everything else is ignored.
     pub fn apply_replicated_diff(&self, diff: &TxDiff) -> Result<()> {
-        let _writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
+        let mut superseded: Vec<(TableId, u64)> = Vec::new();
         let mut touched = false;
         for table_diff in &diff.tables {
             let Some(schema) = self.catalog.get(&table_diff.table_id) else {
@@ -573,8 +676,9 @@ impl MemStore {
                 continue;
             };
             let table = Arc::make_mut(slot);
+            let mut sup: Vec<u64> = Vec::new();
             for (pk, _old) in &table_diff.deletes {
-                if let Some(existing) = table.rows.remove(pk) {
+                if let Some(existing) = table.take_row(pk, &mut sup)? {
                     for constraint in &mut table.unique {
                         constraint.remove(&existing, pk)?;
                     }
@@ -591,9 +695,9 @@ impl MemStore {
             }
             for row in &table_diff.inserts {
                 let pk = encode_pk_of_row(schema, row.values())?;
-                // An in-place replacement arrives as delete+insert; a bare
-                // insert over an existing key (replays) removes first.
-                if let Some(existing) = table.rows.remove(&pk) {
+                // An in-place replacement upserts (CoW replace); the retired
+                // row's index entries come out before the new row's go in.
+                if let Some(existing) = table.put_row(&pk, row, &mut sup)? {
                     for constraint in &mut table.unique {
                         constraint.remove(&existing, &pk)?;
                     }
@@ -619,12 +723,12 @@ impl MemStore {
                 for fulltext in &mut table.fulltext {
                     fulltext.insert_row(row, pk.clone())?;
                 }
-                table.rows.insert(pk, row.clone());
             }
+            superseded.extend(sup.into_iter().map(|p| (table_diff.table_id, p)));
             touched = true;
         }
         if touched {
-            self.committed.store(Arc::new(CommittedState { tables }));
+            self.publish(&mut writer, tables, superseded)?;
         }
         Ok(())
     }
@@ -658,6 +762,7 @@ impl MemStore {
         }
         let mut tables = self.committed.load_full().tables.clone();
         let mut diffs: Vec<TableDiff> = Vec::with_capacity(record.mutations.len());
+        let mut superseded: Vec<(TableId, u64)> = Vec::new();
         for mutation in &record.mutations {
             let table_id = mutation.table();
             let schema = self.schema_of(table_id)?;
@@ -667,6 +772,7 @@ impl MemStore {
                 ))
             })?;
             let table = Arc::make_mut(slot);
+            let mut sup: Vec<u64> = Vec::new();
             let mut diff = TableDiff {
                 table_id,
                 inserts: Vec::new(),
@@ -674,7 +780,7 @@ impl MemStore {
             };
             for pk in mutation.delete_pks() {
                 let pk = PkBytes::from_bytes(pk);
-                if let Some(existing) = table.rows.remove(&pk) {
+                if let Some(existing) = table.take_row(&pk, &mut sup)? {
                     for constraint in &mut table.unique {
                         constraint.remove(&existing, &pk)?;
                     }
@@ -692,10 +798,10 @@ impl MemStore {
             }
             for row in mutation.insert_rows()? {
                 let pk = encode_pk_of_row(schema, row.values())?;
-                // An in-place replacement arrives as delete+insert of the
-                // same pk; a bare insert over an existing key (convergent
-                // replays) removes first, mirroring recovery semantics.
-                if let Some(existing) = table.rows.remove(&pk) {
+                // An in-place replacement upserts (CoW replace); a bare insert
+                // over an existing key (convergent replays) retires the old
+                // row's index entries first, mirroring recovery semantics.
+                if let Some(existing) = table.put_row(&pk, &row, &mut sup)? {
                     for constraint in &mut table.unique {
                         constraint.remove(&existing, &pk)?;
                     }
@@ -721,9 +827,9 @@ impl MemStore {
                 for fulltext in &mut table.fulltext {
                     fulltext.insert_row(&row, pk.clone())?;
                 }
-                table.rows.insert(pk, row.clone());
                 diff.inserts.push(row);
             }
+            superseded.extend(sup.into_iter().map(|p| (table_id, p)));
             diffs.push(diff);
         }
 
@@ -748,8 +854,7 @@ impl MemStore {
         // Consume the record's tx id and swap — atomic for readers, exactly
         // like a local commit (REP-014 step 4).
         writer.next_tx_id = record.tx_id.saturating_add(1);
-        let published = Arc::new(CommittedState { tables });
-        self.committed.store(Arc::clone(&published));
+        let published = self.publish(&mut writer, tables, superseded)?;
 
         // SPEC-022 RV-020: replicas retain the same temporal window, so
         // `AS OF` reads answer identically on primary and replica.
@@ -963,7 +1068,7 @@ impl Tx<'_> {
             engine.on_write_row(table, &mut values, pk.as_bytes())?;
         }
 
-        let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
+        let committed_row = self.base.table(table)?.row_at(&pk)?;
         // Overlay occupancy (STG-007): a pending insert/reinsert holds the
         // key; a committed row holds it unless tx-deleted. `PendingOp` rows
         // are `Arc`-shared, so this clone is a pointer bump.
@@ -1142,7 +1247,7 @@ impl Tx<'_> {
         {
             Some(PendingOp::Insert(_) | PendingOp::Update(_)) => Ok(true),
             Some(PendingOp::Delete) => Ok(false),
-            None => Ok(self.base.table(fk.parent)?.rows.contains_key(&pk)),
+            None => self.base.table(fk.parent)?.contains_pk(&pk),
         }
     }
 
@@ -1250,13 +1355,13 @@ impl Tx<'_> {
     ) -> Result<()> {
         let children: Vec<Row> = self
             .scan_all(fk.child)?
+            .into_iter()
             .filter(|row| {
                 fk_value_matches(
                     row.values().get(usize::from(fk.child_ordinal)),
                     parent_value,
                 )
             })
-            .cloned()
             .collect();
         for child in children {
             match fk.on_delete {
@@ -1317,7 +1422,7 @@ impl Tx<'_> {
             ));
         }
         let pk = encode_pk_values(schema, pk_values)?;
-        let committed_row = self.base.table(table)?.rows.get(&pk).cloned();
+        let committed_row = self.base.table(table)?.row_at(&pk)?;
         let ops = self.state.tables.entry(table).or_default();
         let old = match ops.get(&pk).cloned() {
             // Insert-then-delete of a pending row cancels to a no-op.
@@ -1412,6 +1517,7 @@ impl Tx<'_> {
             let schema = self.store.schema_of(*table)?;
             let victims: Vec<Vec<RowValue>> = self
                 .scan(*table)?
+                .into_iter()
                 .filter(|row| {
                     key_ordinals
                         .iter()
@@ -1465,13 +1571,14 @@ impl Tx<'_> {
     pub fn query_pk(&self, table: TableId, pk_values: &[RowValue]) -> Result<Option<Row>> {
         let t = self.base.table(table)?;
         let pk = encode_pk_values(t.schema, pk_values)?;
-        Ok(t.rows.get(&pk).cloned())
+        t.row_at(&pk)
     }
 
     /// Scan the committed snapshot captured at `begin`, in encoded-PK byte
-    /// order (STG-004: pending writes are never visible).
-    pub fn scan(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
-        Ok(self.base.table(table)?.rows.values())
+    /// order (STG-004: pending writes are never visible). Materialized from the
+    /// paged tree.
+    pub fn scan(&self, table: TableId) -> Result<Vec<Row>> {
+        self.base.table(table)?.all_rows()
     }
 
     /// The rows a SPEC-010 (T3.6) migration rewrite operates on: every
@@ -1488,18 +1595,19 @@ impl Tx<'_> {
     pub(crate) fn migrate_rows(&self, table: TableId) -> Result<Vec<(PkBytes, Row)>> {
         let base = self.base.table(table)?;
         let ops = self.state.tables.get(&table);
-        Ok(base
-            .rows
-            .iter()
-            .filter_map(|(pk, row)| {
-                let effective = match ops.and_then(|pending| pending.get(pk)) {
-                    Some(PendingOp::Update(replacement)) => replacement.clone(),
-                    Some(PendingOp::Delete | PendingOp::Insert(_)) => return None,
-                    None => row.clone(),
-                };
-                Some((pk.clone(), effective))
-            })
-            .collect())
+        let mut out = Vec::with_capacity(base.row_count());
+        base.for_each_row(|pk, row| {
+            let effective = match ops.and_then(|pending| pending.get(&pk)) {
+                Some(PendingOp::Update(replacement)) => Some(replacement.clone()),
+                Some(PendingOp::Delete | PendingOp::Insert(_)) => None,
+                None => Some(row),
+            };
+            if let Some(effective) = effective {
+                out.push((pk, effective));
+            }
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// SPEC-010 (T3.6) migration seam: buffer an in-place replacement of the
@@ -1522,7 +1630,7 @@ impl Tx<'_> {
         values: Vec<RowValue>,
     ) -> Result<()> {
         let schema = self.store.schema_of(table)?;
-        if !self.base.table(table)?.rows.contains_key(&pk) {
+        if !self.base.table(table)?.contains_pk(&pk)? {
             return Err(FluxumError::Storage(format!(
                 "migrate_replace: table `{}` has no committed row at pk {pk} (SPEC-010 \
                  rewrites address committed rows only)",
@@ -1544,7 +1652,7 @@ impl Tx<'_> {
         prefix: &[RowValue],
         lower: Bound<&RowValue>,
         upper: Bound<&RowValue>,
-    ) -> Result<impl Iterator<Item = &Row>> {
+    ) -> Result<Vec<Row>> {
         self.base
             .table(table)?
             .index_scan(index, prefix, lower, upper)
@@ -1552,12 +1660,7 @@ impl Tx<'_> {
 
     /// Equality lookup on a B-tree index of the committed snapshot captured
     /// at `begin` (see [`super::Snapshot::index_eq`]).
-    pub fn index_eq(
-        &self,
-        table: TableId,
-        index: IndexId,
-        key: &[RowValue],
-    ) -> Result<impl Iterator<Item = &Row>> {
+    pub fn index_eq(&self, table: TableId, index: IndexId, key: &[RowValue]) -> Result<Vec<Row>> {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
     }
 
@@ -1614,27 +1717,30 @@ impl Tx<'_> {
     /// with the same key, and a pending delete removes it. Order: committed
     /// keys in encoded-PK byte order (replacements in place), followed by
     /// the rows newly inserted by this transaction in encoded-PK byte order.
-    pub fn scan_all(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
-        let committed = &self.base.table(table)?.rows;
+    pub fn scan_all(&self, table: TableId) -> Result<Vec<Row>> {
+        let base = self.base.table(table)?;
         let pending = self.state.tables.get(&table);
-        let overlaid = committed.iter().filter_map(move |(pk, row)| {
-            match pending.and_then(|ops| ops.get(pk)) {
-                None => Some(row),
-                Some(PendingOp::Update(replacement)) => Some(replacement),
-                // Delete: shadowed. Insert over a committed key cannot
-                // happen (the write path turns it into Update/Delete), but
-                // yielding it from the pending pass below keeps the
-                // dedup-by-PK contract even then.
-                Some(PendingOp::Delete | PendingOp::Insert(_)) => None,
+        let mut out = Vec::with_capacity(base.row_count());
+        base.for_each_row(|pk, row| {
+            match pending.and_then(|ops| ops.get(&pk)) {
+                None => out.push(row),
+                Some(PendingOp::Update(replacement)) => out.push(replacement.clone()),
+                // Delete: shadowed. Insert over a committed key cannot happen
+                // (the write path turns it into Update/Delete), but skipping it
+                // here keeps the dedup-by-PK contract even then — the pending
+                // pass below yields it once.
+                Some(PendingOp::Delete | PendingOp::Insert(_)) => {}
             }
-        });
-        let inserted = pending.into_iter().flat_map(|ops| {
-            ops.values().filter_map(|op| match op {
-                PendingOp::Insert(row) => Some(row),
-                PendingOp::Update(_) | PendingOp::Delete => None,
-            })
-        });
-        Ok(overlaid.chain(inserted))
+            Ok(())
+        })?;
+        if let Some(ops) = pending {
+            for op in ops.values() {
+                if let PendingOp::Insert(row) = op {
+                    out.push(row.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Commit: merge `TxState` into a new `CommittedState` and swap it in
@@ -1647,6 +1753,9 @@ impl Tx<'_> {
         //    snapshot; nothing is observable until the swap).
         let mut tables = self.base.tables.clone(); // Arc bumps only
         let mut diffs: Vec<TableDiff> = Vec::with_capacity(self.state.tables.len());
+        // Pages the copy-on-write merge superseded, per table — retired
+        // against the new version once it is published (TIER-061).
+        let mut superseded: Vec<(TableId, u64)> = Vec::new();
         let tx_tables = std::mem::take(&mut self.state.tables);
         for (table_id, ops) in tx_tables {
             if ops.is_empty() {
@@ -1659,6 +1768,7 @@ impl Tx<'_> {
                 ))
             })?;
             let table = Arc::make_mut(slot); // deep-clones only touched tables
+            let mut sup: Vec<u64> = Vec::new();
             let mut diff = TableDiff {
                 table_id,
                 inserts: Vec::new(),
@@ -1671,16 +1781,16 @@ impl Tx<'_> {
             // merges regardless of pk iteration order.
             for (pk, op) in &ops {
                 if matches!(op, PendingOp::Delete | PendingOp::Update(_)) {
-                    let old = table.rows.get(pk).ok_or_else(invariant_missing_row)?;
+                    let old = table.row_at(pk)?.ok_or_else(invariant_missing_row)?;
                     for constraint in &mut table.unique {
-                        constraint.remove(old, pk)?;
+                        constraint.remove(&old, pk)?;
                     }
                 }
             }
-            // Rows and secondary indexes are updated together on this
-            // private pre-swap copy (STG-005 steps 2–4), so the published
-            // snapshot's rows and indexes are mutually consistent and
-            // rollback never has index state to revert (STG-007 rule 2).
+            // Rows (paged, CoW) and secondary indexes are updated together on
+            // this private pre-swap copy (STG-005 steps 2–4), so the published
+            // snapshot's rows and indexes are mutually consistent and rollback
+            // never has index state to revert (STG-007 rule 2).
             for (pk, op) in ops {
                 match op {
                     PendingOp::Insert(row) => {
@@ -1696,11 +1806,13 @@ impl Tx<'_> {
                         for constraint in &mut table.unique {
                             constraint.insert(&row, pk.clone())?;
                         }
-                        table.rows.insert(pk, row.clone());
+                        table.put_row(&pk, &row, &mut sup)?;
                         diff.inserts.push(row);
                     }
                     PendingOp::Delete => {
-                        let old = table.rows.remove(&pk).ok_or_else(invariant_missing_row)?;
+                        let old = table
+                            .take_row(&pk, &mut sup)?
+                            .ok_or_else(invariant_missing_row)?;
                         for index in table.indexes.values_mut() {
                             index.remove(&old, &pk)?;
                         }
@@ -1714,8 +1826,7 @@ impl Tx<'_> {
                     }
                     PendingOp::Update(row) => {
                         let old = table
-                            .rows
-                            .insert(pk.clone(), row.clone())
+                            .put_row(&pk, &row, &mut sup)?
                             .ok_or_else(invariant_missing_row)?;
                         for index in table.indexes.values_mut() {
                             index.remove(&old, &pk)?;
@@ -1744,6 +1855,7 @@ impl Tx<'_> {
                     }
                 }
             }
+            superseded.extend(sup.into_iter().map(|p| (table_id, p)));
             diffs.push(diff);
         }
 
@@ -1767,11 +1879,11 @@ impl Tx<'_> {
             auto_inc.push((table_id, high_water));
         }
 
-        // 3. Consume the tx id and swap the snapshot — atomic for readers.
+        // 3. Consume the tx id and publish the new version — atomic for
+        //    readers — retiring the pages the CoW merge superseded (TIER-061).
         let tx_id = self.state.tx_id;
         self.writer.next_tx_id = tx_id.saturating_add(1);
-        let published = Arc::new(CommittedState { tables });
-        self.store.committed.store(Arc::clone(&published));
+        let published = self.store.publish(&mut self.writer, tables, superseded)?;
 
         // SPEC-022 RV-020: retain this commit's snapshot in the bounded
         // temporal window. Untouched tables are `Arc`-shared with the
@@ -2274,9 +2386,7 @@ mod tests {
         };
         assert!(err.contains("next_tx_id must be >= 1"), "{err}");
 
-        let empty = CommittedState {
-            tables: HashMap::new(),
-        };
+        let empty = CommittedState::detached(HashMap::new());
         let err = match store.install_recovered(empty, 5) {
             Ok(()) => panic!("empty recovered state accepted"),
             Err(e) => e.to_string(),

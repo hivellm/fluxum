@@ -120,12 +120,14 @@ fn index_eq_returns_exactly_the_matching_rows() {
         let mut got: Vec<_> = snap
             .index_eq(ids.table, ids.by_channel, &[RowValue::Str(channel.into())])
             .unwrap()
+            .iter()
             .map(triple)
             .collect();
         got.sort();
         let mut want: Vec<_> = snap
             .scan(ids.table)
             .unwrap()
+            .iter()
             .map(triple)
             .filter(|(_, c, _)| c == channel)
             .collect();
@@ -140,6 +142,7 @@ fn index_eq_returns_exactly_the_matching_rows() {
             &[RowValue::Str("a".into()), RowValue::I64(5)],
         )
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     assert_eq!(got.len(), 2);
@@ -168,6 +171,7 @@ fn range_scans_on_signed_ints_are_value_ordered() {
         let (lo, hi) = (lower.map(RowValue::I64), upper.map(RowValue::I64));
         snap.index_scan(ids.table, ids.by_sent, &[], lo.as_ref(), hi.as_ref())
             .unwrap()
+            .iter()
             .map(|row| triple(row).2)
             .collect()
     };
@@ -217,6 +221,7 @@ fn range_scans_on_strings_are_value_ordered_including_embedded_nul() {
         );
         snap.index_scan(ids.table, ids.by_channel, &[], lo.as_ref(), hi.as_ref())
             .unwrap()
+            .iter()
             .map(|row| triple(row).1)
             .collect()
     };
@@ -256,6 +261,7 @@ fn composite_prefix_scans_resolve_equality_plus_range() {
     let got: Vec<_> = snap
         .index_eq(ids.table, ids.composite, &[RowValue::Str("a".into())])
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     assert!(got.iter().all(|(_, c, _)| c == "a"));
@@ -273,6 +279,7 @@ fn composite_prefix_scans_resolve_equality_plus_range() {
             Bound::Excluded(&hi),
         )
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     let sent: Vec<i64> = got.iter().map(|&(_, _, t)| t).collect();
@@ -283,6 +290,7 @@ fn composite_prefix_scans_resolve_equality_plus_range() {
     let all: Vec<_> = snap
         .index_eq(ids.table, ids.composite, &[])
         .unwrap()
+        .iter()
         .map(triple)
         .map(|(_, c, t)| (c, t))
         .collect();
@@ -317,12 +325,13 @@ fn commit_maintains_indexes_across_insert_update_delete() {
     assert_eq!(
         snap.index_eq(ids.table, ids.by_channel, &[RowValue::Str("a".into())])
             .unwrap()
-            .count(),
+            .len(),
         0
     );
     assert_eq!(
         snap.index_eq(ids.table, ids.by_channel, &[RowValue::Str("c".into())])
             .unwrap()
+            .iter()
             .map(triple)
             .collect::<Vec<_>>(),
         [(1, "c".to_string(), 7)]
@@ -337,7 +346,7 @@ fn commit_maintains_indexes_across_insert_update_delete() {
     assert_eq!(
         snap.index_eq(ids.table, ids.by_channel, &[RowValue::Str("b".into())])
             .unwrap()
-            .count(),
+            .len(),
         0
     );
 }
@@ -357,6 +366,7 @@ fn index_reads_in_a_tx_see_committed_state_only() {
     let got: Vec<_> = tx
         .index_eq(ids.table, ids.by_channel, &[RowValue::Str("a".into())])
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     assert_eq!(got, [(1, "a".to_string(), 5)]);
@@ -366,6 +376,7 @@ fn index_reads_in_a_tx_see_committed_state_only() {
         .snapshot()
         .index_eq(ids.table, ids.by_channel, &[RowValue::Str("a".into())])
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     assert_eq!(got, [(2, "a".to_string(), 6)]);
@@ -384,7 +395,7 @@ fn snapshots_pin_rows_and_indexes_together() {
         before
             .index_eq(ids.table, ids.by_channel, &[RowValue::Str("a".into())])
             .unwrap()
-            .count(),
+            .len(),
         1
     );
     assert_eq!(
@@ -392,7 +403,7 @@ fn snapshots_pin_rows_and_indexes_together() {
             .snapshot()
             .index_eq(ids.table, ids.by_channel, &[RowValue::Str("a".into())])
             .unwrap()
-            .count(),
+            .len(),
         2
     );
 }
@@ -417,6 +428,7 @@ fn rollback_leaves_indexes_bit_identical_to_a_rebuild() {
     let got: Vec<_> = after
         .index_eq(ids.table, ids.composite, &[])
         .unwrap()
+        .iter()
         .map(triple)
         .collect();
     assert_eq!(got, [(1, "a".to_string(), 5), (2, "b".to_string(), 6)]);
@@ -526,7 +538,7 @@ fn check_against_model(store: &MemStore, ids: &Ids, model: &Model) {
     snap.verify_index_integrity(ids.table).unwrap();
 
     // Full scan == model.
-    let mut scanned: Vec<_> = snap.scan(ids.table).unwrap().map(triple).collect();
+    let mut scanned: Vec<_> = snap.scan(ids.table).unwrap().iter().map(triple).collect();
     scanned.sort();
     let expected: Vec<_> = model
         .iter()
@@ -543,6 +555,7 @@ fn check_against_model(store: &MemStore, ids: &Ids, model: &Model) {
                 &[RowValue::Str((*channel).into())],
             )
             .unwrap()
+            .iter()
             .map(triple)
             .collect();
         got.sort();
@@ -565,6 +578,7 @@ fn check_against_model(store: &MemStore, ids: &Ids, model: &Model) {
         let got: Vec<_> = snap
             .index_scan(ids.table, ids.by_sent, &[], lo.as_ref(), hi.as_ref())
             .unwrap()
+            .iter()
             .map(triple)
             .collect();
         assert!(
@@ -602,6 +616,7 @@ fn check_against_model(store: &MemStore, ids: &Ids, model: &Model) {
                     hi.as_ref(),
                 )
                 .unwrap()
+                .iter()
                 .map(triple)
                 .collect();
             assert!(

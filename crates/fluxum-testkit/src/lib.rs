@@ -340,7 +340,7 @@ impl TestShard {
             panic!("fluxum-testkit: no table named `{table}` in the assembled schema");
         };
         match self.store.snapshot().scan(id) {
-            Ok(rows) => rows.map(|row| row.values().to_vec()).collect(),
+            Ok(rows) => rows.iter().map(|row| row.values().to_vec()).collect(),
             Err(e) => panic!("fluxum-testkit: scan `{table}`: {e}"),
         }
     }
@@ -367,7 +367,10 @@ impl TestShard {
             let Ok(rows) = snapshot.scan(id) else {
                 continue;
             };
-            let mut printed: Vec<String> = rows.map(|row| format!("{:?}", row.values())).collect();
+            let mut printed: Vec<String> = rows
+                .iter()
+                .map(|row| format!("{:?}", row.values()))
+                .collect();
             printed.sort_unstable();
             for row in printed {
                 mix(row.as_bytes());

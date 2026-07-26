@@ -229,14 +229,15 @@ impl CheckpointRepo {
             }
             let mut chunks = Vec::new();
             let mut current: Vec<Vec<LogValue>> = Vec::new();
-            for (pk, row) in &table.rows {
-                current.push(row_to_log(row));
+            table.for_each_row(|pk, row| {
+                current.push(row_to_log(&row));
                 if current.len() >= CHUNK_MAX_ROWS
                     || crc32(pk.as_bytes()).is_multiple_of(CHUNK_TARGET_ROWS)
                 {
                     chunks.push(self.write_chunk(&mut current, &mut stats)?);
                 }
-            }
+                Ok(())
+            })?;
             if !current.is_empty() {
                 chunks.push(self.write_chunk(&mut current, &mut stats)?);
             }
@@ -244,7 +245,7 @@ impl CheckpointRepo {
                 table_id: table_id.as_u32(),
                 table_name: table.schema.name.to_string(),
                 auto_inc_high_water: table.auto_inc_high_water,
-                row_count: table.rows.len() as u64,
+                row_count: table.row_count() as u64,
                 chunks,
             });
         }

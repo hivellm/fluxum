@@ -205,7 +205,7 @@ fn ten_x_dataset_is_served_correctly_under_a_tiny_budget() {
     assert_budget_held(&pager);
 
     // Full scan matches the snapshot scan exactly (same pk-byte order).
-    let hot: Vec<Row> = snap.scan(table).expect("hot scan").cloned().collect();
+    let hot: Vec<Row> = snap.scan(table).expect("hot scan");
     let cold_rows = cold.scan_all().expect("cold scan");
     assert_eq!(cold_rows.len(), hot.len());
     assert_eq!(cold_rows, hot, "full scan diverged");
@@ -220,9 +220,7 @@ fn ten_x_dataset_is_served_correctly_under_a_tiny_budget() {
     for device in ["device-000", "device-017", "device-039", "device-999"] {
         let hot: Vec<Row> = snap
             .index_eq(table, by_device_seq, &[RowValue::Str(device.into())])
-            .expect("hot index scan")
-            .cloned()
-            .collect();
+            .expect("hot index scan");
         let cold_hits = cold
             .index_eq(by_device_seq, &[RowValue::Str(device.into())])
             .expect("cold index scan");
@@ -236,9 +234,7 @@ fn ten_x_dataset_is_served_correctly_under_a_tiny_budget() {
             Bound::Included(&RowValue::I64(1_000)),
             Bound::Excluded(&RowValue::I64(9_000)),
         )
-        .expect("hot range")
-        .cloned()
-        .collect();
+        .expect("hot range");
     let cold_range = cold
         .index_scan(
             by_seq,
@@ -316,9 +312,7 @@ fn index_pages_alone_exceeding_the_budget_fault_and_stay_correct() {
         let device = format!("very-long-device-name-{bucket:0100}");
         let hot: Vec<Row> = snap
             .index_eq(table, by_device_seq, &[RowValue::Str(device.clone())])
-            .expect("hot index scan")
-            .cloned()
-            .collect();
+            .expect("hot index scan");
         let cold_hits = cold
             .index_eq(by_device_seq, &[RowValue::Str(device)])
             .expect("cold index scan");
@@ -503,9 +497,9 @@ fn tampered_pages_are_never_served_and_content_hashes_round_trip() {
     let hash_after = pager.content_hash(table, root).expect("hash after fault");
     assert_eq!(hash_before, hash_after, "evict/fault changed page content");
 
-    // A mutation invalidates the hash (recomputed on demand → new value):
-    // use a small table whose root is a leaf, so an insert provably
-    // rewrites the hashed page in place.
+    // TIER-063 under copy-on-write: pages are immutable, so a mutation never
+    // rewrites a page in place — it publishes a *new* root whose content hash
+    // differs from the old root's (the paged tree is a versioned structure).
     {
         let (small_store, small_table) = populated_store(10, 20);
         let small_snap = small_store.snapshot();
@@ -516,13 +510,13 @@ fn tampered_pages_are_never_served_and_content_hashes_round_trip() {
         small_cold
             .insert(reading(10, &mut Rng(1), 20))
             .expect("insert");
-        assert_eq!(
-            small_cold.primary_tree().root_page_id(),
-            leaf_root,
-            "ten rows plus one must still fit the leaf root"
+        let new_root = small_cold.primary_tree().root_page_id();
+        assert_ne!(
+            new_root, leaf_root,
+            "a copy-on-write insert must publish a fresh root"
         );
-        let h2 = pager.content_hash(small_table, leaf_root).expect("hash");
-        assert_ne!(h1, h2, "mutation must change the content hash");
+        let h2 = pager.content_hash(small_table, new_root).expect("hash");
+        assert_ne!(h1, h2, "the new version's root must hash differently");
     }
 
     // TIER-021/032/062: flip one bit in a live extent — the page must fail

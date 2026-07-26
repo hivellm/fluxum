@@ -48,8 +48,10 @@
 //! - **Delete-then-reinsert cancellation** (STG-007 rule 1): `TxState` keys
 //!   pending operations by PK as `Insert` / `Delete` / `Update`, so
 //!   reinserting a tx-deleted committed row with identical content cancels to
-//!   a structural no-op (the committed `Arc<Row>` identity is preserved), and
-//!   insert-then-delete of a pending row vanishes entirely.
+//!   a structural no-op (the committed row is preserved — the commit produces
+//!   no diff for it; with the paged store rows are serialized, so "preserved"
+//!   is value equality, not `Arc` pointer identity), and insert-then-delete of
+//!   a pending row vanishes entirely.
 //! - **Constraint overlay** (STG-007 tail): PK-uniqueness (TXN-040) and
 //!   `#[unique]` checks (TXN-041, T3.1 — the `unique` submodule) run eagerly at
 //!   `insert`/`upsert` time against `CommittedState` ⊕ `TxState` — a
@@ -65,11 +67,26 @@
 //!   consumed by rolled-back transactions are not returned — gaps are normal
 //!   and documented; IDs are unique and monotonic, never dense.
 //!
-//! T2.8 layers the paged cold tier under this same logical API: [`pager`]
-//! owns the on-disk page format, the buffer pool, and the paged evictable
-//! B-trees (SPEC-015) — see [`pager::ColdTable::spill_snapshot`] for how a
-//! published snapshot materializes as pages without changing any MVCC
-//! semantics defined here.
+//! **Tiered live store (SPEC-015, phase2_tiered-live-store-integration).**
+//! [`CommittedState`]'s primary row map is a paged copy-on-write B-tree
+//! ([`pager::PagedTree`]), not a resident `imbl::OrdMap`: rows live in the
+//! [`pager`]'s on-disk page format and fault in / evict through the buffer
+//! pool under `memory.budget`, so steady-state RSS is a function of the budget,
+//! never of the resident row count (TIER-004) — the SpacetimeDB-differentiating
+//! pillar, and the precondition for the billion-row soak (T7.7). MVCC is
+//! preserved by treating each published version as a copy-on-write root: the
+//! commit merge rewrites only the touched root-to-leaf paths to fresh pages and
+//! hands the superseded pages to a version-scoped reclaimer ([`pager::Reclaimer`],
+//! TIER-061), so a snapshot on the old root keeps reading a consistent old tree
+//! and its pages free only once no live version can reach them — the paged
+//! analogue of the `imbl`+`Arc` structural sharing this map used to give. Rows
+//! are stored in the same self-describing MessagePack-over-`LogValue` form the
+//! commit log and checkpoints use, so `#[encrypted]`/`#[signed]` columns and
+//! mid-migration layouts (SPEC-010) round-trip exactly. Secondary/spatial/
+//! full-text indexes and `#[unique]` maps remain resident this pass; paging
+//! them onto the same substrate (TIER-050/051) is the tracked follow-up.
+//! [`pager::ColdTable::spill_snapshot`] materializes a published snapshot as a
+//! standalone paged copy for the checkpoint path.
 //!
 //! [`Snapshot`]: committed::Snapshot
 //! [`CommittedState`]: committed::CommittedState

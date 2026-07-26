@@ -329,7 +329,7 @@ fn coord(dir: &std::path::Path, shards: u32) -> ShardCoord {
 fn rows_on(coord: &ShardCoord, shard: ShardId, table: &str) -> usize {
     let store = coord.host(shard).unwrap().store();
     let tid = store.table_id(table).unwrap();
-    store.snapshot().scan(tid).unwrap().count()
+    store.snapshot().scan(tid).unwrap().len()
 }
 
 /// Export the entity's FluxBIN row-set buffer straight from a shard's

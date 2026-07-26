@@ -506,7 +506,7 @@ async fn panic_rolls_back_answers_500_and_the_shard_keeps_serving() {
     assert_eq!(receipt.tx_id, 1, "panic consumed no tx id");
     let events = shard.store.snapshot();
     let id = shard.store.table_id("Event").unwrap();
-    assert_eq!(events.scan(id).unwrap().count(), 1);
+    assert_eq!(events.scan(id).unwrap().len(), 1);
 }
 
 // --- RED-010..RED-013: lifecycle ----------------------------------------------
@@ -525,7 +525,7 @@ async fn on_init_runs_exactly_once_and_on_shard_start_every_boot() {
         assert_eq!(report.ran_on_shard_start, ["warm_caches"]);
         // The seed row committed (RED-010).
         let id = shard.store.table_id("Event").unwrap();
-        assert_eq!(shard.store.snapshot().scan(id).unwrap().count(), 1);
+        assert_eq!(shard.store.snapshot().scan(id).unwrap().len(), 1);
         shard.engine.pipeline().log().wait_durable(1).await.unwrap();
     }
     {
@@ -541,7 +541,7 @@ async fn on_init_runs_exactly_once_and_on_shard_start_every_boot() {
         assert_eq!(report.ran_on_shard_start, ["warm_caches"]);
         let id = shard.store.table_id("Event").unwrap();
         assert_eq!(
-            shard.store.snapshot().scan(id).unwrap().count(),
+            shard.store.snapshot().scan(id).unwrap().len(),
             1,
             "no duplicate seed"
         );
@@ -571,7 +571,7 @@ async fn connect_and_disconnect_drive_presence_end_to_end() {
 
     let snapshot = shard.store.snapshot();
     assert_eq!(
-        snapshot.scan(online).unwrap().count(),
+        snapshot.scan(online).unwrap().len(),
         2,
         "both online (UC-1)"
     );
@@ -597,7 +597,7 @@ async fn connect_and_disconnect_drive_presence_end_to_end() {
             .is_none(),
         "disconnect removes presence (RED-012)"
     );
-    assert_eq!(snapshot.scan(online).unwrap().count(), 1, "bo stays online");
+    assert_eq!(snapshot.scan(online).unwrap().len(), 1, "bo stays online");
 }
 
 // --- RED-030/RED-031: read-only views ------------------------------------------

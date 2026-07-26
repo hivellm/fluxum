@@ -138,6 +138,7 @@ fn subscribe_returns_initialdata_matching_a_direct_query() {
         .snapshot()
         .scan(sensor_id)
         .unwrap()
+        .iter()
         .filter(|r| r.value(1) == Some(&RowValue::U32(7)))
         .count();
     assert_eq!(direct, 2);

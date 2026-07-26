@@ -377,6 +377,7 @@ impl ReducerEngine {
                 for (table, owner, schema) in &cleanup {
                     let doomed: Vec<Vec<RowValue>> = tx
                         .scan(*table)?
+                        .into_iter()
                         .filter(|row| {
                             matches!(
                                 row.value(*owner),

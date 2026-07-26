@@ -73,7 +73,7 @@ fn harness(dir: &std::path::Path) -> Harness {
 }
 
 fn row_count(h: &Harness) -> usize {
-    h.store.snapshot().scan(h.table).unwrap().count()
+    h.store.snapshot().scan(h.table).unwrap().len()
 }
 
 /// DMX-020 field mode: rows whose `expires_at` is at or before the sweep time

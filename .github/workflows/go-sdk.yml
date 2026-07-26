@@ -1,0 +1,64 @@
+name: Go SDK
+
+# The Go SDK's conformance runner (SPEC-013 TST-052, SDK-064): the shared
+# corpus must be green in the Go client before release. Runs when the SDK,
+# the corpus, or the server (which the runner boots) changes.
+on:
+  push:
+    branches: [ master, main, develop ]
+    paths:
+      - 'sdks/go/**'
+      - 'tests/conformance/**'
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/go-sdk.yml'
+  pull_request:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+concurrency:
+  group: go-sdk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v5
+
+    - name: Install toolchain from rust-toolchain.toml
+      run: rustup toolchain install
+
+    - uses: Swatinem/rust-cache@v2
+
+    - name: Install mold
+      uses: rui314/setup-mold@v1
+
+    - name: Configure mold linker
+      run: |
+        mkdir -p .cargo
+        echo "[target.x86_64-unknown-linux-gnu]" >> .cargo/config.toml
+        echo "linker = \"clang\"" >> .cargo/config.toml
+        echo "rustflags = [\"-C\", \"link-arg=-fuse-ld=/usr/local/bin/mold\"]" >> .cargo/config.toml
+
+    - name: Build the reference server (the runner boots it)
+      run: cargo build -p fluxum-server
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+
+    - name: go vet
+      working-directory: sdks/go
+      run: go vet ./...
+
+    - name: Run the conformance corpus + unit suite
+      working-directory: sdks/go
+      run: go test -count=1 ./...

@@ -447,6 +447,47 @@ pub(crate) fn decode_row(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
     Ok(Row::new(values))
 }
 
+/// Encode a row for the paged store's leaf payloads (SPEC-015 TIER-021).
+///
+/// The schema-driven [`encode_row`]/[`decode_row`] pair is a wire/partition
+/// freeze surface (subscription rows, shard hashing) and is decoded strictly
+/// by the compiled column types — it cannot round-trip a row whose shape or
+/// value variants differ from the current schema. The *live* store must,
+/// because the resident `imbl` map stored each `Row` verbatim (no schema-typed
+/// re-serialization): `#[encrypted]`/`#[signed]` columns hold a `Bytes`
+/// envelope in a differently-typed column (SPEC-017), and mid-migration rows
+/// (SPEC-010) live in intermediate layouts with a different column *count*.
+/// So the paged store uses the same **self-describing** representation the
+/// commit log and checkpoints do — MessagePack over [`LogValue`], the closed
+/// SPEC-001 value universe — which round-trips any row independent of the
+/// schema. Purely in-process: the paged pages are scratch, rebuilt from the
+/// WAL + checkpoint on recovery, so this is not a persistence or wire format.
+pub(crate) fn encode_row_paged(_schema: &TableSchema, values: &[RowValue]) -> Result<Vec<u8>> {
+    let log: Vec<crate::commitlog::record::LogValue> = values
+        .iter()
+        .map(crate::commitlog::record::LogValue::from)
+        .collect();
+    rmp_serde::to_vec(&log)
+        .map_err(|e| FluxumError::Storage(format!("paged row encode failed: {e}")))
+}
+
+/// Decode a row encoded by [`encode_row_paged`] (self-describing — the schema
+/// is used only for error context).
+pub(crate) fn decode_row_paged(schema: &TableSchema, bytes: &[u8]) -> Result<Row> {
+    let log: Vec<crate::commitlog::record::LogValue> =
+        rmp_serde::from_slice(bytes).map_err(|e| {
+            FluxumError::Storage(format!(
+                "table `{}`: paged row decode failed: {e}",
+                schema.name
+            ))
+        })?;
+    let mut values = Vec::with_capacity(log.len());
+    for value in &log {
+        values.push(value.to_row_value()?);
+    }
+    Ok(Row::new(values))
+}
+
 /// Decode one value of type `ty` (recursive for `Option`/`List`).
 fn decode_value(r: &mut FluxBinReader<'_>, ty: &FluxType) -> Result<RowValue> {
     let map = |e: FluxBinError| FluxumError::Storage(e.to_string());

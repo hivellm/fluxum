@@ -161,6 +161,7 @@ async fn macro_declared_ticks_and_schedules_run_end_to_end() {
     let labels: Vec<String> = snapshot
         .scan(table)
         .unwrap()
+        .iter()
         .map(|row| CycleLog::from_values(row.values()).unwrap().label)
         .collect();
 
@@ -184,6 +185,7 @@ async fn macro_declared_ticks_and_schedules_run_end_to_end() {
     let pending: Vec<String> = snapshot
         .scan(sched)
         .unwrap()
+        .iter()
         .map(|row| {
             fluxum_core::scheduler::ScheduleEntry::from_values(row.values())
                 .unwrap()

@@ -378,7 +378,7 @@ async fn page_corruption_is_never_served_and_recovers_from_root_plus_replay() {
     for row in snap3.scan(table).unwrap() {
         let pk = row.value(0).unwrap().clone();
         let got = cold3.get(std::slice::from_ref(&pk)).unwrap().unwrap();
-        assert_eq!(&got, row, "row {pk:?} diverged after re-spill");
+        assert_eq!(got, row, "row {pk:?} diverged after re-spill");
     }
 }
 

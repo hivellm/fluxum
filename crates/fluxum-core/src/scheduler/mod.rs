@@ -550,6 +550,7 @@ async fn prune_idempotency(fire: &FireContext, options: &SchedulerOptions, now_u
             return;
         };
         let records: Vec<(Vec<RowValue>, i64)> = rows
+            .into_iter()
             .filter_map(|row| {
                 let values = row.values();
                 let created_us = match values.get(3) {
@@ -608,6 +609,7 @@ fn due_entries(
         return Vec::new();
     };
     let mut due: Vec<ScheduleEntry> = rows
+        .into_iter()
         .filter_map(|row| ScheduleEntry::from_values(row.values()).ok())
         .filter(|entry| entry.execute_at_us <= now_us && !backoff.contains_key(&entry.id))
         .collect();
@@ -785,7 +787,7 @@ impl EphemeralSweeper {
                     let key = (entry.table, pk);
                     live.insert(key.clone());
                     match witnesses.get_mut(&key) {
-                        Some(witness) if witness.row.same_identity(row) => {
+                        Some(witness) if witness.row == row => {
                             let age = now.as_micros() - witness.changed_at.as_micros();
                             if age > entry.expire_after_us {
                                 let pk_values = entry
@@ -828,7 +830,7 @@ impl EphemeralSweeper {
             .call(Box::new(move |tx| {
                 for (table, pk_values, witness) in &plan {
                     match tx.query_pk(*table, pk_values)? {
-                        Some(current) if current.same_identity(witness) => {
+                        Some(current) if current == *witness => {
                             tx.delete(*table, pk_values)?;
                         }
                         // Rewritten or already gone: leave it alone.
@@ -997,7 +999,7 @@ impl TtlSweeper {
                                 if ts.as_micros() <= now.as_micros())
                         }
                         TtlMode::After { after_us } => match witnesses.get(&key) {
-                            Some(witness) if witness.row.same_identity(row) => {
+                            Some(witness) if witness.row == row => {
                                 now.as_micros() - witness.changed_at.as_micros() > after_us
                             }
                             // New or rewritten row: refresh the witness, not due.
@@ -1052,7 +1054,7 @@ impl TtlSweeper {
                                 if ts.as_micros() <= now_us)
                         }
                         // Sliding TTL: identity match means it was not rewritten.
-                        TtlMode::After { .. } => current.same_identity(witness),
+                        TtlMode::After { .. } => current == *witness,
                     };
                     if still_expired {
                         tx.delete(entry.table, pk_values)?;

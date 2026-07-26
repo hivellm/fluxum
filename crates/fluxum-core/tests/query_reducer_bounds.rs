@@ -271,7 +271,7 @@ fn a_breached_bound_is_latched_even_if_the_reducer_swallows_the_error() {
     );
     drop(tx); // rollback
     assert_eq!(
-        store.snapshot().scan(TableId::of("Item")).unwrap().count(),
+        store.snapshot().scan(TableId::of("Item")).unwrap().len(),
         0,
         "nothing committed"
     );
@@ -342,7 +342,7 @@ async fn the_engine_rolls_back_a_write_ceiling_breach_and_counts_it() {
         "{err}"
     );
     assert_eq!(
-        store.snapshot().scan(TableId::of("Item")).unwrap().count(),
+        store.snapshot().scan(TableId::of("Item")).unwrap().len(),
         0,
         "the transaction rolled back"
     );
@@ -355,7 +355,7 @@ async fn the_engine_rolls_back_a_write_ceiling_breach_and_counts_it() {
     engine.bounds().set(0, 0);
     engine.call(caller(), "fill_notes", vec![]).await.unwrap();
     assert_eq!(
-        store.snapshot().scan(TableId::of("Item")).unwrap().count(),
+        store.snapshot().scan(TableId::of("Item")).unwrap().len(),
         100
     );
 }

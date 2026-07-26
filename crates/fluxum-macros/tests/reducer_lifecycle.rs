@@ -252,5 +252,5 @@ async fn macro_declared_module_runs_end_to_end() {
         .await
         .unwrap();
     let online = store.table_id("OnlineUser").unwrap();
-    assert_eq!(store.snapshot().scan(online).unwrap().count(), 0);
+    assert_eq!(store.snapshot().scan(online).unwrap().len(), 0);
 }

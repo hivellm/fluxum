@@ -47,6 +47,7 @@ pub mod format;
 pub mod metrics;
 pub mod pagefile;
 pub mod pool;
+pub mod reclaim;
 pub mod tree;
 
 mod cold;
@@ -55,6 +56,7 @@ pub use codec::PageCodec;
 pub use cold::ColdTable;
 pub use metrics::{MetricsSnapshot, PagerMetrics};
 pub use pool::{BufferPool, PageGuard, PoolOptions};
+pub use reclaim::{Reclaimer, VersionGuard};
 pub use tree::PagedTree;
 
 use std::collections::HashMap;
@@ -380,7 +382,11 @@ impl Pager {
         self.pool.install(key, image, false, &spill)
     }
 
-    /// Replace a pinned page's image (single-writer node rewrite).
+    /// Replace a pinned page's image in place (single-writer node rewrite).
+    /// Test-only since the copy-on-write [`tree`](super::tree) never rewrites a
+    /// page in place — it is the corruption seam the tree's malformed-node
+    /// tests overwrite a root through.
+    #[cfg(test)]
     pub(crate) fn write_pinned(&self, guard: &mut PageGuard, image: Vec<u8>) -> Result<()> {
         self.pool.write_page(guard, image)
     }

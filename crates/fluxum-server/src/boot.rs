@@ -85,10 +85,27 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         return Err(BootError::NoTables);
     }
 
-    let store = Arc::new(MemStore::new(&schema)?);
     // Shard 0 of this process. Multi-shard hosting is ShardCoord's job
     // (SPEC-024); a single-process server owns one shard.
     let shard = 0_u32;
+
+    // SPEC-015: the live store serves through a paged cold tier whose buffer
+    // pool is sized from the effective `memory.budget` (TIER-002/003) over the
+    // configured `storage.page_dir`, so steady-state RSS is bounded by the
+    // budget rather than the resident row count (TIER-004) — the pillar the
+    // billion-row soak (T7.7) exercises.
+    let hardware = fluxum_core::hw::HardwareProfile::probe();
+    let effective = fluxum_core::hw::derive(&hardware, config)?;
+    std::fs::create_dir_all(&config.storage.page_dir).map_err(fluxum_core::FluxumError::from)?;
+    let pager = fluxum_core::store::pager::Pager::open(
+        &config.storage.page_dir,
+        fluxum_core::store::pager::PagerOptions::from_effective(config, &effective, shard),
+    )?;
+    let store = Arc::new(MemStore::with_pager(
+        &schema,
+        fluxum_core::store::StoreOptions::default(),
+        pager,
+    )?);
 
     // The commit log is what makes a restart non-destructive: the store is in
     // memory, but every committed transaction is on disk and folded back in

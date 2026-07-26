@@ -38,7 +38,6 @@
 //! depends on fill factor.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{FluxumError, Result};
 use crate::store::TableId;
@@ -77,36 +76,80 @@ enum Node {
     Interior(InteriorEntries),
 }
 
-/// A paged B-tree over one table's page file. Reads (`get`, `scan`) are
-/// `&self` and safe to run concurrently; mutations are `&mut self`
-/// (single-writer, matching STG-003).
+/// How a copy-on-write rewrite replaced a subtree root: a single fresh page,
+/// or a split into two fresh pages the parent must adopt.
 #[derive(Debug)]
+enum Cow {
+    /// The subtree root was rewritten to this fresh page id (old superseded).
+    Node(u64),
+    /// The subtree root split; `sep` is the right half's first key.
+    Split { left: u64, sep: Vec<u8>, right: u64 },
+}
+
+/// A paged B-tree over one table's page file (TIER-050).
+///
+/// Reads (`get`, `scan`) are `&self`; mutations are `&mut self` (single-writer,
+/// matching STG-003). Writes are **copy-on-write**: every node from the root
+/// to the touched leaf is rewritten to a *fresh* page id, producing a new
+/// [`root_page_id`](Self::root_page_id); the pages the write superseded are
+/// never overwritten in place. A [`PagedTree`] handle is therefore a cheap,
+/// immutable *version* — `clone` shares the pager and points at the same root,
+/// so a snapshot taken before a commit keeps reading a consistent old tree
+/// while a later version writes new pages. The superseded page ids are
+/// reported to the caller ([`insert_cow`](Self::insert_cow) /
+/// [`delete_cow`](Self::delete_cow)) so a version-scoped reclaimer frees them
+/// only once no snapshot pins the version that still reaches them — the paged
+/// analogue of the `imbl`+`Arc` structural sharing the resident store used
+/// (SPEC-015 TIER-061, SPEC-002 STG-004).
+///
+/// The `insert`/`delete` convenience wrappers free the superseded pages
+/// immediately; they are for single-version callers (the checkpoint spill
+/// target, tests) with no concurrent readers of the old root.
+#[derive(Debug, Clone)]
 pub struct PagedTree {
     pager: Arc<Pager>,
     table_id: TableId,
     /// Whether leaf nodes carry the TIER-021 index flag (secondary/spatial
     /// index trees). Interior nodes always do.
     index_tree: bool,
-    root: AtomicU64,
+    /// This version's root page id. Plain (not atomic): each handle is one
+    /// immutable version; a `&mut self` write publishes a new root on this
+    /// handle alone, leaving clones (older versions) on their own roots.
+    root: u64,
 }
 
 impl PagedTree {
     /// Create an empty tree: one empty leaf as root.
     pub fn create(pager: &Arc<Pager>, table_id: TableId, index_tree: bool) -> Result<Self> {
-        let tree = Self {
+        let mut tree = Self {
             pager: Arc::clone(pager),
             table_id,
             index_tree,
-            root: AtomicU64::new(NIL),
+            root: NIL,
         };
-        let root = tree.write_new_node(&Node::Leaf(Vec::new()))?;
-        tree.root.store(root, Ordering::Release);
+        tree.root = tree.write_new_node(&Node::Leaf(Vec::new()))?;
         Ok(tree)
     }
 
-    /// The current root page id (diagnostics / tests).
+    /// The current root page id (the version identity; diagnostics / tests).
     pub fn root_page_id(&self) -> u64 {
-        self.root.load(Ordering::Acquire)
+        self.root
+    }
+
+    /// Adopt `root` as this handle's version root — the recovery seam
+    /// (checkpoint manifest restores the persisted root, TIER-061).
+    pub fn with_root(pager: &Arc<Pager>, table_id: TableId, index_tree: bool, root: u64) -> Self {
+        Self {
+            pager: Arc::clone(pager),
+            table_id,
+            index_tree,
+            root,
+        }
+    }
+
+    /// The table this tree's pages belong to.
+    pub fn table_id(&self) -> TableId {
+        self.table_id
     }
 
     /// Usable payload bytes per node (page minus header minus kind byte).
@@ -141,7 +184,7 @@ impl PagedTree {
     /// over the pinned frame's bytes, never parsed into owned entries
     /// (that keeps a resident point lookup < 1 µs, NFR-02).
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut page_id = self.root.load(Ordering::Acquire);
+        let mut page_id = self.root;
         loop {
             let guard = self.pager.fault(self.table_id, page_id)?;
             let payload = payload_of(&guard);
@@ -186,7 +229,7 @@ impl PagedTree {
     /// scans fault with normal reference semantics — frequently scanned
     /// ranges staying hot is intended).
     pub fn scan(&self, start: &[u8], end: Option<&[u8]>, f: &mut ScanFn<'_>) -> Result<bool> {
-        self.scan_node(self.root.load(Ordering::Acquire), start, end, f)
+        self.scan_node(self.root, start, end, f)
     }
 
     fn scan_node(
@@ -264,11 +307,10 @@ impl PagedTree {
         }
     }
 
-    // --- writes --------------------------------------------------------
+    // --- writes (copy-on-write) ----------------------------------------
 
-    /// Insert or replace (`upsert`) `key → value`. Node splits propagate up
-    /// and may grow a new root.
-    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+    /// Reject an out-of-contract key before any page is touched.
+    fn check_key(&self, key: &[u8]) -> Result<()> {
         if key.is_empty() {
             return Err(FluxumError::Storage(
                 "paged tree keys must be non-empty".into(),
@@ -282,75 +324,151 @@ impl PagedTree {
                 self.pager.page_size()
             )));
         }
-        let root = self.root.load(Ordering::Acquire);
-        if let Some((sep, right)) = self.insert_into(root, key, value)? {
-            // Root split: new interior root with a low-sentinel first entry
-            // (the empty key routes everything below `sep` left).
-            let entries: InteriorEntries = vec![(Vec::new(), root), (sep, right)];
-            let new_root = self.write_new_node(&Node::Interior(entries))?;
-            self.root.store(new_root, Ordering::Release);
-        }
         Ok(())
     }
 
-    /// Recursive insert; returns the `(separator, new_right_page)` of a
-    /// split, to be applied by the parent.
-    fn insert_into(
+    /// Copy-on-write insert/replace of `key → value`. The root-to-leaf path is
+    /// rewritten to fresh pages (a new [`root_page_id`](Self::root_page_id));
+    /// the pages it superseded — old path nodes and any replaced overflow
+    /// chain — are appended to `superseded` for the caller's version-scoped
+    /// reclaimer, never freed here (a snapshot on the old root still reads
+    /// them). Splits propagate up and may grow a new root.
+    pub fn insert_cow(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        superseded: &mut Vec<u64>,
+    ) -> Result<()> {
+        self.check_key(key)?;
+        let root = self.root;
+        self.root = match self.insert_into_cow(root, key, value, superseded)? {
+            Cow::Node(page) => page,
+            Cow::Split { left, sep, right } => {
+                // Root split: a new interior root whose low-sentinel first
+                // entry routes everything below `sep` left.
+                let entries: InteriorEntries = vec![(Vec::new(), left), (sep, right)];
+                self.write_new_node(&Node::Interior(entries))?
+            }
+        };
+        Ok(())
+    }
+
+    /// Insert/replace, freeing superseded pages immediately (single-version
+    /// callers with no concurrent readers of the old root).
+    pub fn insert(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+        let mut superseded = Vec::new();
+        self.insert_cow(key, value, &mut superseded)?;
+        self.free_superseded(&superseded)?;
+        Ok(())
+    }
+
+    /// Recursive CoW insert; returns how the rewritten subtree root replaced
+    /// `page_id` (a fresh page, or a split into two fresh pages). `page_id`
+    /// itself is recorded superseded.
+    fn insert_into_cow(
         &mut self,
         page_id: u64,
         key: &[u8],
         value: &[u8],
-    ) -> Result<Option<(Vec<u8>, u64)>> {
-        let mut guard = self.pager.fault(self.table_id, page_id)?;
-        match parse_node(&guard)? {
+        superseded: &mut Vec<u64>,
+    ) -> Result<Cow> {
+        let node = parse_node(&self.pager.fault(self.table_id, page_id)?)?;
+        match node {
             Node::Leaf(mut entries) => {
                 let leaf_value = self.store_value(key, value)?;
                 match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(idx) => {
-                        // Replace: free the superseded overflow chain first.
+                        // Replace: the superseded value's overflow chain (if
+                        // any) is retired, not freed — an old snapshot's leaf
+                        // still points at it.
                         let old = std::mem::replace(&mut entries[idx].1, leaf_value);
-                        self.free_value(&old)?;
+                        self.supersede_value(&old, superseded)?;
                     }
                     Err(idx) => entries.insert(idx, (key.to_vec(), leaf_value)),
                 }
-                self.write_or_split(&mut guard, page_id, Node::Leaf(entries))
+                superseded.push(page_id);
+                self.write_or_split_new(Node::Leaf(entries))
             }
-            Node::Interior(entries) => {
+            Node::Interior(mut entries) => {
                 let idx = route_index(&entries, key)?;
                 let child = entries[idx].1;
-                // The parent stays pinned across the recursion — split
-                // application must land on this exact node (single writer).
-                let split = self.insert_into(child, key, value)?;
-                let Some((sep, right)) = split else {
-                    return Ok(None);
-                };
-                let mut entries = entries;
-                entries.insert(idx + 1, (sep, right));
-                self.write_or_split(&mut guard, page_id, Node::Interior(entries))
+                match self.insert_into_cow(child, key, value, superseded)? {
+                    Cow::Node(new_child) => entries[idx].1 = new_child,
+                    Cow::Split { left, sep, right } => {
+                        entries[idx].1 = left;
+                        entries.insert(idx + 1, (sep, right));
+                    }
+                }
+                superseded.push(page_id);
+                self.write_or_split_new(Node::Interior(entries))
             }
         }
     }
 
-    /// Remove `key`. Returns whether it was present. No rebalancing (see
-    /// module docs); an emptied leaf stays as a valid, routable node.
+    /// Copy-on-write delete of `key`. Returns whether it was present; when it
+    /// was, the root-to-leaf path is rewritten to fresh pages and the pages it
+    /// superseded (old path nodes + the deleted value's overflow chain) are
+    /// appended to `superseded`. A missing key rewrites nothing. No
+    /// rebalancing (module docs); an emptied leaf stays a valid routable node.
+    pub fn delete_cow(&mut self, key: &[u8], superseded: &mut Vec<u64>) -> Result<bool> {
+        let root = self.root;
+        match self.delete_into_cow(root, key, superseded)? {
+            Some(new_root) => {
+                self.root = new_root;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Delete, freeing superseded pages immediately (single-version callers).
     pub fn delete(&mut self, key: &[u8]) -> Result<bool> {
-        let mut page_id = self.root.load(Ordering::Acquire);
-        loop {
-            let mut guard = self.pager.fault(self.table_id, page_id)?;
-            match parse_node(&guard)? {
-                Node::Interior(entries) => page_id = route(&entries, key)?,
-                Node::Leaf(mut entries) => {
-                    let Ok(idx) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) else {
-                        return Ok(false);
-                    };
-                    let (_, old) = entries.remove(idx);
-                    self.free_value(&old)?;
-                    let image = self.encode_node(page_id, &Node::Leaf(entries))?;
-                    self.pager.write_pinned(&mut guard, image)?;
-                    return Ok(true);
-                }
+        let mut superseded = Vec::new();
+        let hit = self.delete_cow(key, &mut superseded)?;
+        self.free_superseded(&superseded)?;
+        Ok(hit)
+    }
+
+    /// Recursive CoW delete; `Ok(None)` = key absent (nothing rewritten),
+    /// `Ok(Some(page))` = the fresh page replacing `page_id` on the path.
+    /// Delete only shrinks nodes, so it never splits.
+    fn delete_into_cow(
+        &mut self,
+        page_id: u64,
+        key: &[u8],
+        superseded: &mut Vec<u64>,
+    ) -> Result<Option<u64>> {
+        let node = parse_node(&self.pager.fault(self.table_id, page_id)?)?;
+        match node {
+            Node::Leaf(mut entries) => {
+                let Ok(idx) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) else {
+                    return Ok(None);
+                };
+                let (_, old) = entries.remove(idx);
+                self.supersede_value(&old, superseded)?;
+                superseded.push(page_id);
+                Ok(Some(self.write_new_node(&Node::Leaf(entries))?))
+            }
+            Node::Interior(mut entries) => {
+                let idx = route_index(&entries, key)?;
+                let child = entries[idx].1;
+                let Some(new_child) = self.delete_into_cow(child, key, superseded)? else {
+                    return Ok(None);
+                };
+                entries[idx].1 = new_child;
+                superseded.push(page_id);
+                Ok(Some(self.write_new_node(&Node::Interior(entries))?))
             }
         }
+    }
+
+    /// Free a batch of superseded page ids (the convenience wrappers' immediate
+    /// reclaim, and the version reclaimer's deferred reclaim).
+    fn free_superseded(&self, page_ids: &[u64]) -> Result<()> {
+        for &page_id in page_ids {
+            self.pager.free_page(self.table_id, page_id)?;
+        }
+        Ok(())
     }
 
     /// Bulk-load a **sorted, unique-key** stream into an **empty** tree:
@@ -421,7 +539,11 @@ impl PagedTree {
             level = next;
         }
         let (_, new_root) = level.remove(0);
-        let old_root = self.root.swap(new_root, Ordering::AcqRel);
+        let old_root = self.root;
+        self.root = new_root;
+        // bulk_load initializes a fresh tree (create → bulk_load) or a spill
+        // target; no snapshot reads the throwaway empty-leaf root, so freeing
+        // it at once is safe.
         if old_root != NIL {
             self.pager.free_page(self.table_id, old_root)?;
         }
@@ -457,8 +579,10 @@ impl PagedTree {
         })
     }
 
-    /// Free a superseded leaf value (its overflow chain, if any).
-    fn free_value(&self, value: &LeafValue) -> Result<()> {
+    /// Record a superseded leaf value's overflow-chain pages (if any) for
+    /// deferred reclaim — the CoW analogue of freeing: a snapshot on the old
+    /// leaf still points at the chain, so it must outlive that version.
+    fn supersede_value(&self, value: &LeafValue, superseded: &mut Vec<u64>) -> Result<()> {
         let LeafValue::Overflow { head, .. } = value else {
             return Ok(());
         };
@@ -475,29 +599,26 @@ impl PagedTree {
                     payload[6], payload[7],
                 ])
             };
-            self.pager.free_page(self.table_id, page_id)?;
+            superseded.push(page_id);
             page_id = next;
         }
         Ok(())
     }
 
-    /// Rewrite `page_id` with `node`, splitting when it no longer fits.
-    fn write_or_split(
-        &mut self,
-        guard: &mut PageGuard,
-        page_id: u64,
-        node: Node,
-    ) -> Result<Option<(Vec<u8>, u64)>> {
+    /// Write `node` to a fresh page (never touching the old one), splitting
+    /// into two fresh pages when it no longer fits — the copy-on-write step.
+    fn write_or_split_new(&mut self, node: Node) -> Result<Cow> {
         if node_size(&node) <= self.node_budget() {
-            let image = self.encode_node(page_id, &node)?;
-            self.pager.write_pinned(guard, image)?;
-            return Ok(None);
+            return Ok(Cow::Node(self.write_new_node(&node)?));
         }
         let (left, sep, right) = split_node(node)?;
+        let left_page = self.write_new_node(&left)?;
         let right_page = self.write_new_node(&right)?;
-        let image = self.encode_node(page_id, &left)?;
-        self.pager.write_pinned(guard, image)?;
-        Ok(Some((sep, right_page)))
+        Ok(Cow::Split {
+            left: left_page,
+            sep,
+            right: right_page,
+        })
     }
 
     /// Allocate a page id and install `node` as a fresh dirty page.
@@ -797,11 +918,6 @@ fn split_node(node: Node) -> Result<(Node, Vec<u8>, Node)> {
     }
 }
 
-/// The child page routing `key` in a sorted interior entry list.
-fn route(entries: &InteriorEntries, key: &[u8]) -> Result<u64> {
-    Ok(entries[route_index(entries, key)?].1)
-}
-
 /// The entry index routing `key`: the rightmost entry with `key_i <= key`,
 /// or entry 0 when `key` sorts below every separator.
 fn route_index(entries: &InteriorEntries, key: &[u8]) -> Result<usize> {
@@ -885,6 +1001,127 @@ mod tests {
         };
         assert!(err.contains("exceeds the"), "{err}");
         assert!(err.contains("byte limit"), "{err}");
+    }
+
+    #[test]
+    fn cow_writes_leave_a_pinned_old_root_readable() {
+        let (_dir, pager, table) = fixture();
+        let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
+        // Enough entries to grow an interior level over 256-byte pages.
+        for i in 0..40u32 {
+            tree.insert(format!("key-{i:04}").as_bytes(), &i.to_le_bytes())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // A snapshot handle pinned at the current version's root.
+        let snap = tree.clone();
+        let snap_root = snap.root_page_id();
+
+        // Copy-on-write updates (change every key) + additions, retaining the
+        // superseded pages rather than freeing them — the snapshot still reads
+        // them.
+        let mut superseded = Vec::new();
+        for i in 0..40u32 {
+            tree.insert_cow(
+                format!("key-{i:04}").as_bytes(),
+                &(i + 1000).to_le_bytes(),
+                &mut superseded,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+        for i in 40..80u32 {
+            tree.insert_cow(
+                format!("key-{i:04}").as_bytes(),
+                &i.to_le_bytes(),
+                &mut superseded,
+            )
+            .unwrap_or_else(|e| panic!("{e}"));
+        }
+
+        // The write published a new root and reported superseded pages.
+        assert_ne!(
+            tree.root_page_id(),
+            snap_root,
+            "a CoW write must publish a fresh root"
+        );
+        assert!(!superseded.is_empty(), "CoW writes report superseded pages");
+
+        // The new version sees the updates and additions…
+        assert_eq!(
+            tree.get(b"key-0007").unwrap_or_else(|e| panic!("{e}")),
+            Some(1007u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            tree.get(b"key-0050").unwrap_or_else(|e| panic!("{e}")),
+            Some(50u32.to_le_bytes().to_vec())
+        );
+        // …while the pinned snapshot still reads the original tree, unfreed.
+        assert_eq!(
+            snap.get(b"key-0007").unwrap_or_else(|e| panic!("{e}")),
+            Some(7u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            snap.get(b"key-0050").unwrap_or_else(|e| panic!("{e}")),
+            None
+        );
+
+        // Reclaiming the superseded pages leaves the new version intact — it
+        // references only fresh pages.
+        tree.free_superseded(&superseded)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            tree.get(b"key-0007").unwrap_or_else(|e| panic!("{e}")),
+            Some(1007u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            tree.get(b"key-0079").unwrap_or_else(|e| panic!("{e}")),
+            Some(79u32.to_le_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn cow_delete_reports_superseded_and_keeps_the_old_root() {
+        let (_dir, pager, table) = fixture();
+        let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
+        for i in 0..40u32 {
+            tree.insert(format!("key-{i:04}").as_bytes(), &i.to_le_bytes())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        let snap = tree.clone();
+        let mut superseded = Vec::new();
+        // Delete a spread of keys under CoW.
+        for i in (0..40u32).step_by(3) {
+            assert!(
+                tree.delete_cow(format!("key-{i:04}").as_bytes(), &mut superseded)
+                    .unwrap_or_else(|e| panic!("{e}"))
+            );
+        }
+        // A missing key rewrites nothing and reports no supersession.
+        let before = superseded.len();
+        assert!(
+            !tree
+                .delete_cow(b"key-9999", &mut superseded)
+                .unwrap_or_else(|e| panic!("{e}"))
+        );
+        assert_eq!(
+            superseded.len(),
+            before,
+            "a no-op delete supersedes nothing"
+        );
+
+        // The new version no longer has the deleted keys; the snapshot still does.
+        assert_eq!(
+            tree.get(b"key-0000").unwrap_or_else(|e| panic!("{e}")),
+            None
+        );
+        assert_eq!(
+            snap.get(b"key-0000").unwrap_or_else(|e| panic!("{e}")),
+            Some(0u32.to_le_bytes().to_vec())
+        );
+        // A surviving key is still readable on both.
+        assert_eq!(
+            tree.get(b"key-0001").unwrap_or_else(|e| panic!("{e}")),
+            Some(1u32.to_le_bytes().to_vec())
+        );
     }
 
     #[test]

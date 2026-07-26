@@ -124,10 +124,15 @@ fn insert_commit_query_and_scan() {
         Some(alice)
     );
     assert_eq!(snap.query_pk(uid, &[RowValue::U64(99)]).unwrap(), None);
-    let names: Vec<&RowValue> = snap.scan(uid).unwrap().filter_map(|r| r.value(1)).collect();
+    let names: Vec<RowValue> = snap
+        .scan(uid)
+        .unwrap()
+        .into_iter()
+        .filter_map(|r| r.value(1).cloned())
+        .collect();
     assert_eq!(
         names,
-        [&RowValue::Str("alice".into()), &RowValue::Str("bob".into())]
+        [RowValue::Str("alice".into()), RowValue::Str("bob".into())]
     );
 }
 
@@ -144,7 +149,7 @@ fn delete_removes_committed_row_and_reports_diff() {
     assert!(!tx.delete(uid, &[RowValue::U64(42)]).unwrap()); // never existed
     let diff = tx.commit().unwrap();
     assert_eq!(diff.tables[0].deletes.len(), 1);
-    assert!(diff.tables[0].deletes[0].1.same_identity(&alice));
+    assert!(diff.tables[0].deletes[0].1 == alice);
 
     let snap = store.snapshot();
     assert_eq!(snap.row_count(uid).unwrap(), 1);
@@ -219,7 +224,7 @@ fn default_reads_never_see_pending_writes() {
 
     // The same transaction reads only CommittedState: the pending insert is
     // invisible, the pending delete has not happened.
-    assert_eq!(tx.scan(uid).unwrap().count(), 1);
+    assert_eq!(tx.scan(uid).unwrap().len(), 1);
     assert!(tx.query_pk(uid, &[RowValue::U64(1)]).unwrap().is_some());
     assert!(tx.query_pk(uid, &[RowValue::U64(2)]).unwrap().is_none());
     tx.commit().unwrap();
@@ -302,18 +307,20 @@ fn delete_then_reinsert_identical_row_cancels_to_a_noop() {
     let mut tx = store.begin();
     assert!(tx.delete(uid, &[RowValue::U64(1)]).unwrap());
     let reinserted = tx.insert(uid, user(1, "alice")).unwrap();
-    // The committed row identity is preserved — not deleted and recreated.
-    assert!(reinserted.same_identity(&alice));
+    // The committed row is preserved — not deleted and recreated (STG-007
+    // rule 1). Under the paged store rows are serialized, so "preserved" is
+    // value equality; the observable proof is the empty diff below.
+    assert_eq!(reinserted, alice);
     let diff = tx.commit().unwrap();
     assert!(diff.is_empty(), "{diff:?}");
 
-    // The committed row is still the very same allocation.
+    // The committed row is unchanged.
     let now = store
         .snapshot()
         .query_pk(uid, &[RowValue::U64(1)])
         .unwrap()
         .expect("row present");
-    assert!(now.same_identity(&alice));
+    assert_eq!(now, alice);
     assert_eq!(before.row_count(uid).unwrap(), 1);
 }
 
@@ -333,8 +340,8 @@ fn delete_then_reinsert_different_content_merges_as_replacement() {
     assert_eq!(diff.tables.len(), 1);
     assert_eq!(diff.tables[0].inserts.len(), 1);
     assert_eq!(diff.tables[0].deletes.len(), 1);
-    assert!(diff.tables[0].deletes[0].1.same_identity(&alice));
-    assert!(diff.tables[0].inserts[0].same_identity(&renamed));
+    assert!(diff.tables[0].deletes[0].1 == alice);
+    assert!(diff.tables[0].inserts[0] == renamed);
     assert_eq!(store.snapshot().row_count(uid).unwrap(), 1);
 }
 

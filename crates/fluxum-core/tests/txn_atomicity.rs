@@ -213,6 +213,7 @@ fn run_case(base_ops: Vec<Op>, ops: Vec<Op>, outcome: Outcome) {
             let got: Model = snap
                 .scan(iid)
                 .unwrap()
+                .iter()
                 .map(|row| {
                     let (
                         Some(&RowValue::U32(id)),

@@ -10,28 +10,38 @@ use crate::index::btree::{self, BTreeIndex};
 use crate::index::{FullTextIndexState, IndexId, Rect, SpatialIndexState, SpatialPredicate};
 use crate::schema::TableSchema;
 use crate::store::TableId;
-use crate::store::row::{PkBytes, Row, RowValue, encode_pk_values};
+use crate::store::pager::PagedTree;
+use crate::store::row::{
+    PkBytes, Row, RowValue, decode_row_paged, encode_pk_values, encode_row_paged,
+};
 use crate::store::unique::UniqueIndex;
 
 /// One table's committed contents (STG-002).
 ///
-/// `rows` is the logical primary map — a **persistent** ordered map
-/// (`imbl::OrdMap`: O(log n) point lookup, deterministic key-order
-/// iteration, and O(1) clone via structurally-shared Arc'd chunks). The
-/// commit merge clones the map handle, path-copies only the chunks its k
-/// touched rows live in (O(k·log n)), and swaps — never an O(n) table
-/// clone, which is what made commit cost grow with table size
-/// (phase6_memstore-structural-sharing; decision bench
-/// `benches/table_clone.rs`). `indexes` are the secondary B-tree indexes
-/// (T2.4) and `spatial` the SPEC-008 spatial index (T2.5), all maintained
-/// together with `rows` inside the commit merge so a published snapshot's
-/// rows and indexes are always mutually consistent.
+/// `rows` is the logical primary map, now a **paged copy-on-write B-tree**
+/// ([`PagedTree`], SPEC-015 TIER-050): key = FluxBIN-encoded PK, value =
+/// FluxBIN row, every node a cold-tier page that faults in and evicts under
+/// `memory.budget`. Steady-state RSS is a function of the budget, not of the
+/// resident row count (TIER-004) — the SpacetimeDB-differentiating pillar.
+/// The paged tree is a cheap immutable *version*: the commit merge writes new
+/// pages for the touched root-to-leaf paths (`insert_cow`/`delete_cow`),
+/// publishes a new root, and hands the superseded pages to the version
+/// reclaimer, so a snapshot on the old root keeps reading a consistent old
+/// tree — the paged analogue of the `imbl`+`Arc` structural sharing this
+/// field used to provide (phase6_memstore-structural-sharing; TIER-061).
+/// `row_count` mirrors the tree's live entry count (a paged tree has no O(1)
+/// `len`). `indexes` are the secondary B-tree indexes (T2.4) and `spatial`
+/// the SPEC-008 spatial index (T2.5), all maintained together with `rows`
+/// inside the commit merge so a published snapshot's rows and indexes are
+/// always mutually consistent.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
     pub(crate) schema: &'static TableSchema,
-    /// Primary row map, keyed by FluxBIN-encoded PK.
-    pub(crate) rows: imbl::OrdMap<PkBytes, Row>,
+    /// Primary row tree (paged, CoW), keyed by FluxBIN-encoded PK.
+    pub(crate) rows: PagedTree,
+    /// Live committed row count (the paged tree offers no O(1) length).
+    pub(crate) row_count: u64,
     /// Secondary B-tree indexes by stable id (STG-051), one per
     /// `#[index(btree(...))]` declaration (DM-030/DM-031).
     pub(crate) indexes: BTreeMap<IndexId, BTreeIndex>,
@@ -58,7 +68,77 @@ impl TableState {
 
     /// Number of committed rows.
     pub fn row_count(&self) -> usize {
-        self.rows.len()
+        self.row_count as usize
+    }
+
+    /// The committed row at an already-encoded primary key, decoded from its
+    /// paged leaf (faults pages on demand).
+    pub(crate) fn row_at(&self, pk: &PkBytes) -> Result<Option<Row>> {
+        match self.rows.get(pk.as_bytes())? {
+            Some(bytes) => Ok(Some(decode_row_paged(self.schema, &bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Whether a row is stored at `pk`.
+    pub(crate) fn contains_pk(&self, pk: &PkBytes) -> Result<bool> {
+        Ok(self.rows.get(pk.as_bytes())?.is_some())
+    }
+
+    /// Every committed row in encoded-PK order (materialized). Callers that
+    /// only need a filtered subset should prefer an index scan — a full
+    /// materialization is O(rows) transient memory.
+    pub(crate) fn all_rows(&self) -> Result<Vec<Row>> {
+        let mut out = Vec::new();
+        self.rows.scan(&[], None, &mut |_, value| {
+            out.push(decode_row_paged(self.schema, value)?);
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Visit every `(pk, row)` in encoded-PK order (index/constraint rebuilds).
+    pub(crate) fn for_each_row(&self, mut f: impl FnMut(PkBytes, Row) -> Result<()>) -> Result<()> {
+        self.rows.scan(&[], None, &mut |key, value| {
+            f(
+                PkBytes::from_bytes(key.to_vec()),
+                decode_row_paged(self.schema, value)?,
+            )?;
+            Ok(true)
+        })?;
+        Ok(())
+    }
+
+    /// Copy-on-write upsert of `row` at `pk`; superseded pages are appended to
+    /// `superseded` for the version reclaimer (never freed here). Returns the
+    /// previously stored row, so the commit merge can retire its index entries.
+    pub(crate) fn put_row(
+        &mut self,
+        pk: &PkBytes,
+        row: &Row,
+        superseded: &mut Vec<u64>,
+    ) -> Result<Option<Row>> {
+        let prev = self.row_at(pk)?;
+        let bytes = encode_row_paged(self.schema, row.values())?;
+        self.rows.insert_cow(pk.as_bytes(), &bytes, superseded)?;
+        if prev.is_none() {
+            self.row_count += 1;
+        }
+        Ok(prev)
+    }
+
+    /// Copy-on-write delete at `pk`; returns the removed row if present.
+    pub(crate) fn take_row(
+        &mut self,
+        pk: &PkBytes,
+        superseded: &mut Vec<u64>,
+    ) -> Result<Option<Row>> {
+        let prev = self.row_at(pk)?;
+        if prev.is_some() {
+            self.rows.delete_cow(pk.as_bytes(), superseded)?;
+            self.row_count = self.row_count.saturating_sub(1);
+        }
+        Ok(prev)
     }
 
     /// Scan a B-tree index of this table: equality on `prefix` (0..=all
@@ -70,7 +150,7 @@ impl TableState {
         prefix: &[RowValue],
         lower: Bound<&RowValue>,
         upper: Bound<&RowValue>,
-    ) -> Result<impl Iterator<Item = &Row>> {
+    ) -> Result<Vec<Row>> {
         let index = self.indexes.get(&index_id).ok_or_else(|| {
             FluxumError::Storage(format!(
                 "unknown index {index_id} on table `{}`",
@@ -107,14 +187,17 @@ impl TableState {
         let lower = self.encode_bound(index_id, range_ordinal, lower)?;
         let upper = self.encode_bound(index_id, range_ordinal, upper)?;
         let (start, end) = btree::plan_scan(prefix_bytes, lower, upper);
-        Ok(index.scan_pks(start, end).filter_map(move |pk| {
-            let row = self.rows.get(pk);
-            debug_assert!(
-                row.is_some(),
-                "index {index_id} points at a pk absent from the row map"
-            );
-            row
-        }))
+        let mut out = Vec::new();
+        for pk in index.scan_pks(start, end) {
+            match self.row_at(pk)? {
+                Some(row) => out.push(row),
+                None => debug_assert!(
+                    false,
+                    "index {index_id} points at a pk absent from the row map"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     /// Type-check `value` against the index column at `ordinal`.
@@ -181,37 +264,38 @@ impl TableState {
         })
     }
 
-    /// Resolve index-returned PKs to rows (spatial indexes and the row map
+    /// Resolve index-returned PKs to rows (spatial indexes and the row tree
     /// of one snapshot are mutually consistent, so every PK resolves).
-    fn rows_of(&self, pks: Vec<PkBytes>) -> Vec<Row> {
-        pks.iter()
-            .filter_map(|pk| {
-                let row = self.rows.get(pk);
-                debug_assert!(
-                    row.is_some(),
-                    "spatial index points at a pk absent from the row map"
-                );
-                row.cloned()
-            })
-            .collect()
+    fn rows_of(&self, pks: Vec<PkBytes>) -> Result<Vec<Row>> {
+        let mut out = Vec::with_capacity(pks.len());
+        for pk in &pks {
+            match self.row_at(pk)? {
+                Some(row) => out.push(row),
+                None => debug_assert!(
+                    false,
+                    "spatial index points at a pk absent from the row tree"
+                ),
+            }
+        }
+        Ok(out)
     }
 
     /// Rows inside `region` via the spatial index (SPX-020). Never a scan.
     pub(crate) fn spatial_region(&self, region: Rect) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_region(region)?))
+        self.rows_of(self.spatial()?.query_region(region)?)
     }
 
     /// Rows within Euclidean distance `r` of `(x, y)` via the spatial index
     /// (SPX-021): bbox prefilter + exact circle filter, distance exactly `r`
     /// included (minimum box distance for R-tree tables).
     pub(crate) fn spatial_radius(&self, x: f64, y: f64, r: f64) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_radius(x, y, r)?))
+        self.rows_of(self.spatial()?.query_radius(x, y, r)?)
     }
 
     /// Rows at the point `(x, y)` via the spatial index (IEEE `==` for
     /// QuadTree points; box containment for R-tree extents).
     pub(crate) fn spatial_point(&self, x: f64, y: f64) -> Result<Vec<Row>> {
-        Ok(self.rows_of(self.spatial()?.query_point(x, y)?))
+        self.rows_of(self.spatial()?.query_point(x, y)?)
     }
 
     /// Evaluate a typed spatial predicate via the spatial index — never a
@@ -228,9 +312,16 @@ impl TableState {
     /// STG-007 rule 2 check: every secondary index equals (bit-identically)
     /// a freshly built index over this table's committed rows.
     pub(crate) fn verify_index_integrity(&self, table_id: TableId) -> Result<()> {
+        // Materialize the paged rows once (encoded-PK order) and rebuild each
+        // resident index over them.
+        let mut rows: Vec<(PkBytes, Row)> = Vec::with_capacity(self.row_count as usize);
+        self.for_each_row(|pk, row| {
+            rows.push((pk, row));
+            Ok(())
+        })?;
         for (index_id, index) in &self.indexes {
             let mut rebuilt = BTreeIndex::new(index.columns());
-            for (pk, row) in &self.rows {
+            for (pk, row) in &rows {
                 rebuilt.insert(row, pk.clone())?;
             }
             if rebuilt != *index {
@@ -245,7 +336,7 @@ impl TableState {
             && spatial.is_ready()
         {
             let mut rebuilt = spatial.fresh_like();
-            for (pk, row) in &self.rows {
+            for (pk, row) in &rows {
                 rebuilt.insert_row(row, pk.clone())?;
             }
             if rebuilt != *spatial {
@@ -261,7 +352,7 @@ impl TableState {
                 continue;
             }
             let mut rebuilt = fulltext.fresh_like();
-            for (pk, row) in &self.rows {
+            for (pk, row) in &rows {
                 rebuilt.insert_row(row, pk.clone())?;
             }
             if rebuilt != *fulltext {
@@ -274,7 +365,7 @@ impl TableState {
         }
         for constraint in &self.unique {
             let mut rebuilt = UniqueIndex::new(constraint.columns());
-            for (pk, row) in &self.rows {
+            for (pk, row) in &rows {
                 rebuilt.insert(row, pk.clone())?;
             }
             if rebuilt != *constraint {
@@ -293,13 +384,52 @@ impl TableState {
 ///
 /// Immutable once published — commits build a new `CommittedState` (sharing
 /// untouched tables via `Arc`) and atomically swap the root pointer, so no
-/// reader ever observes a partial transaction (STG-005).
+/// reader ever observes a partial transaction (STG-005). Each published state
+/// carries a monotonic `version` and a [`VersionGuard`] that pins it live in
+/// the paged store's page reclaimer for exactly as long as any reader holds
+/// it, so pages a later commit superseded are freed only once this version
+/// retires (SPEC-015 TIER-061).
 #[derive(Debug, Clone)]
 pub struct CommittedState {
     pub(crate) tables: HashMap<TableId, Arc<TableState>>,
+    /// This state's monotonic version (0 = the initial empty state).
+    pub(crate) version: u64,
+    /// Pins `version` live in the page reclaimer for as long as this state
+    /// lives — RAII, read only via its `Drop`. `None` only for detached test
+    /// states with no paged store behind them. Shared (`Arc`) so a clone of
+    /// this state is the same version, pinned once.
+    pub(crate) _guard: Option<Arc<crate::store::pager::VersionGuard>>,
 }
 
 impl CommittedState {
+    /// A published state at `version`, pinned live by `guard`.
+    pub(crate) fn new(
+        tables: HashMap<TableId, Arc<TableState>>,
+        version: u64,
+        guard: Arc<crate::store::pager::VersionGuard>,
+    ) -> Self {
+        Self {
+            tables,
+            version,
+            _guard: Some(guard),
+        }
+    }
+
+    /// A detached state with no reclaimer behind it (tests / bootstrap before
+    /// the guard exists).
+    pub(crate) fn detached(tables: HashMap<TableId, Arc<TableState>>) -> Self {
+        Self {
+            tables,
+            version: 0,
+            _guard: None,
+        }
+    }
+
+    /// This state's version.
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+
     /// The state of table `id`, or an unknown-table error.
     pub(crate) fn table(&self, id: TableId) -> Result<&Arc<TableState>> {
         self.tables.get(&id).ok_or_else(|| {
@@ -327,12 +457,14 @@ impl Snapshot {
     pub fn query_pk(&self, table: TableId, pk_values: &[RowValue]) -> Result<Option<Row>> {
         let t = self.state.table(table)?;
         let pk = encode_pk_values(t.schema, pk_values)?;
-        Ok(t.rows.get(&pk).cloned())
+        t.row_at(&pk)
     }
 
-    /// Iterate all committed rows of `table` in encoded-PK byte order.
-    pub fn scan(&self, table: TableId) -> Result<impl Iterator<Item = &Row>> {
-        Ok(self.state.table(table)?.rows.values())
+    /// All committed rows of `table` in encoded-PK byte order (materialized
+    /// from the paged tree — see [`TableState::all_rows`] on the transient
+    /// cost of a full scan).
+    pub fn scan(&self, table: TableId) -> Result<Vec<Row>> {
+        self.state.table(table)?.all_rows()
     }
 
     /// Scan a B-tree index (DM-030/DM-031), lock-free over this snapshot.
@@ -354,7 +486,7 @@ impl Snapshot {
         prefix: &[RowValue],
         lower: Bound<&RowValue>,
         upper: Bound<&RowValue>,
-    ) -> Result<impl Iterator<Item = &Row>> {
+    ) -> Result<Vec<Row>> {
         self.state
             .table(table)?
             .index_scan(index, prefix, lower, upper)
@@ -363,12 +495,7 @@ impl Snapshot {
     /// Equality lookup on a B-tree index: all rows whose leading index
     /// columns equal `key` (a full key for point lookups, a shorter prefix
     /// for DM-031 prefix equality).
-    pub fn index_eq(
-        &self,
-        table: TableId,
-        index: IndexId,
-        key: &[RowValue],
-    ) -> Result<impl Iterator<Item = &Row>> {
+    pub fn index_eq(&self, table: TableId, index: IndexId, key: &[RowValue]) -> Result<Vec<Row>> {
         self.index_scan(table, index, key, Bound::Unbounded, Bound::Unbounded)
     }
 
@@ -376,7 +503,7 @@ impl Snapshot {
     /// boundary's row resolution (SPEC-020 PLG-041: a retriever returns
     /// encoded candidate keys).
     pub(crate) fn row_by_encoded_pk(&self, table: TableId, pk: &PkBytes) -> Result<Option<Row>> {
-        Ok(self.state.table(table)?.rows.get(pk).cloned())
+        self.state.table(table)?.row_at(pk)
     }
 
     /// Encode primary-key values into the table's stable [`PkBytes`] — the
@@ -409,14 +536,14 @@ impl Snapshot {
             })?;
         let mut out = Vec::new();
         for (pk, score) in index.search(query)? {
-            let row = state.rows.get(&pk).ok_or_else(|| {
+            let row = state.row_at(&pk)?.ok_or_else(|| {
                 FluxumError::Storage(
                     "internal invariant violated: full-text posting references a \
                      missing row"
                         .into(),
                 )
             })?;
-            out.push((row.clone(), score));
+            out.push((row, score));
         }
         Ok(out)
     }
@@ -434,15 +561,12 @@ impl Snapshot {
             )));
         };
         let index = IndexId::of(state.schema.name, &[from_column.name]);
-        Ok(state
-            .index_scan(
-                index,
-                std::slice::from_ref(from),
-                Bound::Unbounded,
-                Bound::Unbounded,
-            )?
-            .cloned()
-            .collect())
+        state.index_scan(
+            index,
+            std::slice::from_ref(from),
+            Bound::Unbounded,
+            Bound::Unbounded,
+        )
     }
 
     /// Rows of `table` inside `region` (bounds inclusive, SPX-020),
@@ -499,7 +623,7 @@ impl Snapshot {
 
     /// Number of committed rows in `table`.
     pub fn row_count(&self, table: TableId) -> Result<usize> {
-        Ok(self.state.table(table)?.rows.len())
+        Ok(self.state.table(table)?.row_count as usize)
     }
 
     /// The durable auto-inc high-water mark of `table` (STG-040).
@@ -557,13 +681,52 @@ mod tests {
         Row::new(vec![RowValue::U64(id), RowValue::F64(x), RowValue::F64(y)])
     }
 
+    /// A throwaway on-disk page directory, unique per call within the process
+    /// (never cleaned during the run — fine for short-lived test processes).
+    fn temp_page_dir() -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("fluxum-committed-test-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        dir
+    }
+
+    /// A paged primary tree over `CovTable` holding `entries`.
+    fn paged_rows(entries: &[(PkBytes, Row)]) -> PagedTree {
+        use crate::config::PageCompression;
+        use crate::store::pager::{Pager, PagerOptions};
+        let pager = Pager::open(
+            temp_page_dir(),
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 256 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut tree = PagedTree::create(&pager, TableId::of("CovTable"), false)
+            .unwrap_or_else(|e| panic!("{e}"));
+        for (pk, row) in entries {
+            let bytes = encode_row_paged(&COV, row.values()).unwrap_or_else(|e| panic!("{e}"));
+            tree.insert(pk.as_bytes(), &bytes)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        tree
+    }
+
     /// A hand-built table state (the corruption seam for invariant tests).
     fn state_with_rows() -> TableState {
-        let mut rows = imbl::OrdMap::new();
-        rows.insert(pk(1), row(1, 1.0, 2.0));
+        let entries = [(pk(1), row(1, 1.0, 2.0))];
         TableState {
             schema: &COV,
-            rows,
+            rows: paged_rows(&entries),
+            row_count: entries.len() as u64,
             indexes: BTreeMap::new(),
             spatial: None,
             fulltext: Vec::new(),
@@ -657,9 +820,7 @@ mod tests {
 
     #[test]
     fn unknown_table_ids_name_the_assembled_schema() {
-        let state = CommittedState {
-            tables: HashMap::new(),
-        };
+        let state = CommittedState::detached(HashMap::new());
         let err = match state.table(TableId::from_raw(0x51)) {
             Ok(_) => panic!("unknown table id resolved"),
             Err(e) => e.to_string(),

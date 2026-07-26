@@ -300,6 +300,7 @@ fn marks(shard: &Shard) -> Vec<Mark> {
         .snapshot()
         .scan(id)
         .unwrap()
+        .iter()
         .map(|row| Mark::from_values(row.values()).unwrap())
         .collect()
 }
@@ -311,6 +312,7 @@ fn pending_schedule_rows(shard: &Shard) -> Vec<ScheduleEntry> {
         .snapshot()
         .scan(id)
         .unwrap()
+        .iter()
         .map(|row| ScheduleEntry::from_values(row.values()).unwrap())
         .collect()
 }
@@ -834,7 +836,7 @@ async fn failing_ticks_roll_back_and_long_stalls_warn_once_and_reset() {
             .snapshot()
             .scan(store.table_id("Mark").unwrap())
             .unwrap()
-            .count(),
+            .len(),
         0
     );
 }
@@ -901,21 +903,21 @@ async fn static_defs_enqueue_at_start_without_duplicating_pending_rows() {
     let first = build().start().await.unwrap();
     let second = build().start().await.unwrap();
     let table = store.table_id("__schedule__").unwrap();
-    let pending = store.snapshot().scan(table).unwrap().count();
+    let pending = store.snapshot().scan(table).unwrap().len();
     assert_eq!(pending, 1, "deduplicated by reducer name at start");
 
     // The one-shot then fires exactly once.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
     let mark_table = store.table_id("Mark").unwrap();
     loop {
-        let count = store.snapshot().scan(mark_table).unwrap().count();
+        let count = store.snapshot().scan(mark_table).unwrap().len();
         if count >= 1 || tokio::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(store.snapshot().scan(mark_table).unwrap().count(), 1);
+    assert_eq!(store.snapshot().scan(mark_table).unwrap().len(), 1);
     first.stop().await;
     second.stop().await;
 }
