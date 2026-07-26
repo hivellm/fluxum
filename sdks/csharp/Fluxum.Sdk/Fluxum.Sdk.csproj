@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+
+    <!-- NuGet package metadata (SDK-060): distributed as Fluxum.Sdk. -->
+    <PackageId>Fluxum.Sdk</PackageId>
+    <Version>0.2.0</Version>
+    <Authors>HiveLLM</Authors>
+    <Description>Async/await .NET client for the Fluxum realtime database.</Description>
+    <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/hivellm/fluxum</RepositoryUrl>
+    <!-- Zero third-party dependencies (SDK-080). -->
+  </PropertyGroup>
+
+</Project>

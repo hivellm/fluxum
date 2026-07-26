@@ -8,6 +8,7 @@
 //! acceptance 11) — which is what lets a repository commit its bindings and
 //! diff them in review.
 
+pub mod csharp;
 pub mod go;
 pub mod python;
 pub mod rust;
@@ -29,6 +30,8 @@ pub enum Lang {
     Python,
     /// Go (context-aware), SDK-062.
     Go,
+    /// C# (.NET, async/await), SDK-060.
+    CSharp,
 }
 
 impl Lang {
@@ -39,6 +42,7 @@ impl Lang {
             "rust" | "rs" => Some(Self::Rust),
             "python" | "py" => Some(Self::Python),
             "go" | "golang" => Some(Self::Go),
+            "csharp" | "cs" | "dotnet" => Some(Self::CSharp),
             _ => None,
         }
     }
@@ -50,6 +54,7 @@ impl Lang {
             Self::Rust => "rust",
             Self::Python => "python",
             Self::Go => "go",
+            Self::CSharp => "csharp",
         }
     }
 }
@@ -84,6 +89,7 @@ pub fn generate(
         Lang::Rust => rust::generate(schema).map_err(CliError::Response),
         Lang::Python => python::generate(schema).map_err(CliError::Response),
         Lang::Go => go::generate(schema).map_err(CliError::Response),
+        Lang::CSharp => csharp::generate(schema).map_err(CliError::Response),
     }
 }
 
@@ -120,6 +126,8 @@ mod tests {
         assert_eq!(Lang::parse("py"), Some(Lang::Python));
         assert_eq!(Lang::parse("go"), Some(Lang::Go));
         assert_eq!(Lang::parse("golang"), Some(Lang::Go));
+        assert_eq!(Lang::parse("csharp"), Some(Lang::CSharp));
+        assert_eq!(Lang::parse("cs"), Some(Lang::CSharp));
         assert_eq!(Lang::parse("cobol"), None);
     }
 

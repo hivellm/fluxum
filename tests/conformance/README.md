@@ -94,7 +94,7 @@ belong in the corpus.
 | Rust | `sdks/rust/tests/conformance.rs` | green |
 | Python (asyncio) | `sdks/python/tests/test_conformance.py` | green |
 | Go (context-aware) | `sdks/go/conformance_test.go` | green |
-| C# | with T7.6 | pending |
+| C# (.NET, async/await) | `sdks/csharp/Fluxum.Sdk.Tests/ConformanceTests.cs` | green |
 
 The two TypeScript runners share one interpreter (`sdks/typescript/tests/support/interpreter.ts`);
 the Chromium runner bundles it into a page served **by the fluxum server under test**
