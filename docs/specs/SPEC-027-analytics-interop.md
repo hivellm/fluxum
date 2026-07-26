@@ -41,3 +41,36 @@ Then it discovers the schema and receives rows served via the index-aware planne
 - Write access, transactions, stored procedures over pgwire (reducers own writes).
 - Full Postgres SQL dialect / JOINs / aggregates beyond the Fluxum query surface + materialized views.
 - Being an OLAP/warehouse engine (export to dedicated analytics tools for heavy analytics).
+
+## 4. Implementation
+
+Landed in `crates/fluxum-server/src/pgwire/` — a hand-rolled Postgres v3 codec
+(`proto.rs`, independent of the FluxRPC `FrameCodec`) plus the listener and per-connection
+state machine (`mod.rs`), gated by the `pgwire` config block (`enabled: false` default;
+loopback host default because the wire is plaintext — SSLRequest is declined, so a remote
+deployment fronts it with a TLS proxy).
+
+- **PGW-001.** Startup + cleartext-token auth: the connection password is a Fluxum token,
+  resolved by the [`Authenticator`](SPEC-009-authentication.md) into the per-connection
+  identity. Both the **simple** (`Q`) and **extended** (`Parse`/`Bind`/`Describe`/`Execute`/
+  `Sync`, zero-parameter) query flows are served. Each `SELECT` runs through the *same*
+  `SubscriptionManager::query_json` engine as admin `POST /query` (SPEC-018 index-aware
+  planner), and the JSON result is translated to `RowDescription`/`DataRow` in text format
+  with a `FluxType`→OID map.
+- **PGW-002.** `INSERT`/`UPDATE`/`DELETE`/DDL are rejected with SQLSTATE `25006`; the Fluxum
+  SQL grammar only parses `SELECT` anyway. Transaction-control (`BEGIN`/`COMMIT`/`ROLLBACK`)
+  and session `SET`/`RESET`/`DISCARD` are accepted as harmless no-ops so tools connect — they
+  enable nothing, since no write path exists.
+- **PGW-003.** `information_schema.tables`/`.columns` (plus `version()`, `current_schema()`,
+  `SHOW`) are reflected from the live `Schema`; views appear as relations (name only). Full
+  `pg_catalog` emulation is out of scope (a non-goal).
+- **PGW-004.** RLS (SPEC-005) and column masking (SPEC-017) apply because a non-peer token
+  yields a `Subscriber::client_with_roles`; a server-peer token bypasses RLS (AUTH-062). The
+  listener is disabled by default and its default bind is loopback.
+- **PGW-005.** `AS OF` rides through `sql::as_of_point` → `MemStore::snapshot_as_of`, so a BI
+  read is point-in-time consistent.
+
+Wire behavior is covered by `crates/fluxum-server/tests/pgwire_e2e.rs` (a real socket
+client: handshake, valid/invalid token, streamed `SELECT`, `information_schema` discovery,
+read-only rejection, no-op `SET`/`BEGIN`, and the extended-query flow) and the `pgwire::proto`
+unit tests.

@@ -27,21 +27,26 @@ use crate::ShardContext;
 use crate::http::{self, HttpOptions, HttpServer};
 use crate::tcp::{self, TcpOptions, TcpServer};
 
-/// A running server: both listeners plus the context they share.
+/// A running server: the listeners plus the context they share.
 pub struct Server {
     /// Streamable HTTP `/rpc` + the admin API.
     pub http: HttpServer,
     /// FluxRPC over raw TCP.
     pub tcp: TcpServer,
-    /// The shard the two listeners drive.
+    /// The optional read-only Postgres wire endpoint (SPEC-027), when enabled.
+    pub pg: Option<crate::pgwire::PgServer>,
+    /// The shard the listeners drive.
     pub ctx: Arc<ShardContext>,
 }
 
 impl Server {
-    /// Stop both listeners.
+    /// Stop every listener.
     pub fn shutdown(&self) {
         self.http.shutdown();
         self.tcp.shutdown();
+        if let Some(pg) = &self.pg {
+            pg.shutdown();
+        }
     }
 }
 
@@ -483,5 +488,38 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         );
     }
 
-    Ok(Server { http, tcp, ctx })
+    // SPEC-027 PGW-001/004: the optional read-only Postgres wire endpoint.
+    // Off by default; when enabled it binds a plaintext listener (loopback by
+    // default — see PgWireConfig) that authenticates each connection's token
+    // and serves SELECTs through the same compiled-query engine as /query.
+    let pg = if config.pgwire.enabled {
+        let pg_addr = format!("{}:{}", config.pgwire.host, config.pgwire.port);
+        let server = crate::pgwire::serve(
+            Arc::clone(&ctx),
+            &pg_addr,
+            crate::pgwire::PgOptions {
+                idle_timeout: idle,
+                socket,
+            },
+        )
+        .await
+        .map_err(|source| {
+            http.shutdown();
+            tcp.shutdown();
+            BootError::Bind {
+                addr: pg_addr.clone(),
+                source,
+            }
+        })?;
+        tracing::info!(
+            target: "fluxum::server",
+            addr = %pg_addr,
+            "read-only Postgres wire endpoint listening (SPEC-027)"
+        );
+        Some(server)
+    } else {
+        None
+    };
+
+    Ok(Server { http, tcp, pg, ctx })
 }

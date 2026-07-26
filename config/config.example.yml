@@ -185,3 +185,13 @@ transforms:
 # Plugin manifest (SPEC-020 PLG-032): validated at startup — unknown
 # capability, illegal placement, or a missing in-proc feature aborts boot.
 plugins: []                  # [{ name, capability, host: { kind: in_process|sidecar, ... } }, ...]
+
+# Read-only Postgres wire endpoint (SPEC-027 PGW-004): lets psql/Grafana/
+# Metabase/Superset connect and run point-in-time SELECTs over the compiled
+# query surface (RLS + masking apply; writes stay in reducers). Off by
+# default; plaintext, so it defaults to a loopback bind — front it with a TLS
+# proxy to expose it off-box. The connection password is a Fluxum token.
+pgwire:
+  enabled: false             # PGW-004: disabled unless explicitly turned on
+  host: 127.0.0.1            # loopback by default (plaintext wire)
+  port: 15802                # beside HTTP :15800 and TCP :15801

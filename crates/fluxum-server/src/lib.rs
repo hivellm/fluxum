@@ -30,6 +30,7 @@ pub mod election;
 pub mod http;
 pub mod logging;
 pub mod namespace;
+pub mod pgwire;
 pub mod quota;
 pub mod replication;
 pub mod session;

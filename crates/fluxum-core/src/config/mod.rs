@@ -314,6 +314,33 @@ impl TlsConfig {
     }
 }
 
+/// Read-only Postgres wire endpoint (SPEC-027 PGW-001/004): lets standard
+/// SQL/BI tools connect and run point-in-time `SELECT`s over the compiled
+/// query surface. **Off by default**, and — because the wire is plaintext and
+/// the auth token is sent in the clear (SSLRequest is declined) — it defaults
+/// to a loopback bind. A remote deployment fronts it with a TLS proxy.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PgWireConfig {
+    /// Enable the listener (PGW-004: disabled by default).
+    pub enabled: bool,
+    /// Bind host — loopback by default, so the plaintext surface is not
+    /// exposed off-box without an explicit opt-in.
+    pub host: String,
+    /// Listen port (default 15802, beside HTTP :15800 and TCP :15801).
+    pub port: u16,
+}
+
+impl Default for PgWireConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            host: "127.0.0.1".to_owned(),
+            port: 15802,
+        }
+    }
+}
+
 /// Async runtime tuning (SPEC-016 derived-defaults table).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1029,6 +1056,8 @@ pub struct Config {
     /// legal for the host, in-proc feature compiled, applies_to targets
     /// exist. Any violation aborts startup.
     pub plugins: Vec<PluginDecl>,
+    /// Read-only Postgres wire endpoint (SPEC-027 PGW-004) — off by default.
+    pub pgwire: PgWireConfig,
     /// Provenance of every non-default key (`key.path` → source).
     #[serde(skip)]
     pub sources: BTreeMap<String, ValueSource>,
@@ -1308,6 +1337,19 @@ impl Config {
                 "server.http_port and server.tcp_port must differ (both {})",
                 self.server.tcp_port
             )));
+        }
+        // SPEC-027 PGW-004: the read-only pgwire listener, only when enabled.
+        if self.pgwire.enabled {
+            if self.pgwire.port == 0 {
+                return Err(FluxumError::config("pgwire.port: must be non-zero"));
+            }
+            if self.pgwire.port == self.server.http_port || self.pgwire.port == self.server.tcp_port
+            {
+                return Err(FluxumError::config(format!(
+                    "pgwire.port ({}) must differ from server.http_port and server.tcp_port",
+                    self.pgwire.port
+                )));
+            }
         }
         if let Some(threads) = self.runtime.worker_threads.explicit()
             && *threads == 0
