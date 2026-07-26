@@ -130,6 +130,55 @@ pub struct FuseRequest {
     pub dense: Vec<Candidate>,
 }
 
+/// One table's committed changes inside a CDC delta (SPEC-020 PLG-050).
+///
+/// `inserts` are opaque per-row MessagePack blobs — each a `Vec<LogValue>`
+/// the host encoded with the shared Fluxum row codec — and `deletes` are the
+/// opaque FluxBIN primary-key bytes. The sidecar decodes them with that same
+/// codec; the host never reshapes a schema onto the wire (the OffPath twin of
+/// the opaque-`pk` rule that keeps a re-ranker out of row decoding).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitDelta {
+    /// The stable table id (`crc32(name)`), as carried in the commit log.
+    pub table_id: u32,
+    /// Inserted rows, each an opaque `Vec<LogValue>` MessagePack blob.
+    pub inserts: Vec<serde_bytes::ByteBuf>,
+    /// Deleted rows: opaque FluxBIN primary-key bytes (the log keeps no
+    /// pre-image, so a CDC consumer keys deletes by pk).
+    pub deletes: Vec<serde_bytes::ByteBuf>,
+}
+
+/// One committed transaction inside a CDC batch (PLG-050).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitTx {
+    /// The committed transaction id (strictly increasing per shard).
+    pub tx_id: u64,
+    /// Per-table changes; only touched (and in-scope) tables appear.
+    pub deltas: Vec<CommitDelta>,
+}
+
+/// `StreamSink::on_commit` over the wire (PLG-050): a batch of committed
+/// transactions, at-least-once and in commit order. The host advances its
+/// per-sink checkpoint only on the matching [`Committed`] ack, so a dropped
+/// or timed-out batch is re-sent — never silently lost.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitRequest {
+    /// Correlates the response; unique per connection.
+    pub call_id: u64,
+    /// The committed transactions, ascending by `tx_id`.
+    pub txs: Vec<CommitTx>,
+}
+
+/// The sidecar durably accepted a [`CommitRequest`] (its ack advances the
+/// host's per-sink checkpoint, PLG-050). Unlike a ReadPath reply this is not
+/// degradable: a missing or failed ack holds the checkpoint back so the batch
+/// re-sends (at-least-once).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Committed {
+    /// Echoes the request's `call_id`.
+    pub call_id: u64,
+}
+
 /// The sidecar accepted the handshake.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ready {
@@ -178,6 +227,8 @@ tagged_enum! {
         "Retrieve" => Retrieve(RetrieveRequest),
         /// ReadPath: fuse two ranked lists.
         "Fuse" => Fuse(FuseRequest),
+        /// OffPath: deliver a batch of committed deltas (CDC, PLG-050).
+        "Commit" => Commit(CommitRequest),
     }
 }
 
@@ -188,6 +239,8 @@ tagged_enum! {
         "Ready" => Ready(Ready),
         /// A capability call's scored result.
         "Candidates" => Candidates(Candidates),
+        /// A CDC batch was durably accepted (PLG-050).
+        "Committed" => Committed(Committed),
         /// The call failed; the host degrades to the base result.
         "Error" => Error(PluginRpcError),
     }
@@ -200,6 +253,7 @@ impl PluginResponse {
         match self {
             Self::Ready(_) => None,
             Self::Candidates(c) => Some(c.call_id),
+            Self::Committed(c) => Some(c.call_id),
             Self::Error(e) => Some(e.call_id),
         }
     }
@@ -213,6 +267,7 @@ impl PluginRequest {
             Self::Rerank(r) => Some(r.call_id),
             Self::Retrieve(r) => Some(r.call_id),
             Self::Fuse(r) => Some(r.call_id),
+            Self::Commit(r) => Some(r.call_id),
         }
     }
 }
@@ -263,6 +318,17 @@ mod tests {
                 lexical: vec![candidate(1, 2.5)],
                 dense: vec![candidate(9, 0.9)],
             }),
+            PluginRequest::Commit(CommitRequest {
+                call_id: 4,
+                txs: vec![CommitTx {
+                    tx_id: 7,
+                    deltas: vec![CommitDelta {
+                        table_id: 0xDEAD_BEEF,
+                        inserts: vec![serde_bytes::ByteBuf::from(vec![0x91, 0x01])],
+                        deletes: vec![serde_bytes::ByteBuf::from(vec![9, 9])],
+                    }],
+                }],
+            }),
         ];
         for request in requests {
             let bytes = rmp_serde::to_vec(&request).unwrap();
@@ -282,6 +348,7 @@ mod tests {
                 call_id: 7,
                 candidates: vec![candidate(2, 9.5), candidate(1, 0.5)],
             }),
+            PluginResponse::Committed(Committed { call_id: 8 }),
             PluginResponse::Error(PluginRpcError {
                 call_id: 7,
                 message: "model not loaded".into(),

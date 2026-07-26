@@ -472,9 +472,9 @@ pub struct BoundPlugin {
     pub columns: Vec<String>,
     /// The constructed instance: the compiled plugin for an in-process
     /// host, a [`SidecarProxy`] for a sidecar one. `None` only for a
-    /// sidecar binding whose capability has no Plugin RPC wire yet
-    /// (`stream_sink`, `key_provider`) — legal and introspectable, never
-    /// called.
+    /// sidecar binding whose capability has no Plugin RPC wire (`key_provider`,
+    /// whose KMS exception caches keys rather than calling) — legal and
+    /// introspectable, never called.
     pub instance: Option<PluginInstance>,
     /// Runtime disable flag + meters, shared with invocation sites.
     pub state: Arc<PluginState>,
@@ -654,19 +654,19 @@ impl PluginRegistry {
                     breaker_cooldown: sidecar::BREAKER_COOLDOWN,
                 }));
                 stats = Some(proxy.stats());
-                // `instance()` is `None` for a capability with no ReadPath
-                // wire yet (`stream_sink`, `key_provider`): the manifest
-                // binding is legal and introspectable, but nothing can call
-                // it until the task that builds its wire lands. That is the
-                // same shape the sidecar bindings had before this proxy —
-                // validated, not live.
+                // `instance()` is `None` only for `key_provider`, whose KMS
+                // exception caches keys rather than making a per-commit call:
+                // the manifest binding is legal and introspectable, but
+                // nothing calls it. The ReadPath capabilities (PLG-031) and
+                // the OffPath `stream_sink` CDC wire (PLG-050) all produce a
+                // live proxy.
                 let instance = Arc::clone(&proxy).instance();
                 if instance.is_none() {
                     tracing::warn!(
                         plugin = %decl.name,
                         capability = capability.name(),
-                        "sidecar binding validated but has no Plugin RPC wire yet \
-                         (PLG-031 models the ReadPath capabilities); it will never be called"
+                        "sidecar binding validated but has no Plugin RPC wire \
+                         (key_provider caches keys instead); it will never be called"
                     );
                 }
                 (

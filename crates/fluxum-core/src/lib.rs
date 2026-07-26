@@ -53,6 +53,7 @@
 
 pub mod auth;
 pub mod backup;
+pub mod cdc;
 pub mod checkpoint;
 pub mod commitlog;
 pub mod config;

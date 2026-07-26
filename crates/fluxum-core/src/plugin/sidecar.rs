@@ -56,15 +56,17 @@ use std::time::{Duration, Instant};
 
 use fluxum_protocol::frame::{Frame, FrameCodec};
 use fluxum_protocol::plugin_rpc::{
-    Candidate, Candidates, FuseRequest, Hello, MatchQuery, PLUGIN_RPC_VERSION, PluginRequest,
-    PluginResponse, RerankRequest, RetrieveRequest,
+    Candidate, Candidates, CommitDelta, CommitRequest, CommitTx, FuseRequest, Hello, MatchQuery,
+    PLUGIN_RPC_VERSION, PluginRequest, PluginResponse, RerankRequest, RetrieveRequest,
 };
+use serde_bytes::ByteBuf;
 
-use crate::store::PkBytes;
+use crate::commitlog::LogValue;
+use crate::store::{PkBytes, TxDiff};
 
 use super::{
-    Capability, FtQuery, Fusion, PluginCtx, PluginError, PluginInstance, Retriever, ScoreReranker,
-    Scored,
+    Capability, CommitBatch, FtQuery, Fusion, Offset, PluginCtx, PluginError, PluginInstance,
+    Retriever, ScoreReranker, Scored, StreamSink,
 };
 
 /// Consecutive failures that open the breaker (PLG-031).
@@ -346,14 +348,16 @@ impl SidecarProxy {
     }
 
     /// Build the [`PluginInstance`] a sidecar binding of `capability` needs,
-    /// or `None` for a capability with no ReadPath wire (PLG-031 models
-    /// rerank/retrieve/fuse; `stream_sink`'s wire is the CDC task's and
-    /// `key_provider`'s KMS exception caches keys instead of calling).
+    /// or `None` for a capability with no wire (only `key_provider`, whose
+    /// KMS exception caches keys instead of calling — PLG-021). PLG-031 models
+    /// the ReadPath calls (rerank/retrieve/fuse); the OffPath `stream_sink`
+    /// wire is this crate's CDC path ([`StreamSink`], PLG-050).
     pub fn instance(self: Arc<Self>) -> Option<PluginInstance> {
         Some(match self.config.capability {
             Capability::ScoreReranker => PluginInstance::ScoreReranker(self),
             Capability::Retriever => PluginInstance::Retriever(self),
             Capability::Fusion => PluginInstance::Fusion(self),
+            Capability::StreamSink => PluginInstance::StreamSink(self),
             _ => return None,
         })
     }
@@ -444,6 +448,10 @@ impl SidecarProxy {
                 SidecarErrorReason::Protocol,
                 "unexpected Ready mid-connection",
             )),
+            PluginResponse::Committed(_) => Err(self.error(
+                SidecarErrorReason::Protocol,
+                "unexpected Committed ack for a ReadPath call",
+            )),
         }
     }
 
@@ -502,9 +510,9 @@ impl SidecarProxy {
                 SidecarErrorReason::Protocol,
                 &format!("handshake rejected: {}", err.message),
             )),
-            PluginResponse::Candidates(_) => Err(self.error(
+            PluginResponse::Candidates(_) | PluginResponse::Committed(_) => Err(self.error(
                 SidecarErrorReason::Protocol,
-                "sidecar answered the handshake with candidates",
+                "sidecar answered the handshake with a call reply (candidates/committed)",
             )),
         }
     }
@@ -628,6 +636,101 @@ impl SidecarProxy {
     fn next_call_id(&self) -> u64 {
         self.next_call_id.fetch_add(1, Ordering::Relaxed)
     }
+
+    /// Deliver a CDC batch and await the sidecar's durable ack (PLG-050). The
+    /// same connection, breaker, and deadline machinery as a ReadPath
+    /// [`call`](Self::call), but the reply is a [`Committed`] ack, not a
+    /// scored list — an OffPath failure holds the host checkpoint back so the
+    /// batch re-sends (at-least-once), it does not degrade to a base result.
+    fn call_committed(&self, request: PluginRequest) -> Result<(), PluginError> {
+        self.stats.calls.fetch_add(1, Ordering::Relaxed);
+        if self
+            .breaker
+            .admit(&self.stats, self.config.breaker_cooldown)
+            == BreakerState::Open
+        {
+            self.stats.note_error(SidecarErrorReason::BreakerOpen);
+            return Err(PluginError(format!(
+                "sidecar `{}`: circuit breaker open (PLG-031)",
+                self.config.name
+            )));
+        }
+        let deadline = Instant::now() + self.config.timeout;
+        let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        match self.exchange_committed(&mut guard, &request, deadline) {
+            Ok(()) => {
+                self.breaker.note_success(&self.stats);
+                Ok(())
+            }
+            Err(err) => {
+                // A failed exchange leaves the stream at an unknown offset;
+                // drop it so the next batch redials cleanly.
+                *guard = None;
+                Err(err)
+            }
+        }
+    }
+
+    fn exchange_committed(
+        &self,
+        guard: &mut Option<Conn>,
+        request: &PluginRequest,
+        deadline: Instant,
+    ) -> Result<(), PluginError> {
+        if guard.is_none() {
+            *guard = Some(self.connect(deadline)?);
+        }
+        let Some(conn) = guard.as_mut() else {
+            return Err(self.error(SidecarErrorReason::Connect, "no connection"));
+        };
+        self.send(conn, request, deadline)?;
+        let expected = request.call_id();
+        match self.recv(conn, deadline)? {
+            PluginResponse::Committed(ack) if Some(ack.call_id) == expected => Ok(()),
+            PluginResponse::Error(err) => {
+                Err(self.error(SidecarErrorReason::Refused, &err.message))
+            }
+            PluginResponse::Committed(ack) => Err(self.error(
+                SidecarErrorReason::Protocol,
+                &format!(
+                    "ack for call_id {} but call {expected:?} is in flight",
+                    ack.call_id
+                ),
+            )),
+            other => Err(self.error(
+                SidecarErrorReason::Protocol,
+                &format!("expected a Committed ack, got {other:?}"),
+            )),
+        }
+    }
+
+    /// Project one committed [`TxDiff`] onto the wire: inserts become opaque
+    /// per-row `Vec<LogValue>` blobs, deletes their opaque primary-key bytes.
+    fn tx_to_wire(diff: &TxDiff) -> Result<CommitTx, PluginError> {
+        let mut deltas = Vec::with_capacity(diff.tables.len());
+        for table in &diff.tables {
+            let mut inserts = Vec::with_capacity(table.inserts.len());
+            for row in &table.inserts {
+                let logged: Vec<LogValue> = row.values().iter().map(LogValue::from).collect();
+                let bytes = rmp_serde::to_vec(&logged)
+                    .map_err(|e| PluginError(format!("cdc row encode: {e}")))?;
+                inserts.push(ByteBuf::from(bytes));
+            }
+            deltas.push(CommitDelta {
+                table_id: table.table_id.as_u32(),
+                inserts,
+                deletes: table
+                    .deletes
+                    .iter()
+                    .map(|(pk, _)| ByteBuf::from(pk.as_bytes().to_vec()))
+                    .collect(),
+            });
+        }
+        Ok(CommitTx {
+            tx_id: diff.tx_id,
+            deltas,
+        })
+    }
 }
 
 impl ScoreReranker for SidecarProxy {
@@ -677,5 +780,25 @@ impl Fusion for SidecarProxy {
             |_| super::ReciprocalRankFusion::default().fuse(lexical, dense, ctx),
             Self::from_wire,
         )
+    }
+}
+
+impl StreamSink for SidecarProxy {
+    fn on_commit(&self, batch: &CommitBatch) -> Result<(), PluginError> {
+        let mut txs = Vec::with_capacity(batch.diffs.len());
+        for diff in &batch.diffs {
+            txs.push(Self::tx_to_wire(diff)?);
+        }
+        let request = PluginRequest::Commit(CommitRequest {
+            call_id: self.next_call_id(),
+            txs,
+        });
+        self.call_committed(request)
+    }
+
+    /// The host owns the persisted resume point (SPEC-020 PLG-050); a v1
+    /// sidecar reports none, so the host checkpoint alone drives resume.
+    fn checkpoint(&self) -> Offset {
+        Offset(0)
     }
 }

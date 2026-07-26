@@ -379,6 +379,17 @@ impl FanoutStageStat {
     }
 }
 
+/// One CDC stream sink's live state (SPEC-020 PLG-050): its lag in
+/// transactions (`durable_tip − checkpoint`), plus cumulative delivered/
+/// dropped/error counts — the `fluxum_plugin_sink_*` series.
+#[derive(Debug, Default, Clone, Copy)]
+struct SinkStat {
+    lag: u64,
+    delivered: u64,
+    dropped: u64,
+    errors: u64,
+}
+
 /// A shard's live `fluxum_*` counters (SPEC-012). Cheap atomic increments on
 /// the hot path; the per-reducer map is behind a mutex touched only at call
 /// admission (off the single-writer commit path).
@@ -454,6 +465,10 @@ pub struct Metrics {
     reducer_aborted_alloc: AtomicU64,
     query_rate_limited_identity: AtomicU64,
     query_rate_limited_source: AtomicU64,
+    /// SPEC-020 PLG-050: per-CDC-sink lag + delivered/dropped/error counts.
+    /// A map (like `replication_peers`) because sinks come and go with the
+    /// manifest, touched only off the commit path by the CDC pump task.
+    sinks: Mutex<BTreeMap<String, SinkStat>>,
 }
 
 /// Why the transports refused a connection on the pre-auth surface
@@ -574,6 +589,7 @@ impl Metrics {
             reducer_aborted_alloc: AtomicU64::new(0),
             query_rate_limited_identity: AtomicU64::new(0),
             query_rate_limited_source: AtomicU64::new(0),
+            sinks: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -729,6 +745,65 @@ impl Metrics {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(peer);
+    }
+
+    // --- CDC stream sinks (SPEC-020 PLG-050) --------------------------------
+
+    fn with_sink<R>(&self, sink: &str, f: impl FnOnce(&mut SinkStat) -> R) -> R {
+        let mut sinks = self.sinks.lock().unwrap_or_else(PoisonError::into_inner);
+        f(sinks.entry(sink.to_owned()).or_default())
+    }
+
+    /// Set a sink's current lag (`durable_tip − checkpoint`, in txs) —
+    /// `fluxum_plugin_sink_lag{shard, sink}`.
+    pub fn set_sink_lag(&self, sink: &str, lag: u64) {
+        self.with_sink(sink, |s| s.lag = lag);
+    }
+
+    /// Count `n` transactions the sink advanced past (delivered or skipped
+    /// as out-of-scope) — `fluxum_plugin_sink_delivered_total`.
+    pub fn note_sink_delivered(&self, sink: &str, n: u64) {
+        self.with_sink(sink, |s| s.delivered += n);
+    }
+
+    /// Count a drop of the sink past the lag threshold or a truncated gap
+    /// (PLG-050) — `fluxum_plugin_sink_dropped_total`.
+    pub fn note_sink_dropped(&self, sink: &str) {
+        self.with_sink(sink, |s| s.dropped += 1);
+    }
+
+    /// Count an `on_commit` error (the batch retries) —
+    /// `fluxum_plugin_sink_errors_total`.
+    pub fn note_sink_error(&self, sink: &str) {
+        self.with_sink(sink, |s| s.errors += 1);
+    }
+
+    /// A sink's current lag (tests).
+    pub fn sink_lag(&self, sink: &str) -> u64 {
+        self.with_sink(sink, |s| s.lag)
+    }
+
+    /// A sink's delivered count (tests).
+    pub fn sink_delivered(&self, sink: &str) -> u64 {
+        self.with_sink(sink, |s| s.delivered)
+    }
+
+    /// A sink's drop count (tests).
+    pub fn sink_dropped(&self, sink: &str) -> u64 {
+        self.with_sink(sink, |s| s.dropped)
+    }
+
+    /// A sink's error count (tests).
+    pub fn sink_errors(&self, sink: &str) -> u64 {
+        self.with_sink(sink, |s| s.errors)
+    }
+
+    /// Drop a sink's series (its binding went away).
+    pub fn remove_sink(&self, sink: &str) {
+        self.sinks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(sink);
     }
 
     /// The OBS-072 slow-reducer WARN threshold (µs).
@@ -1128,6 +1203,61 @@ impl Metrics {
                     let _ = writeln!(
                         out,
                         "fluxum_replication_lag_tx{{shard=\"{shard}\",peer=\"{peer}\"}} {lag}"
+                    );
+                }
+            }
+        }
+
+        // --- CDC stream sinks (SPEC-020 PLG-050) ---
+        {
+            let sinks = self.sinks.lock().unwrap_or_else(PoisonError::into_inner);
+            if !sinks.is_empty() {
+                out.push_str(
+                    "# HELP fluxum_plugin_sink_lag Committed txs behind per CDC sink \
+                     (durable tip minus checkpoint, PLG-050).\n\
+                     # TYPE fluxum_plugin_sink_lag gauge\n",
+                );
+                for (sink, s) in sinks.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_plugin_sink_lag{{shard=\"{shard}\",sink=\"{sink}\"}} {}",
+                        s.lag
+                    );
+                }
+                out.push_str(
+                    "# HELP fluxum_plugin_sink_delivered_total Committed txs handed to each CDC \
+                     sink at least once (PLG-050).\n\
+                     # TYPE fluxum_plugin_sink_delivered_total counter\n",
+                );
+                for (sink, s) in sinks.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_plugin_sink_delivered_total{{shard=\"{shard}\",sink=\"{sink}\"}} {}",
+                        s.delivered
+                    );
+                }
+                out.push_str(
+                    "# HELP fluxum_plugin_sink_dropped_total CDC sinks dropped past the lag \
+                     threshold or a truncated gap (PLG-050).\n\
+                     # TYPE fluxum_plugin_sink_dropped_total counter\n",
+                );
+                for (sink, s) in sinks.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_plugin_sink_dropped_total{{shard=\"{shard}\",sink=\"{sink}\"}} {}",
+                        s.dropped
+                    );
+                }
+                out.push_str(
+                    "# HELP fluxum_plugin_sink_errors_total CDC sink on_commit failures \
+                     (batch retried, PLG-050).\n\
+                     # TYPE fluxum_plugin_sink_errors_total counter\n",
+                );
+                for (sink, s) in sinks.iter() {
+                    let _ = writeln!(
+                        out,
+                        "fluxum_plugin_sink_errors_total{{shard=\"{shard}\",sink=\"{sink}\"}} {}",
+                        s.errors
                     );
                 }
             }

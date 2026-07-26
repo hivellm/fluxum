@@ -19,19 +19,21 @@ use std::time::{Duration, Instant};
 
 use fluxum_core::config::{Config, PluginDecl, PluginHost, PluginScope};
 use fluxum_core::plugin::{
-    BreakerState, Capability, FtQuery, PluginCtx, PluginRegistry, ScoreReranker, Scored,
-    SidecarConfig, SidecarErrorReason, SidecarProxy,
+    BreakerState, Capability, CommitBatch, FtQuery, PluginCtx, PluginInstance, PluginRegistry,
+    ScoreReranker, Scored, SidecarConfig, SidecarErrorReason, SidecarProxy, StreamSink,
 };
 use fluxum_core::schema::{
     ColumnSchema, FluxType, FullTextLanguage, IndexSchema, Schema, TableAccess, TableSchema,
     VisibilityRule,
 };
-use fluxum_core::store::{MemStore, PkBytes, RowValue};
+use fluxum_core::store::row::Row;
+use fluxum_core::store::{MemStore, PkBytes, RowValue, TableDiff, TableId, TxDiff};
 use fluxum_core::subscription::{Subscriber, SubscriptionLimits, SubscriptionManager};
 use fluxum_core::types::Identity;
 use fluxum_protocol::frame::{Frame, FrameCodec};
 use fluxum_protocol::plugin_rpc::{
-    Candidate, Candidates, PLUGIN_RPC_VERSION, PluginRequest, PluginResponse, PluginRpcError, Ready,
+    Candidate, Candidates, Committed, PLUGIN_RPC_VERSION, PluginRequest, PluginResponse,
+    PluginRpcError, Ready,
 };
 
 // --- The fake sidecar -------------------------------------------------------------
@@ -163,6 +165,36 @@ fn serve(mut stream: TcpStream, behavior: Behavior, calls: &AtomicU64, stop: &At
                     }),
                 };
                 write_frame(&mut stream, &codec, &response);
+                continue;
+            }
+            // OffPath CDC (PLG-050): a commit batch is acked (or refused/
+            // hung per behavior), never turned into candidates.
+            PluginRequest::Commit(r) => {
+                calls.fetch_add(1, Ordering::Relaxed);
+                match behavior {
+                    Behavior::Refuse => write_frame(
+                        &mut stream,
+                        &codec,
+                        &PluginResponse::Error(PluginRpcError {
+                            call_id: r.call_id,
+                            message: "sink down".into(),
+                        }),
+                    ),
+                    Behavior::Hang => {
+                        for _ in 0..200 {
+                            if stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        return;
+                    }
+                    _ => write_frame(
+                        &mut stream,
+                        &codec,
+                        &PluginResponse::Committed(Committed { call_id: r.call_id }),
+                    ),
+                }
                 continue;
             }
             PluginRequest::Rerank(r) => (r.call_id, r.candidates.clone()),
@@ -571,15 +603,15 @@ fn the_breaker_recovers_when_the_sidecar_comes_back() {
 
 #[test]
 fn a_proxy_builds_the_instance_its_capability_can_be_called_through() {
-    use fluxum_core::plugin::PluginInstance;
-    // A ReadPath capability yields a live instance of that variant; a
-    // capability with no Plugin RPC wire yet yields none (the binding is
-    // still legal and introspectable).
+    // The ReadPath capabilities and the OffPath `stream_sink` CDC wire each
+    // yield a live instance of their variant; `key_provider` (whose KMS
+    // exception caches keys instead of calling) yields none — the binding is
+    // still legal and introspectable.
     for (cap, is_some) in [
         (Capability::ScoreReranker, true),
         (Capability::Retriever, true),
         (Capability::Fusion, true),
-        (Capability::StreamSink, false),
+        (Capability::StreamSink, true),
         (Capability::KeyProvider, false),
     ] {
         let proxy = proxy_with(cap, "127.0.0.1:1".into(), None);
@@ -592,6 +624,7 @@ fn a_proxy_builds_the_instance_its_capability_can_be_called_through() {
                 (Capability::ScoreReranker, PluginInstance::ScoreReranker(_))
                     | (Capability::Retriever, PluginInstance::Retriever(_))
                     | (Capability::Fusion, PluginInstance::Fusion(_))
+                    | (Capability::StreamSink, PluginInstance::StreamSink(_))
             ));
         }
     }
@@ -913,4 +946,83 @@ fn a_sidecar_cannot_disable_itself_out_of_the_operators_hands() {
     );
     assert!(registry.set_disabled("reranker", false));
     assert_eq!(ids(&manager, &store), vec![1, 2, 3], "and back on");
+}
+
+// --- OffPath CDC stream sink over the wire (SPEC-020 §6, PLG-050) ------------------
+
+fn stream_sink_proxy(endpoint: &str, timeout: Duration) -> Arc<SidecarProxy> {
+    Arc::new(SidecarProxy::new(SidecarConfig {
+        name: "vectorizer_ingest".into(),
+        capability: Capability::StreamSink,
+        endpoint: endpoint.to_owned(),
+        timeout,
+        token: None,
+        breaker_cooldown: Duration::from_millis(50),
+    }))
+}
+
+fn one_tx_batch(tx_id: u64) -> CommitBatch {
+    CommitBatch {
+        diffs: vec![TxDiff {
+            tx_id,
+            tables: vec![TableDiff {
+                table_id: TableId::of("Item"),
+                inserts: vec![Row::new(vec![
+                    RowValue::U64(tx_id),
+                    RowValue::Str("a".into()),
+                ])],
+                deletes: vec![(PkBytes::from_bytes(vec![9]), Row::new(vec![]))],
+            }],
+            auto_inc: vec![],
+        }],
+    }
+}
+
+#[test]
+fn a_stream_sink_sidecar_binding_yields_a_live_off_path_instance() {
+    // The OffPath capability now produces a real proxy instance (its wire is
+    // this task's), unlike key_provider which stays None.
+    let sidecar = FakeSidecar::start(Behavior::Reverse);
+    let proxy = stream_sink_proxy(&sidecar.endpoint(), Duration::from_secs(2));
+    let instance = Arc::clone(&proxy)
+        .instance()
+        .expect("stream_sink has a wire");
+    assert!(matches!(instance, PluginInstance::StreamSink(_)));
+    assert_eq!(instance.capability(), Capability::StreamSink);
+}
+
+#[test]
+fn a_healthy_sidecar_sink_acks_a_committed_batch() {
+    let sidecar = FakeSidecar::start(Behavior::Reverse); // acks any Commit
+    let proxy = stream_sink_proxy(&sidecar.endpoint(), Duration::from_secs(2));
+    StreamSink::on_commit(&*proxy, &one_tx_batch(1)).expect("a healthy sink acks");
+    StreamSink::on_commit(&*proxy, &one_tx_batch(2)).expect("and again on the same connection");
+    assert_eq!(sidecar.calls(), 2, "the sidecar received both batches");
+}
+
+#[test]
+fn a_refusing_sidecar_sink_surfaces_an_error_so_the_batch_retries() {
+    // Unlike a ReadPath call (which degrades), an OffPath failure must be an
+    // error so the CDC pump holds the checkpoint and re-sends (at-least-once).
+    let sidecar = FakeSidecar::start(Behavior::Refuse);
+    let proxy = stream_sink_proxy(&sidecar.endpoint(), Duration::from_secs(1));
+    let err = StreamSink::on_commit(&*proxy, &one_tx_batch(1)).unwrap_err();
+    assert!(
+        err.0.contains("refused") || err.0.contains("sink down"),
+        "{}",
+        err.0
+    );
+}
+
+#[test]
+fn a_hung_sidecar_sink_times_out_within_budget_and_errors() {
+    let sidecar = FakeSidecar::start(Behavior::Hang);
+    let proxy = stream_sink_proxy(&sidecar.endpoint(), Duration::from_millis(120));
+    let started = Instant::now();
+    let err = StreamSink::on_commit(&*proxy, &one_tx_batch(1)).unwrap_err();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "bounded by the timeout"
+    );
+    assert!(err.0.contains("timeout"), "{}", err.0);
 }

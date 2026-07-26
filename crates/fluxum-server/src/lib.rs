@@ -22,6 +22,7 @@
 
 pub mod admin;
 pub mod boot;
+pub mod cdc;
 pub mod clientip;
 pub mod connguard;
 pub mod console;

@@ -156,7 +156,13 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         fluxum_core::auth::server_identity("fluxum-server"),
     );
 
-    let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    // SPEC-020 PLG-001/032: validate the plugin manifest against the schema
+    // (capability exists, placement legal for the host, in-proc feature
+    // compiled, applies_to targets exist) — any violation aborts startup. An
+    // empty manifest yields a registry of just the adopted built-in seams.
+    let schema = Arc::new(schema);
+    let plugins = Arc::new(fluxum_core::plugin::PluginRegistry::build(&schema, config)?);
+    let subs = SubscriptionManager::new(Arc::clone(&schema), SubscriptionLimits::default());
     // AUTH-062 / REP-005: the configured server peers — operators, ingest
     // services, and replica-set members all authenticate through this
     // registry. (It was silently empty before T7.1 wired replication in.)
@@ -285,6 +291,18 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         ctx.metrics().set_replication_epoch(epoch);
         ctx.set_election(election);
     }
+    // SPEC-020 §6 (PLG-050): install the registry for `GET /plugins`
+    // introspection and spawn a CDC pump per `stream_sink` binding, fed off
+    // the durable commit log (never the write path). The pumps are detached
+    // like the checkpoint worker and replica client; they end when the log
+    // closes at shutdown.
+    ctx.set_plugins(Arc::clone(&plugins));
+    let _cdc_pumps = crate::cdc::spawn_sinks(
+        &ctx,
+        &plugins,
+        config.storage.commit_log_dir.clone(),
+        config.storage.data_dir.join("cdc"),
+    );
     Ok(ctx)
 }
 

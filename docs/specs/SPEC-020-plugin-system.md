@@ -186,6 +186,19 @@ pub trait StreamSink: Send + Sync {
   (the non-blocking guarantee of SUB-041 applies). This is the substrate for Vectorizer ingestion
   (embed changed rows) and generic external integrations.
 
+  *Implementation (`fluxum_core::cdc`, `fluxum_server::cdc`).* The pump is a follower of the
+  **durable** log, exactly as the replication streamer is: it wakes on the durable-tx watch,
+  reads a bounded batch via `commitlog::read_frames_after`, converts each committed record to the
+  delta view (inserts carry full rows; deletes carry the primary key only — the log keeps no
+  pre-image), and hands it to `on_commit` under `PluginState::guard` panic isolation. The durable
+  log is the queue and a single persisted `Offset` is the resume point, so at-least-once and
+  restart-resume are structural; a sink that keeps failing accumulates lag until it is **dropped**
+  (disabled + metered) so it can neither spin nor grow memory, its checkpoint kept for a later
+  re-enable. A sink may be hosted **in-process** (a feature-gated `InProcPluginDef`) or in a
+  **sidecar** (the `SidecarProxy` `StreamSink` wire — Plugin RPC `Commit`/`Committed`, PLG-031),
+  indistinguishable to the pump. Observability: `fluxum_plugin_sink_lag{shard,sink}` (gauge) plus
+  the `fluxum_plugin_sink_{delivered,dropped,errors}_total` counters.
+
 ## 7. Introspection & security
 
 - **PLG-060** [P0] `GET /plugins` (HTTP admin) SHALL list active plugins: name, capability, host
