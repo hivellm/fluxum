@@ -351,13 +351,12 @@ fn reducers_go(banner: &str, reducers: &[Value]) -> Result<String, String> {
             sig.push_str(&format!(", {pname} {}", param_type(pty)));
             arg_names.push(pname);
         }
-        let args: Vec<String> = arg_names.iter().map(|a| a.clone()).collect();
         out.push_str(&format!(
             "// {go_name} calls the `{name}` reducer (RPC-021).\n\
              func {go_name}(ctx context.Context, {sig}) error {{\n\
              \treturn db.CallReducer(ctx, {name:?}, []any{{{args}}})\n\
              }}\n\n",
-            args = args.join(", "),
+            args = arg_names.join(", "),
         ));
     }
     Ok(out)

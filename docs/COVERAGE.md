@@ -5,11 +5,14 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.08% lines** — 2026-07-25, gate command below (PG + SpacetimeDB
-drivers live), after phase7_python-sdk (T7.4): the Rust surface grew only by
-`generate/python.rs` (the `fluxum generate --lang python` codegen), covered by its
-emit/determinism/unmodelled-type unit tests — the SDK itself is Python (out of the Rust
-llvm-cov scope; validated by its own 20-test pytest suite, conformance + codec). Prior:
+**Current standing:** **90.11% lines** — 2026-07-25, gate command below (PG + SpacetimeDB
+drivers live), after phase7_go-sdk (T7.5): the Rust surface grew only by
+`generate/go.rs` (the `fluxum generate --lang go` codegen), covered by its
+emit/determinism/unmodelled-type unit tests — the SDK itself is Go (out of the Rust
+llvm-cov scope; validated by its own `go test` suite, 11 conformance scenarios + 7 codec
+tests, go vet + gofmt clean). Prior: 90.08% after phase7_python-sdk (T7.4): the Rust
+surface grew only by `generate/python.rs`, covered by its unit tests — the SDK itself is
+Python (out of Rust llvm-cov scope; its own 20-test pytest suite). Prior:
 90.05% after phase7_replica-sets-failover COMPLETE (T7.2 — the custom Raft-style
 election, demote-on-fence, ReplicaStale admission, the /health replication object, the
 SDK replica-set failover, and the replication DST; ~2,300 more lines). The floor holds:
@@ -40,7 +43,7 @@ phase6_seed-fixtures-migrate-plan (the plan/verdict matrix and the seed path are
 by their suites; that dip from 90.23% was the new CLI glue — `migrate.rs`'s cargo-spawn
 wrapper and the `run()` dispatch arms — the same category-9 shape as the standing debt).
 **The floor holds**, recovered from the ~89.8% T6.6 breach:
-90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01% → 90.00% → 90.09% → 90.05% → 90.08%. The **standing debt items below remain open**: (a) the
+90.02% → 90.09% → 90.23% → 90.08% → 90.09% → 90.16% → 90.14% → 90.01% → 90.00% → 90.09% → 90.05% → 90.08% → 90.11%. The **standing debt items below remain open**: (a) the
 `fluxum dev` watch/restart loop body + `logs` network glue (T6 inner-loop); (b) the
 `fluxum-bench load`/`fanout` command handlers in `main.rs` + `load.rs` sustained paths the
 short-window smokes don't reach (the `/metrics`-scrape and counter parsing ARE covered);
