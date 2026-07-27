@@ -2,9 +2,9 @@
 
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-nightly%20(edition%202024)-orange.svg)](rust-toolchain.toml)
-[![Status](https://img.shields.io/badge/status-in%20development%20(phase%205)-green.svg)](#-project-status)
+[![Status](https://img.shields.io/badge/status-phase%207%20(soak%20validation)-green.svg)](#-project-status)
 [![Specs](https://img.shields.io/badge/specs-28%20documents-blue.svg)](docs/specs/README.md)
-[![Version](https://img.shields.io/badge/version-0.1.0--alpha-blue.svg)](CHANGELOG.md)
+[![SDKs](https://img.shields.io/badge/SDKs-0.2.0%20on%205%20registries-blue.svg)](https://github.com/hivellm/fluxum/releases/tag/v0.2.0)
 
 > **Database as a Server for Realtime Applications**
 
@@ -51,8 +51,10 @@ real time.
 ## ✨ Features
 
 ### Storage & Transactions
-- **Tiered storage** — hot working set in a buffer pool (< 1 µs reads); cold data in a paged,
-  LZ4-compressed on-disk tier under a single `memory.budget` knob — datasets bounded by disk, not RAM
+- **Tiered storage, live** — the committed row map and every B-tree/`#[unique]` index are paged
+  copy-on-write B-trees served through one buffer pool under a single `memory.budget` knob:
+  datasets bounded by disk, not RAM. Measured: a 1M-row live soak holds **396.9 MiB peak RSS under
+  a 512 MiB budget** (the resident design peaked at 1147 MiB on the same workload)
 - **Commit log** — durability via append-only log (CRC32C + epoch per entry, group-commit flush
   actor: batched fsync, bounded p99, no per-tx fsync)
 - **ACID transactions** — every reducer call is one atomic transaction; full rollback (with index
@@ -87,7 +89,9 @@ real time.
 - **Replica sets** — per-shard primary + N replicas; the commit log is the replication stream;
   async or semi-sync; automatic failover with consensus election
 - **Read offload** — replicas serve reads and subscription fan-out
-- **Backup + PITR** — `fluxum backup create/restore/verify`; point-in-time recovery from archived log segments
+- **Backup + PITR** — `fluxum backup create/restore/verify`; point-in-time recovery from archived
+  log segments; S3-compatible object storage as backup/archive target
+- **CDC** — change-data-capture stream sink via the plugin system (SPEC-020)
 
 ### Performance Engineering
 - **SIMD everywhere it pays** — runtime dispatch (AVX-512/AVX2/SSE4.2/NEON, scalar fallback) on
@@ -109,6 +113,8 @@ real time.
   binary push streams via fetch `ReadableStream` (the modern MCP-style transport, no WebSocket)
 - **Enriched `TxUpdate`** — `caller`, `reducer_name`, `timestamp`, `duration_us` on every diff
 - **HTTP/JSON admin** — unversioned paths: `/schema`, `/metrics`, `/health` (no `/v1`)
+- **Postgres wire (read-only)** — opt-in pgwire listener on :15802 (SPEC-027): point `psql`,
+  BI tools, or any Postgres driver at the live data for ad-hoc reads
 
 ### Data Model
 - **`#[fluxum::table]` + `#[primary_key]` / `#[auto_inc]`** — schema declared as Rust structs
@@ -138,13 +144,26 @@ real time.
   and a circuit breaker keep a slow or dead sidecar from ever breaking a query. The core binary
   stays lean (no model runtime, no weights in-image)
 
-### SDKs (5 languages)
-- **JavaScript/TypeScript** · **Python** · **Go** · **Rust** · **C#** — generated from
-  `GET /schema` (`fluxum generate`), all passing the same conformance corpus; C++ post-launch
+### SDKs (5 languages — published)
+
+All five clients pass the same declarative conformance corpus and are live on their registries
+(0.2.0), published via OIDC Trusted Publishing on every GitHub Release:
+
+| Language | Install |
+|----------|---------|
+| Rust | `cargo add fluxum-sdk` |
+| TypeScript/JavaScript | `npm install @hivehub/fluxum` |
+| Python | `pip install fluxum-sdk` (imports as `fluxum`) |
+| Go | `go get github.com/hivellm/fluxum-go` |
+| C# | `dotnet add package Fluxum.Sdk` |
+
+- **Typed bindings** generated from `GET /schema` (`fluxum generate`); C++ post-launch
 - **Browser-native JS** — the browser talks the binary FluxRPC directly to the database over
   **Streamable HTTP** (`/rpc`: POST frames + GET push stream via fetch `ReadableStream`, FluxBIN
   on `ArrayBuffer`, no JSON hot path, no gateway); plain-JS consumable via npm or
   `<script type="module">`, zero dependencies, ≤ 50 KB min+gzip
+- **Offline-first** — local persistence, optimistic mutations with rollback, offline call queue,
+  auto-reconnect with cache resync
 
 ### Performance Targets
 
@@ -191,8 +210,9 @@ architecture is proven; Fluxum removes its ceilings (RAM-bound datasets, single 
                                      │
 ┌────────────────────────────────────▼─────────────────────────────┐
 │                        STORAGE LAYER                             │
-│   MemStore (BTreeMap + spatial idx)  ·  CommitLog (append-only)  │
-│   SnapshotRepo (periodic dumps, recovery base)                   │
+│   MemStore — paged CoW B-trees (rows + indexes) faulting through │
+│   one BufferPool under memory.budget · CommitLog (append-only)   │
+│   CheckpointRepo (incremental, content-addressed recovery base)  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -203,6 +223,14 @@ Full design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ---
 
 ## 🚀 Quick Start
+
+### Run the server (Docker)
+
+```bash
+# Zero-CVE scratch image with a built-in --healthcheck probe (SPEC-025)
+docker run -d --name fluxum -p 15800:15800 -p 15801:15801 hivehub/fluxum:latest
+# or: docker compose -f deploy/docker-compose.yml up -d
+```
 
 ### Define a schema
 
@@ -336,6 +364,7 @@ await db.call("send_chat", [5, "hello world"]);
 |------|----------|-----------|
 | 15800 | HTTP — `/rpc` Streamable HTTP (binary FluxRPC) + JSON admin (`/health`, `/metrics`, `/schema`, …) | Web/mobile clients, admin tools |
 | 15801 | FluxRPC / TCP | Backend services, native SDKs (binary traffic) |
+| 15802 | pgwire (read-only, opt-in) | `psql`, BI tools, Postgres drivers |
 
 HiveLLM 15xxx port family — Nexus 15474–6 · Synap 15500–2 · Vectorizer 15002/15503.
 
@@ -368,9 +397,10 @@ Full rationale: [gaps analysis](docs/analysis/README.md).
 
 ## 📊 Project Status
 
-**Phase: In development** — the storage engine, execution/reducer runtime, subscriptions, and the
-transport/scale layer are implemented and under test (line coverage held above 90%). Work is now in
-[Phase 5](docs/DAG.md) with the SDK/hardening and replication phases ahead.
+**Phase 7 (final validation)** — storage, execution, subscriptions, transport/scale, hardening,
+replication, backup/PITR, and all five SDKs are implemented, tested (line coverage held above
+90%), and shipping; the SDK train is released as **0.2.0** on all five registries. See
+[docs/DAG.md](docs/DAG.md).
 
 | Track | Status |
 |-------|--------|
@@ -378,15 +408,16 @@ transport/scale layer are implemented and under test (line coverage held above 9
 | Architecture · PRD · implementation DAG · 28 specs | ✅ Done |
 | Phase 0 — bootstrap (workspace + hardware probe) | ✅ Done |
 | Phase 1 — foundation (macros, FluxBIN codec, auth, column transforms) | ✅ Done |
-| Phase 2 — storage core (tiered + compression + SIMD + full-text index) | ✅ Done |
+| Phase 2 — storage core (tiered live store + compression + SIMD + full-text index) | ✅ Done |
 | Phase 3 — execution core (transactions, reducer runtime, plugin framework) | ✅ Done |
 | Phase 4 — subscriptions + fan-out, query planner, full-text MATCH, reactive views | ✅ Done |
-| Phase 5 — transport & scale (FluxRPC, sharding, plugin sidecar, ops/hot-reload) | 🔄 In progress |
-| Phase 6 — developer experience & hardening (TS/Rust SDKs + PostgreSQL parity) → 0.1.0 | 📋 Planned |
-| Phase 7 — replica sets, backup/PITR, Python/Go/C# SDKs, 1B-row soak → 0.2.0 | 📋 Planned |
+| Phase 5 — transport & scale (FluxRPC, sharding, sidecar, multitenancy, audit, ops) | ✅ Done |
+| Phase 6 — DX & hardening (TS/Rust SDKs, conformance corpus, PostgreSQL parity, security) | ✅ Done |
+| Phase 7 — replica sets + failover, backup/PITR + S3, pgwire, CDC, Python/Go/C# SDKs → **0.2.0** | ✅ Shipped |
 
-Remaining in Phase 5: audit-trail/event-sourcing, connection-abuse protection, database
-namespaces/multitenancy, and per-tenant resource quotas.
+Remaining before 1.0: the billion-row soak on a 1 vCPU / 512 MB droplet (gate G7), and two
+tracked storage follow-ups (paged spatial/full-text indexes; overflow keys for multi-KB index
+values — today index keys cap at ~2 KB, the Postgres-parity limit).
 
 ---
 
@@ -397,7 +428,10 @@ namespaces/multitenancy, and per-tenant resource quotas.
 - [Implementation DAG](docs/DAG.md) — dependency graph, 8 phases, gates, critical path
 - [Roadmap](docs/ROADMAP.md) — milestones to 0.1.0 and 0.2.0, parallel tracks, post-launch backlog
 - [Spec index](docs/specs/README.md) — 28 normative implementation specs (SPEC-001…SPEC-028)
+- [Deployment](docs/DEPLOYMENT.md) — Docker image, compose, config profiles, ops runbook
 - [Deployment hardening](docs/DEPLOYMENT-HARDENING.md) — OS/socket/firewall baseline for a directly exposed port
+- [Soak reports](docs/SOAK.md) — memory-budget soak methodology and results ([latest raw report](docs/reports/soak-report.md))
+- [PostgreSQL/SpacetimeDB parity](docs/analysis/parity/README.md) — comparative benchmark reports
 - [SpacetimeDB source dossier](docs/analysis/spacetimedb-code/README.md) — deep analysis of the real v2.7.0 codebase (~237k LOC); hard problems + adoptions in [10-hard-problems](docs/analysis/spacetimedb-code/10-hard-problems.md)
 - [Reference analysis](docs/analysis/README.md) — SpacetimeDB, Convex, SurrealDB design studies
 - [Contributing](CONTRIBUTING.md) — setup, conventions, spec-driven development
