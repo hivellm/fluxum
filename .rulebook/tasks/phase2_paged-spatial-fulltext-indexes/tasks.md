@@ -1,10 +1,10 @@
 ## 1. Implementation
-- [ ] 1.1 Design doc: linear-quadtree key mapping for QuadTree points and a packed/linearized layout (or documented fallback) for R-tree extents over `PagedTree`; term/postings + document-statistics page layout for full-text (SPEC-008, SPEC-019, TIER-051)
-- [ ] 1.2 Page the spatial index: inserts/removes copy-on-write inside the commit merge, region/radius/point queries decompose into key-range scans with exact-filter semantics preserved (SPX-020/021/023); SPX-031 rebuild lifecycle unchanged
+- [x] 1.1 Design doc: linear-quadtree key mapping for QuadTree points and a packed/linearized layout (or documented fallback) for R-tree extents over `PagedTree`; term/postings + document-statistics page layout for full-text (SPEC-008, SPEC-019, TIER-051). Settled: **QuadTree** — the existing sortable quadrant-path `NodeKey` becomes the paged key (`0x00 ++ aligned_be ++ depth`), so a subtree stays one contiguous range; the SPX-004 overflow bucket shares the page file under `0x01 ++ totalOrder(x) ++ totalOrder(y) ++ pk`. **R-tree** — the arena already addresses nodes by logical `NodeId` (eviction-safe), so the paged key is the node id and the value the encoded node; the free list stays a head id + `Free(next)` slots. **Full-text** — postings become `term ++ 0x00 ++ pk → positions` (term-prefix scans are key-range scans) and `doc_len` becomes `pk → u32`, with `total_len` a resident counter.
+- [~] 1.2 Page the spatial index — **QuadTree done**: inserts/removes are copy-on-write inside the commit merge, region/radius/point queries decompose into key-range scans with exact-filter semantics preserved (SPX-020/021/023), the SPX-031 rebuild lifecycle is unchanged, and the canonical shape is still asserted bit-identical to a fresh rebuild. **R-tree still resident** — porting its arena to paged nodes is the remaining half.
 - [ ] 1.3 Page the full-text index: posting lists and BM25 statistics fault/evict under the budget with identical scores (FTS-030); FTS-022 rebuild lifecycle unchanged
 - [ ] 1.4 Verification: a spatial-dominated and an FTS-dominated dataset >10x the memory budget stay within budget end-to-end through reducers (TIER-070); spatial e2e + FTS suites green
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation (drop the TIER-051 residency caveat from `store/mod.rs` / SPEC-015 notes)
-- [ ] 2.2 Write tests covering the new behavior (paged spatial/FTS MVCC equivalence + eviction-under-budget)
-- [ ] 2.3 Run tests and confirm they pass
+- [ ] 2.1 Update or create documentation covering the implementation (drop the TIER-051 residency caveat from `store/mod.rs` / SPEC-015 notes once R-tree + full-text land)
+- [~] 2.2 Write tests covering the new behavior — QuadTree covered: the brute-force oracle property test runs against the paged index, and canonical-shape equality with a fresh rebuild is still asserted
+- [~] 2.3 Run tests and confirm they pass — fluxum-core green with the paged QuadTree (commit 003d098); full workspace + the budget verification await the remaining families
