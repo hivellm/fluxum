@@ -56,7 +56,7 @@ pub use codec::PageCodec;
 pub use cold::ColdTable;
 pub use metrics::{MetricsSnapshot, PagerMetrics};
 pub use pool::{BufferPool, PageGuard, PoolOptions};
-pub use reclaim::{Reclaimer, VersionGuard};
+pub use reclaim::{ReclaimPending, Reclaimer, VersionGuard};
 pub use tree::PagedTree;
 
 use std::collections::HashMap;

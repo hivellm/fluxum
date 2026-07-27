@@ -43,11 +43,25 @@ pub struct StoreOptions {
     /// correctly (overflow bucket) — the bounds only size the tree.
     pub spatial_bounds: Rect,
     /// SPEC-022 RV-020: how many recent commits' snapshots stay reachable
-    /// for `AS OF` reads (default 64; `0` disables temporal reads). Each
-    /// retained snapshot structurally shares untouched tables with its
-    /// neighbors, so the cost is bounded by the touched-table copies the
-    /// commits already made.
+    /// for `AS OF` reads (default 64; `0` disables temporal reads). This is
+    /// the **feature** bound — how far back `AS OF` can see. It is not the
+    /// binding one under load; see [`Self::temporal_window_max_bytes`].
     pub temporal_window: usize,
+    /// SPEC-022 RV-020's *"bounded by budget"* half: the ceiling, in bytes,
+    /// on the superseded pages the temporal window is allowed to pin.
+    /// `None` derives it from the buffer pool's capacity.
+    ///
+    /// The count bound alone is not enough on a paged store. Retaining a
+    /// snapshot pins every page that snapshot's commit superseded (TIER-061
+    /// cannot free them while a live version reaches them), so the window's
+    /// real cost is `superseded pages per commit x window` — and
+    /// transaction size is unbounded. Measured before this bound existed: a
+    /// 100 000-row table with ~5 MB of live data held **241 MiB** of pinned
+    /// version garbage under 800-row transactions, which pushed the pool
+    /// past its eviction watermark and cut write throughput by 24x (37 900
+    /// to 1 563 rows/s). The count bound was doing its job; it was simply
+    /// measuring the wrong thing.
+    pub temporal_window_max_bytes: Option<u64>,
 }
 
 impl Default for StoreOptions {
@@ -59,9 +73,19 @@ impl Default for StoreOptions {
             // bounds rows stay correct via the overflow bucket (SPX-004).
             spatial_bounds: Rect::new(-1_048_576.0, -1_048_576.0, 2_097_152.0, 2_097_152.0),
             temporal_window: 64,
+            temporal_window_max_bytes: None,
         }
     }
 }
+
+/// Share of the buffer pool the temporal window may pin when
+/// [`StoreOptions::temporal_window_max_bytes`] is left to derive.
+///
+/// A quarter leaves the working set three quarters of the pool. The exact
+/// figure matters far less than having *some* ceiling: without one the
+/// window's cost is unbounded in transaction size, and with one the pool
+/// stops being able to fill with garbage at all.
+const TEMPORAL_WINDOW_POOL_SHARE: f64 = 0.25;
 
 /// Per-table auto-inc counter (STG-040).
 ///
@@ -183,6 +207,13 @@ pub struct MemStore {
     /// each tagged `(tx_id, commit timestamp µs)`. `AS OF` reads resolve
     /// here ([`MemStore::snapshot_as_of`]).
     history: Mutex<std::collections::VecDeque<(u64, i64, Arc<CommittedState>)>>,
+    /// The resolved RV-020 byte ceiling for `history` (see
+    /// [`StoreOptions::temporal_window_max_bytes`]).
+    temporal_window_max_bytes: u64,
+    /// How many snapshots the byte ceiling has dropped that the count bound
+    /// would have kept — the operator-visible signal that `AS OF` reach is
+    /// being traded for memory, which is otherwise silent.
+    temporal_window_budget_evictions: std::sync::atomic::AtomicU64,
     /// SPEC-007 SHD-031: `false` on non-authoritative shards — a reducer
     /// writing a `#[fluxum::table(global)]` row there errors instead of
     /// diverging from the authoritative copy. Default `true` (single-shard
@@ -296,6 +327,21 @@ impl MemStore {
         }
         let reclaimer = Reclaimer::new(Arc::clone(&pager));
         let mut catalog: HashMap<TableId, &'static TableSchema> = HashMap::new();
+        // RV-020 "bounded by budget": the garbage the temporal window pins
+        // lives in the buffer pool, so the pool's capacity is what the
+        // ceiling should be a share of. Resolved here, before `pager` moves
+        // into the store.
+        let temporal_window_max_bytes = options.temporal_window_max_bytes.unwrap_or_else(|| {
+            #[allow(
+                clippy::cast_precision_loss,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
+            {
+                (pager.metrics().snapshot().bufferpool_capacity_bytes as f64
+                    * TEMPORAL_WINDOW_POOL_SHARE) as u64
+            }
+        });
         let mut tables: HashMap<TableId, Arc<TableState>> = HashMap::new();
         let mut counters: HashMap<TableId, AutoIncCounter> = HashMap::new();
         for table in schema.tables() {
@@ -347,6 +393,8 @@ impl MemStore {
             fks_out,
             fks_in,
             history: Mutex::new(std::collections::VecDeque::new()),
+            temporal_window_max_bytes,
+            temporal_window_budget_evictions: std::sync::atomic::AtomicU64::new(0),
             global_writes_allowed: std::sync::atomic::AtomicBool::new(true),
             committed: ArcSwap::from_pointee(CommittedState::new(tables, 0, guard0)),
             writer: Mutex::new(WriterState {
@@ -363,6 +411,91 @@ impl MemStore {
     /// the checkpoint/recovery seam and buffer-pool diagnostics reach it here.
     pub fn pager(&self) -> &Arc<Pager> {
         &self.pager
+    }
+
+    /// Retain `published` in the SPEC-022 RV-020 temporal window, trimmed
+    /// back to **both** its bounds: the commit count (how far `AS OF` may
+    /// see) and the byte ceiling (what that reach is allowed to cost).
+    ///
+    /// The byte bound is the one that binds under load. Retaining a
+    /// snapshot of a paged store pins every page its commit superseded —
+    /// TIER-061 cannot free a page while a live version reaches it — so the
+    /// window's cost scales with transaction size, which nothing bounds.
+    ///
+    /// Popped entries are dropped **after** the history lock is released.
+    /// Dropping one releases its `VersionGuard`, which unpins the version
+    /// and runs reclamation (page-file frees); doing that inline would hold
+    /// this lock across I/O and would take the reclaimer lock beneath it.
+    fn retain_in_temporal_window(
+        &self,
+        tx_id: u64,
+        at_micros: i64,
+        published: Arc<CommittedState>,
+    ) {
+        if self.options.temporal_window == 0 {
+            return;
+        }
+        let mut evicted_for_budget = 0u64;
+        let dropped: Vec<_> = {
+            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
+            history.push_back((tx_id, at_micros, published));
+            let mut dropped = Vec::new();
+            while history.len() > self.options.temporal_window {
+                dropped.extend(history.pop_front());
+            }
+            // Then the cost bound. `pending()` counts pages pinned by
+            // *anything*, including snapshots this store does not own, so
+            // the loop is bounded by the history rather than by reaching a
+            // target it might never reach.
+            while !history.is_empty()
+                && self.retained_window_bytes() > self.temporal_window_max_bytes
+            {
+                dropped.extend(history.pop_front());
+                evicted_for_budget += 1;
+            }
+            dropped
+        };
+        if evicted_for_budget > 0 {
+            self.temporal_window_budget_evictions
+                .fetch_add(evicted_for_budget, std::sync::atomic::Ordering::Relaxed);
+        }
+        drop(dropped);
+    }
+
+    /// Bytes of superseded pages currently pinned awaiting reclamation.
+    fn retained_window_bytes(&self) -> u64 {
+        let pages = self.reclaimer.pending().pages as u64;
+        pages.saturating_mul(self.pager.page_size() as u64)
+    }
+
+    /// Snapshots the temporal window currently holds — how far `AS OF`
+    /// actually reaches, which the configured `temporal_window` is only an
+    /// upper bound on once the byte ceiling starts binding.
+    pub fn temporal_window_len(&self) -> usize {
+        self.history
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// How many snapshots the RV-020 byte ceiling has dropped that the
+    /// commit-count bound would have kept. A non-zero and rising count means
+    /// `AS OF` reach is being traded for memory — expected under large
+    /// transactions, but it should be visible rather than inferred.
+    pub fn temporal_window_budget_evictions(&self) -> u64 {
+        self.temporal_window_budget_evictions
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// What the TIER-061 reclaimer is still holding: superseded pages that
+    /// some live version can still reach, so the pool cannot drop them.
+    ///
+    /// Read alongside `pager().metrics()`: buffer-pool occupancy alone
+    /// cannot distinguish a pool full of live pages from one full of
+    /// version garbage waiting on a pinned snapshot, and the two call for
+    /// opposite responses.
+    pub fn reclaim_pending(&self) -> crate::store::pager::ReclaimPending {
+        self.reclaimer.pending()
     }
 
     /// Assign the next version under the writer lock, pin it, and swap it in as
@@ -884,13 +1017,7 @@ impl MemStore {
 
         // SPEC-022 RV-020: replicas retain the same temporal window, so
         // `AS OF` reads answer identically on primary and replica.
-        if self.options.temporal_window > 0 {
-            let mut history = self.history.lock().unwrap_or_else(PoisonError::into_inner);
-            history.push_back((record.tx_id, record.timestamp, published));
-            while history.len() > self.options.temporal_window {
-                history.pop_front();
-            }
-        }
+        self.retain_in_temporal_window(record.tx_id, record.timestamp, published);
 
         let diff = TxDiff {
             tx_id: record.tx_id,
@@ -1915,17 +2042,11 @@ impl Tx<'_> {
         // temporal window. Untouched tables are `Arc`-shared with the
         // neighbors, so retention costs only the copies the commit already
         // made. Metadata only — never reducer-visible (SEC-020 unaffected).
-        if self.store.options.temporal_window > 0 {
-            let mut history = self
-                .store
-                .history
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            history.push_back((tx_id, crate::types::Timestamp::now().as_micros(), published));
-            while history.len() > self.store.options.temporal_window {
-                history.pop_front();
-            }
-        }
+        self.store.retain_in_temporal_window(
+            tx_id,
+            crate::types::Timestamp::now().as_micros(),
+            published,
+        );
 
         // 4. Blob refcounts (DMX-040): row references drive GC. Applied
         //    under the writer lock, increments before decrements so an

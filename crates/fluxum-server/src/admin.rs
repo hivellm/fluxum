@@ -775,6 +775,32 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     {
         let shard = health.shard_id;
         let pager = ctx.store().pager().metrics().snapshot();
+        // SPEC-015 TIER-061 / SPEC-022 RV-020: what the version reclaimer is
+        // still holding, and how far `AS OF` actually reaches. Pool
+        // occupancy alone cannot tell a pool full of live pages from one
+        // full of version garbage waiting on a pinned snapshot, and the two
+        // call for opposite responses.
+        let store = ctx.store();
+        let pending = store.reclaim_pending();
+        let _ = writeln!(
+            text,
+            "# HELP fluxum_reclaim_pending_pages Superseded pages awaiting reclamation (TIER-061).\n\
+             # TYPE fluxum_reclaim_pending_pages gauge\n\
+             fluxum_reclaim_pending_pages{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_reclaim_live_versions Pinned versions holding those pages live.\n\
+             # TYPE fluxum_reclaim_live_versions gauge\n\
+             fluxum_reclaim_live_versions{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_temporal_window_snapshots Snapshots AS OF can currently reach (RV-020).\n\
+             # TYPE fluxum_temporal_window_snapshots gauge\n\
+             fluxum_temporal_window_snapshots{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_temporal_window_budget_evictions_total Snapshots dropped to honour the RV-020 byte ceiling.\n\
+             # TYPE fluxum_temporal_window_budget_evictions_total counter\n\
+             fluxum_temporal_window_budget_evictions_total{{shard=\"{shard}\"}} {}",
+            pending.pages,
+            pending.live_versions,
+            store.temporal_window_len(),
+            store.temporal_window_budget_evictions(),
+        );
         text.push_str(TIER_080_HEADERS);
         for (series, value) in pager.samples() {
             // A series may already carry labels (`name{kind="clean"}`); the

@@ -17,6 +17,24 @@
 //! live for exactly as long as any `Arc<CommittedState>` at that version does —
 //! piggy-backing on the same reference-count lifecycle `imbl`+`Arc` used, with
 //! page frees deferred to the reclaimer instead of running inline.
+//!
+//! # What actually holds pages here
+//!
+//! In a plain commit loop the previous version unpins as soon as the commit
+//! returns, so garbage barely lands. In practice the dominant pin is the
+//! **temporal window** (SPEC-022 RV-020): the store retains the last N
+//! commits' snapshots for `AS OF` reads, and each retained snapshot pins its
+//! version — which pins every page that version's commit superseded.
+//!
+//! That coupling is easy to underestimate. On the *resident* store, retaining
+//! a snapshot cost only the `imbl` chunks the commit touched, so a count-based
+//! window was cheap by construction. On the paged store the same retention
+//! pins whole page versions, making the window's cost
+//! `superseded pages per commit x window` — unbounded in transaction size. The
+//! window is therefore bounded by bytes as well as by count
+//! (`StoreOptions::temporal_window_max_bytes`); [`Reclaimer::pending`] is what
+//! that bound is measured against, and what an operator reads to tell a pool
+//! full of live pages from one full of garbage waiting on a pinned snapshot.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -39,6 +57,11 @@ struct Inner {
     /// Live pinned versions → pin count. The smallest key is the reclamation
     /// floor: garbage keyed at or below it can never be reached again.
     live: BTreeMap<u64, u64>,
+    /// Running total of `garbage`'s page count. Maintained incrementally
+    /// because the commit path consults it on **every** commit to bound the
+    /// temporal window (RV-020), and re-summing the batches there would make
+    /// that check O(window) per commit.
+    pending_pages: usize,
 }
 
 /// The per-shard version reclaimer (TIER-061). Shared (`Arc`) across every
@@ -87,6 +110,7 @@ impl Reclaimer {
     pub fn retire(&self, version: u64, pages: Vec<SupersededPage>) -> Result<()> {
         if !pages.is_empty() {
             let mut inner = self.lock();
+            inner.pending_pages += pages.len();
             inner.garbage.entry(version).or_default().extend(pages);
         }
         self.collect()
@@ -103,7 +127,10 @@ impl Reclaimer {
             // Split off everything strictly above the floor; keep it pending,
             // and take what is at or below the floor to free.
             let keep = inner.garbage.split_off(&floor.saturating_add(1));
-            std::mem::replace(&mut inner.garbage, keep)
+            let drained = std::mem::replace(&mut inner.garbage, keep);
+            let freed: usize = drained.values().map(Vec::len).sum();
+            inner.pending_pages = inner.pending_pages.saturating_sub(freed);
+            drained
         };
         for (_version, pages) in drained {
             for (table_id, page_id) in pages {
@@ -113,11 +140,54 @@ impl Reclaimer {
         Ok(())
     }
 
+    /// How many superseded pages are still pending reclaim, and how far back
+    /// the oldest pending batch reaches.
+    ///
+    /// This is the reclamation-lag surface (SPEC-015 TIER-061): pages sit
+    /// here only while some live version can still reach them, so a pending
+    /// count that stays large means versions are being pinned longer than
+    /// readers need — memory the pool is holding for nobody. An operator
+    /// cannot see that from `fluxum_bufferpool_bytes` alone, because a pool
+    /// full of live pages and a pool full of unreclaimable garbage look
+    /// identical from the outside.
+    pub fn pending(&self) -> ReclaimPending {
+        let inner = self.lock();
+        let oldest_pending_version = inner.garbage.keys().next().copied();
+        ReclaimPending {
+            pages: inner.pending_pages,
+            batches: inner.garbage.len(),
+            oldest_pending_version,
+            live_versions: inner.live.len(),
+            // The floor is what gates reclamation: garbage keyed at or below
+            // it is freeable, everything above waits for this to rise.
+            floor: inner.live.keys().next().copied(),
+        }
+    }
+
     /// Test/diagnostic: how many superseded pages are still pending reclaim.
     #[cfg(test)]
     pub(crate) fn pending_pages(&self) -> usize {
-        self.lock().garbage.values().map(Vec::len).sum()
+        self.pending().pages
     }
+}
+
+/// A snapshot of what the reclaimer is still holding (TIER-061).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReclaimPending {
+    /// Superseded pages awaiting reclamation.
+    pub pages: usize,
+    /// Retirement batches awaiting reclamation (one per commit that
+    /// superseded anything).
+    pub batches: usize,
+    /// The version of the oldest pending batch, if any. The distance from
+    /// here to the newest published version is the reclamation lag.
+    pub oldest_pending_version: Option<u64>,
+    /// Distinct live (pinned) versions.
+    pub live_versions: usize,
+    /// The reclamation floor — the smallest live version. Garbage keyed at
+    /// or below it is freeable; `None` means nothing is pinned, so
+    /// everything is.
+    pub floor: Option<u64>,
 }
 
 /// Pins one version live for as long as it exists (held inside the version's

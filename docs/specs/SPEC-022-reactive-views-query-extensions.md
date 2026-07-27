@@ -43,6 +43,17 @@ Then subscribers receive a bounded reorder delta and no full re-evaluation of th
 ### Requirement: Point-in-time reads
 - **RV-020** [P1] The storage engine SHALL retain superseded row versions for a configurable temporal
   window (bounded by budget / checkpoint horizon), tagged by committing `tx_id`/timestamp.
+  *Implemented with **two** bounds, both binding.* `temporal_window` (default 64 commits) is the
+  feature bound — how far `AS OF` may see. `temporal_window_max_bytes` is the "bounded by budget"
+  half, defaulting to a quarter of the buffer pool's capacity, and it is the one that binds under
+  load: on the paged store, retaining a snapshot pins every page that snapshot's commit superseded
+  (SPEC-015 TIER-061 cannot free a page a live version still reaches), so the window's real cost is
+  `superseded pages per commit x window` — and transaction size bounds nothing. Measured with the
+  count bound alone, a 100 000-row table holding ~5 MB of live data pinned **241 MiB** of version
+  garbage under 800-row transactions, crossed the pool's eviction watermark, and cut write
+  throughput from 37 900 to 1 563 rows/s. When the byte ceiling binds, the oldest snapshots are
+  dropped first (shortening `AS OF` reach, per RV-021's typed out-of-window error) and
+  `fluxum_temporal_window_budget_evictions_total` counts the trade so it is not silent.
 - **RV-021** [P1] `OneOffQuery` and `/query` SHALL accept `AS OF (tx_id | timestamp)` returning the
   committed state at that point; requests older than the retained window return a typed error.
 - **RV-022** [P2] `AS OF` reads MUST honor RLS and column masking exactly as live reads do.
