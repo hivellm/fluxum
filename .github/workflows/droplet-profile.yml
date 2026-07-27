@@ -1,0 +1,119 @@
+name: Droplet Profile (NFR-12)
+
+# SPEC-013 TST-110/TST-111 — the small-droplet validation, and the CI
+# profile PRD NFR-12 names in its validation column.
+#
+# The point of this job is the *constraint*: the server runs inside a
+# container capped at 1 CPU and 512 MB, cgroup-enforced, holding a dataset
+# far larger than that. Running the same command on an unconstrained runner
+# would exercise the harness without validating anything, which is why the
+# `--cgroup-enforced` flag below is only ever passed here — a developer's
+# local run must not produce an artifact claiming NFR-12 was met.
+#
+# Cost discipline, matching rust-test.yml: this is heavy (a multi-GiB
+# dataset written twice), so it runs weekly and on demand rather than on
+# every push.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'  # Monday 07:00 UTC, after the weekly full matrix
+  workflow_dispatch:
+    inputs:
+      users:
+        description: 'Distinct users (each with its own owner_only row set)'
+        default: '8'
+      rows:
+        description: 'Rows per user'
+        default: '400000'
+      budget:
+        description: "Constrained server memory.budget (>= the 128 MiB floor)"
+        default: '128MiB'
+
+concurrency:
+  group: droplet-profile-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # 8 x 400 000 = 3.2M rows. The 10x bar against a 128 MiB budget needs
+  # >= 1.28 GiB on disk; the job asserts the ratio rather than trusting
+  # this arithmetic, and fails if the dataset came up short.
+  DROPLET_USERS: ${{ github.event.inputs.users || '8' }}
+  DROPLET_ROWS: ${{ github.event.inputs.rows || '400000' }}
+  DROPLET_BUDGET: ${{ github.event.inputs.budget || '128MiB' }}
+
+jobs:
+  droplet-profile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the server and the bench harness (release)
+        run: cargo build --release -p fluxum-server -p fluxum-bench
+
+      - name: Confirm cgroup v2 is available
+        # The whole job's claim rests on the limits below being enforced by
+        # the kernel. If the runner does not expose cgroup v2, say so and
+        # stop rather than emitting an artifact that overstates what ran.
+        run: |
+          if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+            echo "::error::cgroup v2 not present on this runner — the NFR-12 envelope cannot be enforced"
+            exit 1
+          fi
+          echo "controllers: $(cat /sys/fs/cgroup/cgroup.controllers)"
+
+      - name: TST-110 — row-set equality under the 1 vCPU / 512 MB envelope
+        # systemd-run applies the NFR-12 envelope to the harness *and* the
+        # servers it spawns (they are children in the same scope), so the
+        # constrained run really is memory-limited rather than merely
+        # configured with a small budget.
+        #
+        # MemoryMax is a hard cap: the kernel OOM-kills the scope if it is
+        # exceeded, which is exactly the failure NFR-12 forbids and is a
+        # louder signal than any assertion the harness could make.
+        run: |
+          sudo systemd-run --scope --quiet \
+            -p CPUQuota=100% \
+            -p MemoryMax=512M \
+            -p MemorySwapMax=0 \
+            --uid=$(id -u) --gid=$(id -g) \
+            ./target/release/fluxum-bench droplet \
+              --users "$DROPLET_USERS" \
+              --rows "$DROPLET_ROWS" \
+              --memory-budget "$DROPLET_BUDGET" \
+              --cgroup-enforced \
+              --out docs/reports
+
+      - name: TST-111 — budget, eviction and idle-RSS witnesses under the same envelope
+        run: |
+          sudo systemd-run --scope --quiet \
+            -p CPUQuota=100% \
+            -p MemoryMax=512M \
+            -p MemorySwapMax=0 \
+            --uid=$(id -u) --gid=$(id -g) \
+            ./target/release/fluxum-bench soak \
+              --profile droplet \
+              --rows 2000000 \
+              --duration-secs 300 \
+              --shards 1 \
+              --memory-budget "$DROPLET_BUDGET" \
+              --clients 4 \
+              --subscribers 4 \
+              --out docs/reports
+
+      - name: Upload the droplet artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: droplet-profile-reports
+          path: |
+            docs/reports/droplet-report.json
+            docs/reports/droplet-report.md
+            docs/reports/soak-report.json
+            docs/reports/soak-report.md
+          if-no-files-found: error

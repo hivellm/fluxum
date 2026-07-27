@@ -233,6 +233,30 @@ impl BenchClient for FluxumClient {
             .map_err(|e| format!("subscribe Task: {e}"))?;
         Ok(self.connection.rows("Task").len() as u32)
     }
+
+    fn read_all_rows(&mut self) -> Result<Vec<String>, String> {
+        // A fresh subscription forces the server to serve every row from
+        // storage — hot pages and cold ones alike — rather than replaying a
+        // cache the client already holds, which is what makes this a real
+        // read of the tiered dataset (TST-110).
+        self.connection
+            .subscribe(&["SELECT * FROM Task"])
+            .map_err(|e| format!("subscribe Task: {e}"))?;
+        let rows = self.connection.rows("Task");
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let (id, title) =
+                task_row(row).ok_or_else(|| "undecodable Task row in the view".to_owned())?;
+            // The id is deliberately excluded: it is auto-inc, so it depends
+            // on the interleaving of concurrent loaders and would differ
+            // between two runs that hold identical data. The title carries
+            // the user and row index, so it identifies the row on its own.
+            let _ = id;
+            out.push(title.to_owned());
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
 }
 
 /// Decode `content` out of a `ChatMessage` row (id, sender, channel,

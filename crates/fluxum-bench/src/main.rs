@@ -109,6 +109,7 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--shards" => opts.shards = parse(&value("--shards")?)?,
             "--require-eviction" => opts.require_eviction = true,
             "--enforce-idle-ceiling" => opts.enforce_idle_ceiling = true,
+            "--cgroup-enforced" => opts.cgroup_enforced = true,
             // The validation profiles of SPEC-013 §12, as one flag each so a
             // runbook command carries its own exit criteria rather than
             // relying on the operator to remember them.
@@ -198,6 +199,11 @@ fn run(args: Vec<String>) -> Result<(), String> {
     // asserts it stays within the memory budget throughout.
     if workload == "soak" {
         return run_soak_command(&opts);
+    }
+    // T7.7 (NFR-12/TST-110): the small-droplet profile validation — a
+    // constrained deployment's row sets against an unconstrained reference.
+    if workload == "droplet" {
+        return run_droplet_command(&opts);
     }
 
     // Cold reads own their server lifecycle (seed → restart → measure), so
@@ -685,6 +691,154 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
 
 fn yes_no(b: bool) -> &'static str {
     if b { "yes" } else { "NO" }
+}
+
+/// SPEC-013 TST-110: load the same dataset into a memory-constrained
+/// deployment and an unconstrained one, then prove the constrained run's row
+/// sets are identical to the reference's.
+///
+/// Two servers, run one after the other rather than side by side, so the
+/// constrained one is not competing for the page cache with a roommate
+/// holding the whole dataset in RAM.
+fn run_droplet_command(opts: &Opts) -> Result<(), String> {
+    use fluxum_bench::droplet::{
+        DropletConfig, DropletReport, diff_rows, droplet_pass, load_and_read, ten_x_dataset,
+    };
+    use fluxum_bench::soak::parse_bytesize;
+
+    if opts.url.is_some() {
+        return Err(
+            "droplet self-hosts both servers (it needs to set each one's budget); omit --url"
+                .to_owned(),
+        );
+    }
+    let budget_str = opts
+        .memory_budget
+        .clone()
+        .unwrap_or_else(|| "256MiB".to_owned());
+    let budget_bytes = parse_bytesize(&budget_str)?;
+    // The server refuses to boot below its configured floor, and it does so
+    // by simply never binding — which surfaces here as an opaque "did not
+    // bind" 20 seconds later. Say what is actually wrong instead.
+    const MIN_BUDGET: u64 = 128 << 20;
+    if budget_bytes < MIN_BUDGET {
+        return Err(format!(
+            "--memory-budget {budget_str} is below the server's {} MiB floor \
+             (config::MIN_MEMORY_BUDGET); it would refuse to start",
+            MIN_BUDGET / (1024 * 1024)
+        ));
+    }
+    let cfg = DropletConfig {
+        users: opts.users.max(1),
+        rows_per_user: opts.rows.max(1),
+        budget_bytes,
+        cgroup_enforced: opts.cgroup_enforced,
+    };
+    println!(
+        "== droplet validation: {} users x {} rows, constrained budget {budget_str} ==",
+        cfg.users, cfg.rows_per_user
+    );
+    if !cfg.cgroup_enforced {
+        println!(
+            "   note: --cgroup-enforced not set, so this run exercises TST-110 but does not \
+             validate NFR-12 (that needs a cgroup-constrained host)."
+        );
+    }
+
+    // The run under test: a budget far below the dataset, so pages fault and
+    // evict continuously while the reads happen.
+    println!("-- constrained run ({budget_str}) --");
+    let constrained = {
+        let server = BenchServer::start_with(Some(budget_str.clone()))?;
+        let side = FluxumSide::new(server.url.clone());
+        let rows = load_and_read(&side, &cfg)?;
+        // The cold tier on disk is the witness that the dataset really did
+        // exceed the budget — a ratio computed from row counts would be a
+        // guess.
+        let dataset_bytes = dir_bytes(&server.data_dir);
+        (rows, dataset_bytes)
+    };
+    let (constrained_rows, dataset_bytes) = constrained;
+
+    // The oracle: the same dataset with room to spare, so nothing is ever
+    // evicted and every read is served from memory.
+    println!("-- reference run (unconstrained) --");
+    let reference_rows = {
+        let server = BenchServer::start_with(None)?;
+        let side = FluxumSide::new(server.url.clone());
+        load_and_read(&side, &cfg)?
+    };
+
+    let diffs: Vec<_> = constrained_rows
+        .iter()
+        .zip(&reference_rows)
+        .enumerate()
+        .map(|(user, (c, r))| diff_rows(u32::try_from(user).unwrap_or(u32::MAX), c, r))
+        .collect();
+    let row_sets_equal = diffs.iter().all(fluxum_bench::droplet::UserDiff::equal);
+    let ten_x = ten_x_dataset(dataset_bytes, budget_bytes);
+    let report = DropletReport {
+        harness_version: env!("CARGO_PKG_VERSION").to_owned(),
+        date: opts.date.clone().unwrap_or_else(default_date),
+        hardware: hardware(opts.disk_note.as_deref()),
+        users: cfg.users,
+        rows_per_user: cfg.rows_per_user,
+        budget_bytes,
+        dataset_bytes,
+        dataset_over_budget: if budget_bytes > 0 {
+            dataset_bytes as f64 / budget_bytes as f64
+        } else {
+            0.0
+        },
+        ten_x_dataset: ten_x,
+        cgroup_enforced: cfg.cgroup_enforced,
+        users_compared: diffs.clone(),
+        row_sets_equal,
+        pass: droplet_pass(&diffs, ten_x),
+    };
+
+    let out = opts
+        .out
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("docs/reports"));
+    report.write_artifacts(&out, "droplet-report")?;
+    println!(
+        "droplet {}: row sets {} | dataset {}x budget ({}) — report at {}/droplet-report.json",
+        if report.pass { "PASS" } else { "FAIL" },
+        if row_sets_equal {
+            "equal to the reference"
+        } else {
+            "DIVERGED"
+        },
+        fluxum_bench::droplet::format_ratio(report.dataset_over_budget),
+        if ten_x {
+            "clears 10x"
+        } else {
+            "BELOW the 10x bar"
+        },
+        out.display()
+    );
+    if !report.pass {
+        return Err("droplet validation did not pass (see the report)".to_owned());
+    }
+    Ok(())
+}
+
+/// Total bytes of every file under `dir`, recursively. Unreadable entries
+/// are skipped: a partial figure understates the dataset, which can only
+/// make the 10× assertion harder to clear, never easier.
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.metadata() {
+            Ok(m) if m.is_dir() => dir_bytes(&entry.path()),
+            Ok(m) => m.len(),
+            Err(_) => 0,
+        })
+        .sum()
 }
 
 /// A closure reading the RSS (bytes) of the server child `pid`, cross-platform
@@ -1355,6 +1509,11 @@ struct Opts {
     /// `soak`: fail the run unless idle RSS < 100 MB (NFR-12). Applies to
     /// the droplet profile; `--profile droplet` sets it.
     enforce_idle_ceiling: bool,
+    /// `droplet`: assert in the artifact that the host really enforces the
+    /// NFR-12 1 vCPU / 512 MB envelope (cgroup / container limits). The CI
+    /// job sets it; a developer box must not, so a convenient local run is
+    /// never mistaken for an NFR-12 validation.
+    cgroup_enforced: bool,
 }
 
 impl Default for Opts {
@@ -1396,6 +1555,7 @@ impl Default for Opts {
             shards: 4,
             require_eviction: false,
             enforce_idle_ceiling: false,
+            cgroup_enforced: false,
         }
     }
 }
@@ -1431,6 +1591,9 @@ fn usage() -> String {
      [--clients N] [--subscribers N] [--out DIR] [--profile droplet|billion] \
      [--require-eviction] [--enforce-idle-ceiling]   \
      (T7.7/NFR-12-13: sharded+tiered soak, RSS + buffer-pool gauges vs budget)\n\
+     \x20      fluxum-bench droplet [--users N] [--rows N] [--memory-budget SIZE] \
+     [--cgroup-enforced] [--out DIR]   \
+     (T7.7/TST-110: constrained vs unconstrained row-set equality)\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()

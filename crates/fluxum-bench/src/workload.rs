@@ -67,6 +67,17 @@ pub trait BenchClient: Send {
     /// baseline: the indexed `SELECT` of every row over HTTP. Returns the
     /// row count so the driver can assert both sides read the same data.
     fn load_my_data(&mut self) -> Result<u32, String>;
+    /// Every row this client can see, rendered canonically and sorted — the
+    /// SPEC-013 TST-110 comparison surface, where a memory-constrained run's
+    /// results must be **row-set-equal** to an unconstrained reference run.
+    /// A count alone would not catch a row whose *content* came back wrong
+    /// after a fault-in, which is exactly the failure tiering could cause.
+    ///
+    /// Default: unsupported. TST-110 is a claim about Fluxum's own tiering,
+    /// so only the Fluxum side needs to answer it.
+    fn read_all_rows(&mut self) -> Result<Vec<String>, String> {
+        Err("row-set capture is not supported on this side".to_owned())
+    }
 }
 
 /// Shared knobs for a workload run (TST-091 warmup + multi-run).

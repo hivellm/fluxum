@@ -22,10 +22,15 @@
 //!   published `spacetimedb-sdk`; [`spacetimedb_bindings`] is the
 //!   `spacetime generate` output for it;
 //! - [`report`] — the comparative report (TST-094) and regression guard
-//!   (TST-095), including the fluxum/spacetimedb competitive ratios.
+//!   (TST-095), including the fluxum/spacetimedb competitive ratios;
+//! - [`soak`] — the billion-row soak driver (T7.7, TST-112) and its report;
+//! - [`droplet`] — the small-droplet profile validation (T7.7, TST-110):
+//!   a constrained run's row sets compared against an unconstrained
+//!   reference run.
 
 pub mod baseline;
 pub mod baseline_side;
+pub mod droplet;
 pub mod fluxum_side;
 pub mod load;
 pub mod measure;
