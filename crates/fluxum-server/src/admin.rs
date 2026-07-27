@@ -585,6 +585,14 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
     {
         map.insert("reloadable".into(), reloadable);
     }
+    // The resolved on-disk locations: sub-directories follow
+    // `storage.data_dir` unless configured themselves, so this is the only
+    // place an operator can read back where the data really lives.
+    if let Some(storage) = ctx.storage_paths()
+        && let Some(map) = body.as_object_mut()
+    {
+        map.insert("storage".into(), storage);
+    }
     AdminResponse { status: code, body }
 }
 

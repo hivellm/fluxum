@@ -198,8 +198,19 @@ data/
 
 - **Boot** = load the latest checkpoint, replay the commit log after it
   (SPEC-002). Recovery time is bounded by `storage.checkpoint_interval_tx`.
-- The directories may live on different volumes (each key is independent);
-  the commit log is the fsync-latency-critical one.
+- **`data_dir` is the only path you must set.** Each sub-directory defaults
+  to its slot under it (`<data_dir>/log`, `/checkpoints`, `/pages`, and
+  `replication.archive.dir` → `<data_dir>/archive`), so one setting — or one
+  volume mount — places the whole database. Set a sub-directory explicitly
+  only to split it onto its own volume (the commit log is the
+  fsync-latency-critical one); an explicit value always wins verbatim.
+- `GET /health` reports the resolved paths under `storage`, each with its
+  provenance (`env`/`file` when configured directly, `derived` when rooted
+  under `data_dir`) — the way to confirm at runtime where data is landing.
+- Page files (`pages/`) are a **cache**, not the record: every boot rebuilds
+  them from the checkpoint plus the commit log, and a page file this build
+  cannot read (an older page format) is discarded with a warning rather than
+  failing startup. Back up `log/`, `checkpoints/`, and `archive/`.
 - `archive/` (`replication.archive.dir`) holds byte-identical copies of
   truncated log segments (SPEC-014 REP-062) — the PITR source. Its
   `retention` window (default `7d`) IS the PITR window.

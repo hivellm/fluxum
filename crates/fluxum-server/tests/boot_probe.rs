@@ -72,3 +72,43 @@ async fn boot_discards_a_page_directory_it_cannot_read() {
         "the page tier is recreated, not left missing"
     );
 }
+
+/// Setting `storage.data_dir` alone must place the whole database there:
+/// the dev-loop shape (a temp data dir, everything else defaulted) used to
+/// scatter pages and checkpoints into the process working directory, where
+/// no volume mount or backup would ever find them.
+#[tokio::test(flavor = "multi_thread")]
+async fn data_dir_alone_places_the_whole_database() {
+    fluxum_demo::link();
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = fluxum_core::config::Config::default();
+    config.storage.data_dir = dir.path().into();
+    config.auth.provider = fluxum_core::config::AuthProvider::None;
+    config.resolve_storage_dirs();
+
+    assert_eq!(config.storage.page_dir, dir.path().join("pages"));
+    assert_eq!(config.storage.commit_log_dir, dir.path().join("log"));
+    assert_eq!(
+        config.storage.checkpoint_dir,
+        dir.path().join("checkpoints")
+    );
+
+    let ctx = fluxum_server::boot::assemble(&config).unwrap();
+    // The binary installs the running config right after assembly; do the
+    // same so the `/health` rendering below sees it.
+    ctx.install_config(None, config.clone(), None);
+
+    // The tier is created where the operator pointed the database…
+    assert!(dir.path().join("pages").is_dir());
+    // …and `/health` reports the resolved locations with their provenance,
+    // so "where is my commit log" has an answer at runtime.
+    let storage = ctx.storage_paths().expect("the installed config renders");
+    assert_eq!(
+        storage["storage.page_dir"]["value"].as_str().unwrap(),
+        dir.path().join("pages").display().to_string()
+    );
+    assert_eq!(
+        storage["storage.page_dir"]["source"].as_str().unwrap(),
+        "derived"
+    );
+}

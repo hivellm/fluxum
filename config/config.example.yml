@@ -84,6 +84,14 @@ memory:
   budget_tolerance_bytes: 67108864 # RSS tolerance above budget; effective = max(this, 10% of budget)
 
 storage:
+  # `data_dir` is the placement knob. The three sub-directories below (and
+  # `replication.archive.dir`) each default to their slot under it —
+  # `<data_dir>/log`, `/checkpoints`, `/pages`, `/archive` — so setting
+  # data_dir alone moves the whole database. They are spelled out here
+  # because this file is the key reference; OMIT them in your own config to
+  # let them follow data_dir, and set one only to split it onto its own
+  # volume. An explicit value always wins, and `GET /health` reports every
+  # resolved path with its provenance (`derived` = rooted under data_dir).
   data_dir: ./data
   commit_log_dir: ./data/log
   checkpoint_dir: ./data/checkpoints
@@ -124,6 +132,8 @@ replication:
   # source. The retention window IS the PITR window.
   archive:
     enabled: true
+    # Omit to follow `<storage.data_dir>/archive`; set it to keep the PITR
+    # source on separate storage.
     dir: ./data/archive
     retention: 7d            # <n>s | <n>m | <n>h | <n>d
     # S3-compatible remote archival (SPEC-025 OPS-010/011): the checkpoint

@@ -673,6 +673,39 @@ impl ShardContext {
             .clone()
     }
 
+    /// Where this server actually writes, with each path's provenance —
+    /// `derived` meaning it was rooted under `storage.data_dir` rather than
+    /// configured in its own right.
+    ///
+    /// Paths are the one part of the config an operator cannot infer from
+    /// the defaults: the sub-directories follow `data_dir`, so the answer to
+    /// "where is my commit log" depends on which keys were set. `None`
+    /// before the config is installed at boot.
+    pub fn storage_paths(&self) -> Option<serde_json::Value> {
+        let guard = self
+            .config_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = &guard.as_ref()?.config;
+        let mut out = serde_json::Map::new();
+        for (key, path) in [
+            ("storage.data_dir", &config.storage.data_dir),
+            ("storage.commit_log_dir", &config.storage.commit_log_dir),
+            ("storage.checkpoint_dir", &config.storage.checkpoint_dir),
+            ("storage.page_dir", &config.storage.page_dir),
+            ("replication.archive.dir", &config.replication.archive.dir),
+        ] {
+            out.insert(
+                key.to_owned(),
+                serde_json::json!({
+                    "value": path.display().to_string(),
+                    "source": config.source_of(key),
+                }),
+            );
+        }
+        Some(serde_json::Value::Object(out))
+    }
+
     /// Install the running configuration (OPS-040): publishes every
     /// reloadable value immediately, and records `path` + `log` so a later
     /// [`reload_config`] can re-read the same layers. The assembly calls

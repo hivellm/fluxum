@@ -192,7 +192,10 @@ fn pinned(config: &Config, key: &str) -> Provenance {
     match config.source_of(key) {
         ValueSource::Env => Provenance::Env,
         ValueSource::File | ValueSource::Profile => Provenance::Config,
-        ValueSource::Default => Provenance::Auto,
+        // `Derived` never applies to an `auto | value` key (it marks paths
+        // rooted under `storage.data_dir`), so it folds in with the
+        // not-explicitly-pinned case.
+        ValueSource::Default | ValueSource::Derived => Provenance::Auto,
     }
 }
 

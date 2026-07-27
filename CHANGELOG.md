@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+
+- **BREAKING (behavioral): the storage sub-directories now follow
+  `storage.data_dir`.** `commit_log_dir`, `checkpoint_dir`, `page_dir`, and
+  `replication.archive.dir` previously each carried their own built-in default —
+  all of them relative to the *process working directory* — so a deployment that
+  set only `storage.data_dir` (the documented placement knob) silently wrote its
+  commit log, checkpoints, and cold-tier pages next to wherever the binary was
+  started, outside the mounted volume and outside backups. They now default to
+  `<data_dir>/log`, `<data_dir>/checkpoints`, `<data_dir>/pages`, and
+  `<data_dir>/archive`. An explicitly configured sub-directory still wins
+  verbatim, and `GET /health` gained a `storage` block reporting each resolved
+  path with its provenance (`derived` when rooted under `data_dir`).
+
+  *Upgrade:* if you set `storage.data_dir` and relied on the old CWD-relative
+  sub-paths, either move those directories under `data_dir` before restarting,
+  or pin the old locations explicitly (`storage.commit_log_dir`, etc.). Check
+  `GET /health` → `storage` after the first boot to confirm where data lands.
+  Deployments that already set every path explicitly are unaffected.
+- **Overflow keys in the paged B-tree (page format v2):** index and primary keys
+  longer than the in-node bound keep a routing prefix in the node and the full
+  key in an overflow chain, so there is no key-length cap on the live path
+  (previously ~2 KB, Postgres-parity) while interior fan-out stays ≥ 2. Page
+  files this build cannot read are discarded at open — the cold tier is a cache
+  rebuilt from the checkpoint plus the commit log, so a format bump never blocks
+  startup.
 - **Adopted performance/stability findings from the SpacetimeDB source dossier into the specs**:
   scalable fan-out via query-hash dedup + value-level plan pruning (SPEC-005, T4.2 — never
   O(clients)); flat row lists, compression negotiation (none/gzip/brotli), `tx_updates: full|light`
