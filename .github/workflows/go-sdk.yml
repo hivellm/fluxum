@@ -31,6 +31,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v5
+      with:
+        # sdks/go is the fluxum-go submodule.
+        submodules: true
 
     - name: Install toolchain from rust-toolchain.toml
       run: rustup toolchain install
