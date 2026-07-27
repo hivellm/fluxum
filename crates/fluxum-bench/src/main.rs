@@ -612,6 +612,7 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
         metrics_addr: Some(format!("127.0.0.1:{}", server.http_port)),
         require_eviction: opts.require_eviction,
         enforce_idle_ceiling: opts.enforce_idle_ceiling,
+        shards_requested: opts.shards.max(1),
     };
     println!(
         "== soak: {} rows into {} shard(s), budget {budget_str}, sustain {}s \
@@ -681,6 +682,15 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
         println!(
             "  note: no buffer-pool samples were collected — the TIER-080 gauges could not be \
              scraped, so the TST-111 witnesses above are not evidence."
+        );
+    }
+    if report.shards_observed < report.shards_requested {
+        println!(
+            "  WARNING: {} shard(s) requested but {} reported. A single-process fluxum-server \
+             owns one shard (multi-shard hosting is ShardCoord's job, which the binary does not \
+             assemble), so --shards only feeds the `auto` hardware derivation. This run does NOT \
+             satisfy TST-112's \"sharded deployment\" clause.",
+            report.shards_requested, report.shards_observed
         );
     }
     if !report.pass {

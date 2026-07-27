@@ -120,6 +120,8 @@ fn soak_driver_loads_sustains_samples_and_reports() {
         // is not a droplet, so neither profile requirement applies here.
         require_eviction: false,
         enforce_idle_ceiling: false,
+        // One process, one shard — which is what the server binary hosts.
+        shards_requested: 1,
     };
     let hw = Hardware {
         cpu: "smoke".into(),
@@ -171,6 +173,16 @@ fn soak_driver_loads_sustains_samples_and_reports() {
         "a healthy smoke keeps every shard inside its pool: {:?}",
         report.shard_pools
     );
+    // The server binary hosts exactly one shard, so asking for one is the
+    // only request it can actually honour. If this ever reports more, the
+    // deployment grew a real multi-shard mode and TST-112's "sharded"
+    // clause becomes reachable — worth noticing rather than silently
+    // passing either way.
+    assert_eq!(
+        report.shards_observed, 1,
+        "a single-process server owns one shard"
+    );
+    assert_eq!(report.shards_requested, 1);
 
     // The report artifact writes as JSON + Markdown.
     let out = std::env::temp_dir().join(format!("fluxum-soak-report-{}", std::process::id()));

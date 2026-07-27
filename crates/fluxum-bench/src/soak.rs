@@ -60,6 +60,10 @@ pub struct SoakConfig {
     /// Enforce the NFR-12 idle-RSS ceiling (< 100 MB). Set by the droplet
     /// profile, where the requirement applies.
     pub enforce_idle_ceiling: bool,
+    /// Shards the run asked the deployment for, recorded so the report can
+    /// be compared against what actually reported (see
+    /// [`SoakReport::shards_observed`]).
+    pub shards_requested: u32,
 }
 
 impl Default for SoakConfig {
@@ -76,6 +80,7 @@ impl Default for SoakConfig {
             metrics_addr: None,
             require_eviction: false,
             enforce_idle_ceiling: false,
+            shards_requested: 1,
         }
     }
 }
@@ -170,6 +175,15 @@ pub struct SoakReport {
     /// Per-shard pool peaks against each shard's own capacity (TST-112:
     /// "within budget on every shard").
     pub shard_pools: Vec<ShardPool>,
+    /// Shards the run *asked* for (`--shards`).
+    pub shards_requested: u32,
+    /// Shards that actually reported metrics. TST-112 wants a **sharded**
+    /// deployment; today a single-process `fluxum-server` owns exactly one
+    /// shard (`boot.rs`: "Multi-shard hosting is ShardCoord's job"), so
+    /// `--shards` only feeds the `auto` hardware derivation and this comes
+    /// back as 1. Recorded separately from the request so a report can
+    /// never imply a topology that did not run.
+    pub shards_observed: u32,
     /// Sustained-write throughput + latency (the `send_chat` stream).
     pub write: Summary,
     /// TxUpdates delivered to the live subscriptions during the sustain phase.
@@ -201,9 +215,25 @@ impl SoakReport {
             "- **verdict: {}**",
             if self.pass { "PASS ✅" } else { "FAIL ❌" }
         );
+        if self.shards_observed < self.shards_requested {
+            let _ = writeln!(
+                out,
+                "\n> ⚠️ {} shard(s) were requested but only {} reported metrics. A \
+                 single-process `fluxum-server` owns exactly one shard — multi-shard \
+                 hosting is `ShardCoord`'s job, which the server binary does not \
+                 assemble — so `--shards` only feeds the `auto` hardware derivation. \
+                 **This run does not satisfy TST-112's \"sharded deployment\" clause.**",
+                self.shards_requested, self.shards_observed
+            );
+        }
         let _ = writeln!(out, "\n## Dataset & duration\n");
         let _ = writeln!(out, "- rows loaded: {}", self.rows_loaded);
         let _ = writeln!(out, "- sustain duration: {:.0}s", self.duration_secs);
+        let _ = writeln!(
+            out,
+            "- shards: {} reported ({} requested)",
+            self.shards_observed, self.shards_requested
+        );
         let _ = writeln!(out, "\n## Memory (TIER-004 / NFR-12)\n");
         let _ = writeln!(out, "- budget: {:.0} MiB", mib(self.budget_bytes));
         let _ = writeln!(out, "- tolerance: {:.0} MiB", mib(self.tolerance_bytes));
@@ -545,6 +575,8 @@ pub fn run_soak(
         eviction_required: cfg.require_eviction,
         rss_samples: sustain.samples,
         pool_samples: sustain.pool_samples,
+        shards_requested: cfg.shards_requested,
+        shards_observed: u32::try_from(shard_pools.len()).unwrap_or(u32::MAX),
         shard_pools,
         write,
         subscription_deliveries: sustain.deliveries,
@@ -968,6 +1000,8 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
                 t_secs: 0.0,
                 rss_bytes: 80 * 1024 * 1024,
             }],
+            shards_requested: 1,
+            shards_observed: 1,
             pool_samples: vec![PoolSample {
                 t_secs: 0.0,
                 pool_bytes: 400 * 1024 * 1024,
@@ -1012,6 +1046,54 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
     }
 
     #[test]
+    fn a_run_that_did_not_actually_shard_says_so() {
+        // The soak's `--shards` only feeds the server's `auto` hardware
+        // derivation; a single-process server still owns one shard. A
+        // report claiming 8 shards when 1 ran would misrepresent TST-112's
+        // "sharded deployment" clause as met.
+        let mut report = SoakReport {
+            harness_version: "0.1.0".into(),
+            date: "2026-07-27".into(),
+            hardware: hardware(),
+            rows_loaded: 10,
+            duration_secs: 1.0,
+            budget_bytes: 1024,
+            tolerance_bytes: 102,
+            idle_rss_bytes: 10,
+            peak_rss_bytes: 20,
+            within_budget: true,
+            idle_rss_ok: true,
+            idle_ceiling_enforced: false,
+            eviction_engaged: true,
+            eviction_required: false,
+            rss_samples: Vec::new(),
+            pool_samples: Vec::new(),
+            shards_requested: 8,
+            shards_observed: 1,
+            shard_pools: vec![ShardPool {
+                shard: 0,
+                peak_pool_bytes: 10,
+                capacity_bytes: 100,
+                within_capacity: true,
+            }],
+            write: Summary::from_runs(&[RunResult {
+                ops: 1,
+                wall: Duration::from_secs(1),
+                latencies_ns: vec![1],
+            }]),
+            subscription_deliveries: 1,
+            pass: true,
+        };
+        let md = report.markdown();
+        assert!(md.contains("8 shard(s) were requested but only 1"), "{md}");
+        assert!(md.contains("does not satisfy TST-112"), "{md}");
+        assert!(md.contains("1 reported (8 requested)"), "{md}");
+        // A genuinely sharded run carries no such warning.
+        report.shards_requested = 1;
+        assert!(!report.markdown().contains("does not satisfy TST-112"));
+    }
+
+    #[test]
     fn an_unsampled_pool_says_so_rather_than_implying_a_clean_run() {
         // No `--metrics-addr`: the artifact must not read as if the shards
         // were checked and found healthy.
@@ -1031,6 +1113,8 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
             eviction_engaged: false,
             eviction_required: false,
             rss_samples: Vec::new(),
+            shards_requested: 1,
+            shards_observed: 1,
             pool_samples: Vec::new(),
             shard_pools: Vec::new(),
             write: Summary::from_runs(&[RunResult {
@@ -1148,6 +1232,7 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
             metrics_addr: None,
             require_eviction: false,
             enforce_idle_ceiling: false,
+            shards_requested: 1,
         };
         // A sampler that stays well under budget.
         let rss = |_: ()| 500_000u64;
@@ -1186,6 +1271,7 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
             metrics_addr: None,
             require_eviction: false,
             enforce_idle_ceiling: false,
+            shards_requested: 1,
         };
         // RSS far over budget → the soak must fail even though load succeeds.
         let report = run_soak(

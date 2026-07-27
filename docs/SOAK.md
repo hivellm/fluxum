@@ -42,6 +42,16 @@ pass `--url`.
 `--memory-budget` must be at least **128 MiB** (`config::MIN_MEMORY_BUDGET`);
 below that the server refuses to start.
 
+> **`--shards` does not shard.** A single-process `fluxum-server` owns exactly
+> one shard — `boot.rs` says so outright, and multi-shard hosting is
+> `ShardCoord`'s job, which the server binary does not assemble. `--shards` only
+> feeds the server's `auto` hardware derivation. The soak records
+> `shards_requested` alongside `shards_observed` and warns loudly when they
+> disagree, so no report can imply a topology that did not run. **TST-112's
+> "sharded + tiered deployment" clause therefore cannot be met by the current
+> server binary**; closing it needs a `ShardCoord`-hosted (or process-per-shard)
+> deployment, which is outside this task.
+
 ## 1. Billion-row soak (NFR-13, TST-112)
 
 On a box with enough disk for the tiered dataset (the cold-tier page file grows
@@ -172,8 +182,21 @@ process — not the driver.
 
 ## Status
 
-The drivers, reports, witnesses and CI workflow are in place. **The
-launch-defining runs themselves have not been performed**: the committed
-`docs/reports/soak-report.*` is a 1M-row / 60 s plumbing-proof run on a
-32-core workstation, not the billion-row run, and no cgroup-enforced droplet
-artifact exists yet. G7 stays open until both land.
+The drivers, reports, witnesses and CI workflow are in place, and the
+witnesses have been observed firing on a real pressure run (200k rows under a
+128 MiB budget: pool peaked at 101.8 MiB against a 102.4 MiB capacity with
+~730k evictions, `eviction_engaged: true`).
+
+Three things stand between here and G7:
+
+1. **The billion-row run has not been performed.** The committed
+   `docs/reports/soak-report.*` is a 1M-row / 60 s plumbing proof on a 32-core
+   workstation. Measured load throughput is ~4 000 rows/s and does **not**
+   improve with more writers or a deeper pipeline (32 clients × pipeline 128
+   was *slower* than 8 clients), so 1e9 rows is on the order of **60+ hours of
+   load alone** — the `--duration-secs 3600` sustain window is a rounding error
+   next to it. Plan the run accordingly, or raise load throughput first.
+2. **No cgroup-enforced droplet artifact exists.** Run the `droplet-profile`
+   workflow (Actions → Run workflow) or a real droplet.
+3. **TST-112's "sharded" clause is not reachable** with today's server binary
+   — see the `--shards` note above.
