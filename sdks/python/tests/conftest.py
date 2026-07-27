@@ -65,6 +65,7 @@ class Server:
             "FLUXUM_SERVER_TCP_PORT": str(self.tcp_port),
             "FLUXUM_STORAGE_DATA_DIR": self._dir,
             "FLUXUM_STORAGE_COMMIT_LOG_DIR": str(Path(self._dir) / "log"),
+            "FLUXUM_STORAGE_PAGE_DIR": str(Path(self._dir) / "pages"),
         }
         self._proc = None
         self._launch()
@@ -77,6 +78,11 @@ class Server:
         self._proc = subprocess.Popen(
             [str(BINARY)],
             env=self._env,
+            # The scenario's fresh dir is also the CWD, so even config paths
+            # that default CWD-relative (./data, ./data/pages) stay isolated
+            # per scenario — one server's recovered state must never leak
+            # into the next scenario's assertions.
+            cwd=self._dir,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
