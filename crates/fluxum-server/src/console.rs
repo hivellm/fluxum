@@ -1,8 +1,10 @@
 //! The built-in admin web console (SPEC-024 DEV-030..032; FR-137): a
 //! self-contained single-page UI served on the HTTP admin port, so a
-//! single-binary deployment gets a data browser, a read-only query panel, a
-//! live diff viewer, the reducer log stream, and the `/metrics` + `/schema`
-//! views with nothing extra to deploy.
+//! single-binary deployment gets an operator overview (health, shard and
+//! replication state, memory-budget occupancy, hardware probe), a data
+//! browser, a read-only query panel, a live diff viewer, the reducer log
+//! stream, a rendered schema browser, and the `/metrics` + `/logs` views
+//! with nothing extra to deploy.
 //!
 //! | Route | Purpose |
 //! |-------|---------|
@@ -177,6 +179,27 @@ mod tests {
         assert!(is_console_path("/console/watch?table=Chat"));
         assert!(!is_console_path("/consoles"));
         assert!(!is_console_path("/health"));
+    }
+
+    #[test]
+    fn the_shell_carries_the_operator_views() {
+        // The phase8 capability areas land as views in the one-file shell;
+        // a refactor that drops one should fail loudly here, not in a browser.
+        for view in [
+            "view-overview",
+            "view-data",
+            "view-query",
+            "view-live",
+            "view-logs",
+            "view-metrics",
+            "view-schema",
+            "view-designer",
+        ] {
+            assert!(
+                CONSOLE_HTML.contains(&format!("id=\"{view}\"")),
+                "console.html lost its `{view}` section"
+            );
+        }
     }
 
     #[test]

@@ -48,7 +48,22 @@ module, stated honestly in the UI.
 
 ## 1. Implementation (full vision — later increments)
 - [ ] 1.1 Foundation: SPA skeleton embedded in the binary (asset pipeline + `statics.rs` embedding, `/console/*` routing, admin-auth gate with the `console_unauthenticated` dev escape), connected via the browser JS SDK over `/rpc`
-- [ ] 1.2 Overview + Schema browser: health/hardware/budget/shard/replication panels; full schema rendering from `GET /schema` (tables, indexes incl. spatial/fulltext/unique, FKs, visibility, migrations)
+- [x] 1.2 Overview + Schema browser (2026-07-27, in the one-file shell — the
+      v1 approach continues; 1.1's separate SPA/asset pipeline only becomes
+      worthwhile if the file outgrows the 1500-line convention). Overview is
+      the landing view: stat tiles (status/uptime/conns/tx/queue/TLS) and
+      panels for memory (budget + buffer-pool occupancy bar from `/metrics`,
+      memstore estimate, reclaim backlog), shard + replication (role/epoch/
+      lag/stale or standalone), hardware probe + every derived value with its
+      provenance badge (auto/config/env, HWA-013), storage paths, and
+      per-table row counts; rides the existing 5 s health poll. Schema view
+      is now a rendered browser: per-table cards (access/partition/visibility
+      badges; columns with pk/auto/unique/transform flags; index footer incl.
+      spatial/fulltext detail), reducer signatures with callable/rate, views
+      — with a Raw JSON toggle. FKs and migration history are not in the
+      `/schema` document today; rendered when the document carries them.
+      Verified in a real browser against the release binary (Playwright);
+      shell view-inventory pinned by a unit test.
 - [ ] 1.3 Data explorer: SQL console with keyset pagination + EXPLAIN display; live mode (query → subscription → TxUpdate-driven updates); row inspector
 - [ ] 1.4 Reducer console: signature-driven typed argument forms, invoke/result, rate-limit display, recent invocations from the audit trail
 - [ ] 1.5 Sessions & subscriptions: connected-client list with queue/backpressure state, active queries, kick, bans/blocklist management (additive JSON endpoints where today CLI-only)
