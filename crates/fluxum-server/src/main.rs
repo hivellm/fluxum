@@ -61,6 +61,24 @@ fn main() -> ExitCode {
                 }
             };
         }
+        Ok(Some(Args::HealthCheck(path))) => {
+            // Container HEALTHCHECK entry point: the scratch image has no
+            // shell or curl, so the binary probes itself (SPEC-025 OPS-020).
+            let config = match Config::load(path.as_deref()) {
+                Ok(config) => config,
+                Err(err) => {
+                    eprintln!("configuration error: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            return match fluxum_server::health::probe(&config) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("healthcheck failed: {err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(Some(Args::Config(path))) => Some(path),
         Ok(None) => None,
         Err(message) => {
@@ -119,7 +137,7 @@ const USAGE: &str = "\
 fluxum-server — the Fluxum reference server
 
 USAGE:
-    fluxum-server [--config <path>] [--migrate-plan]
+    fluxum-server [--config <path>] [--migrate-plan | --healthcheck]
 
 OPTIONS:
     -c, --config <path>    Configuration file (YAML). Defaults apply if omitted.
@@ -127,6 +145,9 @@ OPTIONS:
                            binary against the configured data directory and
                            exit — 0 when the next boot proceeds, 3 when it
                            would refuse (SPEC-024 DEV-041). Nothing is mutated.
+        --healthcheck      Probe GET /health on the loopback HTTP listener and
+                           exit 0 (healthy) or 1. Made for the container
+                           HEALTHCHECK: the scratch image has no shell/curl.
     -h, --help             Print this message.
     -V, --version          Print the version.
 
@@ -138,6 +159,7 @@ enum Args {
     Version,
     Config(std::path::PathBuf),
     MigratePlan(Option<std::path::PathBuf>),
+    HealthCheck(Option<std::path::PathBuf>),
 }
 
 /// Parse the command line, which is deliberately one option wide.
@@ -160,10 +182,19 @@ fn parse_args(args: &[String]) -> Result<Option<Args>, String> {
             },
             Some(other) => Err(format!("unrecognised argument: {other}")),
         },
+        "--healthcheck" => match args.get(1).map(String::as_str) {
+            None => Ok(Some(Args::HealthCheck(None))),
+            Some("-c" | "--config") => match args.get(2) {
+                Some(path) => Ok(Some(Args::HealthCheck(Some(path.into())))),
+                None => Err("--config needs a path".into()),
+            },
+            Some(other) => Err(format!("unrecognised argument: {other}")),
+        },
         "-c" | "--config" => match args.get(1) {
             Some(path) => match args.get(2).map(String::as_str) {
                 None => Ok(Some(Args::Config(path.into()))),
                 Some("--migrate-plan") => Ok(Some(Args::MigratePlan(Some(path.into())))),
+                Some("--healthcheck") => Ok(Some(Args::HealthCheck(Some(path.into())))),
                 Some(other) => Err(format!("unrecognised argument: {other}")),
             },
             None => Err(format!("{first} needs a path")),

@@ -4,10 +4,11 @@
 #   curl http://127.0.0.1:15800/health
 services:
   fluxum:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-    image: fluxum:latest
+    # Published image; comment `image:` + uncomment `build:` to build from
+    # the working tree instead.
+    image: hivehub/fluxum:latest
+    # build:
+    #   context: ..
     ports:
       - "15800:15800"   # HTTP: admin API + console + /rpc
       - "15801:15801"   # FluxRPC binary TCP

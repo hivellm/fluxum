@@ -27,6 +27,7 @@ pub mod clientip;
 pub mod connguard;
 pub mod console;
 pub mod election;
+pub mod health;
 pub mod http;
 pub mod logging;
 pub mod namespace;

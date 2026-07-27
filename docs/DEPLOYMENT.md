@@ -81,11 +81,14 @@ resolves to `/var/lib/fluxum/data` — see [§7 data directory](#7-data-director
 
 ## 4. Docker
 
-The image builds the release binary in a build stage and runs it as a
-non-root user ([`deploy/Dockerfile`](../deploy/Dockerfile)):
+The published image is [`hivehub/fluxum`](https://hub.docker.com/r/hivehub/fluxum).
+The root [`Dockerfile`](../Dockerfile) follows the Nexus/Synap zero-CVE
+pattern: a fully static musl `fluxum-server` in a `FROM scratch` runtime —
+no OS packages, no shell (debug via `docker logs` + the HTTP admin API; the
+`HEALTHCHECK` execs `fluxum-server --healthcheck` since there is no curl):
 
 ```sh
-docker build -f deploy/Dockerfile -t fluxum:latest .
+docker build -t fluxum:latest .        # or: docker pull hivehub/fluxum
 docker run -d --name fluxum \
   -p 15800:15800 -p 15801:15801 \
   -e FLUXUM_AUTH_SECRET="$(openssl rand -hex 32)" \
@@ -109,6 +112,23 @@ image's `HEALTHCHECK` polls `/health`, so `docker ps` reports readiness.
 `0.0.0.0` and Fluxum refuses a non-loopback bind with real auth and no TLS
 by default — read [§6](#6-tls-and-exposure) before exposing the ports beyond
 a trusted network.
+
+### Publishing to Docker Hub
+
+Multi-arch (amd64 + arm64, arm64 via qemu/binfmt) with SBOM + provenance
+attestations, tagged with the workspace version and `latest`:
+
+```sh
+docker login
+docker buildx build --platform linux/amd64,linux/arm64 \
+  --sbom=true --provenance=mode=max \
+  -t hivehub/fluxum:0.1.0 -t hivehub/fluxum:latest --push .
+```
+
+Bump the version in two places when releasing: the tag above and the
+`org.opencontainers.image.version` label in the [`Dockerfile`](../Dockerfile).
+The arm64 leg is slow under qemu on a cold cache; BuildKit cache mounts make
+re-runs incremental.
 
 ## 5. Configuration reference
 
