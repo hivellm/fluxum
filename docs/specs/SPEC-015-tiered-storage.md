@@ -195,7 +195,8 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
 
   `flags` bit assignments: bits 0–1 = compression codec (`0` none, `1` LZ4, `2` zstd,
   `3` reserved); bit 2 = index page (interior/leaf B-tree node rather than data leaf); bit 3 =
-  overflow page (TIER-026); bits 8–11 = page-format version (initially `1`). Unknown flag bits
+  overflow page (TIER-026); bits 8–11 = page-format version (`1` initially; `2` adds the
+  TIER-027 overflow-key entry encodings). Unknown flag bits
   SHALL cause the page to be rejected as unreadable (forward-compatibility guard). This layout
   freezes at gate G5; any change bumps the version bits.
 
@@ -251,6 +252,23 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
   capacity SHALL be stored as a chain of overflow pages (flag bit 3), with the leaf holding
   the key and the head overflow `page_id`. Chains SHALL be read with sequential page-ins on
   fault; each overflow page carries its own header and CRC.
+
+- **TIER-027** [P1] **Overflow keys.** A key longer than the node's inline-key bound
+  (implementation: `node_budget / 8`) SHALL be stored as a bounded, order-preserving *routing
+  prefix* inside the node plus the full key in its own overflow chain (TIER-026), in both leaf
+  and interior nodes. Bounding in-node key bytes guarantees that two interior entries always
+  fit one node, so **interior fan-out is ≥ 2 for any key mix** — bottom-up level building
+  strictly shrinks and tree depth stays logarithmic even when every key is multi-kilobyte.
+
+  Ordering SHALL remain exact, never approximate: a comparison is decided on the prefix unless
+  the probe *extends* it, and only that case faults the full-key chain. Consequently there is
+  **no maximum key length** on the live path (primary keys, secondary index keys, `#[unique]`
+  values) beyond the `u32` length field — the read path is O(1) chain faults per undecidable
+  comparison, and long keys never truncate or collide.
+
+  Updating the value of an existing key SHALL reuse that entry's key chain (no chain churn);
+  replacing or deleting the entry SHALL retire its key chain through the same superseded-page
+  protocol as value chains (TIER-061).
 
 ## 5. Write path, eviction, and fault-in
 

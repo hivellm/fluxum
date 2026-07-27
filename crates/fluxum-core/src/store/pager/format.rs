@@ -30,7 +30,8 @@
 //!   mixed-codec files read correctly (TIER-041).
 //! - bit 2: index page — interior/leaf B-tree node rather than a data leaf.
 //! - bit 3: overflow page (TIER-026).
-//! - bits 8–11: page-format version, currently `1`.
+//! - bits 8–11: page-format version, currently `2` (version 2 adds
+//!   overflow keys to B-tree nodes — see [`super::tree`]).
 //! - all other bits: reserved; a set unknown bit rejects the page as
 //!   unreadable (forward-compatibility guard).
 //!
@@ -74,7 +75,15 @@ pub const SUPERBLOCK_LEN: usize = 32;
 pub const EXTENT_ALIGN: u64 = 256;
 
 /// Current page-format version (flags bits 8–11) and file-format version.
-pub const FORMAT_VERSION: u16 = 1;
+///
+/// Version history:
+/// - `1` — initial paged cold tier (T2.8).
+/// - `2` — B-tree nodes may carry **overflow keys**: a routing prefix in
+///   the node plus the full key in an overflow chain, so arbitrarily long
+///   keys keep fan-out ≥ 2 ([`super::tree`], SPEC-015 TIER-021/026/050).
+///   Pages are in-process scratch rebuilt from WAL + checkpoint on
+///   recovery, so a version-1 file is simply not read by this build.
+pub const FORMAT_VERSION: u16 = 2;
 
 /// Flags bits 0–1: compression codec (`0` none, `1` LZ4, `2` zstd).
 pub const FLAG_CODEC_MASK: u16 = 0b0000_0011;
@@ -340,7 +349,7 @@ mod tests {
         assert_eq!(decoded.row_count, 3);
         assert!(decoded.is_index());
         assert!(!decoded.is_overflow());
-        assert_eq!(decoded.version(), 1);
+        assert_eq!(decoded.version(), FORMAT_VERSION);
         assert_eq!(decoded.codec(), 0);
     }
 
@@ -444,22 +453,30 @@ mod tests {
 
     #[test]
     fn future_format_versions_are_rejected_by_name() {
-        // Version bits stamped as 2 (a future format), valid CRC: the page
-        // must be rejected as unreadable with the version in the message.
+        // Version bits stamped one past the current format, valid CRC: the
+        // page must be rejected as unreadable with the version in the
+        // message. (An OLDER version is rejected the same way — page files
+        // are in-process scratch, rebuilt from WAL + checkpoint.)
+        let future = FORMAT_VERSION + 1;
         let header = PageHeader {
             page_id: 4,
             table_id: 5,
             row_count: 0,
-            flags: 2 << 8,
+            flags: future << 8,
         };
-        let image = encode_page(&header, b"v2").unwrap_or_else(|e| panic!("{e}"));
+        let image = encode_page(&header, b"vNext").unwrap_or_else(|e| panic!("{e}"));
         let err = match decode_page(&image, 0, 5, 4) {
             Ok(_) => panic!("future-version page served"),
             Err(e) => e,
         };
-        assert!(err.to_string().contains("format version 2"), "{err}");
         assert!(
-            err.to_string().contains("this build reads version 1"),
+            err.to_string()
+                .contains(&format!("format version {future}")),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&format!("this build reads version {FORMAT_VERSION}")),
             "{err}"
         );
     }
@@ -490,7 +507,7 @@ mod tests {
         };
         assert!(err.to_string().contains("magic mismatch"), "{err}");
 
-        let bad_version = restamp(block.clone(), 4, 2);
+        let bad_version = restamp(block.clone(), 4, u32::from(FORMAT_VERSION) + 1);
         let err = match decode_superblock(&bad_version, 3, 0xCAFE) {
             Ok(_) => panic!("future version accepted"),
             Err(e) => e,

@@ -33,3 +33,42 @@ async fn assemble_installs_the_probe_derived_effective_config() {
     // derivation saw (HWA-013).
     assert!(effective["hardware"]["logical_cores"].as_u64().unwrap() >= 1);
 }
+
+/// SPEC-015 TIER-021: the cold-tier page directory is a *cache* — recovery
+/// rebuilds every tree from the newest checkpoint plus the commit log. Page
+/// files written by an older page format (a version bump) or a half-written
+/// run must therefore never strand a durable database behind a disposable
+/// tier: boot discards the directory and rebuilds it.
+#[tokio::test(flavor = "multi_thread")]
+async fn boot_discards_a_page_directory_it_cannot_read() {
+    fluxum_demo::link();
+    let dir = tempfile::tempdir().unwrap();
+    let pages = dir.path().join("pages");
+    let mut config = fluxum_core::config::Config::default();
+    config.storage.data_dir = dir.path().into();
+    config.storage.commit_log_dir = dir.path().join("log");
+    config.storage.checkpoint_dir = dir.path().join("checkpoints");
+    config.storage.page_dir = pages.clone();
+    config.auth.provider = fluxum_core::config::AuthProvider::None;
+
+    // A page file this build cannot read: a superblock from another format
+    // (the shape a version bump leaves behind), in the on-disk layout
+    // `page_dir/shard-<id>/table-<id>.pages`.
+    let shard = pages.join("shard-0");
+    std::fs::create_dir_all(&shard).unwrap();
+    let mut superblock = vec![0u8; 32];
+    superblock[..4].copy_from_slice(&0x584D_5546u32.to_le_bytes()); // magic
+    superblock[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // version
+    std::fs::write(shard.join("table-1634948758.pages"), &superblock).unwrap();
+
+    // Boot succeeds and the unreadable tier is gone, recreated empty.
+    let ctx = fluxum_server::boot::assemble(&config).unwrap();
+    assert!(
+        ctx.effective_config().is_some(),
+        "boot completed over a discarded page tier"
+    );
+    assert!(
+        pages.is_dir(),
+        "the page tier is recreated, not left missing"
+    );
+}

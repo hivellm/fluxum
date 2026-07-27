@@ -21,17 +21,41 @@
 //! # Node payload encoding (freeze surface, versioned with the page format)
 //!
 //! The first payload byte is the node kind; entries follow back to back,
-//! sorted by key, `row_count` of them (TIER-021 header field):
+//! sorted by (full) key, `row_count` of them (TIER-021 header field):
 //!
-//! - **Leaf** (`0x4C`, `'L'`): entry = `key_len: u16 | tag: u8 | key |`
-//!   then `tag 0` (inline): `val_len: u32 | value`, or `tag 1` (overflow):
-//!   `total_len: u64 | head_page_id: u64` — the value lives in a chain of
-//!   overflow pages (TIER-026).
+//! - **Leaf** (`0x4C`, `'L'`): entry = `key_len: u16 | tag: u8 | key |` then
+//!   per tag: `0` (inline value): `val_len: u32 | value`; `1` (overflow
+//!   value): `total_len: u64 | head_page_id: u64` — the value lives in a
+//!   chain of overflow pages (TIER-026). Format version 2 adds the
+//!   **overflow-key** tags: `2` (inline value) and `3` (overflow value) —
+//!   `key_len`/`key` hold a bounded, order-preserving *routing prefix* of
+//!   the full key, followed by `full_key_len: u32 | key_head_page_id: u64`
+//!   (the full key in its own overflow chain), then the value part as for
+//!   tags 0/1.
 //! - **Interior** (`0x49`, `'I'`): entry = `key_len: u16 | key |
 //!   child_page_id: u64`. Entry *i* routes keys in `[key_i, key_{i+1})`;
-//!   keys below `key_0` route to entry 0.
+//!   keys below `key_0` route to entry 0. Version 2: `key_len` bit 15 set
+//!   marks an overflow separator — `key_len & 0x7FFF` prefix bytes, then
+//!   `full_key_len: u32 | key_head_page_id: u64 | child_page_id: u64`.
+//!   (Bit 15 was never set in version-1 pages: keys were capped far below
+//!   32 KiB.)
 //! - **Overflow** (header flag bit 3): payload = `next_page_id: u64 |
-//!   chunk` (`next = 0` ends the chain). `row_count = 0`.
+//!   chunk` (`next = 0` ends the chain). `row_count = 0`. Key and value
+//!   chains share this format.
+//!
+//! # Long keys (overflow keys)
+//!
+//! Keys longer than [`max_inline_key`](PagedTree::max_inline_key)
+//! (`node_budget/8`) keep only their routing prefix in the node, so entry
+//! sizes stay bounded and **interior fan-out is ≥ 2 for any key mix** —
+//! `bulk_load` level building strictly shrinks and depth stays logarithmic
+//! even for uniformly multi-KB keys (the livelock that motivated the old
+//! ~2 KB key cap). Ordering is exact, not approximate: a probe compares
+//! against the prefix and is decided there unless it *extends* the prefix,
+//! and only that tie faults the full-key chain. A same-key value update
+//! reuses the entry's existing key chain (no chain churn); replacing or
+//! deleting the entry retires the chain through the same superseded-page
+//! protocol as value chains (TIER-061).
 //!
 //! Deletion removes entries without rebalancing (a sparse node stays valid
 //! and is compacted by the next checkpoint rewrite); correctness never
@@ -54,6 +78,13 @@ const NODE_INTERIOR: u8 = 0x49;
 /// Nil page id (chain terminator / no page).
 const NIL: u64 = 0;
 
+/// Interior `key_len` bit 15: the separator is an overflow key (its full
+/// bytes live in a chain). Never set by version-1 writers — keys were
+/// capped far below 32 KiB — so the bit is a safe format extension.
+const KEY_LEN_OVERFLOW: u16 = 1 << 15;
+/// Mask for the stored (prefix) length in an interior `key_len`.
+const KEY_LEN_MASK: u16 = KEY_LEN_OVERFLOW - 1;
+
 /// A decoded leaf value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LeafValue {
@@ -63,8 +94,35 @@ enum LeafValue {
     Overflow { total_len: u64, head: u64 },
 }
 
-type LeafEntries = Vec<(Vec<u8>, LeafValue)>;
-type InteriorEntries = Vec<(Vec<u8>, u64)>;
+/// A decoded entry key: stored inline, or — for keys longer than
+/// [`PagedTree::max_inline_key`] — a bounded routing prefix in the node
+/// plus the full key in an overflow chain (module docs, "Long keys").
+///
+/// Invariant: an overflow key's full length is strictly greater than its
+/// prefix length, so a probe that is `<=` the prefix in length and matches
+/// it bytewise always sorts *before* the full key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EntryKey {
+    Inline(Vec<u8>),
+    Overflow {
+        prefix: Vec<u8>,
+        total_len: u32,
+        head: u64,
+    },
+}
+
+impl EntryKey {
+    /// The bytes stored in the node (full key, or routing prefix).
+    fn stored(&self) -> &[u8] {
+        match self {
+            EntryKey::Inline(k) => k,
+            EntryKey::Overflow { prefix, .. } => prefix,
+        }
+    }
+}
+
+type LeafEntries = Vec<(EntryKey, LeafValue)>;
+type InteriorEntries = Vec<(EntryKey, u64)>;
 
 /// Scan visitor: `(key, value) -> keep_going`.
 pub type ScanFn<'a> = dyn FnMut(&[u8], &[u8]) -> Result<bool> + 'a;
@@ -163,17 +221,16 @@ impl PagedTree {
         self.node_budget() / 4
     }
 
-    /// Largest accepted key: two interior routing entries (`2 + key + 8`
-    /// bytes each) must always fit one node, so interior fan-out is ≥ 2 for
-    /// *any* key mix — `bulk_load`'s level building strictly shrinks (no
-    /// 1-entry-per-node livelock) and tree depth stays logarithmic even for
-    /// uniformly huge keys. Keys are PKs or memcomparable index keys; the
-    /// resulting ~2 KB cap at 4 KiB pages is the Postgres-parity index-row
-    /// limit (PG caps at ~page/3; ours is ~page/2), surfaced as a schema
-    /// error — an index over multi-KB values wants full-text (SPEC-019) or
-    /// the tracked overflow-key follow-up, not a B-tree entry.
-    fn max_key(&self) -> usize {
-        self.node_budget() / 2 - 10
+    /// Largest key stored fully inline in a node; longer keys keep this
+    /// many routing-prefix bytes inline and the full key in an overflow
+    /// chain (module docs, "Long keys"). Bounding the in-node key bytes at
+    /// `budget/8` keeps every entry small enough that two interior entries
+    /// always fit one node — fan-out ≥ 2 for any key mix, so `bulk_load`
+    /// level building strictly shrinks and depth stays logarithmic. There
+    /// is no key-length cap: arbitrarily long keys are exact (full-key
+    /// tie-break), never truncated.
+    fn max_inline_key(&self) -> usize {
+        self.node_budget() / 8
     }
 
     /// Bytes of value chunk per overflow page.
@@ -200,14 +257,41 @@ impl PagedTree {
                 .ok_or_else(|| node_err(self.table_id, page_id, "empty node payload"))?;
             match *kind {
                 NODE_INTERIOR => {
-                    page_id = raw_interior_route(rest, key)
-                        .ok_or_else(|| node_err(self.table_id, page_id, "malformed interior"))?;
+                    match raw_interior_route(rest, key)
+                        .ok_or_else(|| node_err(self.table_id, page_id, "malformed interior"))?
+                    {
+                        RawRoute::Child(child) => page_id = child,
+                        // An overflow separator tied on its prefix: decide
+                        // with full keys on the parsed (chain-faulting) path.
+                        RawRoute::NeedsFullKeys => {
+                            let node = parse_node(&guard)?;
+                            drop(guard);
+                            let Node::Interior(entries) = node else {
+                                return Err(node_err(self.table_id, page_id, "kind mismatch"));
+                            };
+                            page_id = entries[self.route_index(&entries, key)?].1;
+                        }
+                    }
                 }
                 NODE_LEAF => {
                     let found = raw_leaf_find(rest, key)
                         .ok_or_else(|| node_err(self.table_id, page_id, "malformed leaf"))?;
-                    let Some(found) = found else {
-                        return Ok(None);
+                    let found = match found {
+                        RawFound::Absent => return Ok(None),
+                        RawFound::Found(value) => value,
+                        // A prefix tie against an overflow key: re-search
+                        // this leaf with full-key comparisons.
+                        RawFound::NeedsFullKeys => {
+                            let node = parse_node(&guard)?;
+                            drop(guard);
+                            let Node::Leaf(entries) = node else {
+                                return Err(node_err(self.table_id, page_id, "kind mismatch"));
+                            };
+                            return match self.search_leaf(&entries, key)? {
+                                Ok(idx) => self.materialize(&entries[idx].1).map(Some),
+                                Err(_) => Ok(None),
+                            };
+                        }
                     };
                     return match found {
                         RawLeafValue::Inline(bytes) => Ok(Some(bytes.to_vec())),
@@ -229,6 +313,67 @@ impl PagedTree {
         }
     }
 
+    /// Compare a probe key against a stored entry key, faulting the full-key
+    /// chain only when the probe extends an overflow key's routing prefix
+    /// (the sole undecidable-by-prefix case — module docs, "Long keys").
+    fn cmp_probe(&self, probe: &[u8], stored: &EntryKey) -> Result<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match stored {
+            EntryKey::Inline(k) => Ok(probe.cmp(k.as_slice())),
+            EntryKey::Overflow {
+                prefix,
+                total_len,
+                head,
+            } => {
+                let l = prefix.len().min(probe.len());
+                match probe[..l].cmp(&prefix[..l]) {
+                    Ordering::Equal if probe.len() <= prefix.len() => {
+                        // The full key strictly extends its prefix, so a
+                        // probe no longer than the prefix sorts first.
+                        Ok(Ordering::Less)
+                    }
+                    Ordering::Equal => {
+                        let full = self.materialize_chain(u64::from(*total_len), *head)?;
+                        Ok(probe.cmp(full.as_slice()))
+                    }
+                    other => Ok(other),
+                }
+            }
+        }
+    }
+
+    /// The full bytes of an entry key (inline slice, or the materialized
+    /// overflow chain).
+    fn full_key<'k>(&self, key: &'k EntryKey) -> Result<std::borrow::Cow<'k, [u8]>> {
+        match key {
+            EntryKey::Inline(k) => Ok(std::borrow::Cow::Borrowed(k.as_slice())),
+            EntryKey::Overflow {
+                total_len, head, ..
+            } => Ok(std::borrow::Cow::Owned(
+                self.materialize_chain(u64::from(*total_len), *head)?,
+            )),
+        }
+    }
+
+    /// Binary search of a parsed leaf by full key order.
+    fn search_leaf(
+        &self,
+        entries: &LeafEntries,
+        probe: &[u8],
+    ) -> Result<std::result::Result<usize, usize>> {
+        use std::cmp::Ordering;
+        let (mut lo, mut hi) = (0usize, entries.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            match self.cmp_probe(probe, &entries[mid].0)? {
+                Ordering::Less => hi = mid,
+                Ordering::Greater => lo = mid + 1,
+                Ordering::Equal => return Ok(Ok(mid)),
+            }
+        }
+        Ok(Err(lo))
+    }
+
     /// In-order scan of `[start, end)` (`end: None` = unbounded). `f`
     /// returns `false` to stop early; the scan result is whether it ran to
     /// completion. Faulted scan pages enter the pool scan-resistant
@@ -246,31 +391,40 @@ impl PagedTree {
         end: Option<&[u8]>,
         f: &mut ScanFn<'_>,
     ) -> Result<bool> {
-        let guard = self.pager.fault(self.table_id, page_id)?;
-        match parse_node(&guard)? {
+        use std::cmp::Ordering;
+        let node = {
+            let guard = self.pager.fault(self.table_id, page_id)?;
+            parse_node(&guard)?
+        };
+        match node {
             Node::Leaf(entries) => {
-                let from = entries.partition_point(|(k, _)| k.as_slice() < start);
-                for (k, v) in &entries[from..] {
+                for (k, v) in &entries {
+                    // stored-key comparisons via cmp_probe (probe = bound):
+                    // k < start  ⟺  cmp_probe(start, k) == Greater
+                    if self.cmp_probe(start, k)? == Ordering::Greater {
+                        continue;
+                    }
                     if let Some(end) = end
-                        && k.as_slice() >= end
+                        && self.cmp_probe(end, k)? != Ordering::Greater
                     {
                         break;
                     }
+                    let key = self.full_key(k)?;
                     let value = self.materialize(v)?;
-                    if !f(k, &value)? {
+                    if !f(&key, &value)? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
             }
             Node::Interior(entries) => {
-                let from = entries
-                    .partition_point(|(k, _)| k.as_slice() <= start)
-                    .saturating_sub(1);
+                // Rightmost child whose separator is <= start (route_index),
+                // then forward until a separator passes `end`.
+                let from = self.route_index(&entries, start)?;
                 for (i, (k, child)) in entries.iter().enumerate().skip(from) {
                     if i > from
                         && let Some(end) = end
-                        && k.as_slice() >= end
+                        && self.cmp_probe(end, k)? != Ordering::Greater
                     {
                         break;
                     }
@@ -287,49 +441,75 @@ impl PagedTree {
     fn materialize(&self, value: &LeafValue) -> Result<Vec<u8>> {
         match value {
             LeafValue::Inline(bytes) => Ok(bytes.clone()),
-            LeafValue::Overflow { total_len, head } => {
-                let mut out = Vec::with_capacity(usize::try_from(*total_len).unwrap_or(0));
-                let mut page_id = *head;
-                while page_id != NIL {
-                    let guard = self.pager.fault(self.table_id, page_id)?;
-                    let payload = payload_of(&guard);
-                    if payload.len() < 8 {
-                        return Err(node_err(self.table_id, page_id, "overflow page too short"));
-                    }
-                    page_id = u64::from_le_bytes([
-                        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5],
-                        payload[6], payload[7],
-                    ]);
-                    out.extend_from_slice(&payload[8..]);
-                }
-                if out.len() as u64 != *total_len {
-                    return Err(node_err(
-                        self.table_id,
-                        *head,
-                        "overflow chain length mismatch",
-                    ));
-                }
-                Ok(out)
-            }
+            LeafValue::Overflow { total_len, head } => self.materialize_chain(*total_len, *head),
         }
+    }
+
+    /// Read a whole overflow chain (key or value) into owned bytes.
+    fn materialize_chain(&self, total_len: u64, head: u64) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(usize::try_from(total_len).unwrap_or(0));
+        let mut page_id = head;
+        while page_id != NIL {
+            let guard = self.pager.fault(self.table_id, page_id)?;
+            let payload = payload_of(&guard);
+            if payload.len() < 8 {
+                return Err(node_err(self.table_id, page_id, "overflow page too short"));
+            }
+            page_id = u64::from_le_bytes([
+                payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+                payload[7],
+            ]);
+            out.extend_from_slice(&payload[8..]);
+        }
+        if out.len() as u64 != total_len {
+            return Err(node_err(
+                self.table_id,
+                head,
+                "overflow chain length mismatch",
+            ));
+        }
+        Ok(out)
     }
 
     // --- writes (copy-on-write) ----------------------------------------
 
-    /// Reject an out-of-contract key before any page is touched.
+    /// Reject an out-of-contract key before any page is touched. Length is
+    /// unbounded (long keys overflow, module docs); only emptiness is
+    /// rejected — an empty key cannot be routed (the low sentinel of a root
+    /// split is empty by design and never collides with a real key).
     fn check_key(&self, key: &[u8]) -> Result<()> {
         if key.is_empty() {
             return Err(FluxumError::Storage(
                 "paged tree keys must be non-empty".into(),
             ));
         }
-        if key.len() > self.max_key() {
-            return Err(FluxumError::Storage(format!(
-                "key of {} bytes exceeds the {}-byte limit for {}-byte pages",
-                key.len(),
-                self.max_key(),
-                self.pager.page_size()
-            )));
+        if u32::try_from(key.len()).is_err() {
+            return Err(FluxumError::Storage(
+                "paged tree keys are limited to u32 length".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Build the stored representation of `key`: inline when it fits, else
+    /// a routing prefix + a fresh full-key overflow chain.
+    fn make_key(&self, key: &[u8]) -> Result<EntryKey> {
+        if key.len() <= self.max_inline_key() {
+            return Ok(EntryKey::Inline(key.to_vec()));
+        }
+        let head = self.store_chain(key)?;
+        Ok(EntryKey::Overflow {
+            prefix: key[..self.max_inline_key()].to_vec(),
+            total_len: key.len() as u32,
+            head,
+        })
+    }
+
+    /// Record a superseded entry key's overflow chain (if any) for deferred
+    /// reclaim — mirror of [`supersede_value`](Self::supersede_value).
+    fn supersede_key(&self, key: &EntryKey, superseded: &mut Vec<u64>) -> Result<()> {
+        if let EntryKey::Overflow { head, .. } = key {
+            self.supersede_chain(*head, superseded)?;
         }
         Ok(())
     }
@@ -353,7 +533,9 @@ impl PagedTree {
             Cow::Split { left, sep, right } => {
                 // Root split: a new interior root whose low-sentinel first
                 // entry routes everything below `sep` left.
-                let entries: InteriorEntries = vec![(Vec::new(), left), (sep, right)];
+                let sep_key = self.make_key(&sep)?;
+                let entries: InteriorEntries =
+                    vec![(EntryKey::Inline(Vec::new()), left), (sep_key, right)];
                 self.write_new_node(&Node::Interior(entries))?
             }
         };
@@ -382,34 +564,62 @@ impl PagedTree {
         let node = parse_node(&self.pager.fault(self.table_id, page_id)?)?;
         match node {
             Node::Leaf(mut entries) => {
-                let leaf_value = self.store_value(key, value)?;
-                match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                match self.search_leaf(&entries, key)? {
                     Ok(idx) => {
-                        // Replace: the superseded value's overflow chain (if
-                        // any) is retired, not freed — an old snapshot's leaf
-                        // still points at it.
+                        // Replace: the entry key (and its chain, if any) is
+                        // identical — reuse it; only the superseded value's
+                        // overflow chain (if any) is retired, not freed — an
+                        // old snapshot's leaf still points at it.
+                        let leaf_value = self.store_value(&entries[idx].0, value)?;
                         let old = std::mem::replace(&mut entries[idx].1, leaf_value);
                         self.supersede_value(&old, superseded)?;
                     }
-                    Err(idx) => entries.insert(idx, (key.to_vec(), leaf_value)),
+                    Err(idx) => {
+                        let entry_key = self.make_key(key)?;
+                        let leaf_value = self.store_value(&entry_key, value)?;
+                        entries.insert(idx, (entry_key, leaf_value));
+                    }
                 }
                 superseded.push(page_id);
                 self.write_or_split_new(Node::Leaf(entries))
             }
             Node::Interior(mut entries) => {
-                let idx = route_index(&entries, key)?;
+                let idx = self.route_index(&entries, key)?;
                 let child = entries[idx].1;
                 match self.insert_into_cow(child, key, value, superseded)? {
                     Cow::Node(new_child) => entries[idx].1 = new_child,
                     Cow::Split { left, sep, right } => {
                         entries[idx].1 = left;
-                        entries.insert(idx + 1, (sep, right));
+                        let sep_key = self.make_key(&sep)?;
+                        entries.insert(idx + 1, (sep_key, right));
                     }
                 }
                 superseded.push(page_id);
                 self.write_or_split_new(Node::Interior(entries))
             }
         }
+    }
+
+    /// The interior entry index routing `key`: the rightmost entry with
+    /// `sep_i <= key`, or entry 0 when `key` sorts below every separator.
+    fn route_index(&self, entries: &InteriorEntries, key: &[u8]) -> Result<usize> {
+        use std::cmp::Ordering;
+        if entries.is_empty() {
+            return Err(FluxumError::Storage(
+                "interior node with zero entries".into(),
+            ));
+        }
+        // sep <= key  ⟺  cmp_probe(key, sep) != Less
+        let (mut lo, mut hi) = (0usize, entries.len());
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.cmp_probe(key, &entries[mid].0)? == Ordering::Less {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        Ok(lo.saturating_sub(1))
     }
 
     /// Copy-on-write delete of `key`. Returns whether it was present; when it
@@ -448,16 +658,17 @@ impl PagedTree {
         let node = parse_node(&self.pager.fault(self.table_id, page_id)?)?;
         match node {
             Node::Leaf(mut entries) => {
-                let Ok(idx) = entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) else {
+                let Ok(idx) = self.search_leaf(&entries, key)? else {
                     return Ok(None);
                 };
-                let (_, old) = entries.remove(idx);
+                let (old_key, old) = entries.remove(idx);
+                self.supersede_key(&old_key, superseded)?;
                 self.supersede_value(&old, superseded)?;
                 superseded.push(page_id);
                 Ok(Some(self.write_new_node(&Node::Leaf(entries))?))
             }
             Node::Interior(mut entries) => {
-                let idx = route_index(&entries, key)?;
+                let idx = self.route_index(&entries, key)?;
                 let child = entries[idx].1;
                 let Some(new_child) = self.delete_into_cow(child, key, superseded)? else {
                     return Ok(None);
@@ -494,13 +705,12 @@ impl PagedTree {
         let mut last_key: Option<Vec<u8>> = None;
 
         for (key, value) in entries {
-            if key.is_empty() || key.len() > self.max_key() {
-                return Err(FluxumError::Storage(format!(
-                    "bulk_load key of {} bytes is empty or exceeds {}",
-                    key.len(),
-                    self.max_key()
-                )));
-            }
+            self.check_key(&key).map_err(|_| {
+                FluxumError::Storage(format!(
+                    "bulk_load key of {} bytes is empty or exceeds u32",
+                    key.len()
+                ))
+            })?;
             if let Some(last) = &last_key
                 && *last >= key
             {
@@ -509,18 +719,24 @@ impl PagedTree {
                 ));
             }
             last_key = Some(key.clone());
-            let leaf_value = self.store_value(&key, &value)?;
-            let size = leaf_entry_size(&key, &leaf_value);
+            let entry_key = self.make_key(&key)?;
+            let leaf_value = self.store_value(&entry_key, &value)?;
+            let size = leaf_entry_size(&entry_key, &leaf_value);
             if leaf_bytes + size > budget && !leaf.is_empty() {
-                let first = leaf[0].0.clone();
+                // The level entry key is a fresh copy of the node's first
+                // key (a separator needs its own chain when long).
+                let first = self.make_key(&self.full_key(&leaf[0].0)?)?;
                 let page = self.write_new_node(&Node::Leaf(std::mem::take(&mut leaf)))?;
                 level.push((first, page));
                 leaf_bytes = 0;
             }
             leaf_bytes += size;
-            leaf.push((key, leaf_value));
+            leaf.push((entry_key, leaf_value));
         }
-        let first = leaf.first().map(|(k, _)| k.clone()).unwrap_or_default();
+        let first = match leaf.first() {
+            Some((k, _)) => self.make_key(&self.full_key(k)?)?,
+            None => EntryKey::Inline(Vec::new()),
+        };
         let page = self.write_new_node(&Node::Leaf(leaf))?;
         level.push((first, page));
 
@@ -532,7 +748,7 @@ impl PagedTree {
             for (key, child) in level {
                 let size = interior_entry_size(&key);
                 if node_bytes + size > budget && !node.is_empty() {
-                    let first = node[0].0.clone();
+                    let first = self.make_key(&self.full_key(&node[0].0)?)?;
                     let page = self.write_new_node(&Node::Interior(std::mem::take(&mut node)))?;
                     next.push((first, page));
                     node_bytes = 0;
@@ -540,7 +756,10 @@ impl PagedTree {
                 node_bytes += size;
                 node.push((key, child));
             }
-            let first = node.first().map(|(k, _)| k.clone()).unwrap_or_default();
+            let first = match node.first() {
+                Some((k, _)) => self.make_key(&self.full_key(k)?)?,
+                None => EntryKey::Inline(Vec::new()),
+            };
             let page = self.write_new_node(&Node::Interior(node))?;
             next.push((first, page));
             level = next;
@@ -561,15 +780,24 @@ impl PagedTree {
 
     /// Store a value for a leaf entry: inline when it fits, otherwise as an
     /// overflow chain (TIER-026).
-    fn store_value(&self, key: &[u8], value: &[u8]) -> Result<LeafValue> {
+    fn store_value(&self, key: &EntryKey, value: &[u8]) -> Result<LeafValue> {
         let inline = LeafValue::Inline(value.to_vec());
         if leaf_entry_size(key, &inline) <= self.max_inline_entry() {
             return Ok(inline);
         }
-        // Build the chain back to front so each page knows its successor.
+        Ok(LeafValue::Overflow {
+            total_len: value.len() as u64,
+            head: self.store_chain(value)?,
+        })
+    }
+
+    /// Write `bytes` as a fresh overflow chain and return its head page id.
+    /// Built back to front so each page knows its successor (TIER-026);
+    /// shared by long values and long keys.
+    fn store_chain(&self, bytes: &[u8]) -> Result<u64> {
         let chunk = self.overflow_chunk();
         let mut next = NIL;
-        let chunks: Vec<&[u8]> = value.chunks(chunk).collect();
+        let chunks: Vec<&[u8]> = bytes.chunks(chunk).collect();
         for part in chunks.iter().rev() {
             let page_id = self.pager.allocate_page_id(self.table_id);
             let mut payload = Vec::with_capacity(8 + part.len());
@@ -580,10 +808,7 @@ impl PagedTree {
             drop(self.pager.install(self.table_id, page_id, image)?);
             next = page_id;
         }
-        Ok(LeafValue::Overflow {
-            total_len: value.len() as u64,
-            head: next,
-        })
+        Ok(next)
     }
 
     /// Record a superseded leaf value's overflow-chain pages (if any) for
@@ -593,7 +818,12 @@ impl PagedTree {
         let LeafValue::Overflow { head, .. } = value else {
             return Ok(());
         };
-        let mut page_id = *head;
+        self.supersede_chain(*head, superseded)
+    }
+
+    /// Walk an overflow chain, recording every page for deferred reclaim.
+    fn supersede_chain(&self, head: u64, superseded: &mut Vec<u64>) -> Result<()> {
+        let mut page_id = head;
         while page_id != NIL {
             let next = {
                 let guard = self.pager.fault(self.table_id, page_id)?;
@@ -619,6 +849,9 @@ impl PagedTree {
             return Ok(Cow::Node(self.write_new_node(&node)?));
         }
         let (left, sep, right) = split_node(node)?;
+        // The separator is handed up as full bytes; the parent re-stores it
+        // (a long separator gets its own chain — the right half keeps its).
+        let sep = self.full_key(&sep)?.into_owned();
         let left_page = self.write_new_node(&left)?;
         let right_page = self.write_new_node(&right)?;
         Ok(Cow::Split {
@@ -647,17 +880,32 @@ impl PagedTree {
         match node {
             Node::Leaf(entries) => {
                 for (key, value) in entries {
-                    payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
+                    let stored = key.stored();
+                    // Tag: bit 0 = overflow value, bit 1 = overflow key
+                    // (0 inline/inline, 1 inline-key/overflow-value,
+                    //  2 overflow-key/inline-value, 3 both).
+                    let tag = match (key, value) {
+                        (EntryKey::Inline(_), LeafValue::Inline(_)) => 0u8,
+                        (EntryKey::Inline(_), LeafValue::Overflow { .. }) => 1,
+                        (EntryKey::Overflow { .. }, LeafValue::Inline(_)) => 2,
+                        (EntryKey::Overflow { .. }, LeafValue::Overflow { .. }) => 3,
+                    };
+                    payload.extend_from_slice(&(stored.len() as u16).to_le_bytes());
+                    payload.push(tag);
+                    payload.extend_from_slice(stored);
+                    if let EntryKey::Overflow {
+                        total_len, head, ..
+                    } = key
+                    {
+                        payload.extend_from_slice(&total_len.to_le_bytes());
+                        payload.extend_from_slice(&head.to_le_bytes());
+                    }
                     match value {
                         LeafValue::Inline(bytes) => {
-                            payload.push(0);
-                            payload.extend_from_slice(key);
                             payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
                             payload.extend_from_slice(bytes);
                         }
                         LeafValue::Overflow { total_len, head } => {
-                            payload.push(1);
-                            payload.extend_from_slice(key);
                             payload.extend_from_slice(&total_len.to_le_bytes());
                             payload.extend_from_slice(&head.to_le_bytes());
                         }
@@ -666,8 +914,24 @@ impl PagedTree {
             }
             Node::Interior(entries) => {
                 for (key, child) in entries {
-                    payload.extend_from_slice(&(key.len() as u16).to_le_bytes());
-                    payload.extend_from_slice(key);
+                    let stored = key.stored();
+                    match key {
+                        EntryKey::Inline(_) => {
+                            payload.extend_from_slice(&(stored.len() as u16).to_le_bytes());
+                            payload.extend_from_slice(stored);
+                        }
+                        EntryKey::Overflow {
+                            total_len, head, ..
+                        } => {
+                            // Bit 15 of key_len marks an overflow separator.
+                            payload.extend_from_slice(
+                                &((stored.len() as u16) | KEY_LEN_OVERFLOW).to_le_bytes(),
+                            );
+                            payload.extend_from_slice(stored);
+                            payload.extend_from_slice(&total_len.to_le_bytes());
+                            payload.extend_from_slice(&head.to_le_bytes());
+                        }
+                    }
                     payload.extend_from_slice(&child.to_le_bytes());
                 }
             }
@@ -689,6 +953,25 @@ fn payload_of(guard: &PageGuard) -> &[u8] {
 enum RawLeafValue<'p> {
     Inline(&'p [u8]),
     Overflow { total_len: u64, head: u64 },
+}
+
+/// Outcome of an in-place leaf search.
+enum RawFound<'p> {
+    /// No entry matches (the walk passed the probe or ran out).
+    Absent,
+    /// The matching entry's value, referenced in the pinned frame.
+    Found(RawLeafValue<'p>),
+    /// An overflow key's routing prefix could not decide the comparison —
+    /// the caller must re-search with full keys (faulting key chains).
+    NeedsFullKeys,
+}
+
+/// Outcome of an in-place interior route.
+enum RawRoute {
+    /// The child page to descend into.
+    Child(u64),
+    /// An overflow separator tied on its prefix — route with full keys.
+    NeedsFullKeys,
 }
 
 /// Fixed-width little-endian reads for the in-place walkers; `None` on a
@@ -713,25 +996,48 @@ fn raw_u64(rest: &[u8], at: usize) -> Option<u64> {
 }
 
 /// Allocation-free leaf search (TIER-014 hot path): walk the sorted entry
-/// stream in place, early-exiting once entry keys pass `key`. Outer `None`
-/// = malformed payload; inner `Option` = present/absent.
-fn raw_leaf_find<'p>(payload: &'p [u8], key: &[u8]) -> Option<Option<RawLeafValue<'p>>> {
+/// stream in place, early-exiting once entry keys pass `key`. `None` =
+/// malformed payload. An entry whose *routing prefix* cannot decide the
+/// comparison (the probe extends an overflow key's prefix) yields
+/// [`RawFound::NeedsFullKeys`] so the caller re-runs the search on the
+/// parsed, chain-faulting path.
+fn raw_leaf_find<'p>(payload: &'p [u8], key: &[u8]) -> Option<RawFound<'p>> {
+    use std::cmp::Ordering;
     let mut at = 0usize;
     while at < payload.len() {
         let key_len = raw_u16(payload, at)? as usize;
         let tag = *payload.get(at + 2)?;
+        if tag > 3 {
+            return None;
+        }
         let entry_key = payload.get(at + 3..at + 3 + key_len)?;
         at += 3 + key_len;
-        let value_len = match tag {
-            0 => 4 + raw_u32(payload, at)? as usize,
-            1 => 16,
-            _ => return None,
+        let key_overflow = tag & 2 != 0;
+        if key_overflow {
+            at += 12; // full_key_len: u32 | key_head: u64
+        }
+        let value_len = if tag & 1 == 0 {
+            4 + raw_u32(payload, at)? as usize
+        } else {
+            16
         };
-        match entry_key.cmp(key) {
-            std::cmp::Ordering::Less => at += value_len,
-            std::cmp::Ordering::Greater => return Some(None), // sorted: past it
-            std::cmp::Ordering::Equal => {
-                return Some(Some(if tag == 0 {
+        let ordering = if key_overflow {
+            // Prefix comparison; only a probe that extends the prefix is
+            // undecidable here (the full key strictly extends it).
+            let l = entry_key.len().min(key.len());
+            match entry_key[..l].cmp(&key[..l]) {
+                Ordering::Equal if key.len() <= entry_key.len() => Ordering::Greater,
+                Ordering::Equal => return Some(RawFound::NeedsFullKeys),
+                other => other,
+            }
+        } else {
+            entry_key.cmp(key)
+        };
+        match ordering {
+            Ordering::Less => at += value_len,
+            Ordering::Greater => return Some(RawFound::Absent), // sorted: past it
+            Ordering::Equal => {
+                return Some(RawFound::Found(if tag & 1 == 0 {
                     RawLeafValue::Inline(payload.get(at + 4..at + value_len)?)
                 } else {
                     RawLeafValue::Overflow {
@@ -742,20 +1048,41 @@ fn raw_leaf_find<'p>(payload: &'p [u8], key: &[u8]) -> Option<Option<RawLeafValu
             }
         }
     }
-    Some(None)
+    Some(RawFound::Absent)
 }
 
 /// Allocation-free interior routing (TIER-014 hot path): the rightmost
 /// entry with `entry_key <= key`, or the first entry when `key` sorts below
 /// every separator. `None` = malformed/empty payload.
-fn raw_interior_route(payload: &[u8], key: &[u8]) -> Option<u64> {
+fn raw_interior_route(payload: &[u8], key: &[u8]) -> Option<RawRoute> {
+    use std::cmp::Ordering;
     let mut at = 0usize;
     let mut chosen: Option<u64> = None;
     while at < payload.len() {
-        let key_len = raw_u16(payload, at)? as usize;
+        let raw_len = raw_u16(payload, at)?;
+        let key_overflow = raw_len & KEY_LEN_OVERFLOW != 0;
+        let key_len = (raw_len & KEY_LEN_MASK) as usize;
         let entry_key = payload.get(at + 2..at + 2 + key_len)?;
-        let child = raw_u64(payload, at + 2 + key_len)?;
-        if entry_key <= key {
+        let mut cursor = at + 2 + key_len;
+        if key_overflow {
+            cursor += 12; // full_key_len: u32 | key_head: u64
+        }
+        let child = raw_u64(payload, cursor)?;
+        // `sep <= key`, decided on the prefix unless the probe extends it.
+        let le = if key_overflow {
+            let l = entry_key.len().min(key.len());
+            match entry_key[..l].cmp(&key[..l]) {
+                // The full separator strictly extends its prefix, so a probe
+                // no longer than the prefix sorts below it.
+                Ordering::Equal if key.len() <= entry_key.len() => false,
+                Ordering::Equal => return Some(RawRoute::NeedsFullKeys),
+                Ordering::Less => true,
+                Ordering::Greater => false,
+            }
+        } else {
+            entry_key <= key
+        };
+        if le {
             chosen = Some(child);
         } else if chosen.is_some() {
             break; // sorted: nothing further can route lower
@@ -763,9 +1090,9 @@ fn raw_interior_route(payload: &[u8], key: &[u8]) -> Option<u64> {
             chosen = Some(child); // key below every separator: first child
             break;
         }
-        at += 2 + key_len + 8;
+        at = cursor + 8;
     }
-    chosen
+    chosen.map(RawRoute::Child)
 }
 
 /// Parse a pooled node page.
@@ -805,22 +1132,30 @@ fn parse_node(guard: &PageGuard) -> Result<Node> {
             while !rest.is_empty() {
                 let key_len = take_u16(&mut rest)? as usize;
                 let tag = take(&mut rest, 1)?[0];
-                let entry_key = take(&mut rest, key_len)?;
-                let value = match tag {
-                    0 => {
-                        let val_len = take_u32(&mut rest)? as usize;
-                        LeafValue::Inline(take(&mut rest, val_len)?)
+                if tag > 3 {
+                    return Err(node_err(
+                        table_id,
+                        key.page_id,
+                        &format!("unknown leaf value tag {tag}"),
+                    ));
+                }
+                let stored = take(&mut rest, key_len)?;
+                let entry_key = if tag & 2 == 0 {
+                    EntryKey::Inline(stored)
+                } else {
+                    EntryKey::Overflow {
+                        prefix: stored,
+                        total_len: take_u32(&mut rest)?,
+                        head: take_u64(&mut rest)?,
                     }
-                    1 => LeafValue::Overflow {
+                };
+                let value = if tag & 1 == 0 {
+                    let val_len = take_u32(&mut rest)? as usize;
+                    LeafValue::Inline(take(&mut rest, val_len)?)
+                } else {
+                    LeafValue::Overflow {
                         total_len: take_u64(&mut rest)?,
                         head: take_u64(&mut rest)?,
-                    },
-                    other => {
-                        return Err(node_err(
-                            table_id,
-                            key.page_id,
-                            &format!("unknown leaf value tag {other}"),
-                        ));
                     }
                 };
                 entries.push((entry_key, value));
@@ -830,8 +1165,17 @@ fn parse_node(guard: &PageGuard) -> Result<Node> {
         NODE_INTERIOR => {
             let mut entries: InteriorEntries = Vec::new();
             while !rest.is_empty() {
-                let key_len = take_u16(&mut rest)? as usize;
-                let entry_key = take(&mut rest, key_len)?;
+                let raw_len = take_u16(&mut rest)?;
+                let stored = take(&mut rest, (raw_len & KEY_LEN_MASK) as usize)?;
+                let entry_key = if raw_len & KEY_LEN_OVERFLOW == 0 {
+                    EntryKey::Inline(stored)
+                } else {
+                    EntryKey::Overflow {
+                        prefix: stored,
+                        total_len: take_u32(&mut rest)?,
+                        head: take_u64(&mut rest)?,
+                    }
+                };
                 let child = take_u64(&mut rest)?;
                 entries.push((entry_key, child));
             }
@@ -852,9 +1196,13 @@ fn node_err(table_id: TableId, page_id: u64, what: &str) -> FluxumError {
 }
 
 /// Encoded size of one leaf entry.
-fn leaf_entry_size(key: &[u8], value: &LeafValue) -> usize {
+fn leaf_entry_size(key: &EntryKey, value: &LeafValue) -> usize {
     2 + 1
-        + key.len()
+        + key.stored().len()
+        + match key {
+            EntryKey::Inline(_) => 0,
+            EntryKey::Overflow { .. } => 12, // full_key_len | key_head
+        }
         + match value {
             LeafValue::Inline(bytes) => 4 + bytes.len(),
             LeafValue::Overflow { .. } => 16,
@@ -862,8 +1210,13 @@ fn leaf_entry_size(key: &[u8], value: &LeafValue) -> usize {
 }
 
 /// Encoded size of one interior entry.
-fn interior_entry_size(key: &[u8]) -> usize {
-    2 + key.len() + 8
+fn interior_entry_size(key: &EntryKey) -> usize {
+    2 + key.stored().len()
+        + match key {
+            EntryKey::Inline(_) => 0,
+            EntryKey::Overflow { .. } => 12,
+        }
+        + 8
 }
 
 /// Total encoded entry bytes of a node (excluding the kind byte).
@@ -875,14 +1228,15 @@ fn node_size(node: &Node) -> usize {
 }
 
 /// Both halves of a split entry list.
-type Halves<T> = (Vec<(Vec<u8>, T)>, Vec<(Vec<u8>, T)>);
+type Halves<T> = (Vec<(EntryKey, T)>, Vec<(EntryKey, T)>);
 
 /// Split an overfull node near its byte midpoint; the separator is the
-/// right half's first key.
-fn split_node(node: Node) -> Result<(Node, Vec<u8>, Node)> {
+/// right half's first key (returned as the stored key — the caller
+/// materializes and re-stores it, so both halves keep valid chains).
+fn split_node(node: Node) -> Result<(Node, EntryKey, Node)> {
     fn split_at_bytes<T>(
-        entries: Vec<(Vec<u8>, T)>,
-        size: impl Fn(&(Vec<u8>, T)) -> usize,
+        entries: Vec<(EntryKey, T)>,
+        size: impl Fn(&(EntryKey, T)) -> usize,
     ) -> Halves<T> {
         let total: usize = entries.iter().map(&size).sum();
         let mut acc = 0usize;
@@ -923,19 +1277,6 @@ fn split_node(node: Node) -> Result<(Node, Vec<u8>, Node)> {
             Ok((Node::Interior(left), sep, Node::Interior(right)))
         }
     }
-}
-
-/// The entry index routing `key`: the rightmost entry with `key_i <= key`,
-/// or entry 0 when `key` sorts below every separator.
-fn route_index(entries: &InteriorEntries, key: &[u8]) -> Result<usize> {
-    if entries.is_empty() {
-        return Err(FluxumError::Storage(
-            "interior node with zero entries".into(),
-        ));
-    }
-    Ok(entries
-        .partition_point(|(k, _)| k.as_slice() <= key)
-        .saturating_sub(1))
 }
 
 #[cfg(test)]
@@ -991,7 +1332,7 @@ mod tests {
     }
 
     #[test]
-    fn key_validation_rejects_empty_and_oversized_keys() {
+    fn empty_keys_are_rejected_but_long_keys_are_not() {
         let (_dir, pager, table) = fixture();
         let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
 
@@ -1001,13 +1342,149 @@ mod tests {
         };
         assert!(err.contains("keys must be non-empty"), "{err}");
 
-        let long = vec![b'k'; tree.max_key() + 1];
-        let err = match tree.insert(&long, b"v") {
-            Ok(()) => panic!("oversized key accepted"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("exceeds the"), "{err}");
-        assert!(err.contains("byte limit"), "{err}");
+        // Keys far past the inline bound (and past a whole page) round-trip
+        // exactly — they overflow instead of erroring.
+        let long = vec![b'k'; PAGE_SIZE * 5];
+        tree.insert(&long, b"v").unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            tree.get(&long).unwrap_or_else(|e| panic!("{e}")),
+            Some(b"v".to_vec())
+        );
+    }
+
+    /// Keys sharing a long common prefix (so the routing prefix cannot
+    /// decide) must still order, find, and scan exactly — the property the
+    /// whole overflow-key design turns on.
+    #[test]
+    fn overflow_keys_sharing_a_prefix_are_exact() {
+        let (_dir, pager, table) = fixture();
+        let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
+        let shared = vec![b'p'; PAGE_SIZE]; // >> max_inline_key
+
+        // Keys: shared ++ suffix, plus the bare shared prefix itself (which
+        // is a proper prefix of every other key — the ordering edge case).
+        let mut keys: Vec<Vec<u8>> = vec![shared.clone()];
+        for i in 0..24u32 {
+            let mut k = shared.clone();
+            k.extend_from_slice(format!("-{i:03}").as_bytes());
+            keys.push(k);
+        }
+        for (i, k) in keys.iter().enumerate() {
+            tree.insert(k, format!("v{i}").as_bytes())
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // Every key resolves to its own value (no prefix collision).
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                tree.get(k).unwrap_or_else(|e| panic!("{e}")),
+                Some(format!("v{i}").into_bytes()),
+                "key {i} lost"
+            );
+        }
+        // A probe that extends the shared prefix but was never inserted.
+        let mut missing = shared.clone();
+        missing.extend_from_slice(b"-999");
+        assert_eq!(tree.get(&missing).unwrap_or_else(|e| panic!("{e}")), None);
+
+        // A full scan yields every key in sorted order.
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        tree.scan(&[], None, &mut |k, _| {
+            seen.push(k.to_vec());
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let mut expect = keys.clone();
+        expect.sort();
+        assert_eq!(seen, expect);
+
+        // A bounded scan over the overflow-key range.
+        let mut lo = shared.clone();
+        lo.extend_from_slice(b"-005");
+        let mut hi = shared.clone();
+        hi.extend_from_slice(b"-010");
+        let mut ranged: Vec<Vec<u8>> = Vec::new();
+        tree.scan(&lo, Some(&hi), &mut |k, _| {
+            ranged.push(k.to_vec());
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        let expect_ranged: Vec<Vec<u8>> = expect
+            .iter()
+            .filter(|k| k.as_slice() >= lo.as_slice() && k.as_slice() < hi.as_slice())
+            .cloned()
+            .collect();
+        assert_eq!(ranged, expect_ranged);
+
+        // Deleting an overflow key removes exactly that entry.
+        assert!(tree.delete(&keys[3]).unwrap_or_else(|e| panic!("{e}")));
+        assert_eq!(tree.get(&keys[3]).unwrap_or_else(|e| panic!("{e}")), None);
+        assert_eq!(
+            tree.get(&keys[4]).unwrap_or_else(|e| panic!("{e}")),
+            Some(b"v4".to_vec())
+        );
+    }
+
+    /// A CoW update of an overflow-key entry keeps an older version readable
+    /// (the key chain is shared, the value chain is retired per version).
+    #[test]
+    fn cow_over_overflow_keys_preserves_snapshots() {
+        let (_dir, pager, table) = fixture();
+        let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for i in 0..12u32 {
+            let mut k = vec![b'z'; PAGE_SIZE / 2];
+            k.extend_from_slice(format!("{i:03}").as_bytes());
+            tree.insert(&k, b"before").unwrap_or_else(|e| panic!("{e}"));
+            keys.push(k);
+        }
+        let snap = tree.clone();
+
+        let mut superseded = Vec::new();
+        for k in &keys {
+            tree.insert_cow(k, b"after", &mut superseded)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        for k in &keys {
+            assert_eq!(
+                tree.get(k).unwrap_or_else(|e| panic!("{e}")),
+                Some(b"after".to_vec())
+            );
+            assert_eq!(
+                snap.get(k).unwrap_or_else(|e| panic!("{e}")),
+                Some(b"before".to_vec()),
+                "the pinned snapshot must still read the old version"
+            );
+        }
+    }
+
+    /// `bulk_load` over long keys builds a balanced tree (the level loop
+    /// terminates — the livelock the inline bound exists to prevent).
+    #[test]
+    fn bulk_load_handles_uniformly_long_keys() {
+        let (_dir, pager, table) = fixture();
+        let mut tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = (0..64u32)
+            .map(|i| {
+                let mut k = vec![b'L'; PAGE_SIZE * 2];
+                k.extend_from_slice(format!("{i:04}").as_bytes());
+                (k, i.to_le_bytes().to_vec())
+            })
+            .collect();
+        tree.bulk_load(entries.clone())
+            .unwrap_or_else(|e| panic!("{e}"));
+        for (k, v) in &entries {
+            assert_eq!(
+                tree.get(k).unwrap_or_else(|e| panic!("{e}")),
+                Some(v.clone())
+            );
+        }
+        let mut count = 0usize;
+        tree.scan(&[], None, &mut |_, _| {
+            count += 1;
+            Ok(true)
+        })
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(count, entries.len());
     }
 
     #[test]
@@ -1258,12 +1735,13 @@ mod tests {
     fn unknown_leaf_value_tags_are_reported_on_both_paths() {
         let (_dir, pager, table) = fixture();
         let tree = PagedTree::create(&pager, table, false).unwrap_or_else(|e| panic!("{e}"));
-        // One leaf entry: key_len=1, tag=2 (unknown), key 'k'.
-        corrupt_root(&pager, table, &tree, &[NODE_LEAF, 1, 0, 2, b'k']);
+        // One leaf entry: key_len=1, tag=4 (unknown — tags 0..=3 are the
+        // inline/overflow key×value matrix), key 'k'.
+        corrupt_root(&pager, table, &tree, &[NODE_LEAF, 1, 0, 4, b'k']);
         let err = get_err(&tree, b"k");
         assert!(err.contains("malformed leaf"), "{err}");
         let err = scan_err(&tree);
-        assert!(err.contains("unknown leaf value tag 2"), "{err}");
+        assert!(err.contains("unknown leaf value tag 4"), "{err}");
     }
 
     #[test]
@@ -1328,5 +1806,87 @@ mod tests {
             Err(e) => e.to_string(),
         };
         assert!(err.contains("overflow page too short"), "{err}");
+    }
+
+    // --- ordering equivalence vs a resident oracle ----------------------
+
+    /// Arbitrary keys built from a small alphabet with lengths spanning the
+    /// inline bound (`max_inline_key` is 27 at 256-byte pages), so a run
+    /// mixes inline keys, overflow keys, shared prefixes, and keys that are
+    /// proper prefixes of others.
+    fn key_strategy() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        use proptest::prelude::*;
+        prop::collection::vec(prop::sample::select(vec![b'a', b'b', b'p']), 1..90)
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        /// The paged tree answers `get` and ordered `scan` exactly like a
+        /// resident `BTreeMap` over the same key/value stream — including
+        /// updates, deletes, and probes for keys never inserted.
+        #[test]
+        fn matches_a_btreemap_oracle_over_mixed_key_lengths(
+            ops in prop::collection::vec(
+                (key_strategy(), any::<u8>(), any::<bool>()),
+                1..40,
+            ),
+            probes in prop::collection::vec(key_strategy(), 1..10),
+        ) {
+            use std::collections::BTreeMap;
+            let (_dir, pager, table) = fixture();
+            let mut tree = PagedTree::create(&pager, table, false)
+                .unwrap_or_else(|e| panic!("{e}"));
+            let mut oracle: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+            for (key, value, is_delete) in ops {
+                if is_delete {
+                    let hit = tree.delete(&key).unwrap_or_else(|e| panic!("{e}"));
+                    prop_assert_eq!(hit, oracle.remove(&key).is_some());
+                } else {
+                    let bytes = vec![value; 1 + usize::from(value % 7)];
+                    tree.insert(&key, &bytes).unwrap_or_else(|e| panic!("{e}"));
+                    oracle.insert(key, bytes);
+                }
+            }
+
+            // Point lookups: inserted keys and arbitrary probes agree.
+            for key in oracle.keys() {
+                let got = tree.get(key).unwrap_or_else(|e| panic!("{e}"));
+                prop_assert_eq!(got.as_ref(), oracle.get(key));
+            }
+            for probe in &probes {
+                let got = tree.get(probe).unwrap_or_else(|e| panic!("{e}"));
+                prop_assert_eq!(got.as_ref(), oracle.get(probe));
+            }
+
+            // Full scan: same pairs, same order.
+            let mut scanned: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            tree.scan(&[], None, &mut |k, v| {
+                scanned.push((k.to_vec(), v.to_vec()));
+                Ok(true)
+            })
+            .unwrap_or_else(|e| panic!("{e}"));
+            let expected: Vec<(Vec<u8>, Vec<u8>)> =
+                oracle.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            prop_assert_eq!(scanned, expected);
+
+            // Bounded scans agree for every probe pair used as [start, end).
+            for probe in &probes {
+                let mut ranged: Vec<Vec<u8>> = Vec::new();
+                tree.scan(probe, None, &mut |k, _| {
+                    ranged.push(k.to_vec());
+                    Ok(true)
+                })
+                .unwrap_or_else(|e| panic!("{e}"));
+                let expect: Vec<Vec<u8>> = oracle
+                    .range(probe.clone()..)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                prop_assert_eq!(ranged, expect);
+            }
+        }
     }
 }

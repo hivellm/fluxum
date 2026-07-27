@@ -60,7 +60,7 @@ pub use reclaim::{Reclaimer, VersionGuard};
 pub use tree::PagedTree;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -189,13 +189,15 @@ impl Pager {
             },
             Arc::clone(&metrics),
         );
+        let dir = dir.into();
+        discard_unreadable_page_files(&dir, options.shard_id)?;
         Ok(Arc::new(Self {
             shard_id: options.shard_id,
             page_size: options.page_size,
             compression: codec::PageCodec::from(options.compression),
             compression_min_bytes: options.compression_min_bytes,
             keyring,
-            dir: dir.into(),
+            dir,
             pool,
             tables: Mutex::new(HashMap::new()),
             metrics,
@@ -460,6 +462,55 @@ impl Pager {
         let file = io.file.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(file.allocated_bytes())
     }
+}
+
+/// Delete page files this build cannot read before they are ever opened
+/// lazily (TIER-023 layout: `dir/shard-<shard_id>/table-<id>.pages`).
+///
+/// The cold tier is a **cache**, not the record: every boot rebuilds its
+/// trees from the newest checkpoint plus the commit log (SPEC-002 STG-030),
+/// so a file left by an older page format (a version bump, TIER-021) or a
+/// half-written run carries nothing durable. Keeping it would strand a
+/// recoverable database behind a disposable tier — the first fault of that
+/// table would fail the superblock check and take the shard down. Files that
+/// *do* verify are left untouched, so a future format that persists roots
+/// across restarts keeps working.
+///
+/// A missing directory is not an error (first boot).
+fn discard_unreadable_page_files(dir: &Path, shard_id: u32) -> Result<()> {
+    let shard_dir = dir.join(format!("shard-{shard_id}"));
+    let entries = match std::fs::read_dir(&shard_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        let Some(table_id) = page_file_table_id(&path) else {
+            continue;
+        };
+        if pagefile::PageFile::open(&path, shard_id, table_id).is_err() {
+            tracing::warn!(
+                path = %path.display(),
+                "discarding an unreadable cold-tier page file; its table is rebuilt from \
+                 the checkpoint + commit log (SPEC-015 TIER-021)"
+            );
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// The table id encoded in a `table-<id>.pages` file name, if it is one.
+fn page_file_table_id(path: &Path) -> Option<u32> {
+    if path.extension()?.to_str()? != "pages" {
+        return None;
+    }
+    path.file_stem()?
+        .to_str()?
+        .strip_prefix("table-")?
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]

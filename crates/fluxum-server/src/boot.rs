@@ -97,6 +97,9 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     let hardware = fluxum_core::hw::HardwareProfile::probe();
     let effective = fluxum_core::hw::derive(&hardware, config)?;
     std::fs::create_dir_all(&config.storage.page_dir).map_err(fluxum_core::FluxumError::from)?;
+    // `Pager::open` discards page files this build cannot read (an older
+    // page format, a half-written run): the tier is a cache, and recovery
+    // below rebuilds it from the checkpoint + commit log (TIER-021).
     let pager = fluxum_core::store::pager::Pager::open(
         &config.storage.page_dir,
         fluxum_core::store::pager::PagerOptions::from_effective(config, &effective, shard),
