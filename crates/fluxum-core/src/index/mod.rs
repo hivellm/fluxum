@@ -53,7 +53,11 @@ pub use fulltext::{
 pub use quadtree::{QuadTree, Rect};
 pub use rtree::{Aabb, RTree};
 
+use std::sync::Arc;
+
 use crate::error::{FluxumError, Result};
+use crate::store::TableId;
+use crate::store::pager::Pager;
 use crate::store::row::{PkBytes, Row, RowValue};
 
 /// Stable `u32` index identifier (STG-051): CRC32 (IEEE) of
@@ -117,12 +121,17 @@ impl std::fmt::Display for IndexId {
 /// server assembly gates `ReducerCall` admission on
 /// `MemStore::spatial_ready` so rebuilding always completes before the shard
 /// serves writes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct SpatialIndexState {
     /// Coordinate column ordinals: `(x, y)` for a QuadTree (SPX-001),
     /// `(min_x, min_y, max_x, max_y)` for an R-tree (SPX-010).
     columns: &'static [u16],
     index: SpatialIndex,
+    /// Paging handles, carried so `fresh_like`/`rebuilding_like` can build
+    /// an empty index of the same configuration on the same page file
+    /// (TIER-051).
+    pager: Arc<Pager>,
+    table_id: TableId,
     /// SPX-031 gate: `false` while the index awaits its post-recovery
     /// rebuild — queries return 503, commit-merge maintenance is skipped
     /// (the rebuild recreates the index from the rows wholesale).
@@ -130,7 +139,7 @@ pub struct SpatialIndexState {
 }
 
 /// The backing structure family (SPX-002 / SPX-010).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 enum SpatialIndex {
     QuadTree(QuadTree),
     RTree(RTree),
@@ -140,43 +149,64 @@ impl SpatialIndexState {
     /// An empty QuadTree spatial index over the point columns `(x, y)`
     /// (`columns`, ordinals into the table schema), rooted at `bounds`
     /// (SPX-004) with the given leaf `bucket_size` (SPX-003).
-    pub(crate) fn quadtree(columns: &'static [u16], bounds: Rect, bucket_size: usize) -> Self {
-        Self {
+    pub(crate) fn quadtree(
+        columns: &'static [u16],
+        bounds: Rect,
+        bucket_size: usize,
+        pager: &Arc<Pager>,
+        table_id: TableId,
+    ) -> Result<Self> {
+        Ok(Self {
             columns,
-            index: SpatialIndex::QuadTree(QuadTree::new(bounds, bucket_size)),
+            index: SpatialIndex::QuadTree(QuadTree::new(bounds, bucket_size, pager, table_id)?),
+            pager: Arc::clone(pager),
+            table_id,
             ready: true,
-        }
+        })
     }
 
     /// An empty R-tree spatial index over the box columns
     /// `(min_x, min_y, max_x, max_y)` (SPX-010) with node capacity
     /// `max_entries`.
-    pub(crate) fn rtree(columns: &'static [u16], max_entries: usize) -> Self {
-        Self {
+    pub(crate) fn rtree(
+        columns: &'static [u16],
+        max_entries: usize,
+        pager: &Arc<Pager>,
+        table_id: TableId,
+    ) -> Result<Self> {
+        Ok(Self {
             columns,
             index: SpatialIndex::RTree(RTree::new(max_entries)),
+            pager: Arc::clone(pager),
+            table_id,
             ready: true,
-        }
+        })
     }
 
     /// An empty index with this index's exact configuration — the rebuild
     /// seed for the STG-007 rule-2 integrity check and for SPX-031 rebuilds.
-    pub(crate) fn fresh_like(&self) -> Self {
+    pub(crate) fn fresh_like(&self) -> Result<Self> {
         match &self.index {
-            SpatialIndex::QuadTree(qt) => {
-                Self::quadtree(self.columns, qt.bounds(), qt.bucket_size())
+            SpatialIndex::QuadTree(qt) => Self::quadtree(
+                self.columns,
+                qt.bounds(),
+                qt.bucket_size(),
+                &self.pager,
+                self.table_id,
+            ),
+            SpatialIndex::RTree(rt) => {
+                Self::rtree(self.columns, rt.max_entries(), &self.pager, self.table_id)
             }
-            SpatialIndex::RTree(rt) => Self::rtree(self.columns, rt.max_entries()),
         }
     }
 
     /// This configuration in the SPX-031 rebuilding state: empty, not
     /// ready — every query answers `503 spatial index not ready`.
-    pub(crate) fn rebuilding_like(&self) -> Self {
-        Self {
+    pub(crate) fn rebuilding_like(&self) -> Result<Self> {
+        Ok(Self {
             ready: false,
-            ..self.fresh_like()
-        }
+            ..self.fresh_like()?
+        })
     }
 
     /// Whether the index serves queries (SPX-031).
@@ -245,7 +275,7 @@ impl SpatialIndexState {
     /// Add `row`'s spatial entry (commit merge, insert side — SPX-030).
     /// Skipped while rebuilding: the SPX-031 rebuild recreates the index
     /// from the committed rows wholesale.
-    pub(crate) fn insert_row(&mut self, row: &Row, pk: PkBytes) -> Result<()> {
+    pub(crate) fn insert_row(&mut self, row: &Row, pk: PkBytes, sup: &mut Vec<u64>) -> Result<()> {
         if !self.ready {
             return Ok(());
         }
@@ -258,7 +288,7 @@ impl SpatialIndexState {
                     ),
                     _ => return Err(arity_invariant("quadtree", 2, self.columns.len())),
                 };
-                qt.insert(x, y, pk);
+                qt.insert(x, y, pk, sup)?;
             }
             SpatialIndex::RTree(rt) => {
                 let aabb = match self.columns {
@@ -277,7 +307,7 @@ impl SpatialIndexState {
     }
 
     /// Remove `row`'s spatial entry (commit merge, delete side — SPX-030).
-    pub(crate) fn remove_row(&mut self, row: &Row, pk: &PkBytes) -> Result<()> {
+    pub(crate) fn remove_row(&mut self, row: &Row, pk: &PkBytes, sup: &mut Vec<u64>) -> Result<()> {
         if !self.ready {
             return Ok(());
         }
@@ -290,7 +320,7 @@ impl SpatialIndexState {
                     ),
                     _ => return Err(arity_invariant("quadtree", 2, self.columns.len())),
                 };
-                qt.remove(x, y, pk);
+                qt.remove(x, y, pk, sup)?;
             }
             SpatialIndex::RTree(rt) => {
                 let aabb = match self.columns {
@@ -308,12 +338,24 @@ impl SpatialIndexState {
         Ok(())
     }
 
+    /// Every indexed entry in canonical order — the STG-007 rule-2
+    /// comparison surface (paged indexes have no structural equality, so
+    /// contents are what must match a fresh rebuild).
+    pub(crate) fn entries(&self) -> Result<Vec<(f64, f64, PkBytes)>> {
+        match &self.index {
+            SpatialIndex::QuadTree(qt) => qt.entries(),
+            // The R-tree is still resident; its contents are compared
+            // structurally until it is paged too (TIER-051 follow-up).
+            SpatialIndex::RTree(rt) => Ok(rt.entries()),
+        }
+    }
+
     /// PKs matching an `IN REGION` box (SPX-020): QuadTree — points inside
     /// the closed box; R-tree — stored boxes **intersecting** it.
     pub(crate) fn query_region(&self, region: Rect) -> Result<Vec<PkBytes>> {
         self.check_ready()?;
         Ok(match &self.index {
-            SpatialIndex::QuadTree(qt) => qt.query_region(region),
+            SpatialIndex::QuadTree(qt) => qt.query_region(region)?,
             SpatialIndex::RTree(rt) => rt.query_region(&Aabb::new(
                 region.x,
                 region.y,
@@ -328,7 +370,7 @@ impl SpatialIndexState {
     pub(crate) fn query_radius(&self, x: f64, y: f64, r: f64) -> Result<Vec<PkBytes>> {
         self.check_ready()?;
         Ok(match &self.index {
-            SpatialIndex::QuadTree(qt) => qt.query_radius(x, y, r),
+            SpatialIndex::QuadTree(qt) => qt.query_radius(x, y, r)?,
             SpatialIndex::RTree(rt) => rt.query_radius(x, y, r),
         })
     }
@@ -338,7 +380,7 @@ impl SpatialIndexState {
     pub(crate) fn query_point(&self, x: f64, y: f64) -> Result<Vec<PkBytes>> {
         self.check_ready()?;
         Ok(match &self.index {
-            SpatialIndex::QuadTree(qt) => qt.query_point(x, y),
+            SpatialIndex::QuadTree(qt) => qt.query_point(x, y)?,
             SpatialIndex::RTree(rt) => rt.query_point(x, y),
         })
     }
@@ -476,25 +518,64 @@ mod tests {
             Row::new(vec![RowValue::F64(x), RowValue::F64(y)])
         }
 
+        /// A throwaway pager (one fresh directory per call) for the paged
+        /// spatial state.
+        fn test_pager() -> Arc<Pager> {
+            use crate::config::PageCompression;
+            use crate::store::pager::PagerOptions;
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static N: AtomicU64 = AtomicU64::new(0);
+            let n = N.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("fluxum-spx-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+            Pager::open(
+                dir,
+                PagerOptions {
+                    shard_id: 0,
+                    page_size: 4096,
+                    pool_capacity_bytes: 512 * 4096,
+                    high_watermark: 0.95,
+                    low_watermark: 0.90,
+                    compression: PageCompression::None,
+                    compression_min_bytes: 1024,
+                },
+            )
+            .unwrap_or_else(|e| panic!("{e}"))
+        }
+
         #[test]
         fn quadtree_state_round_trips_points_and_rebuilding_gates_queries() {
-            let mut state =
-                SpatialIndexState::quadtree(&[0, 1], Rect::new(0.0, 0.0, 100.0, 100.0), 4);
+            let mut state = SpatialIndexState::quadtree(
+                &[0, 1],
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                4,
+                &test_pager(),
+                TableId::of("SpxTest"),
+            )
+            .unwrap();
             assert!(state.is_ready());
-            state.insert_row(&point_row(5.0, 5.0), pk(1)).unwrap();
+            state
+                .insert_row(&point_row(5.0, 5.0), pk(1), &mut Vec::new())
+                .unwrap();
             assert_eq!(
                 state.query_region(Rect::new(0.0, 0.0, 10.0, 10.0)).unwrap(),
                 vec![pk(1)]
             );
             assert_eq!(state.query_point(5.0, 5.0).unwrap(), vec![pk(1)]);
-            state.remove_row(&point_row(5.0, 5.0), &pk(1)).unwrap();
+            state
+                .remove_row(&point_row(5.0, 5.0), &pk(1), &mut Vec::new())
+                .unwrap();
             assert!(state.query_radius(5.0, 5.0, 1.0).unwrap().is_empty());
 
             // SPX-031: the rebuilding clone answers 503 and skips maintenance.
-            let mut rebuilding = state.rebuilding_like();
+            let mut rebuilding = state.rebuilding_like().unwrap();
             assert!(!rebuilding.is_ready());
-            rebuilding.insert_row(&point_row(1.0, 1.0), pk(2)).unwrap(); // no-op
-            rebuilding.remove_row(&point_row(1.0, 1.0), &pk(2)).unwrap(); // no-op
+            rebuilding
+                .insert_row(&point_row(1.0, 1.0), pk(2), &mut Vec::new())
+                .unwrap(); // no-op
+            rebuilding
+                .remove_row(&point_row(1.0, 1.0), &pk(2), &mut Vec::new())
+                .unwrap(); // no-op
             let err = rebuilding.query_point(1.0, 1.0).unwrap_err();
             assert_eq!(
                 err.query_code(),
@@ -503,12 +584,14 @@ mod tests {
             );
 
             // fresh_like restores a ready, empty index of the same shape.
-            assert!(state.fresh_like().is_ready());
+            assert!(state.fresh_like().unwrap().is_ready());
         }
 
         #[test]
         fn rtree_state_supports_point_queries_and_insert_constraints() {
-            let mut state = SpatialIndexState::rtree(&[0, 1, 2, 3], 8);
+            let mut state =
+                SpatialIndexState::rtree(&[0, 1, 2, 3], 8, &test_pager(), TableId::of("SpxRT"))
+                    .unwrap();
             let row = Row::new(vec![
                 RowValue::F64(0.0),
                 RowValue::F64(0.0),
@@ -516,10 +599,10 @@ mod tests {
                 RowValue::F64(10.0),
             ]);
             state.check_insert("Zone", row.values()).unwrap();
-            state.insert_row(&row, pk(1)).unwrap();
+            state.insert_row(&row, pk(1), &mut Vec::new()).unwrap();
             assert_eq!(state.query_point(5.0, 5.0).unwrap(), vec![pk(1)]);
             assert!(state.query_point(50.0, 50.0).unwrap().is_empty());
-            state.remove_row(&row, &pk(1)).unwrap();
+            state.remove_row(&row, &pk(1), &mut Vec::new()).unwrap();
             assert!(state.query_point(5.0, 5.0).unwrap().is_empty());
 
             // SPX-010: inverted boxes are rejected eagerly at insert time.
@@ -537,25 +620,44 @@ mod tests {
         fn coordinate_and_arity_invariants_surface_as_errors_not_panics() {
             // A non-float coordinate column (the registry validates DM-032;
             // this is the runtime backstop).
-            let mut qt = SpatialIndexState::quadtree(&[0, 1], Rect::new(0.0, 0.0, 1.0, 1.0), 4);
+            let mut qt = SpatialIndexState::quadtree(
+                &[0, 1],
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                4,
+                &test_pager(),
+                TableId::of("SpxTest"),
+            )
+            .unwrap();
             let bad = Row::new(vec![RowValue::Str("x".into()), RowValue::Str("y".into())]);
-            let err = qt.insert_row(&bad, pk(1)).unwrap_err();
+            let err = qt.insert_row(&bad, pk(1), &mut Vec::new()).unwrap_err();
             assert!(err.to_string().contains("not a float column"), "{err}");
 
             // Wrong coordinate arity for each family, on every maintenance op.
-            let mut qt_bad = SpatialIndexState::quadtree(&[0], Rect::new(0.0, 0.0, 1.0, 1.0), 4);
+            let mut qt_bad = SpatialIndexState::quadtree(
+                &[0],
+                Rect::new(0.0, 0.0, 1.0, 1.0),
+                4,
+                &test_pager(),
+                TableId::of("SpxTest"),
+            )
+            .unwrap();
             let row = point_row(0.5, 0.5);
-            let err = qt_bad.insert_row(&row, pk(1)).unwrap_err();
+            let err = qt_bad.insert_row(&row, pk(1), &mut Vec::new()).unwrap_err();
             assert!(err.to_string().contains("quadtree"), "{err}");
             assert!(err.to_string().contains("expected 2"), "{err}");
-            let err = qt_bad.remove_row(&row, &pk(1)).unwrap_err();
+            let err = qt_bad
+                .remove_row(&row, &pk(1), &mut Vec::new())
+                .unwrap_err();
             assert!(err.to_string().contains("DM-032"), "{err}");
 
-            let mut rt_bad = SpatialIndexState::rtree(&[0, 1], 8);
-            let err = rt_bad.insert_row(&row, pk(1)).unwrap_err();
+            let mut rt_bad =
+                SpatialIndexState::rtree(&[0, 1], 8, &test_pager(), TableId::of("SpxRT")).unwrap();
+            let err = rt_bad.insert_row(&row, pk(1), &mut Vec::new()).unwrap_err();
             assert!(err.to_string().contains("rtree"), "{err}");
             assert!(err.to_string().contains("expected 4"), "{err}");
-            let err = rt_bad.remove_row(&row, &pk(1)).unwrap_err();
+            let err = rt_bad
+                .remove_row(&row, &pk(1), &mut Vec::new())
+                .unwrap_err();
             assert!(err.to_string().contains("DM-032"), "{err}");
             let err = rt_bad.check_insert("Zone", row.values()).unwrap_err();
             assert!(err.to_string().contains("expected 4"), "{err}");

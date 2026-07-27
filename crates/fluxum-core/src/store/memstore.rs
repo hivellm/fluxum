@@ -318,7 +318,7 @@ impl MemStore {
                     rows: PagedTree::create(&pager, id, false)?,
                     row_count: 0,
                     indexes: build_btree_indexes(table, &pager, id)?,
-                    spatial: build_spatial_index(table, &options)?,
+                    spatial: build_spatial_index(table, &options, &pager, id)?,
                     fulltext: build_fulltext_indexes(table),
                     unique,
                     auto_inc_high_water: 0,
@@ -489,16 +489,20 @@ impl MemStore {
     /// rebuild always finishes before the shard serves writes. Called by the
     /// recovery path when spatial state must be reconstructed asynchronously
     /// (spatial indexes are not persisted).
-    pub fn mark_spatial_rebuilding(&self) {
+    pub fn mark_spatial_rebuilding(&self) -> Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             if let Some(spatial) = &slot.spatial {
-                let rebuilding = spatial.rebuilding_like();
+                // A fresh paged index (its own root); the superseded root of
+                // the index being replaced is one empty page in this flow —
+                // the store has just booted — and is reclaimed with the file.
+                let rebuilding = spatial.rebuilding_like()?;
                 Arc::make_mut(slot).spatial = Some(rebuilding);
             }
         }
         self.publish_versioned(&mut writer, tables);
+        Ok(())
     }
 
     /// SPX-031, step 2: rebuild every spatial index from the committed rows
@@ -507,15 +511,18 @@ impl MemStore {
     pub fn rebuild_spatial_indexes(&self) -> Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
-        for slot in tables.values_mut() {
+        let mut superseded: Vec<(TableId, u64)> = Vec::new();
+        for (id, slot) in &mut tables {
             let Some(spatial) = &slot.spatial else {
                 continue;
             };
-            let mut rebuilt = spatial.fresh_like();
-            slot.for_each_row(|pk, row| rebuilt.insert_row(&row, pk))?;
+            let mut rebuilt = spatial.fresh_like()?;
+            let mut sup = Vec::new();
+            slot.for_each_row(|pk, row| rebuilt.insert_row(&row, pk, &mut sup))?;
             Arc::make_mut(slot).spatial = Some(rebuilt);
+            superseded.extend(sup.into_iter().map(|p| (*id, p)));
         }
-        self.publish_versioned(&mut writer, tables);
+        self.publish(&mut writer, tables, superseded)?;
         Ok(())
     }
 
@@ -690,7 +697,7 @@ impl MemStore {
                         index.remove(&existing, pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
-                        spatial.remove_row(&existing, pk)?;
+                        spatial.remove_row(&existing, pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
                         fulltext.remove_row(&existing, pk)?;
@@ -709,7 +716,7 @@ impl MemStore {
                         index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
-                        spatial.remove_row(&existing, &pk)?;
+                        spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
                         fulltext.remove_row(&existing, &pk)?;
@@ -722,7 +729,7 @@ impl MemStore {
                     constraint.insert(row, pk.clone(), &mut sup)?;
                 }
                 if let Some(spatial) = &mut table.spatial {
-                    spatial.insert_row(row, pk.clone())?;
+                    spatial.insert_row(row, pk.clone(), &mut sup)?;
                 }
                 for fulltext in &mut table.fulltext {
                     fulltext.insert_row(row, pk.clone())?;
@@ -792,7 +799,7 @@ impl MemStore {
                         index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
-                        spatial.remove_row(&existing, &pk)?;
+                        spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
                         fulltext.remove_row(&existing, &pk)?;
@@ -813,7 +820,7 @@ impl MemStore {
                         index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
-                        spatial.remove_row(&existing, &pk)?;
+                        spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
                         fulltext.remove_row(&existing, &pk)?;
@@ -826,7 +833,7 @@ impl MemStore {
                     constraint.insert(&row, pk.clone(), &mut sup)?;
                 }
                 if let Some(spatial) = &mut table.spatial {
-                    spatial.insert_row(&row, pk.clone())?;
+                    spatial.insert_row(&row, pk.clone(), &mut sup)?;
                 }
                 for fulltext in &mut table.fulltext {
                     fulltext.insert_row(&row, pk.clone())?;
@@ -1802,7 +1809,7 @@ impl Tx<'_> {
                             index.insert(&row, pk.clone(), &mut sup)?;
                         }
                         if let Some(spatial) = &mut table.spatial {
-                            spatial.insert_row(&row, pk.clone())?;
+                            spatial.insert_row(&row, pk.clone(), &mut sup)?;
                         }
                         for fulltext in &mut table.fulltext {
                             fulltext.insert_row(&row, pk.clone())?;
@@ -1821,7 +1828,7 @@ impl Tx<'_> {
                             index.remove(&old, &pk, &mut sup)?;
                         }
                         if let Some(spatial) = &mut table.spatial {
-                            spatial.remove_row(&old, &pk)?;
+                            spatial.remove_row(&old, &pk, &mut sup)?;
                         }
                         for fulltext in &mut table.fulltext {
                             fulltext.remove_row(&old, &pk)?;
@@ -1840,8 +1847,8 @@ impl Tx<'_> {
                             // SPX-032: old coordinates out, new coordinates
                             // in — atomic with the row swap on this private
                             // pre-swap copy, so no stale entry can publish.
-                            spatial.remove_row(&old, &pk)?;
-                            spatial.insert_row(&row, pk.clone())?;
+                            spatial.remove_row(&old, &pk, &mut sup)?;
+                            spatial.insert_row(&row, pk.clone(), &mut sup)?;
                         }
                         for fulltext in &mut table.fulltext {
                             // FTS-021: re-analyze the old text out, the new
@@ -1990,6 +1997,8 @@ fn invariant_missing_row() -> FluxumError {
 fn build_spatial_index(
     table: &'static TableSchema,
     options: &StoreOptions,
+    pager: &Arc<Pager>,
+    table_id: TableId,
 ) -> Result<Option<SpatialIndexState>> {
     let mut spatial = None;
     for index in table.indexes {
@@ -2008,8 +2017,12 @@ fn build_spatial_index(
                 columns,
                 options.spatial_bounds,
                 options.spatial_bucket_size,
-            ),
-            SpatialKind::RTree => SpatialIndexState::rtree(columns, options.spatial_bucket_size),
+                pager,
+                table_id,
+            )?,
+            SpatialKind::RTree => {
+                SpatialIndexState::rtree(columns, options.spatial_bucket_size, pager, table_id)?
+            }
         });
     }
     Ok(spatial)
@@ -2639,7 +2652,29 @@ mod tests {
             ],
             ..SPOT
         };
-        let err = match build_spatial_index(&DOUBLE, &StoreOptions::default()) {
+        let dir = tempfile::Builder::new()
+            .prefix("fluxum-spx-build-")
+            .tempdir()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let pager = Pager::open(
+            dir.path(),
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 64 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: crate::config::PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let err = match build_spatial_index(
+            &DOUBLE,
+            &StoreOptions::default(),
+            &pager,
+            TableId::of("Spot"),
+        ) {
             Ok(_) => panic!("two spatial declarations accepted"),
             Err(e) => e.to_string(),
         };

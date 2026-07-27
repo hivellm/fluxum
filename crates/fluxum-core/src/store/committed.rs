@@ -341,11 +341,14 @@ impl TableState {
         if let Some(spatial) = &self.spatial
             && spatial.is_ready()
         {
-            let mut rebuilt = spatial.fresh_like();
+            // Paged structures have no meaningful structural equality; the
+            // rule-2 property is that the *contents* match a fresh rebuild.
+            let mut rebuilt = spatial.fresh_like()?;
+            let mut sup = Vec::new();
             for (pk, row) in &rows {
-                rebuilt.insert_row(row, pk.clone())?;
+                rebuilt.insert_row(row, pk.clone(), &mut sup)?;
             }
-            if rebuilt != *spatial {
+            if rebuilt.entries()? != spatial.entries()? {
                 return Err(FluxumError::Storage(format!(
                     "spatial index on table `{}` ({table_id}) diverged from a fresh rebuild \
                      over CommittedState (STG-007, SPX-030)",
@@ -813,13 +816,18 @@ mod tests {
 
     #[test]
     fn integrity_check_reports_a_diverged_spatial_index() {
-        let (_pager, mut state) = state_with_rows();
+        let (pager, mut state) = state_with_rows();
         // Ready but empty while rows exist: a rebuild must differ.
-        state.spatial = Some(SpatialIndexState::quadtree(
-            &[1, 2],
-            Rect::new(0.0, 0.0, 100.0, 100.0),
-            8,
-        ));
+        state.spatial = Some(
+            SpatialIndexState::quadtree(
+                &[1, 2],
+                Rect::new(0.0, 0.0, 100.0, 100.0),
+                8,
+                &pager,
+                TableId::of("CovTable"),
+            )
+            .unwrap_or_else(|e| panic!("{e}")),
+        );
         let err = match state.verify_index_integrity(TableId::of("CovTable")) {
             Ok(()) => panic!("diverged spatial index verified"),
             Err(e) => e.to_string(),

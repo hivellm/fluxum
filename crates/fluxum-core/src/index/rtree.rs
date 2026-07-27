@@ -203,6 +203,27 @@ impl RTree {
     }
 
     /// Whether no entry is indexed.
+    /// Every indexed `(aabb, pk)` in canonical order — the STG-007 rule-2
+    /// comparison surface, shared with the paged QuadTree's `entries`.
+    pub(crate) fn entries(&self) -> Vec<(f64, f64, PkBytes)> {
+        let mut out = Vec::new();
+        for node in &self.nodes {
+            if let Node::Leaf(entries) = node {
+                out.extend(
+                    entries
+                        .iter()
+                        .map(|e| (e.aabb.min_x, e.aabb.min_y, e.pk.clone())),
+                );
+            }
+        }
+        out.sort_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.total_cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        out
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

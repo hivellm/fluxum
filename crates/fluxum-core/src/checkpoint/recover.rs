@@ -147,7 +147,11 @@ pub fn recover(
     let mut tables = HashMap::with_capacity(working.len());
     for (id, table) in working {
         let empty = base.state.table(id)?;
-        let mut spatial = empty.spatial.clone();
+        let mut spatial = match &empty.spatial {
+            Some(state) => Some(state.fresh_like()?),
+            None => None,
+        };
+        let mut spatial_sup: Vec<u64> = Vec::new();
         let mut fulltext = empty.fulltext.clone();
         // Sorted entry staging per paged index (bulk_load wants strict order).
         let mut index_entries: BTreeMap<crate::index::IndexId, BTreeMap<Vec<u8>, Vec<u8>>> = empty
@@ -173,7 +177,9 @@ pub fn recover(
                 staged.insert(constraint.key_of_values(row.values())?, pk_bytes.clone());
             }
             if let Some(spatial) = &mut spatial {
-                spatial.insert_row(&row, pk.clone())?;
+                // Recovery rebuilds into a fresh paged index; its copy-on-write
+                // churn is retired with the state it publishes.
+                spatial.insert_row(&row, pk.clone(), &mut spatial_sup)?;
             }
             for fulltext in &mut fulltext {
                 fulltext.insert_row(&row, pk.clone())?;
