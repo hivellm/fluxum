@@ -72,9 +72,15 @@ while any live version can still reach it - the existing `store_acid`,
 - Risk: HIGH - retiring a page one version too early is silent data corruption
   for any reader holding that snapshot, and the failure would surface far from
   the change. Treat the MVCC regression suites as the gate, not a formality.
-- User benefit: sustained write throughput stops falling off a cliff, RSS
-  reflects live data instead of version garbage, and the billion-row soak
-  becomes a practical run rather than a multi-day one
+- User benefit: sustained write throughput stops falling off a cliff and RSS
+  reflects live data instead of version garbage
+- **Correction (measured after the fix landed):** this proposal originally
+  also claimed the billion-row soak would become a practical run. It did not.
+  The soak writes one row per reducer call, and single-row commits pin so
+  little superseded state that the byte ceiling never binds — the fix had
+  nothing to reclaim there, and the soak's load rate is unchanged at
+  ~3 600-4 400 rows/s. That bottleneck is the per-transaction path, not
+  version garbage; see `docs/SOAK.md`.
 
 ## Notes
 

@@ -191,11 +191,22 @@ Three things stand between here and G7:
 
 1. **The billion-row run has not been performed.** The committed
    `docs/reports/soak-report.*` is a 1M-row / 60 s plumbing proof on a 32-core
-   workstation. Measured load throughput is ~4 000 rows/s and does **not**
-   improve with more writers or a deeper pipeline (32 clients × pipeline 128
-   was *slower* than 8 clients), so 1e9 rows is on the order of **60+ hours of
-   load alone** — the `--duration-secs 3600` sustain window is a rounding error
-   next to it. Plan the run accordingly, or raise load throughput first.
+   workstation. Measured load throughput is ~3 600–4 400 rows/s under a
+   128 MiB budget and does **not** improve with more writers or a deeper
+   pipeline (32 clients × pipeline 128 was *slower* than 8 clients), so 1e9
+   rows is on the order of **60+ hours of load alone** — the
+   `--duration-secs 3600` sustain window is a rounding error next to it. Plan
+   the run accordingly, or raise load throughput first.
+
+   Note for anyone tracking the storage work: the RV-020 temporal-window fix
+   (which removed a 24× write-throughput cliff for *large* transactions) did
+   **not** move this number, and was not expected to. The soak writes one row
+   per `add_task` reducer call, and single-row commits pin so little
+   superseded state that the window's byte ceiling never binds. What limits
+   the soak's load phase is the per-transaction path itself — one serialized
+   commit per row, plus genuine tiering once the dataset exceeds the budget.
+   Batching rows per transaction is the lever here, and it needs a bulk
+   reducer in the demo module rather than a storage change.
 2. **No cgroup-enforced droplet artifact exists.** Run the `droplet-profile`
    workflow (Actions → Run workflow) or a real droplet.
 3. **TST-112's "sharded" clause is not reachable** with today's server binary
