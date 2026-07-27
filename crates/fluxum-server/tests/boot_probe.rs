@@ -20,7 +20,7 @@ async fn assemble_installs_the_probe_derived_effective_config() {
     config.storage.page_dir = dir.path().join("pages");
     config.auth.provider = fluxum_core::config::AuthProvider::None;
 
-    let ctx = fluxum_server::boot::assemble(&config).unwrap();
+    let ctx = fluxum_server::boot::assemble(&config).unwrap().ctx;
 
     let effective = ctx
         .effective_config()
@@ -62,7 +62,7 @@ async fn boot_discards_a_page_directory_it_cannot_read() {
     std::fs::write(shard.join("table-1634948758.pages"), &superblock).unwrap();
 
     // Boot succeeds and the unreadable tier is gone, recreated empty.
-    let ctx = fluxum_server::boot::assemble(&config).unwrap();
+    let ctx = fluxum_server::boot::assemble(&config).unwrap().ctx;
     assert!(
         ctx.effective_config().is_some(),
         "boot completed over a discarded page tier"
@@ -93,7 +93,7 @@ async fn data_dir_alone_places_the_whole_database() {
         dir.path().join("checkpoints")
     );
 
-    let ctx = fluxum_server::boot::assemble(&config).unwrap();
+    let ctx = fluxum_server::boot::assemble(&config).unwrap().ctx;
     // The binary installs the running config right after assembly; do the
     // same so the `/health` rendering below sees it.
     ctx.install_config(None, config.clone(), None);

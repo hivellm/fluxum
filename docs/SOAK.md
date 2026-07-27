@@ -42,15 +42,18 @@ pass `--url`.
 `--memory-budget` must be at least **128 MiB** (`config::MIN_MEMORY_BUDGET`);
 below that the server refuses to start.
 
-> **`--shards` does not shard.** A single-process `fluxum-server` owns exactly
-> one shard — `boot.rs` says so outright, and multi-shard hosting is
-> `ShardCoord`'s job, which the server binary does not assemble. `--shards` only
-> feeds the server's `auto` hardware derivation. The soak records
-> `shards_requested` alongside `shards_observed` and warns loudly when they
-> disagree, so no report can imply a topology that did not run. **TST-112's
-> "sharded + tiered deployment" clause therefore cannot be met by the current
-> server binary**; closing it needs a `ShardCoord`-hosted (or process-per-shard)
-> deployment, which is outside this task.
+> **`--shards N` provisions N real shards.** The server assembles
+> `sharding.shards` fully-independent hosts behind a `ShardCoord` (SHD-010) —
+> each with its own store, buffer-pool split, commit log and checkpoint worker
+> under `shard-<k>/` — or **refuses to start** when the memory budget cannot
+> host that many pools. Sessions route by identity affinity after
+> authentication (SHD-011). The soak records `shards_requested` alongside
+> `shards_observed` and **fails** when they disagree, since that can only mean
+> the metrics scrape missed shards. One caveat for data distribution: the demo
+> module's tables are unpartitioned, so identity affinity resolves every
+> session to the default shard (SHD-011) — all load lands on shard 0 while the
+> other shards run and report idle gauges. A load-spread TST-112 run needs a
+> partitioned demo table (tracked in the T7.7 task).
 
 ## 1. Billion-row soak (NFR-13, TST-112)
 
@@ -209,5 +212,8 @@ Three things stand between here and G7:
    reducer in the demo module rather than a storage change.
 2. **No cgroup-enforced droplet artifact exists.** Run the `droplet-profile`
    workflow (Actions → Run workflow) or a real droplet.
-3. **TST-112's "sharded" clause is not reachable** with today's server binary
-   — see the `--shards` note above.
+3. **TST-112's "sharded" clause is now reachable** — the server assembles
+   `sharding.shards` hosts (see the `--shards` note above) — but the demo
+   module's tables are unpartitioned, so identity affinity routes every
+   session to shard 0 and the siblings idle. Partitioning a demo table is
+   the remaining piece for a load-spread sharded run.

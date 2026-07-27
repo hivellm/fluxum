@@ -211,6 +211,26 @@ data/
   them from the checkpoint plus the commit log, and a page file this build
   cannot read (an older page format) is discarded with a warning rather than
   failing startup. Back up `log/`, `checkpoints/`, and `archive/`.
+- **Multi-shard layout** (an **explicit** `sharding.shards > 1`; `auto`
+  always hosts one shard, so a core count can never change the layout on
+  upgrade): every shard — including
+  shard 0 — owns its slice of each directory under `shard-<k>/`
+  (`log/shard-0/`, `log/shard-1/`, `pages/shard-0/`, …), because shards
+  share nothing (SPEC-007 SHD-020) and two commit logs in one directory
+  would corrupt each other. A single-shard deployment keeps the flat layout
+  above, so existing data directories recover unchanged. **Changing
+  `sharding.shards` on an existing data directory is a topology change, not
+  a reload**: the old layout's rows are not re-partitioned (SHD-003 routing
+  determinism forbids silently rehashing), so migrate explicitly — export,
+  reconfigure, re-import — or start the new topology on a fresh directory.
+- **What a shard costs**: each shard runs its own store, commit log,
+  checkpoint worker and buffer pool; the one `memory.budget` is split
+  evenly across the pools, and boot **refuses** a shard count whose
+  per-shard pool would fall below a working floor (raise the budget or
+  lower the count). Sessions acquire shard affinity at authentication
+  (SHD-011): identity-hash routing for partitioned schemas, shard 0 for
+  everything else. Node-level services — the T7.2 election and the CDC
+  pumps — stay on shard 0; per-shard CDC fan-in is future work.
 - `archive/` (`replication.archive.dir`) holds byte-identical copies of
   truncated log segments (SPEC-014 REP-062) — the PITR source. Its
   `retention` window (default `7d`) IS the PITR window.

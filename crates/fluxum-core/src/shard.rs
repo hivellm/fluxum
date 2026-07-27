@@ -255,7 +255,20 @@ impl ShardRouter {
         if self.partitioning.is_empty() || shard_count <= 1 {
             return self.default_shard;
         }
-        let hash = crate::simd::global().hash64(identity.as_bytes(), 0);
+        // SHD-011's affinity must AGREE with SHD-012's row placement: for a
+        // table partitioned by an identity column, the caller's connection
+        // and the caller's rows have to land on the same shard, or every
+        // insert would immediately read as an entity move (SHD-040) and
+        // trigger a handoff. The hash therefore runs over the identity's
+        // FluxBIN encoding — exactly the bytes `PartitionStrategy::Hash`
+        // hashes for a `RowValue::Identity` partition key — never over the
+        // raw identity bytes, which encode differently.
+        let Ok(encoded) =
+            crate::store::row::encode_row(&[crate::store::RowValue::Identity(*identity)])
+        else {
+            return self.default_shard; // unreachable: identities always encode
+        };
+        let hash = crate::simd::global().hash64(&encoded, 0);
         #[allow(clippy::cast_possible_truncation)]
         {
             (hash % u64::from(shard_count.max(1))) as ShardId

@@ -145,6 +145,22 @@ pub struct Sensor {
   Connections without affinity (unauthenticated clients, admin and observer sessions, callers
   with no partitioned rows) **SHALL** route to the default shard.
 
+  *Implemented (server assembly):* `boot::assemble` provisions an **explicitly configured**
+  `sharding.shards` count behind a `ShardCoord` (`auto` hosts one shard: honouring a
+  hardware-derived count would let a core count silently change the on-disk layout on upgrade —
+  an implicit re-partition, which SHD-003 forbids; topology is an operator decision) — each with its own store, an even split of the buffer pool, commit log, recovery
+  and checkpoint worker under `shard-<k>/` — and **refuses** a count whose per-shard pool would be
+  degenerate; there is no silent downgrade to one shard. A session resolves its affinity shard at
+  `Authenticate` (identity hash for partitioned schemas, the default shard otherwise), rebinds its
+  context to it, and every subsequent read, write and subscription runs there; the binding is
+  connection-lifetime (a re-`Authenticate` keeps it, like the OPS-050 namespace binding) and is
+  recorded in the persisted caller's `shard_id`, so the per-request HTTP transport re-resolves it
+  identically. Reducer calls route through the coordinator, so SHD-030 global replication and
+  SHD-040 move detection run on the transport path; `ReplicaHello` routes by its `shard_id` to
+  that shard's replication primary. Node-level services (T7.2 election, CDC pumps) stay on the
+  default shard. `sharding.shards = 1` builds no coordinator at all — the single-shard assembly
+  is byte-for-byte the pre-existing one.
+
 - **SHD-012** [P0] Given a partition key value, the owning shard **SHALL** be resolved as:
 
   ```

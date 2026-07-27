@@ -103,6 +103,30 @@ impl Session {
         self.peer_name.as_deref()
     }
 
+    /// The shard context this session is bound to. The transport must use
+    /// THIS — not the listener's accept-time context — for fan-out
+    /// registration and cleanup: on a multi-shard deployment the session
+    /// rebinds to its affinity shard at authentication (SHD-011), and a
+    /// handle registered on the wrong shard's registry would simply never
+    /// receive that shard's TxUpdates.
+    pub fn ctx(&self) -> &Arc<ShardContext> {
+        &self.ctx
+    }
+
+    /// SHD-011: rebind this session to `shard`'s context, when a
+    /// coordinator is present and hosts it. A single-shard deployment has
+    /// no coordinator, so this is a no-op there by construction.
+    fn rebind_to_shard(&mut self, shard: u32) {
+        if shard == self.ctx.shard_id {
+            return;
+        }
+        if let Some(coord) = self.ctx.coord()
+            && let Some(host) = coord.host(shard)
+        {
+            self.ctx = Arc::clone(host);
+        }
+    }
+
     /// Record the transport-resolved client IP (SEC-035) so the SEC-047
     /// source bucket keys on it rather than the connection id.
     pub fn set_source_ip(&mut self, ip: std::net::IpAddr) {
@@ -113,13 +137,21 @@ impl Session {
     /// HTTP transport rebuilds one per request from its `Fluxum-Session`
     /// entry (SPEC-006 §3; the router core is transport-independent).
     pub fn with_state(ctx: Arc<ShardContext>, state: SessionState) -> Self {
-        Self {
+        let mut session = Self {
             ctx,
             state,
             namespace: None,
             source_ip: None,
             peer_name: None,
+        };
+        // SHD-011: the affinity binding survives in the persisted caller's
+        // `shard_id`; a rebuilt session re-resolves it so a per-request
+        // transport routes exactly like a long-lived connection.
+        if let SessionState::Authenticated { caller, .. } = &session.state {
+            let shard = caller.shard_id;
+            session.rebind_to_shard(shard);
         }
+        session
     }
 
     /// [`Session::with_state`] rebound to a namespace — the HTTP transport
@@ -130,13 +162,22 @@ impl Session {
         state: SessionState,
         namespace: Option<Arc<crate::namespace::Namespace>>,
     ) -> Self {
-        Self {
+        let mut session = Self {
             ctx,
             state,
             namespace,
             source_ip: None,
             peer_name: None,
+        };
+        // A namespaced session stays on the default shard (OPS-050 tenants
+        // are single-shard); only the default database rebinds (SHD-011).
+        if session.namespace.is_none()
+            && let SessionState::Authenticated { caller, .. } = &session.state
+        {
+            let shard = caller.shard_id;
+            session.rebind_to_shard(shard);
         }
+        session
     }
 
     /// The namespace this session is bound to (`None` = the default
@@ -322,6 +363,21 @@ impl Session {
         // OBS-040: a successful authentication; a first auth is a new
         // connection (re-auth on an existing session keeps its id).
         self.ctx.metrics().note_auth(true);
+        // SHD-011: on a multi-shard deployment the connection acquires
+        // affinity to the shard owning the caller's rows — for
+        // identity-partitioned domains the shard of the identity hash; the
+        // default shard when nothing is partitioned. First auth only, and
+        // only on the default database: a re-auth keeps its binding (the
+        // connection's fan-out handle is registered on it — the same
+        // connection-lifetime rule the namespace binding follows), and
+        // OPS-050 tenants are single-shard.
+        if self.namespace.is_none()
+            && !self.is_authenticated()
+            && let Some(coord) = self.ctx.coord()
+        {
+            let shard = coord.affinity_of(&outcome.identity);
+            self.rebind_to_shard(shard);
+        }
         // Keep the connection id across a re-auth; allocate on first auth.
         let connection_id = match &self.state {
             SessionState::Authenticated { caller, .. } => caller.connection_id.as_u128(),
@@ -385,10 +441,29 @@ impl Session {
                 return Routed::reply(from_error(Some(id), &e));
             }
         }
-        let outcome = self
-            .engine()
-            .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
-            .await;
+        // SHD-030/040: a multi-shard deployment routes through the
+        // coordinator so a committed global-table write replicates to every
+        // shard before the ReducerResult, and an entity whose partition key
+        // moved is handed off before the client's next call. Namespaced
+        // sessions keep the direct engine path (tenants are single-shard).
+        let outcome = match self.ctx.coord() {
+            Some(coord) if self.namespace.is_none() => {
+                coord
+                    .call_idempotent(
+                        self.ctx.shard_id,
+                        caller,
+                        &reducer,
+                        args,
+                        idempotency_key.as_deref(),
+                    )
+                    .await
+            }
+            _ => {
+                self.engine()
+                    .call_idempotent(caller, &reducer, args, idempotency_key.as_deref())
+                    .await
+            }
+        };
         match outcome {
             Ok(CallOutcome::Committed(receipt)) => {
                 // TXN-004: the append must reach the OS before the

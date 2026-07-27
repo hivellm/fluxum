@@ -1081,8 +1081,9 @@ async fn handle_post(
         let connection_id = connection_id_of(&router_state).unwrap_or(0);
         let (out_tx, out_rx) = mpsc::channel::<OutFrame>(state.options.send_queue_depth);
         let shutdown = Arc::new(Notify::new());
-        state
-            .ctx
+        // SHD-011: the handle registers on the shard the session bound to
+        // at authentication, or its TxUpdates would never arrive.
+        shard_ctx_of(&state.ctx, &router_state)
             .connections
             .insert(
                 connection_id,
@@ -1327,6 +1328,23 @@ async fn handle_get(
     result
 }
 
+/// The shard context a persisted session's state binds it to (SHD-011):
+/// the affinity shard recorded in the authenticated caller's `shard_id`,
+/// resolved through the coordinator when one exists. The HTTP transport
+/// registers fan-out handles and deregisters subscriptions outside any
+/// live [`Session`], so it re-derives the binding exactly the way
+/// `Session::with_state` does.
+fn shard_ctx_of(default: &Arc<ShardContext>, state: &SessionState) -> Arc<ShardContext> {
+    if let SessionState::Authenticated { caller, .. } = state
+        && caller.shard_id != default.shard_id
+        && let Some(coord) = default.coord()
+        && let Some(host) = coord.host(caller.shard_id)
+    {
+        return Arc::clone(host);
+    }
+    Arc::clone(default)
+}
+
 /// Retire a session for good: drop it from the registry, deregister its
 /// connection and subscriptions, and run the RED-012 `on_disconnect` hooks,
 /// publishing their diff so a presence cleanup reaches the remaining
@@ -1343,14 +1361,17 @@ async fn evict_session(state: &Arc<HttpState>, token: &str, connection_id: u128)
         .lock()
         .await
         .retain(|old, (current, _)| old != token && current != token);
-    state.ctx.metrics().note_disconnect(); // OBS-040
-    state.ctx.connections.remove(connection_id).await;
+    let shard_ctx = evicted.as_ref().map_or_else(
+        || Arc::clone(&state.ctx),
+        |s| shard_ctx_of(&state.ctx, &s.state),
+    );
+    shard_ctx.metrics().note_disconnect(); // OBS-040
+    shard_ctx.connections.remove(connection_id).await;
     // Deregister from the session's own database (OPS-050).
     let namespace = evicted.as_ref().and_then(|s| s.namespace.clone());
     match &namespace {
         Some(ns) => ns.subscriptions().lock().await.disconnect(connection_id),
-        None => state
-            .ctx
+        None => shard_ctx
             .subscriptions
             .lock()
             .await

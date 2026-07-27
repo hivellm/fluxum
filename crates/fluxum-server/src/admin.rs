@@ -738,79 +738,103 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     // Lock-free snapshot; the byte figure is a schema-width estimate (the
     // spec's `memstore_bytes` is explicitly an estimate, not exact bytes).
     {
-        let shard = health.shard_id;
-        let snapshot = ctx.store().snapshot();
-        let mut rows_block = String::from(
-            "# HELP fluxum_table_rows Committed rows per table.\n\
-             # TYPE fluxum_table_rows gauge\n",
+        // On a multi-shard deployment every host reports its own block —
+        // TST-112's "within budget on every shard" reads exactly these
+        // shard-labelled series, and emitting one shard N times would make
+        // that assertion pass vacuously. HELP/TYPE headers are emitted once
+        // (repeating them per shard is invalid exposition).
+        let hosts: Vec<Arc<ShardContext>> = match ctx.coord() {
+            Some(coord) => coord
+                .shard_ids()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .filter_map(|s| coord.host(s).cloned())
+                .collect(),
+            None => vec![Arc::clone(ctx)],
+        };
+        text.push_str(
+            "# HELP fluxum_table_rows Committed rows per table.
+             # TYPE fluxum_table_rows gauge
+",
         );
-        let mut estimated_bytes: u64 = 0;
-        for table in ctx.store().table_schemas() {
-            let table_id = fluxum_core::store::TableId::of(table.name);
-            let rows = snapshot.row_count(table_id).unwrap_or(0);
-            let rows_u64 = u64::try_from(rows).unwrap_or(u64::MAX);
+        let mut memstore_block = String::from(
+            "# HELP fluxum_memstore_bytes Estimated in-memory CommittedState size.
+             # TYPE fluxum_memstore_bytes gauge
+",
+        );
+        for host in &hosts {
+            let shard = host.shard_id;
+            let snapshot = host.store().snapshot();
+            let mut estimated_bytes: u64 = 0;
+            for table in host.store().table_schemas() {
+                let table_id = fluxum_core::store::TableId::of(table.name);
+                let rows = snapshot.row_count(table_id).unwrap_or(0);
+                let rows_u64 = u64::try_from(rows).unwrap_or(u64::MAX);
+                let _ = writeln!(
+                    text,
+                    "fluxum_table_rows{{shard=\"{shard}\",table=\"{}\"}} {rows_u64}",
+                    table.name,
+                );
+                // ~24 bytes per column (tag + inline scalar / small heap) — a
+                // coarse gauge for RAM-pressure alerting (OBS-031).
+                let width = u64::try_from(table.columns.len()).unwrap_or(0) * 24;
+                estimated_bytes = estimated_bytes.saturating_add(rows_u64.saturating_mul(width));
+            }
             let _ = writeln!(
-                rows_block,
-                "fluxum_table_rows{{shard=\"{shard}\",table=\"{}\"}} {rows_u64}",
-                table.name,
+                memstore_block,
+                "fluxum_memstore_bytes{{shard=\"{shard}\"}} {estimated_bytes}",
             );
-            // ~24 bytes per column (tag + inline scalar / small heap) — a
-            // coarse gauge for RAM-pressure alerting (OBS-031).
-            let width = u64::try_from(table.columns.len()).unwrap_or(0) * 24;
-            estimated_bytes = estimated_bytes.saturating_add(rows_u64.saturating_mul(width));
         }
-        text.push_str(&rows_block);
-        let _ = writeln!(
-            text,
-            "# HELP fluxum_memstore_bytes Estimated in-memory CommittedState size.\n\
-             # TYPE fluxum_memstore_bytes gauge\n\
-             fluxum_memstore_bytes{{shard=\"{shard}\"}} {estimated_bytes}",
-        );
-    }
-    // SPEC-015 TIER-080: the buffer-pool and page-I/O series. Unlike
-    // `fluxum_memstore_bytes` above these are *exact* — the pool's own
-    // accounting, the enforced side of the TIER-004 budget — which is what
-    // makes them the in-process witness SPEC-013 TST-111 samples alongside
-    // process RSS, and what proves eviction engaged under pressure.
-    {
-        let shard = health.shard_id;
-        let pager = ctx.store().pager().metrics().snapshot();
-        // SPEC-015 TIER-061 / SPEC-022 RV-020: what the version reclaimer is
-        // still holding, and how far `AS OF` actually reaches. Pool
+        text.push_str(&memstore_block);
+        // SPEC-015 TIER-080: the buffer-pool and page-I/O series. Unlike
+        // `fluxum_memstore_bytes` above these are *exact* — the pool's own
+        // accounting, the enforced side of the TIER-004 budget — which is
+        // what makes them the in-process witness SPEC-013 TST-111 samples
+        // alongside process RSS, and what proves eviction engaged under
+        // pressure. SPEC-015 TIER-061 / SPEC-022 RV-020 ride along: pool
         // occupancy alone cannot tell a pool full of live pages from one
-        // full of version garbage waiting on a pinned snapshot, and the two
-        // call for opposite responses.
-        let store = ctx.store();
-        let pending = store.reclaim_pending();
-        let _ = writeln!(
-            text,
-            "# HELP fluxum_reclaim_pending_pages Superseded pages awaiting reclamation (TIER-061).\n\
-             # TYPE fluxum_reclaim_pending_pages gauge\n\
-             fluxum_reclaim_pending_pages{{shard=\"{shard}\"}} {}\n\
-             # HELP fluxum_reclaim_live_versions Pinned versions holding those pages live.\n\
-             # TYPE fluxum_reclaim_live_versions gauge\n\
-             fluxum_reclaim_live_versions{{shard=\"{shard}\"}} {}\n\
-             # HELP fluxum_temporal_window_snapshots Snapshots AS OF can currently reach (RV-020).\n\
-             # TYPE fluxum_temporal_window_snapshots gauge\n\
-             fluxum_temporal_window_snapshots{{shard=\"{shard}\"}} {}\n\
-             # HELP fluxum_temporal_window_budget_evictions_total Snapshots dropped to honour the RV-020 byte ceiling.\n\
-             # TYPE fluxum_temporal_window_budget_evictions_total counter\n\
-             fluxum_temporal_window_budget_evictions_total{{shard=\"{shard}\"}} {}",
-            pending.pages,
-            pending.live_versions,
-            store.temporal_window_len(),
-            store.temporal_window_budget_evictions(),
+        // full of version garbage waiting on a pinned snapshot.
+        text.push_str(
+            "# HELP fluxum_reclaim_pending_pages Superseded pages awaiting reclamation (TIER-061).
+             # TYPE fluxum_reclaim_pending_pages gauge
+             # HELP fluxum_reclaim_live_versions Pinned versions holding those pages live.
+             # TYPE fluxum_reclaim_live_versions gauge
+             # HELP fluxum_temporal_window_snapshots Snapshots AS OF can currently reach (RV-020).
+             # TYPE fluxum_temporal_window_snapshots gauge
+             # HELP fluxum_temporal_window_budget_evictions_total Snapshots dropped to honour the RV-020 byte ceiling.
+             # TYPE fluxum_temporal_window_budget_evictions_total counter
+",
         );
+        for host in &hosts {
+            let shard = host.shard_id;
+            let store = host.store();
+            let pending = store.reclaim_pending();
+            let _ = writeln!(
+                text,
+                "fluxum_reclaim_pending_pages{{shard=\"{shard}\"}} {}
+                 fluxum_reclaim_live_versions{{shard=\"{shard}\"}} {}
+                 fluxum_temporal_window_snapshots{{shard=\"{shard}\"}} {}
+                 fluxum_temporal_window_budget_evictions_total{{shard=\"{shard}\"}} {}",
+                pending.pages,
+                pending.live_versions,
+                store.temporal_window_len(),
+                store.temporal_window_budget_evictions(),
+            );
+        }
         text.push_str(TIER_080_HEADERS);
-        for (series, value) in pager.samples() {
-            // A series may already carry labels (`name{kind="clean"}`); the
-            // shard label is spliced into the existing set either way.
-            let line = match series.split_once('{') {
-                Some((name, rest)) => format!("{name}{{shard=\"{shard}\",{rest} {value}"),
-                None => format!("{series}{{shard=\"{shard}\"}} {value}"),
-            };
-            text.push_str(&line);
-            text.push('\n');
+        for host in &hosts {
+            let shard = host.shard_id;
+            let pager = host.store().pager().metrics().snapshot();
+            for (series, value) in pager.samples() {
+                // A series may already carry labels (`name{kind="clean"}`);
+                // the shard label is spliced into the existing set.
+                let line = match series.split_once('{') {
+                    Some((name, rest)) => format!("{name}{{shard=\"{shard}\",{rest} {value}"),
+                    None => format!("{series}{{shard=\"{shard}\"}} {value}"),
+                };
+                text.push_str(&line);
+                text.push('\n');
+            }
         }
     }
     // SPEC-017 CT-014/034: transform read-error and signature-verify meters.

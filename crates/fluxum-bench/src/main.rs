@@ -684,17 +684,20 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
              scraped, so the TST-111 witnesses above are not evidence."
         );
     }
-    if report.shards_observed < report.shards_requested {
-        println!(
-            "  WARNING: {} shard(s) requested but {} reported. A single-process fluxum-server \
-             owns one shard (multi-shard hosting is ShardCoord's job, which the binary does not \
-             assemble), so --shards only feeds the `auto` hardware derivation. This run does NOT \
-             satisfy TST-112's \"sharded deployment\" clause.",
-            report.shards_requested, report.shards_observed
-        );
-    }
     if !report.pass {
         return Err("soak did not pass its budget/liveness criteria (see the report)".to_owned());
+    }
+    // The server assembles `sharding.shards` hosts and refuses a count it
+    // cannot honour, so requested and observed can only disagree when the
+    // metrics scrape missed shards — a broken run, not a caveat. (This was
+    // a warning while multi-shard hosting did not exist; now that it does,
+    // a soak that did not shard must not read as a TST-112 input.)
+    if report.shards_observed < report.shards_requested {
+        return Err(format!(
+            "{} shard(s) requested but only {} reported metrics — the run did not observe \
+             the sharded deployment it was asked for (TST-112)",
+            report.shards_requested, report.shards_observed
+        ));
     }
     Ok(())
 }

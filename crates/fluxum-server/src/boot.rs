@@ -35,8 +35,13 @@ pub struct Server {
     pub tcp: TcpServer,
     /// The optional read-only Postgres wire endpoint (SPEC-027), when enabled.
     pub pg: Option<crate::pgwire::PgServer>,
-    /// The shard the listeners drive.
+    /// The default shard the listeners accept on (SHD-011: sessions rebind
+    /// to their affinity shard after authentication).
     pub ctx: Arc<ShardContext>,
+    /// The multi-shard coordinator (SHD-010), when `sharding.shards > 1`.
+    /// This handle **owns** the cluster — every shard context holds only a
+    /// weak back-reference — so it lives exactly as long as the server.
+    pub coord: Option<Arc<crate::shard::ShardCoord>>,
 }
 
 impl Server {
@@ -74,38 +79,218 @@ pub enum BootError {
     },
 }
 
-/// Build the shard context from `config` and the link-time registry.
+/// What [`assemble`] hands back: the default shard's context plus, on a
+/// multi-shard boot, the coordinator that owns the whole cluster.
+pub struct Assembled {
+    /// The default shard (SHD-004) — what the listeners accept on.
+    pub ctx: Arc<ShardContext>,
+    /// The coordinator, `Some` iff `sharding.shards > 1`. **This is the
+    /// owning handle**: shard contexts hold only weak back-references, so
+    /// dropping it dissolves the cluster's routing. Keep it alive for the
+    /// server's lifetime (the [`Server`] struct does).
+    pub coord: Option<Arc<crate::shard::ShardCoord>>,
+}
+
+/// The storage directories one shard owns.
 ///
-/// Split from [`serve`] so a test can assemble a shard without binding ports.
-pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
+/// A single-shard boot keeps the configured directories verbatim, so every
+/// existing deployment recovers its data unchanged. A multi-shard boot puts
+/// **every** shard — including shard 0 — under `shard-<k>/`, because shards
+/// share nothing (SHD-020) and two commit logs in one directory would
+/// corrupt each other. Changing `sharding.shards` on an existing data
+/// directory is therefore a topology change, not a reload: the old layout's
+/// data is not re-partitioned (routing determinism, SHD-003, would be
+/// violated by silently rehashing), and the operator migrates explicitly.
+struct ShardDirs {
+    page_dir: std::path::PathBuf,
+    commit_log_dir: std::path::PathBuf,
+    checkpoint_dir: std::path::PathBuf,
+    archive_dir: std::path::PathBuf,
+}
+
+fn shard_dirs(config: &Config, shard_count: u32, shard: u32) -> ShardDirs {
+    let place = |base: &std::path::Path| {
+        if shard_count <= 1 {
+            base.to_path_buf()
+        } else {
+            base.join(format!("shard-{shard}"))
+        }
+    };
+    ShardDirs {
+        page_dir: place(&config.storage.page_dir),
+        commit_log_dir: place(&config.storage.commit_log_dir),
+        checkpoint_dir: place(&config.storage.checkpoint_dir),
+        archive_dir: place(&config.replication.archive.dir),
+    }
+}
+
+/// Build the shard context(s) from `config` and the link-time registry.
+///
+/// Split from [`serve`] so a test can assemble a deployment without binding
+/// ports. `sharding.shards = 1` (the default; the development and droplet
+/// profiles pin it) assembles exactly what it always has — one context, no
+/// coordinator. `> 1` assembles that many fully-independent [`ShardHost`]s
+/// (SHD-020: each with its own store, pager, commit log, recovery and
+/// checkpoint worker) behind a [`crate::shard::ShardCoord`], and the
+/// configured count is **honoured or refused** — there is no silent
+/// downgrade to one shard.
+///
+/// [`ShardHost`]: crate::shard::ShardHost
+pub fn assemble(config: &Config) -> Result<Assembled, BootError> {
     // `assemble` collects and validates the link-time registry, which is the
     // same path `ServerBuilder::build` documents.
     let schema = Schema::assemble()?;
     if schema.is_empty() {
         return Err(BootError::NoTables);
     }
+    let schema = Arc::new(schema);
 
-    // Shard 0 of this process. Multi-shard hosting is ShardCoord's job
-    // (SPEC-024); a single-process server owns one shard.
-    let shard = 0_u32;
-
-    // SPEC-015: the live store serves through a paged cold tier whose buffer
-    // pool is sized from the effective `memory.budget` (TIER-002/003) over the
-    // configured `storage.page_dir`, so steady-state RSS is bounded by the
-    // budget rather than the resident row count (TIER-004) — the pillar the
-    // billion-row soak (T7.7) exercises.
     let hardware = fluxum_core::hw::HardwareProfile::probe();
     let effective = fluxum_core::hw::derive(&hardware, config)?;
-    std::fs::create_dir_all(&config.storage.page_dir).map_err(fluxum_core::FluxumError::from)?;
+    // Only an EXPLICIT `sharding.shards` provisions a multi-shard topology.
+    // `auto` derives a per-hardware value for sizing, but honouring it here
+    // would let a core count silently change the on-disk layout (flat →
+    // `shard-<k>/`) on upgrade — an implicit re-partition, which SHD-003
+    // forbids. Topology is an operator decision; `auto` hosts one shard.
+    let shard_count = config
+        .sharding
+        .shards
+        .explicit()
+        .copied()
+        .unwrap_or(1)
+        .max(1);
+    if shard_count == 1 && effective.shards.value > 1 {
+        tracing::info!(
+            target: "fluxum::server",
+            derived = effective.shards.value,
+            "sharding.shards is `auto`: hosting one shard (multi-shard \
+             topology needs an explicit count — it changes the data layout)"
+        );
+    }
+
+    // The one memory budget covers the whole process (TIER-004), so N pools
+    // split it — a per-shard pool below a working floor means the operator
+    // asked for more shards than the budget can host, which is a refusal,
+    // not a degraded boot.
+    let pool_per_shard = effective.bufferpool_capacity_bytes.value / u64::from(shard_count);
+    const MIN_POOL_PER_SHARD: u64 = 8 << 20;
+    if shard_count > 1 && pool_per_shard < MIN_POOL_PER_SHARD {
+        return Err(BootError::Core(fluxum_core::FluxumError::config(format!(
+            "sharding.shards: {} shards over a {} B buffer pool leaves {} B per shard \
+             (< the {} MiB floor); raise memory.budget or lower the shard count",
+            shard_count,
+            effective.bufferpool_capacity_bytes.value,
+            pool_per_shard,
+            MIN_POOL_PER_SHARD >> 20,
+        ))));
+    }
+
+    // SPEC-020 PLG-001/032: validate the plugin manifest once; the registry
+    // is shared read-only by every shard.
+    let plugins = Arc::new(fluxum_core::plugin::PluginRegistry::build(&schema, config)?);
+    // SPEC-026 §4: ONE pre-auth guard for the whole process, so the per-IP
+    // view stays unified across shards exactly as it is across transports.
+    let conn_guard = Arc::new(crate::connguard::ConnGuard::new(
+        crate::connguard::ConnLimits::from_config(&config.server.connection_limits),
+    ));
+
+    let mut hosts: Vec<crate::shard::ShardHost> = Vec::with_capacity(shard_count as usize);
+    for shard in 0..shard_count {
+        let dirs = shard_dirs(config, shard_count, shard);
+        let ctx = assemble_shard(
+            config,
+            &schema,
+            &effective,
+            shard,
+            pool_per_shard,
+            &dirs,
+            &plugins,
+            &conn_guard,
+        )?;
+        hosts.push(crate::shard::ShardHost {
+            shard_id: shard,
+            ctx,
+        });
+    }
+
+    // Single shard: no coordinator, no routing layer — the assembly every
+    // deployment has run since T0. Multi-shard: the SHD-010 registry.
+    if shard_count == 1 {
+        let ctx = hosts.pop().map(|h| h.ctx).unwrap_or_else(|| unreachable!());
+        finish_default_shard(config, &ctx)?;
+        return Ok(Assembled { ctx, coord: None });
+    }
+
+    let router = fluxum_core::shard::ShardRouter::from_schema(&schema, shard_count);
+    let default_shard = 0_u32;
+    let coord = Arc::new(crate::shard::ShardCoord::new(
+        Arc::clone(&schema),
+        router,
+        hosts,
+    )?);
+    for shard in coord.shard_ids().collect::<Vec<_>>() {
+        if let Some(ctx) = coord.host(shard) {
+            ctx.set_coord(&coord);
+            // The transports spawn fan-out + sweepers for the shard they
+            // accept on; every other shard gets them here, or its
+            // subscribers would never receive a TxUpdate. The Notify is
+            // shard-lifetime: these tasks end with the process.
+            if shard != default_shard {
+                crate::spawn_fanout(Arc::clone(ctx), Arc::new(tokio::sync::Notify::new()));
+                ctx.start_ephemeral_sweeper();
+                ctx.start_ttl_sweeper();
+            }
+        }
+    }
+    let ctx = coord.host(default_shard).cloned().ok_or_else(|| {
+        BootError::Core(fluxum_core::FluxumError::config(
+            "sharding: no default shard 0 in the assembled registry (SHD-004)",
+        ))
+    })?;
+    finish_default_shard(config, &ctx)?;
+    tracing::info!(
+        target: "fluxum::server",
+        shards = shard_count,
+        "multi-shard deployment assembled (SHD-010): sessions route by \
+         identity affinity after authentication (SHD-011)"
+    );
+    Ok(Assembled {
+        ctx,
+        coord: Some(coord),
+    })
+}
+
+/// Assemble one fully-independent shard (SHD-020): its own pager + store,
+/// recovery, commit log, pipeline, engine, subscriptions, checkpoint worker
+/// and replication primary, over its own directories.
+#[allow(clippy::too_many_arguments)] // the boot wiring, called exactly once
+fn assemble_shard(
+    config: &Config,
+    schema: &Arc<Schema>,
+    effective: &fluxum_core::hw::EffectiveConfig,
+    shard: u32,
+    pool_per_shard: u64,
+    dirs: &ShardDirs,
+    plugins: &Arc<fluxum_core::plugin::PluginRegistry>,
+    conn_guard: &Arc<crate::connguard::ConnGuard>,
+) -> Result<Arc<ShardContext>, BootError> {
+    // SPEC-015: the live store serves through a paged cold tier whose buffer
+    // pool is sized from the effective `memory.budget` (TIER-002/003), so
+    // steady-state RSS is bounded by the budget rather than the resident row
+    // count (TIER-004) — the pillar the billion-row soak (T7.7) exercises.
+    // On a multi-shard boot each shard gets an equal split of the pool, so
+    // the budget covers the process, not each shard (TST-112's "within
+    // budget on every shard" reads each split's own gauges).
+    std::fs::create_dir_all(&dirs.page_dir).map_err(fluxum_core::FluxumError::from)?;
     // `Pager::open` discards page files this build cannot read (an older
     // page format, a half-written run): the tier is a cache, and recovery
     // below rebuilds it from the checkpoint + commit log (TIER-021).
-    let pager = fluxum_core::store::pager::Pager::open(
-        &config.storage.page_dir,
-        fluxum_core::store::pager::PagerOptions::from_effective(config, &effective, shard),
-    )?;
+    let mut pager_options =
+        fluxum_core::store::pager::PagerOptions::from_effective(config, effective, shard);
+    pager_options.pool_capacity_bytes = pool_per_shard;
+    let pager = fluxum_core::store::pager::Pager::open(&dirs.page_dir, pager_options)?;
     let store = Arc::new(MemStore::with_pager(
-        &schema,
+        schema,
         fluxum_core::store::StoreOptions::default(),
         pager,
     )?);
@@ -121,13 +306,11 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // than left to CommitLog::open (which also creates it) because recovery
     // replays the directory FIRST, and an absent directory is an I/O error,
     // not an empty log.
-    std::fs::create_dir_all(&config.storage.commit_log_dir)
-        .map_err(fluxum_core::FluxumError::from)?;
+    std::fs::create_dir_all(&dirs.commit_log_dir).map_err(fluxum_core::FluxumError::from)?;
     let repo = Arc::new(fluxum_core::checkpoint::CheckpointRepo::open(
-        &config.storage.checkpoint_dir,
+        &dirs.checkpoint_dir,
     )?);
-    let recovery =
-        fluxum_core::checkpoint::recover(&store, &repo, &config.storage.commit_log_dir, shard)?;
+    let recovery = fluxum_core::checkpoint::recover(&store, &repo, &dirs.commit_log_dir, shard)?;
     if recovery.last_tx_id.is_some() || !recovery.rejected.is_empty() {
         tracing::info!(
             target: "fluxum::server",
@@ -135,6 +318,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
             checkpoint_tx_id = ?recovery.checkpoint_tx_id,
             replayed_records = recovery.applied_records,
             rejected_checkpoints = recovery.rejected.len(),
+            shard,
             "recovered shard state (STG-030)"
         );
     }
@@ -143,13 +327,11 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // the highest of the persisted replication epoch and any PITR lineage
     // marker (a forked history must start above everything it forked from).
     // It is persisted before the member acts under it.
-    let epoch = fluxum_core::backup::pitr_lineage_min_epoch(&config.storage.commit_log_dir)?
+    let epoch = fluxum_core::backup::pitr_lineage_min_epoch(&dirs.commit_log_dir)?
         .unwrap_or(0)
-        .max(crate::replication::load_epoch(
-            &config.storage.commit_log_dir,
-        )?)
+        .max(crate::replication::load_epoch(&dirs.commit_log_dir)?)
         .max(1);
-    crate::replication::persist_epoch(&config.storage.commit_log_dir, epoch)?;
+    crate::replication::persist_epoch(&dirs.commit_log_dir, epoch)?;
     if epoch > 1 {
         tracing::info!(
             target: "fluxum::server",
@@ -158,7 +340,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         );
     }
     let log = Arc::new(CommitLog::open(
-        &config.storage.commit_log_dir,
+        &dirs.commit_log_dir,
         shard,
         epoch,
         CommitLogOptions {
@@ -181,13 +363,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         fluxum_core::auth::server_identity("fluxum-server"),
     );
 
-    // SPEC-020 PLG-001/032: validate the plugin manifest against the schema
-    // (capability exists, placement legal for the host, in-proc feature
-    // compiled, applies_to targets exist) — any violation aborts startup. An
-    // empty manifest yields a registry of just the adopted built-in seams.
-    let schema = Arc::new(schema);
-    let plugins = Arc::new(fluxum_core::plugin::PluginRegistry::build(&schema, config)?);
-    let subs = SubscriptionManager::new(Arc::clone(&schema), SubscriptionLimits::default());
+    let subs = SubscriptionManager::new(Arc::clone(schema), SubscriptionLimits::default());
     // AUTH-062 / REP-005: the configured server peers — operators, ingest
     // services, and replica-set members all authenticate through this
     // registry. (It was silently empty before T7.1 wired replication in.)
@@ -201,9 +377,7 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
     // not the built-in defaults. (The SEC-033/034 lists and global ceiling
     // land through `install_config` → `publish_reloadable`, the same path a
     // hot reload takes.)
-    ctx.set_conn_guard(Arc::new(crate::connguard::ConnGuard::new(
-        crate::connguard::ConnLimits::from_config(&config.server.connection_limits),
-    )));
+    ctx.set_conn_guard(Arc::clone(conn_guard));
     // SPEC-026 SEC-054: the admin access policy, from config; the profile
     // decides whether the console admits anonymous callers (DEV-031). (Also
     // republished on hot reload via `publish_reloadable`.)
@@ -211,13 +385,10 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         &config.server.admin,
         config.profile,
     )?);
-    // FR-05 / HWA-012/013: probe the hardware (container-aware — cgroup CPU
-    // and memory limits win over host totals), derive the `auto` keys, and
-    // install the result so `GET /health` reports the probe inputs and every
-    // derived value with its provenance. `main.rs` runs the same derivation
-    // earlier to size the Tokio runtime, which exists before this is reached.
-    let hardware = fluxum_core::hw::HardwareProfile::probe();
-    ctx.set_effective_config(&fluxum_core::hw::derive(&hardware, config)?);
+    // FR-05 / HWA-012/013: install the derived config so `GET /health`
+    // reports the probe inputs and every derived value with its provenance
+    // (the caller probed and derived once for the whole assembly).
+    ctx.set_effective_config(effective);
     // STG-020: the periodic checkpoint worker, wired for REP-062 archival —
     // covered segments are copied durably to the archive (the PITR source)
     // before truncation may delete them, and archived copies age out with
@@ -241,9 +412,16 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
                     .map(|s| s.expose_str().to_owned())
                     .unwrap_or_default(),
             });
+        // A multi-shard boot namespaces the remote prefix per shard, the
+        // object-store analogue of the `shard-<k>/` directory split.
+        let prefix = if dirs.commit_log_dir == config.storage.commit_log_dir {
+            remote.effective_prefix().to_owned()
+        } else {
+            format!("{}/shard-{shard}", remote.effective_prefix())
+        };
         Some(Arc::new(fluxum_core::backup::remote::RemoteArchiver::new(
             Arc::new(store),
-            remote.effective_prefix(),
+            &prefix,
         )))
     } else {
         None
@@ -256,8 +434,8 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
             interval_tx: config.storage.checkpoint_interval_tx,
             epoch,
             compaction: Some(fluxum_core::checkpoint::LogCompaction {
-                log_dir: config.storage.commit_log_dir.clone(),
-                archive_dir: archive.enabled.then(|| archive.dir.clone()),
+                log_dir: dirs.commit_log_dir.clone(),
+                archive_dir: archive.enabled.then(|| dirs.archive_dir.clone()),
                 archive_retention: archive
                     .enabled
                     .then(|| archive.retention_duration())
@@ -287,8 +465,8 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         });
     ctx.set_replication_primary(crate::replication::ReplicationPrimary::new(
         shard,
-        config.storage.commit_log_dir.clone(),
-        config.storage.checkpoint_dir.clone(),
+        dirs.commit_log_dir.clone(),
+        dirs.checkpoint_dir.clone(),
         epoch,
         crate::replication::PrimaryOptions {
             heartbeat_interval: Duration::from_millis(config.replication.heartbeat_interval_ms),
@@ -296,16 +474,33 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
             semi_sync,
         },
     ));
+    ctx.set_plugins(Arc::clone(plugins));
+    Ok(ctx)
+}
+
+/// The node-level services that live on the **default** shard only: the
+/// T7.2 election (a member's role is per node, not per shard) and the CDC
+/// pumps (SPEC-020 PLG-050; they follow the default shard's log — per-shard
+/// CDC fan-in is future work, documented in `docs/DEPLOYMENT.md`).
+fn finish_default_shard(config: &Config, ctx: &Arc<ShardContext>) -> Result<(), BootError> {
+    let dirs = shard_dirs(config, 1, 0);
+    // The default shard's own epoch, as persisted by its assembly above.
+    let log_dir = if ctx.coord().is_some() {
+        shard_dirs(config, 2, 0).commit_log_dir
+    } else {
+        dirs.commit_log_dir
+    };
     // SPEC-014 §5 (T7.2): the election state serves votes and publishes
     // the role the moment the member has peers — REP-003: the config role
     // is a bootstrap hint; consensus owns it after the first election. A
     // standalone node (no peers) skips it and is always the primary.
     if !config.replication.peers.is_empty() {
+        let epoch = crate::replication::load_epoch(&log_dir)?.max(1);
         let primary = config.replication.role == fluxum_core::config::ReplicationRole::Primary;
         let election = crate::election::ElectionState::new(
-            shard,
+            ctx.shard_id,
             config.replication.member_name.clone(),
-            config.storage.commit_log_dir.clone(),
+            log_dir.clone(),
             primary,
             epoch,
             Duration::from_millis(config.replication.election_timeout_ms),
@@ -316,19 +511,18 @@ pub fn assemble(config: &Config) -> Result<Arc<ShardContext>, BootError> {
         ctx.metrics().set_replication_epoch(epoch);
         ctx.set_election(election);
     }
-    // SPEC-020 §6 (PLG-050): install the registry for `GET /plugins`
-    // introspection and spawn a CDC pump per `stream_sink` binding, fed off
-    // the durable commit log (never the write path). The pumps are detached
-    // like the checkpoint worker and replica client; they end when the log
-    // closes at shutdown.
-    ctx.set_plugins(Arc::clone(&plugins));
-    let _cdc_pumps = crate::cdc::spawn_sinks(
-        &ctx,
-        &plugins,
-        config.storage.commit_log_dir.clone(),
-        config.storage.data_dir.join("cdc"),
-    );
-    Ok(ctx)
+    // SPEC-020 §6 (PLG-050): spawn a CDC pump per `stream_sink` binding,
+    // fed off the durable commit log (never the write path). The pumps are
+    // detached like the checkpoint worker; they end when the log closes.
+    if let Some(plugins) = ctx.plugins() {
+        let _cdc_pumps = crate::cdc::spawn_sinks(
+            ctx,
+            &Arc::clone(plugins),
+            log_dir,
+            config.storage.data_dir.join("cdc"),
+        );
+    }
+    Ok(())
 }
 
 /// Depth of the shard-wide commit broadcast the fan-out task consumes.
@@ -392,7 +586,7 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
             }
         }
     }
-    let ctx = assemble(&config)?;
+    let Assembled { ctx, coord } = assemble(&config)?;
 
     let idle = match config.server.idle_timeout_secs {
         0 => None,
@@ -541,5 +735,11 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
         None
     };
 
-    Ok(Server { http, tcp, pg, ctx })
+    Ok(Server {
+        http,
+        tcp,
+        pg,
+        ctx,
+        coord,
+    })
 }

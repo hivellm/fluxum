@@ -385,6 +385,13 @@ pub struct ShardContext {
     /// The validated plugin registry (SPEC-020), once installed: drives
     /// `GET /plugins` introspection and hot disable (PLG-060/061).
     plugins: std::sync::OnceLock<Arc<fluxum_core::plugin::PluginRegistry>>,
+    /// The multi-shard coordinator this shard is hosted under (SPEC-007
+    /// SHD-010/011), when the deployment runs more than one shard. `Weak`,
+    /// because the coordinator owns every shard's context strongly — the
+    /// boot assembly (or the test that built the cluster) holds the owning
+    /// `Arc<ShardCoord>`. A single-shard boot never installs one, so every
+    /// existing single-shard path is untouched by construction.
+    coord: std::sync::OnceLock<std::sync::Weak<crate::shard::ShardCoord>>,
     /// The pre-auth connection-abuse guard (SPEC-026 SEC-030/031), shared by
     /// both transports so the per-IP view is unified. Installed once via
     /// [`ShardContext::set_conn_guard`]; a default permissive guard is
@@ -529,6 +536,7 @@ impl ShardContext {
             replication: std::sync::OnceLock::new(),
             election: std::sync::OnceLock::new(),
             plugins: std::sync::OnceLock::new(),
+            coord: std::sync::OnceLock::new(),
             conn_guard: std::sync::OnceLock::new(),
             namespaces: std::sync::RwLock::new(HashMap::new()),
             started: std::time::Instant::now(),
@@ -850,6 +858,20 @@ impl ShardContext {
     /// The installed plugin registry, if any.
     pub fn plugins(&self) -> Option<&Arc<fluxum_core::plugin::PluginRegistry>> {
         self.plugins.get()
+    }
+
+    /// Install the multi-shard coordinator this shard serves under
+    /// (SHD-010). Called once per shard by the boot assembly; stored weak —
+    /// the assembly's owner keeps the coordinator alive.
+    pub fn set_coord(&self, coord: &Arc<crate::shard::ShardCoord>) {
+        let _ = self.coord.set(Arc::downgrade(coord));
+    }
+
+    /// The multi-shard coordinator, when this deployment runs one. `None`
+    /// on a single-shard boot — the common case — so every caller treats
+    /// the coordinator as an upgrade, never a requirement.
+    pub fn coord(&self) -> Option<Arc<crate::shard::ShardCoord>> {
+        self.coord.get().and_then(std::sync::Weak::upgrade)
     }
 
     /// Install the pre-auth connection-abuse guard (SPEC-026 SEC-030/031),

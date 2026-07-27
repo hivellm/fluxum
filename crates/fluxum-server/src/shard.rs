@@ -212,6 +212,41 @@ impl ShardCoord {
         Ok(receipt)
     }
 
+    /// [`Self::call`] with idempotency-key semantics — the transport
+    /// session's reducer path (RPC-021 carries `idempotency_key`). A
+    /// deduplicated call ran nothing and committed nothing, so it neither
+    /// replicates globals nor detects moves; a committed one follows the
+    /// exact [`Self::call`] flow.
+    pub async fn call_idempotent(
+        &self,
+        shard: ShardId,
+        caller: ReducerCaller,
+        reducer: &str,
+        args: Vec<FluxValue>,
+        key: Option<&str>,
+    ) -> Result<fluxum_core::reducer::CallOutcome> {
+        let host = self
+            .hosts
+            .get(&shard)
+            .ok_or_else(|| FluxumError::Storage(format!("unknown shard {shard} (SHD-010)")))?;
+        let outcome = host
+            .engine
+            .call_idempotent(caller, reducer, args, key)
+            .await?;
+        if let fluxum_core::reducer::CallOutcome::Committed(receipt) = &outcome {
+            // SHD-030: the committed global write is readable on every shard
+            // before the ReducerResult is.
+            self.replicate_globals(shard, &receipt.diff)?;
+            // SHD-040: an entity whose key now resolves elsewhere moves
+            // before the client's next call can route to it.
+            for (entity_key, key_bytes, target) in self.detect_moves(shard, &receipt.diff)? {
+                self.run_handoff(&entity_key, key_bytes, shard, target)
+                    .await;
+            }
+        }
+        Ok(outcome)
+    }
+
     /// The routing entry for entity-keyed calls (SHD-011/044): resolve the
     /// owning shard from the partition key, or queue the call when that
     /// entity's handoff is in flight — queued calls execute exactly once,

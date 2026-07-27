@@ -486,8 +486,10 @@ async fn drive_connection(
     // heartbeat interval), so `writer.await` cannot hang on it.
     conn_closed.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(conn_id) = session.connection_id() {
-        ctx.metrics().note_disconnect(); // OBS-040
-        ctx.connections.remove(conn_id).await;
+        // The session's context, not the listener's: an SHD-011 rebound
+        // session registered its fan-out handle on its affinity shard.
+        session.ctx().metrics().note_disconnect(); // OBS-040
+        session.ctx().connections.remove(conn_id).await;
         session.subscriptions().lock().await.disconnect(conn_id);
         // RED-012: run the `on_disconnect` hooks; their diff reaches the
         // remaining subscribers via the commit hook (P0-A 1.3), like any
@@ -549,9 +551,25 @@ async fn route_frame(
                         "hello refused: this member is not the primary");
                     return false;
                 }
-                if let Some(primary) = ctx.replication_primary() {
+                // SHD-020/REP-014: `ReplicaHello.shard_id` names whose log
+                // the replica wants; on a multi-shard deployment each shard
+                // has its own log and its own primary service, so the hello
+                // routes to that shard's context.
+                let target = match ctx.coord() {
+                    Some(coord) => match coord.host(hello.shard_id) {
+                        Some(host) => Arc::clone(host),
+                        None => {
+                            tracing::warn!(target: "fluxum::repl", from = %peer,
+                                shard = hello.shard_id,
+                                "hello refused: unknown shard (SHD-010)");
+                            return false;
+                        }
+                    },
+                    None => Arc::clone(ctx),
+                };
+                if let Some(primary) = target.replication_primary() {
                     return primary.accept(
-                        ctx,
+                        &target,
                         hello,
                         peer,
                         out_tx.clone(),
@@ -621,7 +639,9 @@ async fn route_frame(
         && session.is_authenticated()
         && let Some(conn_id) = session.connection_id()
     {
-        ctx.connections
+        session
+            .ctx()
+            .connections
             .insert(
                 conn_id,
                 ConnHandle {

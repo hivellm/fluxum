@@ -173,15 +173,10 @@ fn soak_driver_loads_sustains_samples_and_reports() {
         "a healthy smoke keeps every shard inside its pool: {:?}",
         report.shard_pools
     );
-    // The server binary hosts exactly one shard, so asking for one is the
-    // only request it can actually honour. If this ever reports more, the
-    // deployment grew a real multi-shard mode and TST-112's "sharded"
-    // clause becomes reachable — worth noticing rather than silently
-    // passing either way.
-    assert_eq!(
-        report.shards_observed, 1,
-        "a single-process server owns one shard"
-    );
+    // This smoke boots without FLUXUM_SHARDING_SHARDS, so the server
+    // assembles its default single shard and the report must say exactly
+    // that — one requested, one observed.
+    assert_eq!(report.shards_observed, 1, "default boot hosts one shard");
     assert_eq!(report.shards_requested, 1);
 
     // The report artifact writes as JSON + Markdown.

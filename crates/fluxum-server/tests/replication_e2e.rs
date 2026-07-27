@@ -145,7 +145,7 @@ async fn a_cold_replica_full_syncs_through_a_checkpoint_transfer() {
     let replica_dir = root.path().join("replica");
     let mut replica_config = base_config(&replica_dir);
     replica_config.replication.role = ReplicationRole::Replica;
-    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let replica_ctx = boot::assemble(&replica_config).unwrap().ctx;
     let client = spawn_replica(
         std::sync::Arc::clone(&replica_ctx),
         ReplicaOptions {
@@ -281,7 +281,7 @@ async fn a_bad_peer_credential_never_opens_a_session() {
     let replica_dir = root.path().join("replica");
     let mut replica_config = base_config(&replica_dir);
     replica_config.replication.role = ReplicationRole::Replica;
-    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let replica_ctx = boot::assemble(&replica_config).unwrap().ctx;
     let client = spawn_replica(
         std::sync::Arc::clone(&replica_ctx),
         ReplicaOptions {
@@ -325,7 +325,7 @@ async fn a_higher_epoch_hello_fences_the_stale_primary() {
     let replica_dir = root.path().join("replica");
     let mut replica_config = base_config(&replica_dir);
     replica_config.replication.role = ReplicationRole::Replica;
-    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let replica_ctx = boot::assemble(&replica_config).unwrap().ctx;
     // The replica has PERSISTED epoch 7 (a past election this primary,
     // still on epoch 1, never saw).
     fluxum_server::replication::persist_epoch(&replica_config.storage.commit_log_dir, 7).unwrap();
@@ -405,7 +405,7 @@ async fn semi_sync_holds_every_client_ack_until_the_quorum_is_durable() {
     let replica_dir = root.path().join("replica");
     let mut replica_config = base_config(&replica_dir);
     replica_config.replication.role = ReplicationRole::Replica;
-    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let replica_ctx = boot::assemble(&replica_config).unwrap().ctx;
     let client = spawn_replica(
         std::sync::Arc::clone(&replica_ctx),
         ReplicaOptions {
@@ -621,7 +621,7 @@ async fn a_replica_converges_cold_and_resumes_from_its_offset() {
     let replica_dir = root.path().join("replica");
     let mut replica_config = base_config(&replica_dir);
     replica_config.replication.role = ReplicationRole::Replica;
-    let replica_ctx = boot::assemble(&replica_config).unwrap();
+    let replica_ctx = boot::assemble(&replica_config).unwrap().ctx;
     let options = ReplicaOptions {
         primary: primary_tcp.to_string(),
         member_name: "replica-1".into(),

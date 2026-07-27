@@ -177,12 +177,10 @@ pub struct SoakReport {
     pub shard_pools: Vec<ShardPool>,
     /// Shards the run *asked* for (`--shards`).
     pub shards_requested: u32,
-    /// Shards that actually reported metrics. TST-112 wants a **sharded**
-    /// deployment; today a single-process `fluxum-server` owns exactly one
-    /// shard (`boot.rs`: "Multi-shard hosting is ShardCoord's job"), so
-    /// `--shards` only feeds the `auto` hardware derivation and this comes
-    /// back as 1. Recorded separately from the request so a report can
-    /// never imply a topology that did not run.
+    /// Shards that actually reported metrics. The server assembles
+    /// `sharding.shards` hosts (or refuses the count), so this should equal
+    /// the request; recorded separately so a run whose metrics scrape
+    /// missed shards can never imply a topology it did not observe.
     pub shards_observed: u32,
     /// Sustained-write throughput + latency (the `send_chat` stream).
     pub write: Summary,
@@ -1047,10 +1045,9 @@ fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
 
     #[test]
     fn a_run_that_did_not_actually_shard_says_so() {
-        // The soak's `--shards` only feeds the server's `auto` hardware
-        // derivation; a single-process server still owns one shard. A
-        // report claiming 8 shards when 1 ran would misrepresent TST-112's
-        // "sharded deployment" clause as met.
+        // Requested and observed can only disagree when the metrics scrape
+        // missed shards; a report claiming 8 shards when it observed 1
+        // would misrepresent TST-112's "sharded deployment" clause as met.
         let mut report = SoakReport {
             harness_version: "0.1.0".into(),
             date: "2026-07-27".into(),
