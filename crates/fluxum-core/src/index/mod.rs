@@ -176,7 +176,7 @@ impl SpatialIndexState {
     ) -> Result<Self> {
         Ok(Self {
             columns,
-            index: SpatialIndex::RTree(RTree::new(max_entries)),
+            index: SpatialIndex::RTree(RTree::new(max_entries, pager, table_id)?),
             pager: Arc::clone(pager),
             table_id,
             ready: true,
@@ -300,7 +300,7 @@ impl SpatialIndexState {
                     ),
                     _ => return Err(arity_invariant("rtree", 4, self.columns.len())),
                 };
-                rt.insert(aabb, pk);
+                rt.insert(aabb, pk, sup)?;
             }
         }
         Ok(())
@@ -332,7 +332,7 @@ impl SpatialIndexState {
                     ),
                     _ => return Err(arity_invariant("rtree", 4, self.columns.len())),
                 };
-                rt.remove(&aabb, pk);
+                rt.remove(&aabb, pk, sup)?;
             }
         }
         Ok(())
@@ -340,13 +340,17 @@ impl SpatialIndexState {
 
     /// Every indexed entry in canonical order — the STG-007 rule-2
     /// comparison surface (paged indexes have no structural equality, so
-    /// contents are what must match a fresh rebuild).
-    pub(crate) fn entries(&self) -> Result<Vec<(f64, f64, PkBytes)>> {
+    /// contents are what must match a fresh rebuild). Both flavours report
+    /// boxes so nothing is lost in the shared shape: a QuadTree point is
+    /// its own degenerate box.
+    pub(crate) fn entries(&self) -> Result<Vec<(Aabb, PkBytes)>> {
         match &self.index {
-            SpatialIndex::QuadTree(qt) => qt.entries(),
-            // The R-tree is still resident; its contents are compared
-            // structurally until it is paged too (TIER-051 follow-up).
-            SpatialIndex::RTree(rt) => Ok(rt.entries()),
+            SpatialIndex::QuadTree(qt) => Ok(qt
+                .entries()?
+                .into_iter()
+                .map(|(x, y, pk)| (Aabb::new(x, y, x, y), pk))
+                .collect()),
+            SpatialIndex::RTree(rt) => rt.entries(),
         }
     }
 
@@ -361,7 +365,7 @@ impl SpatialIndexState {
                 region.y,
                 region.x + region.w,
                 region.y + region.h,
-            )),
+            ))?,
         })
     }
 
@@ -371,7 +375,7 @@ impl SpatialIndexState {
         self.check_ready()?;
         Ok(match &self.index {
             SpatialIndex::QuadTree(qt) => qt.query_radius(x, y, r)?,
-            SpatialIndex::RTree(rt) => rt.query_radius(x, y, r),
+            SpatialIndex::RTree(rt) => rt.query_radius(x, y, r)?,
         })
     }
 
@@ -381,7 +385,7 @@ impl SpatialIndexState {
         self.check_ready()?;
         Ok(match &self.index {
             SpatialIndex::QuadTree(qt) => qt.query_point(x, y)?,
-            SpatialIndex::RTree(rt) => rt.query_point(x, y),
+            SpatialIndex::RTree(rt) => rt.query_point(x, y)?,
         })
     }
 }

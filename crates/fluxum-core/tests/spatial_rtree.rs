@@ -510,7 +510,7 @@ fn rebuild_gate_returns_503_then_identical_results() {
 
     // Enter the rebuilding state (what recovery does for unpersisted
     // spatial indexes, SPX-031).
-    store.mark_spatial_rebuilding();
+    store.mark_spatial_rebuilding().unwrap();
     assert!(!store.spatial_ready()); // ReducerCall admission gate input
     let snap = store.snapshot();
     for table in [ids.zone, ids.vehicle] {
