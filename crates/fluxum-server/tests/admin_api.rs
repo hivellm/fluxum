@@ -575,6 +575,138 @@ async fn reducer_endpoint_calls_and_commits() {
     server.shutdown();
 }
 
+// --- POST /rows: the console's row editor (DEV-030 v1) ---------------------------
+
+/// Upsert inserts and edits through the pipeline; delete removes by PK; the
+/// commit is attributed to the console and visible to plain SQL afterwards.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_endpoint_upserts_edits_and_deletes() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // Insert a fresh row (explicit PK — the grid's "new row" gesture).
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"upsert","row":{"id":7,"text":"first"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let json = resp.json();
+    assert_eq!(json["success"], true);
+    assert_eq!(json["payload"]["op"], "upsert");
+
+    // Edit it in place: same PK, new value.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"upsert","row":{"id":7,"text":"edited"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+
+    // The edit is visible to plain SQL — it was a real commit.
+    let resp = request(
+        addr,
+        "POST",
+        "/query",
+        Some(r#"{"payload":{"sql":"SELECT * FROM Chat WHERE id = 7"}}"#),
+    )
+    .await;
+    let json = resp.json();
+    assert_eq!(json["payload"]["rows"][0]["text"], "edited");
+
+    // Delete by the row as the grid holds it (extra columns tolerated).
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"delete","row":{"id":7,"text":"edited"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", resp.text());
+    let resp = request(
+        addr,
+        "POST",
+        "/query",
+        Some(r#"{"payload":{"sql":"SELECT * FROM Chat WHERE id = 7"}}"#),
+    )
+    .await;
+    assert_eq!(resp.json()["payload"]["rows"].as_array().unwrap().len(), 0);
+
+    // Deleting a row that is not there is a client error, not a silent ok.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"delete","row":{"id":7}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400, "{}", resp.text());
+    server.shutdown();
+}
+
+/// The conversion layer rejects what the schema rejects, with the column
+/// named — a console must say WHICH field is wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn rows_endpoint_validates_types_tables_and_shapes() {
+    let server = start().await;
+    let addr = server.local_addr;
+
+    // Unknown table.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Nope","op":"upsert","row":{"id":1}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 404);
+
+    // A type mismatch names the offending column.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"upsert","row":{"id":"not-a-number","text":"x"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"].as_str().unwrap().contains("id"),
+        "{}",
+        resp.text()
+    );
+
+    // A missing column names itself.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"upsert","row":{"id":1}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    assert!(
+        resp.json()["error"].as_str().unwrap().contains("text"),
+        "{}",
+        resp.text()
+    );
+
+    // A bad op is refused.
+    let resp = request(
+        addr,
+        "POST",
+        "/rows",
+        Some(r#"{"table":"Chat","op":"truncate","row":{"id":1,"text":"x"}}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 400);
+    server.shutdown();
+}
+
 // --- POST /query: one-off SQL → JSON rows --------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
