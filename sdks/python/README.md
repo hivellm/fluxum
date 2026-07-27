@@ -6,7 +6,7 @@ T7.4). Zero runtime dependencies — the SDK carries its own minimal
 MessagePack codec and FluxBIN row reader.
 
 ```sh
-pip install fluxum
+pip install fluxum-sdk
 ```
 
 ```python

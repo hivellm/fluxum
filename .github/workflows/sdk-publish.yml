@@ -22,7 +22,7 @@ name: Publish SDKs
 #     repository hivellm/fluxum, workflow sdk-publish.yml, no environment.
 #   npm → @hivehub/fluxum → package Settings → Trusted publisher:
 #     GitHub Actions, hivellm/fluxum, workflow sdk-publish.yml.
-#   PyPI → fluxum → Manage → Publishing → Add trusted publisher:
+#   PyPI → fluxum-sdk → Manage → Publishing → Add trusted publisher:
 #     owner hivellm, repository fluxum, workflow sdk-publish.yml, no environment.
 #   nuget.org → Fluxum.Sdk → Trusted Publishing policy owned by the account in
 #     the `NUGET_USER` repository variable: repo hivellm/fluxum, workflow
@@ -208,7 +208,7 @@ jobs:
           manifest=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
           echo "tag=$version manifest=$manifest"
           if [ "$manifest" != "$version" ]; then
-            echo "::error::fluxum is $manifest but the tag says $version"
+            echo "::error::fluxum-sdk is $manifest but the tag says $version"
             exit 1
           fi
 
@@ -216,9 +216,9 @@ jobs:
         id: check
         run: |
           version="${RELEASE_TAG#v}"
-          if curl -sfo /dev/null "https://pypi.org/pypi/fluxum/$version/json"; then
+          if curl -sfo /dev/null "https://pypi.org/pypi/fluxum-sdk/$version/json"; then
             echo "published=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::fluxum $version is already on PyPI — skipping"
+            echo "::notice::fluxum-sdk $version is already on PyPI — skipping"
           else
             echo "published=false" >> "$GITHUB_OUTPUT"
           fi

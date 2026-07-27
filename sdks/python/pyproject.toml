@@ -3,7 +3,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fluxum"
+name = "fluxum-sdk"
 version = "0.2.0"
 description = "Asyncio-first Python client for the Fluxum realtime database"
 readme = "README.md"
