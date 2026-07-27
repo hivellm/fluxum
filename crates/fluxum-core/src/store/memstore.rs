@@ -319,7 +319,7 @@ impl MemStore {
                     row_count: 0,
                     indexes: build_btree_indexes(table, &pager, id)?,
                     spatial: build_spatial_index(table, &options, &pager, id)?,
-                    fulltext: build_fulltext_indexes(table),
+                    fulltext: build_fulltext_indexes(table, &pager, id)?,
                     unique,
                     auto_inc_high_water: 0,
                 }),
@@ -530,17 +530,25 @@ impl MemStore {
     /// state — emptied, not ready — mirroring [`mark_spatial_rebuilding`].
     ///
     /// [`mark_spatial_rebuilding`]: Self::mark_spatial_rebuilding
-    pub fn mark_fulltext_rebuilding(&self) {
+    pub fn mark_fulltext_rebuilding(&self) -> Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
         for slot in tables.values_mut() {
             if slot.fulltext.is_empty() {
                 continue;
             }
-            let rebuilding = slot.fulltext.iter().map(|f| f.rebuilding_like()).collect();
+            // Fresh paged indexes (their own roots); the superseded roots of
+            // the indexes being replaced are empty pages in this flow — the
+            // store has just booted — and are reclaimed with the file.
+            let rebuilding = slot
+                .fulltext
+                .iter()
+                .map(FullTextIndexState::rebuilding_like)
+                .collect::<Result<Vec<_>>>()?;
             Arc::make_mut(slot).fulltext = rebuilding;
         }
         self.publish_versioned(&mut writer, tables);
+        Ok(())
     }
 
     /// FTS-022, step 2: rebuild every full-text index from the committed rows
@@ -549,20 +557,27 @@ impl MemStore {
     pub fn rebuild_fulltext_indexes(&self) -> Result<()> {
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         let mut tables = self.committed.load_full().tables.clone();
-        for slot in tables.values_mut() {
+        let mut superseded: Vec<(TableId, u64)> = Vec::new();
+        for (id, slot) in &mut tables {
             if slot.fulltext.is_empty() {
                 continue;
             }
-            let mut rebuilt: Vec<_> = slot.fulltext.iter().map(|f| f.fresh_like()).collect();
+            let mut rebuilt = slot
+                .fulltext
+                .iter()
+                .map(FullTextIndexState::fresh_like)
+                .collect::<Result<Vec<_>>>()?;
+            let mut sup = Vec::new();
             slot.for_each_row(|pk, row| {
                 for index in &mut rebuilt {
-                    index.insert_row(&row, pk.clone())?;
+                    index.insert_row(&row, pk.clone(), &mut sup)?;
                 }
                 Ok(())
             })?;
             Arc::make_mut(slot).fulltext = rebuilt;
+            superseded.extend(sup.into_iter().map(|p| (*id, p)));
         }
-        self.publish_versioned(&mut writer, tables);
+        self.publish(&mut writer, tables, superseded)?;
         Ok(())
     }
 
@@ -700,7 +715,7 @@ impl MemStore {
                         spatial.remove_row(&existing, pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
-                        fulltext.remove_row(&existing, pk)?;
+                        fulltext.remove_row(&existing, pk, &mut sup)?;
                     }
                 }
             }
@@ -719,7 +734,7 @@ impl MemStore {
                         spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
-                        fulltext.remove_row(&existing, &pk)?;
+                        fulltext.remove_row(&existing, &pk, &mut sup)?;
                     }
                 }
                 for index in table.indexes.values_mut() {
@@ -732,7 +747,7 @@ impl MemStore {
                     spatial.insert_row(row, pk.clone(), &mut sup)?;
                 }
                 for fulltext in &mut table.fulltext {
-                    fulltext.insert_row(row, pk.clone())?;
+                    fulltext.insert_row(row, pk.clone(), &mut sup)?;
                 }
             }
             superseded.extend(sup.into_iter().map(|p| (table_diff.table_id, p)));
@@ -802,7 +817,7 @@ impl MemStore {
                         spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
-                        fulltext.remove_row(&existing, &pk)?;
+                        fulltext.remove_row(&existing, &pk, &mut sup)?;
                     }
                     diff.deletes.push((pk, existing));
                 }
@@ -823,7 +838,7 @@ impl MemStore {
                         spatial.remove_row(&existing, &pk, &mut sup)?;
                     }
                     for fulltext in &mut table.fulltext {
-                        fulltext.remove_row(&existing, &pk)?;
+                        fulltext.remove_row(&existing, &pk, &mut sup)?;
                     }
                 }
                 for index in table.indexes.values_mut() {
@@ -836,7 +851,7 @@ impl MemStore {
                     spatial.insert_row(&row, pk.clone(), &mut sup)?;
                 }
                 for fulltext in &mut table.fulltext {
-                    fulltext.insert_row(&row, pk.clone())?;
+                    fulltext.insert_row(&row, pk.clone(), &mut sup)?;
                 }
                 diff.inserts.push(row);
             }
@@ -1812,7 +1827,7 @@ impl Tx<'_> {
                             spatial.insert_row(&row, pk.clone(), &mut sup)?;
                         }
                         for fulltext in &mut table.fulltext {
-                            fulltext.insert_row(&row, pk.clone())?;
+                            fulltext.insert_row(&row, pk.clone(), &mut sup)?;
                         }
                         for constraint in &mut table.unique {
                             constraint.insert(&row, pk.clone(), &mut sup)?;
@@ -1831,7 +1846,7 @@ impl Tx<'_> {
                             spatial.remove_row(&old, &pk, &mut sup)?;
                         }
                         for fulltext in &mut table.fulltext {
-                            fulltext.remove_row(&old, &pk)?;
+                            fulltext.remove_row(&old, &pk, &mut sup)?;
                         }
                         diff.deletes.push((pk, old));
                     }
@@ -1853,8 +1868,8 @@ impl Tx<'_> {
                         for fulltext in &mut table.fulltext {
                             // FTS-021: re-analyze the old text out, the new
                             // text in — atomic with the row swap.
-                            fulltext.remove_row(&old, &pk)?;
-                            fulltext.insert_row(&row, pk.clone())?;
+                            fulltext.remove_row(&old, &pk, &mut sup)?;
+                            fulltext.insert_row(&row, pk.clone(), &mut sup)?;
                         }
                         // The old row's unique values were released in the
                         // two-pass removal above; claim the new row's.
@@ -2170,31 +2185,34 @@ fn build_foreign_keys(catalog: &HashMap<TableId, &'static TableSchema>) -> Resul
 
 /// The empty full-text indexes of `table`, one per `#[fulltext(...)]`
 /// declaration, in declaration order (SPEC-019 FTS-001/010).
-fn build_fulltext_indexes(table: &'static TableSchema) -> Vec<FullTextIndexState> {
+fn build_fulltext_indexes(
+    table: &'static TableSchema,
+    pager: &Arc<Pager>,
+    table_id: TableId,
+) -> Result<Vec<FullTextIndexState>> {
     use crate::index::{Analyzer, Language};
-    table
-        .indexes
-        .iter()
-        .filter_map(|index| match index {
-            IndexSchema::FullText {
-                column,
-                language,
-                stop_words,
-                stemming,
-            } => {
-                let analyzer = Analyzer {
-                    language: match language {
-                        crate::schema::FullTextLanguage::Simple => Language::Simple,
-                        crate::schema::FullTextLanguage::English => Language::English,
-                    },
-                    stop_words: *stop_words,
-                    stemming: *stemming,
-                };
-                Some(FullTextIndexState::new(*column, analyzer))
-            }
-            _ => None,
-        })
-        .collect()
+    let mut out = Vec::new();
+    for index in table.indexes {
+        let IndexSchema::FullText {
+            column,
+            language,
+            stop_words,
+            stemming,
+        } = index
+        else {
+            continue;
+        };
+        let analyzer = Analyzer {
+            language: match language {
+                crate::schema::FullTextLanguage::Simple => Language::Simple,
+                crate::schema::FullTextLanguage::English => Language::English,
+            },
+            stop_words: *stop_words,
+            stemming: *stemming,
+        };
+        out.push(FullTextIndexState::new(*column, analyzer, pager, table_id)?);
+    }
+    Ok(out)
 }
 
 /// Empty secondary B-tree indexes for `table`, keyed by stable [`IndexId`]

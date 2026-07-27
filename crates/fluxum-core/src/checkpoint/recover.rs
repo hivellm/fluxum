@@ -141,9 +141,11 @@ pub fn recover(
     // indexes rebuilt from the recovered rows (bit-identical to a fresh
     // rebuild by construction, STG-007 rule 2). Paged B-tree/unique indexes
     // are built as *fresh* trees and bulk-loaded sorted — never clones of
-    // the fresh store's handles, whose empty roots version 0 still reads —
-    // while the resident spatial/full-text structures clone the store's own
-    // empty configuration (B-tree columns, spatial bounds and bucket size).
+    // the fresh store's handles, whose empty roots version 0 still reads.
+    // The spatial and full-text indexes are paged too, so they are seeded
+    // with `fresh_like` (the store's own configuration — B-tree columns,
+    // spatial bounds and bucket size, analyzer — on a brand-new root) and
+    // filled row by row.
     let mut tables = HashMap::with_capacity(working.len());
     for (id, table) in working {
         let empty = base.state.table(id)?;
@@ -152,7 +154,12 @@ pub fn recover(
             None => None,
         };
         let mut spatial_sup: Vec<u64> = Vec::new();
-        let mut fulltext = empty.fulltext.clone();
+        let mut fulltext = empty
+            .fulltext
+            .iter()
+            .map(crate::index::FullTextIndexState::fresh_like)
+            .collect::<Result<Vec<_>>>()?;
+        let mut fulltext_sup: Vec<u64> = Vec::new();
         // Sorted entry staging per paged index (bulk_load wants strict order).
         let mut index_entries: BTreeMap<crate::index::IndexId, BTreeMap<Vec<u8>, Vec<u8>>> = empty
             .indexes
@@ -182,7 +189,7 @@ pub fn recover(
                 spatial.insert_row(&row, pk.clone(), &mut spatial_sup)?;
             }
             for fulltext in &mut fulltext {
-                fulltext.insert_row(&row, pk.clone())?;
+                fulltext.insert_row(&row, pk.clone(), &mut fulltext_sup)?;
             }
             paged.push((pk_bytes, encode_row_paged(table.schema, row.values())?));
             row_count += 1;

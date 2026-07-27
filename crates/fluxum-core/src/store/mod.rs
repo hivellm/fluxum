@@ -89,10 +89,12 @@
 //! layout of the checkpoint spill target — maintained copy-on-write inside
 //! the commit merge, so index memory counts against the one budget and an
 //! index-dominated dataset stays bounded (TIER-070). Spatial and full-text
-//! indexes remain resident: they are unpersisted rebuild-from-rows
-//! structures (quadtree/R-tree geometry, BM25 posting lists) whose paging
-//! (TIER-051) needs a linear-key redesign — the tracked follow-up
-//! `phase2_paged-spatial-fulltext-indexes`.
+//! indexes page onto the same substrate (TIER-051), each with the linear key
+//! form its queries need: QuadTree nodes by quadrant path, R-tree nodes by
+//! arena id, and full-text postings by `term ++ pk` so term and prefix
+//! lookups are key-range scans. They stay unpersisted rebuild-from-rows
+//! structures (SPX-031/FTS-022) — paging bounds their *memory*, not their
+//! durability.
 //! [`pager::ColdTable::spill_snapshot`] materializes a published snapshot as a
 //! standalone paged copy for the checkpoint path.
 //!

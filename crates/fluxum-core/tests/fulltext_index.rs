@@ -178,7 +178,7 @@ async fn rebuild_from_rows_restores_the_index() {
     assert!(h.store.fulltext_ready());
 
     // Simulate the recovery gate: mark rebuilding (not ready), then rebuild.
-    h.store.mark_fulltext_rebuilding();
+    h.store.mark_fulltext_rebuilding().unwrap();
     assert!(!h.store.fulltext_ready(), "gated while rebuilding");
 
     h.store.rebuild_fulltext_indexes().unwrap();

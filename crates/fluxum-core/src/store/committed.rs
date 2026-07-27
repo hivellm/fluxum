@@ -32,11 +32,12 @@ use crate::store::unique::UniqueIndex;
 /// `row_count` mirrors the tree's live entry count (a paged tree has no O(1)
 /// `len`). `indexes` (secondary B-trees, T2.4) and `unique` (`#[unique]`
 /// maps, T3.1) are paged onto the same substrate (TIER-050) and follow the
-/// same copy-on-write discipline; `spatial` (SPEC-008) and `fulltext`
-/// (SPEC-019) remain resident rebuild-from-rows structures until the
-/// TIER-051 follow-up. All are maintained together with `rows` inside the
-/// commit merge so a published snapshot's rows and indexes are always
-/// mutually consistent.
+/// same copy-on-write discipline, as do `spatial` (SPEC-008) and `fulltext`
+/// (SPEC-019) since TIER-051 — those two stay unpersisted
+/// rebuild-from-rows structures, but their pages count against the one
+/// budget like every other family. All are maintained together with `rows`
+/// inside the commit merge so a published snapshot's rows and indexes are
+/// always mutually consistent.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
@@ -360,11 +361,14 @@ impl TableState {
             if !fulltext.is_ready() {
                 continue;
             }
-            let mut rebuilt = fulltext.fresh_like();
+            // Paged structures have no meaningful structural equality; the
+            // rule-2 property is that the *contents* match a fresh rebuild.
+            let mut rebuilt = fulltext.fresh_like()?;
+            let mut sup = Vec::new();
             for (pk, row) in &rows {
-                rebuilt.insert_row(row, pk.clone())?;
+                rebuilt.insert_row(row, pk.clone(), &mut sup)?;
             }
-            if rebuilt != *fulltext {
+            if rebuilt.entries()? != fulltext.entries()? {
                 return Err(FluxumError::Storage(format!(
                     "full-text index on table `{}` ({table_id}) diverged from a fresh rebuild \
                      over CommittedState (STG-007, FTS-021)",

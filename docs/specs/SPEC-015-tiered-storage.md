@@ -367,11 +367,16 @@ subscription (SPEC-005) layers see one logical `CommittedState`. These types liv
   at the same logical coordinates) must therefore be designed and validated from scratch.
   *(adopted from SpacetimeDB analysis, file 02)*
 
-- **TIER-051** [P1] **Spatial indexes.** QuadTree and R-tree nodes (SPEC-008) SHALL likewise
-  be stored as pages and faulted/evicted through the same pool. SPEC-008's linear-quadtree
-  (BTreeMap-backed, no pointer chasing) representation maps directly onto the paged B-tree of
-  TIER-050. Spatial queries fault node pages on demand and compete for the same budget;
-  frequently queried regions stay hot naturally under clock-LRU.
+- **TIER-051** [P1] **Spatial and full-text indexes.** QuadTree and R-tree nodes (SPEC-008)
+  and full-text posting lists (SPEC-019) SHALL likewise be stored as pages and
+  faulted/evicted through the same pool. Each maps onto the paged B-tree of TIER-050 under
+  a linear key chosen so its queries stay key-range scans rather than pointer chasing:
+  SPEC-008's linear-quadtree quadrant path for QuadTree nodes, the arena node id for R-tree
+  nodes (eviction-safe by construction — a node is addressed logically, never by heap
+  pointer), and `term ++ pk` for postings, which keeps a term's whole posting list
+  contiguous and makes prefix search one scan. Queries fault node and posting pages on
+  demand and compete for the same budget; frequently queried regions and terms stay hot
+  naturally under clock-LRU.
 
 ## 8. Checkpoints and recovery
 

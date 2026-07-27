@@ -29,8 +29,8 @@ use fluxum_core::FluxumError;
 use fluxum_core::config::PageCompression;
 use fluxum_core::index::IndexId;
 use fluxum_core::schema::{
-    ColumnSchema, FluxType, IndexSchema, Schema, SpatialKind, TableAccess, TableSchema,
-    VisibilityRule,
+    ColumnSchema, FluxType, FullTextLanguage, IndexSchema, Schema, SpatialKind, TableAccess,
+    TableSchema, VisibilityRule,
 };
 use fluxum_core::store::pager::{ColdTable, Pager, PagerOptions};
 use fluxum_core::store::{MemStore, Row, RowValue, TableId};
@@ -703,6 +703,215 @@ fn live_store_pages_btree_and_unique_indexes_under_a_tiny_budget() {
     assert!(
         m.evictions_total() > 0,
         "no evictions in a 10x live run: {m:?}"
+    );
+    assert_budget_held(&pager);
+}
+
+// --- phase2 1.4: spatial- and full-text-dominated datasets under budget -----
+
+/// A document table whose bulk lives in the *indexes*, not the rows: an
+/// R-tree over four box columns and a `#[fulltext]` index over a prose
+/// column. Rows stay small so the pool pressure comes from the index
+/// families this task paged (TIER-051), not from row pages.
+static DOC_COLS: &[ColumnSchema] = &[
+    ColumnSchema {
+        name: "id",
+        ty: FluxType::U64,
+    },
+    ColumnSchema {
+        name: "body",
+        ty: FluxType::Str,
+    },
+    ColumnSchema {
+        name: "min_x",
+        ty: FluxType::F64,
+    },
+    ColumnSchema {
+        name: "min_y",
+        ty: FluxType::F64,
+    },
+    ColumnSchema {
+        name: "max_x",
+        ty: FluxType::F64,
+    },
+    ColumnSchema {
+        name: "max_y",
+        ty: FluxType::F64,
+    },
+];
+
+static DOC: TableSchema = TableSchema {
+    name: "Doc",
+    columns: DOC_COLS,
+    primary_key: &[0],
+    auto_inc: None,
+    access: TableAccess::Public,
+    partition_by: None,
+    unique: &[],
+    indexes: &[
+        IndexSchema::Spatial {
+            kind: SpatialKind::RTree,
+            columns: &[2, 3, 4, 5],
+        },
+        IndexSchema::FullText {
+            column: 1,
+            language: FullTextLanguage::Simple,
+            stop_words: false,
+            stemming: false,
+        },
+    ],
+    visibility: VisibilityRule::PublicAll,
+};
+
+/// TIER-051/070: a dataset whose **spatial and full-text index pages** far
+/// exceed the pool budget is still served correctly — region and radius
+/// queries, `MATCH` with BM25, and the STG-007 rule-2 integrity check —
+/// while those index pages fault and evict continuously. Before this task
+/// both families were resident, so their memory scaled with the corpus
+/// rather than with `memory.budget`; this is the witness that they no
+/// longer do.
+#[test]
+fn spatial_and_fulltext_dominated_dataset_stays_within_budget() {
+    use fluxum_core::index::{Aabb, Analyzer, FtsQuery, Rect};
+    use fluxum_core::store::StoreOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pager = tiny_pager(dir.path());
+    let schema = Schema::from_tables([&DOC]).expect("schema assembles");
+    let store = MemStore::with_pager(&schema, StoreOptions::default(), Arc::clone(&pager))
+        .expect("store builds over the tiny pool");
+    let table = store.table_id("Doc").expect("table registered");
+
+    // 4 000 documents. Each body carries ~12 distinct terms drawn from a
+    // wide vocabulary, so the posting keyspace alone (term ++ pk per pair)
+    // runs to tens of thousands of keys — many times the 256 KiB pool.
+    let docs = 4_000u64;
+    let mut inserted = 0u64;
+    while inserted < docs {
+        let mut tx = store.begin();
+        for _ in 0..1_000 {
+            let id = inserted;
+            let body = (0..12)
+                .map(|k| format!("term{:05}", (id * 7 + k * 977) % 6_000))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let x = (id % 200) as f64;
+            let y = (id / 200) as f64;
+            tx.insert(
+                table,
+                vec![
+                    RowValue::U64(id),
+                    RowValue::Str(body),
+                    RowValue::F64(x),
+                    RowValue::F64(y),
+                    RowValue::F64(x + 1.0),
+                    RowValue::F64(y + 1.0),
+                ],
+            )
+            .expect("insert");
+            inserted += 1;
+        }
+        tx.commit().expect("commit");
+        assert_budget_held(&pager);
+    }
+    let snap = store.snapshot();
+    let all: Vec<Row> = snap.scan(table).expect("scan");
+    assert_eq!(all.len() as u64, docs);
+
+    // Region queries match a brute-force oracle over the same box semantics
+    // (SPX-020: closed boxes, touching edges intersect) while R-tree node
+    // pages fault and evict.
+    for band in 0..8u64 {
+        let region = Rect {
+            x: (band * 25) as f64,
+            y: 0.0,
+            w: 10.0,
+            h: 5.0,
+        };
+        let query = Aabb::new(region.x, region.y, region.x + region.w, region.y + region.h);
+        let hits = snap.spatial_region(table, region).expect("region query");
+        let oracle = all
+            .iter()
+            .filter(|row| {
+                let f = |i| match row.value(i) {
+                    Some(RowValue::F64(v)) => *v,
+                    _ => panic!("box column"),
+                };
+                Aabb::new(f(2), f(3), f(4), f(5)).intersects(&query)
+            })
+            .count();
+        assert_eq!(hits.len(), oracle, "region band {band} diverged");
+        assert_budget_held(&pager);
+    }
+
+    // Radius queries use the SPX-021 min-distance metric — same oracle.
+    let (cx, cy, r) = (100.0, 10.0, 4.0);
+    let hits = snap.spatial_radius(table, cx, cy, r).expect("radius query");
+    let oracle = all
+        .iter()
+        .filter(|row| {
+            let f = |i| match row.value(i) {
+                Some(RowValue::F64(v)) => *v,
+                _ => panic!("box column"),
+            };
+            Aabb::new(f(2), f(3), f(4), f(5)).min_dist2(cx, cy) <= r * r
+        })
+        .count();
+    assert_eq!(hits.len(), oracle, "radius query diverged");
+    assert!(!hits.is_empty());
+
+    // `MATCH` resolves from the paged posting lists — exact terms and the
+    // FTS-031 prefix union — against a brute-force oracle over the bodies.
+    let body_of = |row: &Row| match row.value(1) {
+        Some(RowValue::Str(s)) => s.clone(),
+        _ => panic!("body column"),
+    };
+    for probe in [
+        "term00007",
+        "term00994",
+        "term01971",
+        "term03000",
+        "term05999",
+    ] {
+        let query = FtsQuery::parse(probe, 1, Analyzer::simple()).expect("query parses");
+        let hits = snap.fulltext_match(table, &query).expect("match");
+        let oracle = all
+            .iter()
+            .filter(|row| body_of(row).split(' ').any(|t| t == probe))
+            .count();
+        assert_eq!(hits.len(), oracle, "MATCH {probe} diverged");
+        assert!(
+            hits.iter().all(|(_, score)| *score > 0.0),
+            "BM25 scores must be positive"
+        );
+        assert_budget_held(&pager);
+    }
+    // A prefix spans a whole term family: one key-range scan over many
+    // posting lists (FTS-031).
+    let prefix = FtsQuery::parse("term0000*", 1, Analyzer::simple()).expect("prefix parses");
+    let prefix_hits = snap.fulltext_match(table, &prefix).expect("prefix match");
+    let prefix_oracle = all
+        .iter()
+        .filter(|row| body_of(row).split(' ').any(|t| t.starts_with("term0000")))
+        .count();
+    assert_eq!(prefix_hits.len(), prefix_oracle, "prefix union diverged");
+    assert!(prefix_hits.len() > 10, "prefix must span many terms");
+
+    // STG-007 rule 2 over both paged families: contents match a fresh
+    // rebuild over the committed rows.
+    snap.verify_index_integrity(table)
+        .expect("paged spatial + full-text match a rebuild");
+
+    // TIER-051 witness: index pages faulted and the pool evicted, yet the
+    // budget held at every checkpoint above.
+    let m = pager.metrics().snapshot();
+    assert!(
+        m.page_reads_index > 0,
+        "spatial/full-text index pages must fault under pressure: {m:?}"
+    );
+    assert!(
+        m.evictions_total() > 0,
+        "no evictions in an index-dominated run: {m:?}"
     );
     assert_budget_held(&pager);
 }

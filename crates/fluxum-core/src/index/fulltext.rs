@@ -9,18 +9,38 @@
 //! length). Maintenance rides the commit merge exactly like the B-tree and
 //! spatial indexes (private pre-swap copy, atomic publish, rollback discards
 //! `TxState`), and the STG-007 rule-2 invariant holds: after any sequence of
-//! commits the index is bit-identical to a fresh rebuild over the committed
-//! rows.
+//! commits the index holds precisely the committed rows' postings and
+//! statistics. Paged storage has no meaningful structural equality, so that
+//! is checked by *contents* — [`FullTextIndexState::entries`] against a
+//! fresh rebuild — rather than by comparing layouts.
 //!
 //! The `MATCH` query operator, BM25 ranking, and subscription integration are
 //! the sibling phase-4 task; this module is the index and its statistics
-//! only. Postings are keyed in a [`BTreeMap`] so term-prefix scans (and, when
-//! the pager is wired into the live path, page-ordered eviction) are plain
-//! range iteration — the same tiering story as the B-tree index.
+//! only.
+//!
+//! # Storage (TIER-051)
+//!
+//! Postings and document lengths live in the paged store, so a full-text
+//! index faults and evicts under `memory.budget` like every other index
+//! family instead of pinning RSS with the corpus. Two prefix-separated
+//! keyspaces share one [`PagedTree`]:
+//!
+//! - `0x00 ++ term ++ 0x00 ++ pk → positions` — one flat key per
+//!   `(term, document)` pair. Terms are maximal alphanumeric runs
+//!   ([`tokenize`]), so a `0x00` separator is unambiguous, and byte order
+//!   puts a term's whole posting list in one contiguous range: term lookup
+//!   and the FTS-031 prefix union are both key-range scans.
+//! - `0x01 ++ pk → doc_len` — the per-document length BM25 needs.
+//!
+//! `total_len` and `total_docs` stay resident: two counters, `O(1)` each,
+//! that would otherwise cost a full scan per query.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
+use crate::store::TableId;
+use crate::store::pager::{PagedTree, Pager};
 use crate::store::row::{PkBytes, Row, RowValue};
 
 /// Analyzer pipeline version (FTS-010). Bumping it changes tokenization,
@@ -410,21 +430,25 @@ impl Posting {
 /// from the recovered rows. A slot in the **rebuilding** state answers every
 /// query with `STORAGE_FULLTEXT_REBUILDING` until the rebuild publishes the
 /// ready state, mirroring the spatial-index readiness gate.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct FullTextIndexState {
     /// Indexed text column ordinal (FTS-001).
     column: u16,
     /// The deterministic analyzer (FTS-010).
     analyzer: Analyzer,
-    /// Positional posting lists: `term → { pk → positions }` (FTS-020).
-    /// Ordered maps so term-prefix scans are range iteration; persistent
-    /// (imbl) so the commit merge's copy-on-write clones handles in O(1)
-    /// instead of the whole corpus (phase6_memstore-structural-sharing).
-    postings: imbl::OrdMap<String, imbl::OrdMap<PkBytes, Posting>>,
-    /// Per-document length (kept-term count) for BM25 (FTS-020).
-    doc_len: imbl::OrdMap<PkBytes, u32>,
+    /// Postings and document lengths, prefix-separated (see the module
+    /// docs). Copy-on-write, so the commit merge's pre-swap clone stays
+    /// `O(1)` in the corpus exactly as the persistent maps it replaced.
+    store: PagedTree,
     /// Sum of `doc_len` over all documents — the BM25 `avgdl` numerator.
     total_len: u64,
+    /// Number of indexed documents — the `0x01` keyspace's cardinality,
+    /// counted rather than scanned.
+    total_docs: usize,
+    /// Paging handles, carried so `fresh_like`/`rebuilding_like` can build
+    /// an empty index of the same configuration on the same page file.
+    pager: Arc<Pager>,
+    table_id: TableId,
     /// FTS-022 gate: `false` while the index awaits its post-recovery
     /// rebuild — queries return `STORAGE_FULLTEXT_REBUILDING`, commit-merge
     /// maintenance is skipped (the rebuild recreates it from the rows).
@@ -432,30 +456,38 @@ pub struct FullTextIndexState {
 }
 
 impl FullTextIndexState {
-    /// An empty, ready full-text index over `column` with `analyzer`.
-    pub(crate) fn new(column: u16, analyzer: Analyzer) -> Self {
-        Self {
+    /// An empty, ready full-text index over `column` with `analyzer`,
+    /// storing its postings in `table_id`'s page file.
+    pub(crate) fn new(
+        column: u16,
+        analyzer: Analyzer,
+        pager: &Arc<Pager>,
+        table_id: TableId,
+    ) -> Result<Self> {
+        Ok(Self {
             column,
             analyzer,
-            postings: imbl::OrdMap::new(),
-            doc_len: imbl::OrdMap::new(),
+            store: PagedTree::create(pager, table_id, true)?,
             total_len: 0,
+            total_docs: 0,
+            pager: Arc::clone(pager),
+            table_id,
             ready: true,
-        }
+        })
     }
 
     /// An empty index with this index's exact configuration — the rebuild
     /// seed for the STG-007 rule-2 integrity check and FTS-022 rebuilds.
-    pub(crate) fn fresh_like(&self) -> Self {
-        Self::new(self.column, self.analyzer)
+    pub(crate) fn fresh_like(&self) -> Result<Self> {
+        Self::new(self.column, self.analyzer, &self.pager, self.table_id)
     }
 
     /// This configuration in the FTS-022 rebuilding state: empty, not ready.
-    pub(crate) fn rebuilding_like(&self) -> Self {
-        Self {
+    pub(crate) fn rebuilding_like(&self) -> Result<Self> {
+        Ok(Self {
             ready: false,
-            ..self.fresh_like()
-        }
+            ..self.fresh_like()?
+        })
     }
 
     /// Whether the index serves queries (FTS-022).
@@ -524,15 +556,83 @@ impl FullTextIndexState {
         ))
     }
 
+    // --- paged keyspaces ---------------------------------------------------
+
+    /// The posting key for `(term, pk)` — see the module docs.
+    fn posting_key(term: &str, pk: &PkBytes) -> Vec<u8> {
+        let mut key = Self::term_prefix(term);
+        key.extend_from_slice(pk.as_bytes());
+        key
+    }
+
+    /// The exclusive-of-nothing prefix every posting key of `term` starts
+    /// with: `0x00 ++ term ++ 0x00`. Scanning from here yields exactly that
+    /// term's posting list.
+    fn term_prefix(term: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(term.len() + 2);
+        key.push(KEY_POSTING);
+        key.extend_from_slice(term.as_bytes());
+        key.push(0x00);
+        key
+    }
+
+    /// The prefix shared by every posting key whose term starts with
+    /// `prefix` — the FTS-031 scan bound. No trailing separator: the scan
+    /// spans all terms extending `prefix`, itself included.
+    fn term_prefix_scan(prefix: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(prefix.len() + 1);
+        key.push(KEY_POSTING);
+        key.extend_from_slice(prefix.as_bytes());
+        key
+    }
+
+    /// The document-length key for `pk`.
+    fn doc_len_key(pk: &PkBytes) -> Vec<u8> {
+        let mut key = Vec::with_capacity(pk.as_bytes().len() + 1);
+        key.push(KEY_DOC_LEN);
+        key.extend_from_slice(pk.as_bytes());
+        key
+    }
+
+    /// Visit every posting under `prefix` as `(pk, posting)`, in key order.
+    /// `f` returns `false` to stop early.
+    fn for_each_posting(
+        &self,
+        prefix: &[u8],
+        f: &mut dyn FnMut(PkBytes, Posting) -> Result<bool>,
+    ) -> Result<()> {
+        self.store.scan(prefix, None, &mut |key, value| {
+            if !key.starts_with(prefix) {
+                return Ok(false); // past the prefix: keys are byte-ordered
+            }
+            // Everything after the term's separator is the PK. A term is a
+            // run of alphanumerics, so the *first* `0x00` past the tag byte
+            // is that separator — searching from the back would be wrong,
+            // since PK bytes may themselves contain `0x00`.
+            let Some(sep) = key[1..].iter().position(|b| *b == 0x00).map(|i| i + 1) else {
+                return Err(FluxumError::Storage(
+                    "malformed paged full-text posting key".into(),
+                ));
+            };
+            f(
+                PkBytes::from_bytes(key[sep + 1..].to_vec()),
+                decode_posting(value)?,
+            )
+        })?;
+        Ok(())
+    }
+
+    // --- maintenance (FTS-021) ---------------------------------------------
+
     /// Add `row`'s document to the index (commit merge, insert side —
-    /// FTS-021). Skipped while rebuilding.
-    pub(crate) fn insert_row(&mut self, row: &Row, pk: PkBytes) -> Result<()> {
+    /// FTS-021). Skipped while rebuilding. Superseded pages go to `sup`.
+    pub(crate) fn insert_row(&mut self, row: &Row, pk: PkBytes, sup: &mut Vec<u64>) -> Result<()> {
         if !self.ready {
             return Ok(());
         }
         let Some(text) = self.document_text(row)? else {
             // NULL document: still a document with length 0 (BM25 counts it).
-            self.doc_len.insert(pk, 0);
+            self.put_doc_len(&pk, 0, sup)?;
             return Ok(());
         };
         let (terms, doc_len) = self.analyzer.analyze_doc(&text);
@@ -541,39 +641,46 @@ impl FullTextIndexState {
             per_term.entry(term).or_default().push(pos);
         }
         for (term, positions) in per_term {
-            // Clone-modify-reinsert: the inner map handle clone is O(1)
-            // (persistent map), and the outer insert path-copies O(log n).
-            let mut docs = self.postings.get(&term).cloned().unwrap_or_default();
-            docs.insert(pk.clone(), Posting { positions });
-            self.postings.insert(term, docs);
+            self.store.insert_cow(
+                &Self::posting_key(&term, &pk),
+                &encode_posting(&Posting { positions }),
+                sup,
+            )?;
         }
-        self.doc_len.insert(pk, doc_len);
-        self.total_len += u64::from(doc_len);
+        self.put_doc_len(&pk, doc_len, sup)?;
+        Ok(())
+    }
+
+    /// Write `pk`'s document length, keeping the resident counters in step
+    /// with the keyspace (re-indexing the same PK must not double-count).
+    fn put_doc_len(&mut self, pk: &PkBytes, len: u32, sup: &mut Vec<u64>) -> Result<()> {
+        let key = Self::doc_len_key(pk);
+        match self.store.get(&key)? {
+            Some(old) => self.total_len -= u64::from(decode_doc_len(&old)?),
+            None => self.total_docs += 1,
+        }
+        self.store.insert_cow(&key, &len.to_le_bytes(), sup)?;
+        self.total_len += u64::from(len);
         Ok(())
     }
 
     /// Remove `row`'s document from the index (commit merge, delete side —
     /// FTS-021). Re-analyzes the old row (the analyzer is deterministic, so
     /// this reproduces exactly what was inserted). Skipped while rebuilding.
-    pub(crate) fn remove_row(&mut self, row: &Row, pk: &PkBytes) -> Result<()> {
+    pub(crate) fn remove_row(&mut self, row: &Row, pk: &PkBytes, sup: &mut Vec<u64>) -> Result<()> {
         if !self.ready {
             return Ok(());
         }
         if let Some(text) = self.document_text(row)? {
             for (term, _) in self.analyzer.analyze(&text) {
-                if let Some(existing) = self.postings.get(&term) {
-                    let mut docs = existing.clone();
-                    docs.remove(pk);
-                    if docs.is_empty() {
-                        self.postings.remove(&term);
-                    } else {
-                        self.postings.insert(term, docs);
-                    }
-                }
+                self.store.delete_cow(&Self::posting_key(&term, pk), sup)?;
             }
         }
-        if let Some(len) = self.doc_len.remove(pk) {
-            self.total_len -= u64::from(len);
+        let key = Self::doc_len_key(pk);
+        if let Some(old) = self.store.get(&key)? {
+            self.total_len -= u64::from(decode_doc_len(&old)?);
+            self.total_docs -= 1;
+            self.store.delete_cow(&key, sup)?;
         }
         Ok(())
     }
@@ -593,29 +700,28 @@ impl FullTextIndexState {
         let mut per_item: Vec<HashMap<PkBytes, u32>> = Vec::with_capacity(query.items.len());
         for item in &query.items {
             let docs: HashMap<PkBytes, u32> = match item {
-                FtsItem::Term(term) => self
-                    .postings
-                    .get(term)
-                    .map(|docs| docs.iter().map(|(pk, p)| (pk.clone(), p.tf())).collect())
-                    .unwrap_or_default(),
-                // FTS-031: BTreeMap range scan over `[prefix, successor)`,
+                // One key-range scan over the term's contiguous postings.
+                FtsItem::Term(term) => {
+                    let mut docs = HashMap::new();
+                    self.for_each_posting(&Self::term_prefix(term), &mut |pk, posting| {
+                        docs.insert(pk, posting.tf());
+                        Ok(true)
+                    })?;
+                    docs
+                }
+                // FTS-031: one scan over every term extending `prefix`,
                 // union of the covered posting lists (one synthetic term).
                 FtsItem::Prefix(prefix) => {
                     let mut union: HashMap<PkBytes, u32> = HashMap::new();
-                    for (_, docs) in self
-                        .postings
-                        .range(prefix.clone()..)
-                        .take_while(|(term, _)| term.starts_with(prefix.as_str()))
-                    {
-                        for (pk, posting) in docs {
-                            *union.entry(pk.clone()).or_default() += posting.tf();
-                        }
-                    }
+                    self.for_each_posting(&Self::term_prefix_scan(prefix), &mut |pk, posting| {
+                        *union.entry(pk).or_default() += posting.tf();
+                        Ok(true)
+                    })?;
                     union
                 }
                 // FTS-032: adjacency in stored positions, honoring the query
                 // phrase's own analyzed position deltas (stop-word gaps).
-                FtsItem::Phrase(terms) => self.phrase_docs(terms),
+                FtsItem::Phrase(terms) => self.phrase_docs(terms)?,
             };
             if docs.is_empty() {
                 return Ok(Vec::new()); // AND semantics: one empty item = no match
@@ -649,7 +755,7 @@ impl FullTextIndexState {
             .collect();
         let mut out = Vec::with_capacity(matched.len());
         for pk in matched {
-            let dl = f64::from(self.doc_len(pk).unwrap_or(0));
+            let dl = f64::from(self.doc_len(pk)?.unwrap_or(0));
             let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * dl / avgdl);
             let mut score = 0.0;
             for (docs, idf) in per_item.iter().zip(&idf) {
@@ -665,15 +771,19 @@ impl FullTextIndexState {
     /// with the phrase's occurrence count as the synthetic tf. The terms
     /// carry their analyzed positions so stop-word gaps in the phrase are
     /// honored exactly as at index time.
-    fn phrase_docs(&self, terms: &[(String, u32)]) -> HashMap<PkBytes, u32> {
+    fn phrase_docs(&self, terms: &[(String, u32)]) -> Result<HashMap<PkBytes, u32>> {
         let Some(((first_term, first_pos), rest)) = terms.split_first() else {
-            return HashMap::new();
+            return Ok(HashMap::new());
         };
-        let Some(first_docs) = self.postings.get(first_term) else {
-            return HashMap::new();
-        };
+        // The anchor term's posting list drives the walk; later terms are
+        // point lookups, so only one scan happens per phrase.
+        let mut anchors: Vec<(PkBytes, Posting)> = Vec::new();
+        self.for_each_posting(&Self::term_prefix(first_term), &mut |pk, posting| {
+            anchors.push((pk, posting));
+            Ok(true)
+        })?;
         let mut out = HashMap::new();
-        for (pk, first_posting) in first_docs {
+        for (pk, first_posting) in anchors {
             // Every later term must appear at the position-delta offset from
             // the anchor occurrence.
             let mut count = 0u32;
@@ -683,9 +793,7 @@ impl FullTextIndexState {
                     let offset = pos - first_pos;
                     let needed = anchor + offset;
                     let present = self
-                        .postings
-                        .get(term)
-                        .and_then(|docs| docs.get(pk))
+                        .posting(term, &pk)?
                         .is_some_and(|p| p.positions.binary_search(&needed).is_ok());
                     if !present {
                         all = false;
@@ -697,17 +805,17 @@ impl FullTextIndexState {
                 }
             }
             if count > 0 {
-                out.insert(pk.clone(), count);
+                out.insert(pk, count);
             }
         }
-        out
+        Ok(out)
     }
 
     // --- BM25 corpus statistics (FTS-020) ---------------------------------
 
     /// Total indexed documents.
     pub fn total_docs(&self) -> usize {
-        self.doc_len.len()
+        self.total_docs
     }
 
     /// Average document length (`avgdl`), or `0.0` for an empty corpus.
@@ -721,24 +829,124 @@ impl FullTextIndexState {
     }
 
     /// Document frequency of `term`: how many documents contain it.
-    pub fn doc_freq(&self, term: &str) -> usize {
-        self.postings.get(term).map_or(0, |docs| docs.len())
+    pub fn doc_freq(&self, term: &str) -> Result<usize> {
+        let mut count = 0;
+        self.for_each_posting(&Self::term_prefix(term), &mut |_, _| {
+            count += 1;
+            Ok(true)
+        })?;
+        Ok(count)
     }
 
     /// The length of document `pk`, if indexed.
-    pub fn doc_len(&self, pk: &PkBytes) -> Option<u32> {
-        self.doc_len.get(pk).copied()
+    pub fn doc_len(&self, pk: &PkBytes) -> Result<Option<u32>> {
+        self.store
+            .get(&Self::doc_len_key(pk))?
+            .map(|bytes| decode_doc_len(&bytes))
+            .transpose()
     }
 
     /// The posting for `term` in document `pk` (positions + `tf`), if any.
-    pub fn posting(&self, term: &str, pk: &PkBytes) -> Option<&Posting> {
-        self.postings.get(term)?.get(pk)
+    pub fn posting(&self, term: &str, pk: &PkBytes) -> Result<Option<Posting>> {
+        self.store
+            .get(&Self::posting_key(term, pk))?
+            .map(|bytes| decode_posting(&bytes))
+            .transpose()
     }
 
-    /// The posting list for `term`: every document that contains it.
-    pub fn postings_for(&self, term: &str) -> Option<&imbl::OrdMap<PkBytes, Posting>> {
-        self.postings.get(term)
+    /// The posting list for `term`: every document that contains it, in PK
+    /// key order.
+    pub fn postings_for(&self, term: &str) -> Result<Vec<(PkBytes, Posting)>> {
+        let mut out = Vec::new();
+        self.for_each_posting(&Self::term_prefix(term), &mut |pk, posting| {
+            out.push((pk, posting));
+            Ok(true)
+        })?;
+        Ok(out)
     }
+
+    /// Every `(term-keyed posting key, positions)` plus every document
+    /// length, in canonical key order — the STG-007 rule-2 comparison
+    /// surface. Paged storage has no meaningful structural equality, so a
+    /// fresh rebuild is compared by contents; the keys embed both term and
+    /// PK, so this covers postings and corpus statistics alike.
+    pub(crate) fn entries(&self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        // Both keyspaces sort at or after the lowest tag, so one unbounded
+        // scan from it covers postings and document lengths in key order.
+        self.store.scan(&[KEY_POSTING], None, &mut |key, value| {
+            out.push((key.to_vec(), value.to_vec()));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+}
+
+/// Keyspace tags (see the module docs).
+const KEY_POSTING: u8 = 0x00;
+const KEY_DOC_LEN: u8 = 0x01;
+
+#[cfg(test)]
+impl FullTextIndexState {
+    /// Test wrapper: insert, discarding the superseded-page sink.
+    fn t_insert(&mut self, row: &Row, pk: PkBytes) {
+        self.insert_row(row, pk, &mut Vec::new())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    /// Test wrapper: remove, discarding the superseded-page sink.
+    fn t_remove(&mut self, row: &Row, pk: &PkBytes) {
+        self.remove_row(row, pk, &mut Vec::new())
+            .unwrap_or_else(|e| panic!("{e}"));
+    }
+
+    fn t_posting(&self, term: &str, pk: &PkBytes) -> Option<Posting> {
+        self.posting(term, pk).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn t_doc_freq(&self, term: &str) -> usize {
+        self.doc_freq(term).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn t_doc_len(&self, pk: &PkBytes) -> Option<u32> {
+        self.doc_len(pk).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Logical content — what the resident `PartialEq` used to compare.
+    fn t_entries(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.entries().unwrap_or_else(|e| panic!("{e}"))
+    }
+}
+
+/// Encode a posting's positions as little-endian `u32`s (ascending, as
+/// stored).
+fn encode_posting(posting: &Posting) -> Vec<u8> {
+    let mut out = Vec::with_capacity(posting.positions.len() * 4);
+    for pos in &posting.positions {
+        out.extend_from_slice(&pos.to_le_bytes());
+    }
+    out
+}
+
+/// Decode a posting written by [`encode_posting`].
+fn decode_posting(bytes: &[u8]) -> Result<Posting> {
+    let (chunks, rest) = bytes.as_chunks::<4>();
+    if !rest.is_empty() {
+        return Err(FluxumError::Storage(
+            "malformed paged full-text posting".into(),
+        ));
+    }
+    Ok(Posting {
+        positions: chunks.iter().copied().map(u32::from_le_bytes).collect(),
+    })
+}
+
+/// Decode a document length written as a little-endian `u32`.
+fn decode_doc_len(bytes: &[u8]) -> Result<u32> {
+    let raw: [u8; 4] = bytes
+        .try_into()
+        .map_err(|_| FluxumError::Storage("malformed paged full-text document length".into()))?;
+    Ok(u32::from_le_bytes(raw))
 }
 
 #[cfg(test)]
@@ -770,6 +978,37 @@ mod tests {
 
     fn text_row(s: &str) -> Row {
         Row::new(vec![RowValue::Str(s.to_owned())])
+    }
+
+    /// A throwaway pager, one fresh directory per call (parallel test
+    /// threads must never share a page file for the same table id).
+    fn test_pager() -> Arc<Pager> {
+        use crate::config::PageCompression;
+        use crate::store::pager::PagerOptions;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("fluxum-fts-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        Pager::open(
+            dir,
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 512 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// An empty paged index over column 0 with `analyzer`, on its own file.
+    fn new_index(analyzer: Analyzer) -> FullTextIndexState {
+        FullTextIndexState::new(0, analyzer, &test_pager(), TableId::of("Doc"))
+            .unwrap_or_else(|e| panic!("{e}"))
     }
 
     #[test]
@@ -857,45 +1096,48 @@ mod tests {
 
     #[test]
     fn postings_carry_tf_and_positions_and_bm25_stats() {
-        let mut idx = FullTextIndexState::new(0, Analyzer::simple());
-        idx.insert_row(&text_row("red fox red fox red"), pk(1))
-            .unwrap();
-        idx.insert_row(&text_row("blue fox"), pk(2)).unwrap();
+        let mut idx = new_index(Analyzer::simple());
+        idx.t_insert(&text_row("red fox red fox red"), pk(1));
+        idx.t_insert(&text_row("blue fox"), pk(2));
 
-        let red = idx.posting("red", &pk(1)).unwrap();
+        let red = idx.t_posting("red", &pk(1)).unwrap();
         assert_eq!(red.tf(), 3);
         assert_eq!(red.positions, vec![0, 2, 4]);
-        assert_eq!(idx.doc_freq("fox"), 2, "fox appears in both docs");
-        assert_eq!(idx.doc_freq("red"), 1);
+        assert_eq!(idx.t_doc_freq("fox"), 2, "fox appears in both docs");
+        assert_eq!(idx.t_doc_freq("red"), 1);
         assert_eq!(idx.total_docs(), 2);
-        assert_eq!(idx.doc_len(&pk(1)), Some(5));
-        assert_eq!(idx.doc_len(&pk(2)), Some(2));
+        assert_eq!(idx.t_doc_len(&pk(1)), Some(5));
+        assert_eq!(idx.t_doc_len(&pk(2)), Some(2));
         assert_eq!(idx.avg_doc_len(), 3.5);
     }
 
     #[test]
     fn remove_reverses_insert_exactly() {
         let analyzer = Analyzer::simple();
-        let empty = FullTextIndexState::new(0, analyzer);
-        let mut idx = FullTextIndexState::new(0, analyzer);
-        idx.insert_row(&text_row("alpha beta gamma"), pk(1))
-            .unwrap();
-        idx.insert_row(&text_row("beta gamma delta"), pk(2))
-            .unwrap();
-        idx.remove_row(&text_row("alpha beta gamma"), &pk(1))
-            .unwrap();
-        idx.remove_row(&text_row("beta gamma delta"), &pk(2))
-            .unwrap();
-        assert_eq!(idx, empty, "full delete returns to the empty index");
+        let empty = new_index(analyzer);
+        let mut idx = new_index(analyzer);
+        idx.t_insert(&text_row("alpha beta gamma"), pk(1));
+        idx.t_insert(&text_row("beta gamma delta"), pk(2));
+        idx.t_remove(&text_row("alpha beta gamma"), &pk(1));
+        idx.t_remove(&text_row("beta gamma delta"), &pk(2));
+        assert_eq!(
+            idx.t_entries(),
+            empty.t_entries(),
+            "full delete returns to the empty index"
+        );
+        // The resident counters must unwind with the keyspace, not just the
+        // keys — a stale `total_len` would skew every later BM25 score.
+        assert_eq!(idx.total_docs(), 0);
+        assert_eq!(idx.avg_doc_len(), 0.0);
     }
 
     #[test]
     fn null_and_list_documents_are_handled() {
-        let mut idx = FullTextIndexState::new(0, Analyzer::simple());
+        let mut idx = new_index(Analyzer::simple());
         // NULL document: counted with length 0, contributes no terms.
         let null_row = Row::new(vec![RowValue::Optional(None)]);
-        idx.insert_row(&null_row, pk(1)).unwrap();
-        assert_eq!(idx.doc_len(&pk(1)), Some(0));
+        idx.t_insert(&null_row, pk(1));
+        assert_eq!(idx.t_doc_len(&pk(1)), Some(0));
         assert_eq!(idx.total_docs(), 1);
 
         // Vec<String>: elements join with a gap so terms never merge.
@@ -903,17 +1145,19 @@ mod tests {
             RowValue::Str("hello world".to_owned()),
             RowValue::Str("world peace".to_owned()),
         ])]);
-        idx.insert_row(&list_row, pk(2)).unwrap();
-        assert_eq!(idx.doc_freq("world"), 1);
-        assert_eq!(idx.posting("world", &pk(2)).unwrap().positions, vec![1, 2]);
+        idx.t_insert(&list_row, pk(2));
+        assert_eq!(idx.t_doc_freq("world"), 1);
+        assert_eq!(
+            idx.t_posting("world", &pk(2)).unwrap().positions,
+            vec![1, 2]
+        );
     }
 
     #[test]
     fn not_ready_index_skips_maintenance_and_gates_queries() {
-        let mut idx = FullTextIndexState::new(0, Analyzer::simple()).rebuilding_like_pub();
+        let mut idx = new_index(Analyzer::simple()).rebuilding_like_pub();
         assert!(!idx.is_ready());
-        idx.insert_row(&text_row("ignored while rebuilding"), pk(1))
-            .unwrap();
+        idx.t_insert(&text_row("ignored while rebuilding"), pk(1));
         assert_eq!(idx.total_docs(), 0, "maintenance skipped");
         let err = idx.check_ready().unwrap_err();
         assert_eq!(
@@ -924,7 +1168,7 @@ mod tests {
 
     impl FullTextIndexState {
         fn rebuilding_like_pub(&self) -> Self {
-            self.rebuilding_like()
+            self.rebuilding_like().unwrap_or_else(|e| panic!("{e}"))
         }
     }
 }

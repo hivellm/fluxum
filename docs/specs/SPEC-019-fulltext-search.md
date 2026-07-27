@@ -115,6 +115,13 @@ snapshot-ranked / boolean-live), so it introduces no new architectural shape.
   spatial indexes, the FTS index MAY be rebuilt from committed rows on recovery behind a "rebuilding"
   gate returning `503` until ready (`index/mod.rs:171`); durable persistence of postings is a
   tiered-storage optimization, not required for v1 correctness.
+  *Implemented (TIER-051):* postings live in a `PagedTree` as
+  `0x00 ++ term ++ 0x00 ++ pk → positions`, with document lengths under `0x01 ++ pk`. Terms are
+  maximal alphanumeric runs, so the `0x00` separator is unambiguous and a term's posting list is
+  one contiguous key range — exact-term lookup and the FTS-031 prefix union are both single scans.
+  `total_len` and `total_docs` stay resident as two counters. Since paged structures have no
+  meaningful structural equality, the FTS-021 rebuild comparison is by *contents* (every key/value
+  in canonical key order) rather than by `PartialEq`.
 
 ### Implementation status (phase 2 — storage foundation complete)
 FTS-001/002, FTS-010, FTS-020/021/022 are implemented; §5 (`MATCH`), §6 (BM25 ranking), and §7's
