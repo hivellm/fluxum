@@ -1,8 +1,12 @@
 # `@hivehub/fluxum`
 
-TypeScript / JavaScript client for [Fluxum](../../README.md). Runs in Node.js (FluxRPC over TCP,
-`fluxum://host:15801`) and in browsers (Streamable HTTP, `http(s)://host:15800`) from the same
-package — SPEC-011 SDK-082.
+TypeScript / JavaScript client for [Fluxum](https://github.com/hivellm/fluxum). Runs in Node.js
+(FluxRPC over TCP, `fluxum://host:15801`) and in browsers (Streamable HTTP,
+`http(s)://host:15800`) from the same package — SPEC-011 SDK-082.
+
+```sh
+npm install @hivehub/fluxum
+```
 
 > **Status:** complete — generator, transports, cache, reconnect, `FluxumClient`, packaging,
 > and the shared conformance corpus green in **Node and headless Chromium**

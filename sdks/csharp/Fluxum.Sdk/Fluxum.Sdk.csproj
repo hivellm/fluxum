@@ -11,10 +11,22 @@
     <PackageId>Fluxum.Sdk</PackageId>
     <Version>0.2.0</Version>
     <Authors>HiveLLM</Authors>
-    <Description>Async/await .NET client for the Fluxum realtime database.</Description>
+    <Company>HiveLLM</Company>
+    <Description>Async/await .NET client for the Fluxum realtime database: typed tables, reducer calls, and live query subscriptions over FluxRPC.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/hivellm/fluxum</PackageProjectUrl>
     <RepositoryUrl>https://github.com/hivellm/fluxum</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>fluxum;realtime;database;live-queries;subscriptions;client;sdk</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
     <!-- Zero third-party dependencies (SDK-080). -->
   </PropertyGroup>
+
+  <!-- README + LICENSE live one level up (sdks/csharp/) so the repo page and
+       the NuGet page share them; packed into the nupkg root. -->
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="/" />
+    <None Include="../LICENSE" Pack="true" PackagePath="/" />
+  </ItemGroup>
 
 </Project>

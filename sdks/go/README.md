@@ -1,19 +1,24 @@
 # Fluxum Go SDK
 
-The context-aware Go client for the [Fluxum](../../README.md) realtime
-database (SPEC-011, T7.5). No third-party dependencies — the SDK carries its
-own minimal MessagePack codec and FluxBIN row reader.
+The context-aware Go client for the
+[Fluxum](https://github.com/hivellm/fluxum) realtime database (SPEC-011,
+T7.5). No third-party dependencies — the SDK carries its own minimal
+MessagePack codec and FluxBIN row reader.
+
+```sh
+go get github.com/hivellm/fluxum-go/fluxum
+```
 
 ```go
 import (
     "context"
 
-    fluxum "github.com/hivellm/fluxum/fluxum"
+    fluxum "github.com/hivellm/fluxum-go/fluxum"
 )
 
 func main() {
     ctx := context.Background()
-    db, err := fluxum.Connect(ctx, "fluxum://127.0.0.1:15800", []byte("my-token"), tables)
+    db, err := fluxum.Connect(ctx, "fluxum://127.0.0.1:15801", []byte("my-token"), tables)
     if err != nil {
         panic(err)
     }
@@ -61,7 +66,8 @@ acceptance 11).
 ## Testing
 
 The SDK is validated by the shared **conformance corpus**
-([`tests/conformance/`](../../tests/conformance/)) — the same declarative
+([`tests/conformance/`](https://github.com/hivellm/fluxum/tree/main/tests/conformance))
+— the same declarative
 scenarios every Fluxum SDK runs against the same server build (TST-052). The
 runner boots a fresh `fluxum-server` per scenario, so build it first:
 

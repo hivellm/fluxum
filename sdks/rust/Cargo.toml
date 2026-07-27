@@ -1,10 +1,18 @@
 [package]
 name = "fluxum-sdk"
 description = "Fluxum Rust client SDK: typed tables, reducer calls, and live subscriptions over FluxRPC (SPEC-011 SDK-050)"
-version.workspace = true
+# Versioned independently of the workspace: SDK releases track the five-SDK
+# store train (npm/PyPI/NuGet/Go are at 0.2.0), not the server binary.
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+readme = "README.md"
+keywords = ["fluxum", "realtime", "database", "client", "sdk"]
+categories = ["database", "network-programming", "api-bindings"]
+# Local test/dev residue (a conformance run writes ./data) must never ship
+# in the crate archive.
+exclude = ["data/"]
 
 # Deliberately depends on nothing internal: `src/protocol/` is vendored from
 # `crates/fluxum-protocol` (see that module's docs) so this crate publishes on

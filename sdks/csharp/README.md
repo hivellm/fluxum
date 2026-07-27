@@ -1,15 +1,20 @@
 # Fluxum C# SDK
 
-The async/await .NET client for the [Fluxum](../../README.md) realtime
-database (SPEC-011, T7.6), distributed as the `Fluxum.Sdk` NuGet package. No
-third-party dependencies — the SDK carries its own minimal MessagePack codec
-and FluxBIN row reader.
+The async/await .NET client for the
+[Fluxum](https://github.com/hivellm/fluxum) realtime database (SPEC-011,
+T7.6), distributed as the `Fluxum.Sdk` NuGet package. No third-party
+dependencies — the SDK carries its own minimal MessagePack codec and FluxBIN
+row reader.
+
+```sh
+dotnet add package Fluxum.Sdk
+```
 
 ```csharp
 using Fluxum.Sdk;
 
 await using var db = await Connection.ConnectAsync(
-    "fluxum://127.0.0.1:15800",
+    "fluxum://127.0.0.1:15801",
     System.Text.Encoding.UTF8.GetBytes("my-token"),
     tables); // from `fluxum generate --lang csharp`
 
@@ -50,7 +55,8 @@ output (SPEC-011 acceptance 11).
 ## Testing
 
 The SDK is validated by the shared **conformance corpus**
-([`tests/conformance/`](../../tests/conformance/)) — the same declarative
+([`tests/conformance/`](https://github.com/hivellm/fluxum/tree/main/tests/conformance))
+— the same declarative
 scenarios every Fluxum SDK runs against the same server build (TST-052). The
 runner boots a fresh `fluxum-server` per scenario, so build it first:
 

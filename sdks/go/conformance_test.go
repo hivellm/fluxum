@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	fluxum "github.com/hivellm/fluxum/fluxum"
+	fluxum "github.com/hivellm/fluxum-go/fluxum"
 )
 
 const awaitTimeout = 5 * time.Second

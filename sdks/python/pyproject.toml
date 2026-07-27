@@ -14,6 +14,7 @@ keywords = ["fluxum", "realtime", "database", "asyncio", "spacetimedb"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Framework :: AsyncIO",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Typing :: Typed",
 ]
@@ -27,6 +28,8 @@ test = ["pytest>=7"]
 [project.urls]
 Homepage = "https://github.com/hivellm/fluxum"
 Documentation = "https://github.com/hivellm/fluxum/tree/main/sdks/python"
+Repository = "https://github.com/hivellm/fluxum"
+Issues = "https://github.com/hivellm/fluxum/issues"
 
 [tool.setuptools]
 packages = ["fluxum"]

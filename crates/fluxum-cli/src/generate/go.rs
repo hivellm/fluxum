@@ -181,7 +181,7 @@ fn tables_go(banner: &str, tables: &[Value]) -> Result<String, String> {
         "import (\n\
          \t\"fmt\"\n\
          \t\"strings\"\n\n\
-         \tfluxum \"github.com/hivellm/fluxum/fluxum\"\n\
+         \tfluxum \"github.com/hivellm/fluxum-go/fluxum\"\n\
          )\n\n",
     );
     // A shared key-projection helper (emitted once).
@@ -316,7 +316,7 @@ fn reducers_go(banner: &str, reducers: &[Value]) -> Result<String, String> {
     out.push_str(
         "import (\n\
          \t\"context\"\n\n\
-         \tfluxum \"github.com/hivellm/fluxum/fluxum\"\n\
+         \tfluxum \"github.com/hivellm/fluxum-go/fluxum\"\n\
          )\n\n",
     );
 
