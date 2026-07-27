@@ -46,6 +46,8 @@ fn rss_of(pid: u32) -> u64 {
 struct Server {
     child: Child,
     tcp_url: String,
+    /// The admin listener, where the TIER-080 buffer-pool gauges live.
+    http_addr: String,
 }
 
 impl Server {
@@ -79,6 +81,7 @@ impl Server {
         Some(Server {
             child,
             tcp_url: format!("fluxum://127.0.0.1:{tcp}"),
+            http_addr: format!("127.0.0.1:{http}"),
         })
     }
 }
@@ -109,6 +112,14 @@ fn soak_driver_loads_sustains_samples_and_reports() {
         budget_bytes: 4 * 1024 * 1024 * 1024,
         tolerance_bytes: 0,
         sample_interval: Duration::from_millis(200),
+        // Scrape the real TIER-080 gauges: this is the end-to-end proof that
+        // the server exposes them and the driver can read them, which is
+        // what the TST-111 witnesses rest on.
+        metrics_addr: Some(server.http_addr.clone()),
+        // 2 000 rows under a 4 GiB ceiling never evicts and the smoke host
+        // is not a droplet, so neither profile requirement applies here.
+        require_eviction: false,
+        enforce_idle_ceiling: false,
     };
     let hw = Hardware {
         cpu: "smoke".into(),
@@ -137,6 +148,29 @@ fn soak_driver_loads_sustains_samples_and_reports() {
     );
     assert!(report.pass, "a healthy smoke soak passes");
     assert_eq!(report.rows_loaded, 2_000);
+
+    // The buffer-pool witnesses came off a live server, not a stub: the
+    // gauges are exposed, parsed, and attributed per shard. Without this the
+    // whole TST-111 sampling path could rot silently and every soak would
+    // still report PASS.
+    assert!(
+        !report.pool_samples.is_empty(),
+        "the TIER-080 gauges were scraped alongside RSS"
+    );
+    assert!(
+        report.pool_samples.iter().all(|s| s.capacity_bytes > 0),
+        "the pool capacity gauge must carry the real ceiling: {:?}",
+        report.pool_samples
+    );
+    assert!(
+        !report.shard_pools.is_empty(),
+        "per-shard pool accounting was attributed (TST-112)"
+    );
+    assert!(
+        report.shard_pools.iter().all(|s| s.within_capacity),
+        "a healthy smoke keeps every shard inside its pool: {:?}",
+        report.shard_pools
+    );
 
     // The report artifact writes as JSON + Markdown.
     let out = std::env::temp_dir().join(format!("fluxum-soak-report-{}", std::process::id()));

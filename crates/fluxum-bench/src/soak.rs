@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::measure::{RunResult, Summary};
 use crate::report::Hardware;
@@ -49,6 +49,17 @@ pub struct SoakConfig {
     pub tolerance_bytes: u64,
     /// RSS sampling cadence during the sustain phase.
     pub sample_interval: Duration,
+    /// `host:port` of the server's admin HTTP listener, for scraping the
+    /// TIER-080 buffer-pool gauges. `None` samples RSS only — the pool
+    /// witnesses TST-111 wants are then absent, so the validation flags
+    /// below cannot be satisfied.
+    pub metrics_addr: Option<String>,
+    /// Require eviction to have engaged (TST-111). Set by the validation
+    /// profiles; false for smoke runs that never reach pool pressure.
+    pub require_eviction: bool,
+    /// Enforce the NFR-12 idle-RSS ceiling (< 100 MB). Set by the droplet
+    /// profile, where the requirement applies.
+    pub enforce_idle_ceiling: bool,
 }
 
 impl Default for SoakConfig {
@@ -62,13 +73,20 @@ impl Default for SoakConfig {
             budget_bytes: 512 * 1024 * 1024,
             tolerance_bytes: 0,
             sample_interval: Duration::from_secs(10),
+            metrics_addr: None,
+            require_eviction: false,
+            enforce_idle_ceiling: false,
         }
     }
 }
 
+/// The idle-RSS ceiling a droplet run must clear (NFR-12 / TST-111: "idle
+/// baseline RSS MUST be < 100 MB"). Decimal MB, as the requirement is written.
+pub const IDLE_RSS_CEILING_BYTES: u64 = 100 * 1000 * 1000;
+
 /// One resident-memory sample: seconds since the sustain phase began, and the
 /// server's RSS in bytes.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RssSample {
     /// Seconds since the sustain phase started.
     pub t_secs: f64,
@@ -76,9 +94,42 @@ pub struct RssSample {
     pub rss_bytes: u64,
 }
 
+/// One buffer-pool sample scraped from the server's `/metrics` (SPEC-015
+/// TIER-080). TST-111 requires these *alongside* process RSS: RSS is the
+/// outside-in witness, these are the engine's own enforced accounting, and
+/// `evictions` is what proves eviction actually engaged under pressure
+/// rather than the dataset having quietly fit in memory.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct PoolSample {
+    /// Seconds since the sustain phase started.
+    pub t_secs: f64,
+    /// `fluxum_bufferpool_bytes` summed across shards.
+    pub pool_bytes: u64,
+    /// `fluxum_bufferpool_capacity_bytes` summed across shards.
+    pub capacity_bytes: u64,
+    /// `fluxum_bufferpool_evictions_total` (clean + spill) summed across
+    /// shards — monotonic, so the last sample is the run total.
+    pub evictions: u64,
+}
+
+/// Per-shard buffer-pool accounting at the end of the run — TST-112 requires
+/// memory to stay within budget "on every shard", which a process-wide RSS
+/// figure cannot show on its own (shards share one process).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct ShardPool {
+    /// The shard id from the metric's `shard` label.
+    pub shard: u32,
+    /// Peak `fluxum_bufferpool_bytes` observed for this shard.
+    pub peak_pool_bytes: u64,
+    /// This shard's `fluxum_bufferpool_capacity_bytes`.
+    pub capacity_bytes: u64,
+    /// Whether the peak stayed at or under this shard's own capacity.
+    pub within_capacity: bool,
+}
+
 /// The soak report — the release artifact (JSON is source of truth; the
 /// Markdown is rendered from it, mirroring the parity report convention).
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SoakReport {
     /// The bench harness version that produced the run.
     pub harness_version: String,
@@ -101,8 +152,24 @@ pub struct SoakReport {
     pub peak_rss_bytes: u64,
     /// Whether the peak stayed within `budget + tolerance` (TIER-004).
     pub within_budget: bool,
+    /// Whether the idle baseline cleared the NFR-12 < 100 MB ceiling. Always
+    /// evaluated; only *enforced* on the droplet profile
+    /// (`enforce_idle_ceiling`), so the number is in the artifact either way.
+    pub idle_rss_ok: bool,
+    /// Whether the NFR-12 idle ceiling was a pass/fail criterion for this run.
+    pub idle_ceiling_enforced: bool,
+    /// Whether eviction was observed engaging (TST-111).
+    pub eviction_engaged: bool,
+    /// Whether the eviction witness was a pass/fail criterion for this run.
+    pub eviction_required: bool,
     /// The RSS samples taken during the sustain phase.
     pub rss_samples: Vec<RssSample>,
+    /// The buffer-pool samples taken alongside them (TIER-080). Empty when
+    /// no `metrics_addr` was configured.
+    pub pool_samples: Vec<PoolSample>,
+    /// Per-shard pool peaks against each shard's own capacity (TST-112:
+    /// "within budget on every shard").
+    pub shard_pools: Vec<ShardPool>,
     /// Sustained-write throughput + latency (the `send_chat` stream).
     pub write: Summary,
     /// TxUpdates delivered to the live subscriptions during the sustain phase.
@@ -147,6 +214,46 @@ impl SoakReport {
             "- within budget: {}",
             if self.within_budget { "yes" } else { "NO" }
         );
+        let _ = writeln!(
+            out,
+            "- idle RSS < 100 MB (NFR-12): {}{}",
+            if self.idle_rss_ok { "yes" } else { "NO" },
+            if self.idle_ceiling_enforced {
+                ""
+            } else {
+                " *(recorded, not enforced for this profile)*"
+            }
+        );
+        let _ = writeln!(
+            out,
+            "- eviction engaged (TST-111): {}{}",
+            if self.eviction_engaged { "yes" } else { "NO" },
+            if self.eviction_required {
+                ""
+            } else {
+                " *(recorded, not required for this profile)*"
+            }
+        );
+        if self.shard_pools.is_empty() {
+            let _ = writeln!(
+                out,
+                "- per-shard buffer pool: *not sampled (no `--metrics-addr`)*"
+            );
+        } else {
+            let _ = writeln!(out, "\n### Buffer pool per shard (TIER-080 / TST-112)\n");
+            let _ = writeln!(out, "| shard | peak pool | capacity | within |");
+            let _ = writeln!(out, "|---|---|---|---|");
+            for s in &self.shard_pools {
+                let _ = writeln!(
+                    out,
+                    "| {} | {:.1} MiB | {:.1} MiB | {} |",
+                    s.shard,
+                    mib(s.peak_pool_bytes),
+                    mib(s.capacity_bytes),
+                    if s.within_capacity { "yes" } else { "**NO**" }
+                );
+            }
+        }
         let _ = writeln!(out, "\n## Sustained load\n");
         let _ = writeln!(
             out,
@@ -248,11 +355,140 @@ pub fn peak_rss(samples: &[RssSample]) -> u64 {
     samples.iter().map(|s| s.rss_bytes).max().unwrap_or(0)
 }
 
-/// The soak verdict (TST-112): within budget, writes flowed, subscriptions
-/// stayed live.
+/// Parse the SPEC-015 TIER-080 buffer-pool series out of a Prometheus
+/// exposition body into one aggregate sample plus the per-shard breakdown.
+///
+/// Values are summed across shards for the aggregate (the process-wide view
+/// RSS is compared against) and kept separate per `shard` label for the
+/// TST-112 per-shard assertion. Unlabelled series are tolerated and folded
+/// into shard 0, so this keeps working against an older server.
 #[must_use]
-pub fn soak_pass(within_budget: bool, write_ops: u64, sub_deliveries: u64) -> bool {
-    within_budget && write_ops > 0 && sub_deliveries > 0
+pub fn parse_pool_metrics(metrics: &str, t_secs: f64) -> (PoolSample, Vec<(u32, u64, u64)>) {
+    use std::collections::BTreeMap;
+    // shard -> (pool_bytes, capacity_bytes)
+    let mut per_shard: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    let mut sample = PoolSample {
+        t_secs,
+        ..PoolSample::default()
+    };
+    for line in metrics.lines() {
+        let line = line.trim();
+        if line.starts_with('#') || line.is_empty() {
+            continue;
+        }
+        let Some((series, value)) = line.rsplit_once(' ') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        let (name, labels) = match series.split_once('{') {
+            Some((name, rest)) => (name, rest.trim_end_matches('}')),
+            None => (series, ""),
+        };
+        let shard = label_value(labels, "shard")
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        match name {
+            "fluxum_bufferpool_bytes" => {
+                sample.pool_bytes += value;
+                per_shard.entry(shard).or_default().0 += value;
+            }
+            "fluxum_bufferpool_capacity_bytes" => {
+                sample.capacity_bytes += value;
+                per_shard.entry(shard).or_default().1 += value;
+            }
+            // Both `kind` variants land on the same total.
+            "fluxum_bufferpool_evictions_total" => sample.evictions += value,
+            _ => {}
+        }
+    }
+    let shards = per_shard
+        .into_iter()
+        .map(|(shard, (pool, capacity))| (shard, pool, capacity))
+        .collect();
+    (sample, shards)
+}
+
+/// The value of `name` in a Prometheus label set (`a="1",b="2"`).
+fn label_value<'a>(labels: &'a str, name: &str) -> Option<&'a str> {
+    labels.split(',').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k.trim() == name).then(|| v.trim().trim_matches('"'))
+    })
+}
+
+/// Whether eviction engaged during the run — the TST-111 witness that the
+/// dataset really exceeded the pool. A run whose data quietly fit proves
+/// nothing about tiering.
+#[must_use]
+pub fn eviction_engaged(samples: &[PoolSample]) -> bool {
+    samples.iter().any(|s| s.evictions > 0)
+}
+
+/// Whether the eviction witness satisfies the run's contract. `required` is
+/// false for small smoke runs, where there is no pressure to engage eviction
+/// and demanding it would fail a healthy run; the validation profiles
+/// (TST-110/112) set it.
+#[must_use]
+pub fn eviction_ok(samples: &[PoolSample], required: bool) -> bool {
+    !required || eviction_engaged(samples)
+}
+
+/// Whether the idle baseline cleared the NFR-12 ceiling. `enforced` is false
+/// for runs that are not the droplet profile, where the requirement does not
+/// apply — it is recorded either way so the artifact always shows the number.
+#[must_use]
+pub fn idle_rss_ok(idle_rss_bytes: u64, enforced: bool) -> bool {
+    !enforced || idle_rss_bytes < IDLE_RSS_CEILING_BYTES
+}
+
+/// Reduce the per-sample shard readings to one [`ShardPool`] per shard,
+/// carrying each shard's own peak and its own capacity (TST-112).
+#[must_use]
+pub fn shard_pools(readings: &[(u32, u64, u64)]) -> Vec<ShardPool> {
+    use std::collections::BTreeMap;
+    let mut peaks: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    for &(shard, pool, capacity) in readings {
+        let entry = peaks.entry(shard).or_insert((0, 0));
+        entry.0 = entry.0.max(pool);
+        // Capacity is configuration, not a measurement; the last non-zero
+        // reading wins so a scrape that raced startup cannot zero it.
+        if capacity > 0 {
+            entry.1 = capacity;
+        }
+    }
+    peaks
+        .into_iter()
+        .map(|(shard, (peak_pool_bytes, capacity_bytes))| ShardPool {
+            shard,
+            peak_pool_bytes,
+            capacity_bytes,
+            // A shard with no capacity reading cannot be judged; treat the
+            // missing witness as a failure rather than a silent pass.
+            within_capacity: capacity_bytes > 0 && peak_pool_bytes <= capacity_bytes,
+        })
+        .collect()
+}
+
+/// The soak verdict (TST-111/112): process RSS within budget, every shard's
+/// pool within its own capacity, eviction observed engaging, the idle
+/// baseline under the NFR-12 ceiling, writes flowing and subscriptions live.
+#[must_use]
+pub fn soak_pass(
+    within_budget: bool,
+    write_ops: u64,
+    sub_deliveries: u64,
+    shards: &[ShardPool],
+    eviction_engaged: bool,
+    idle_rss_ok: bool,
+) -> bool {
+    within_budget
+        && write_ops > 0
+        && sub_deliveries > 0
+        && shards.iter().all(|s| s.within_capacity)
+        && eviction_engaged
+        && idle_rss_ok
 }
 
 /// Run a soak: load `cfg.rows`, then sustain writes + subscriptions for
@@ -280,7 +516,17 @@ pub fn run_soak(
     let tolerance_bytes = budget_tolerance(cfg.budget_bytes, cfg.tolerance_bytes);
     let within = within_budget(peak, cfg.budget_bytes, tolerance_bytes);
     let write = Summary::from_runs(&[sustain.write]);
-    let pass = soak_pass(within, write.total_ops, sustain.deliveries);
+    let shard_pools = shard_pools(&sustain.shard_readings);
+    let evicted = eviction_engaged(&sustain.pool_samples);
+    let idle_ok = idle_rss_ok(idle_rss_bytes, cfg.enforce_idle_ceiling);
+    let pass = soak_pass(
+        within,
+        write.total_ops,
+        sustain.deliveries,
+        &shard_pools,
+        eviction_ok(&sustain.pool_samples, cfg.require_eviction),
+        idle_ok,
+    );
 
     Ok(SoakReport {
         harness_version: harness_version.to_owned(),
@@ -293,7 +539,13 @@ pub fn run_soak(
         idle_rss_bytes,
         peak_rss_bytes: peak,
         within_budget: within,
+        idle_rss_ok: idle_rss_bytes < IDLE_RSS_CEILING_BYTES,
+        idle_ceiling_enforced: cfg.enforce_idle_ceiling,
+        eviction_engaged: evicted,
+        eviction_required: cfg.require_eviction,
         rss_samples: sustain.samples,
+        pool_samples: sustain.pool_samples,
+        shard_pools,
         write,
         subscription_deliveries: sustain.deliveries,
         pass,
@@ -344,6 +596,10 @@ struct Sustain {
     deliveries: u64,
     /// RSS samples over the phase.
     samples: Vec<RssSample>,
+    /// Buffer-pool samples taken on the same cadence (TIER-080).
+    pool_samples: Vec<PoolSample>,
+    /// Raw `(shard, pool_bytes, capacity_bytes)` readings from every scrape.
+    shard_readings: Vec<(u32, u64, u64)>,
 }
 
 /// Sustain writes + live subscriptions for `cfg.duration`, sampling RSS.
@@ -366,6 +622,8 @@ fn sustain(
     // together.
     let barrier = Arc::new(Barrier::new(writers + cfg.subscribers + feeders + 1));
     let samples = Arc::new(Mutex::new(Vec::new()));
+    let pool_samples = Arc::new(Mutex::new(Vec::new()));
+    let shard_readings = Arc::new(Mutex::new(Vec::new()));
 
     std::thread::scope(|scope| {
         // Live subscriptions (delivery lands on the SDK's read loop; the
@@ -439,8 +697,12 @@ fn sustain(
             }));
         }
 
-        // The RSS sampler: this thread owns the duration and the stop signal.
+        // The sampler: this thread owns the duration and the stop signal. It
+        // takes the RSS reading and the TIER-080 pool scrape on the same
+        // cadence so the two witnesses TST-111 requires are time-aligned.
         let sampler_samples = Arc::clone(&samples);
+        let sampler_pool = Arc::clone(&pool_samples);
+        let sampler_shards = Arc::clone(&shard_readings);
         let sampler_stop = Arc::clone(&stop);
         let sampler_barrier = Arc::clone(&barrier);
         let sampler = scope.spawn(move || {
@@ -448,13 +710,31 @@ fn sustain(
             let start = Instant::now();
             loop {
                 let elapsed = start.elapsed();
+                let t_secs = elapsed.as_secs_f64();
                 sampler_samples
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .push(RssSample {
-                        t_secs: elapsed.as_secs_f64(),
+                        t_secs,
                         rss_bytes: sample_rss(),
                     });
+                // A failed scrape is skipped, not fatal: losing one sample
+                // must not abort an hours-long soak. Losing *every* sample
+                // shows up as an empty series, which fails the TST-111
+                // witnesses rather than passing silently.
+                if let Some(addr) = cfg.metrics_addr.as_deref()
+                    && let Ok(body) = crate::load::scrape_metrics(addr)
+                {
+                    let (sample, shards) = parse_pool_metrics(&body, t_secs);
+                    sampler_pool
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(sample);
+                    sampler_shards
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .extend(shards);
+                }
                 if elapsed >= cfg.duration {
                     break;
                 }
@@ -481,14 +761,21 @@ fn sustain(
                 latencies_ns: all_latencies,
             },
             deliveries: deliveries.load(Ordering::Relaxed),
-            samples: Arc::try_unwrap(samples)
-                .map(|m| {
-                    m.into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                })
-                .unwrap_or_default(),
+            samples: take_shared(samples),
+            pool_samples: take_shared(pool_samples),
+            shard_readings: take_shared(shard_readings),
         })
     })
+}
+
+/// Take a scoped collector's contents once its producer thread has joined.
+fn take_shared<T>(shared: Arc<Mutex<Vec<T>>>) -> Vec<T> {
+    Arc::try_unwrap(shared)
+        .map(|m| {
+            m.into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        })
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -552,11 +839,112 @@ mod tests {
         ];
         assert_eq!(peak_rss(&samples), 42);
         assert_eq!(peak_rss(&[]), 0);
-        // Pass needs all three: budget ok, writes, deliveries.
-        assert!(soak_pass(true, 100, 5));
-        assert!(!soak_pass(false, 100, 5)); // over budget
-        assert!(!soak_pass(true, 0, 5)); // no writes
-        assert!(!soak_pass(true, 100, 0)); // subscriptions silent
+        let ok_shards = [ShardPool {
+            shard: 0,
+            peak_pool_bytes: 10,
+            capacity_bytes: 100,
+            within_capacity: true,
+        }];
+        let bad_shard = [ShardPool {
+            shard: 1,
+            peak_pool_bytes: 200,
+            capacity_bytes: 100,
+            within_capacity: false,
+        }];
+        // Every criterion is load-bearing: budget, writes, deliveries, each
+        // shard's own pool, the eviction witness, the idle ceiling.
+        assert!(soak_pass(true, 100, 5, &ok_shards, true, true));
+        assert!(!soak_pass(false, 100, 5, &ok_shards, true, true)); // over budget
+        assert!(!soak_pass(true, 0, 5, &ok_shards, true, true)); // no writes
+        assert!(!soak_pass(true, 100, 0, &ok_shards, true, true)); // subs silent
+        assert!(!soak_pass(true, 100, 5, &bad_shard, true, true)); // a shard over
+        assert!(!soak_pass(true, 100, 5, &ok_shards, false, true)); // never evicted
+        assert!(!soak_pass(true, 100, 5, &ok_shards, true, false)); // idle too fat
+        // One healthy shard does not excuse a sibling that blew its pool.
+        let mixed = [ok_shards[0], bad_shard[0]];
+        assert!(!soak_pass(true, 100, 5, &mixed, true, true));
+    }
+
+    #[test]
+    fn pool_metrics_parse_per_shard_and_sum_across_them() {
+        let body = "\
+# HELP fluxum_bufferpool_bytes ignored
+# TYPE fluxum_bufferpool_bytes gauge
+fluxum_bufferpool_bytes{shard=\"0\"} 100
+fluxum_bufferpool_bytes{shard=\"1\"} 250
+fluxum_bufferpool_capacity_bytes{shard=\"0\"} 1000
+fluxum_bufferpool_capacity_bytes{shard=\"1\"} 1000
+fluxum_bufferpool_evictions_total{shard=\"0\",kind=\"clean\"} 7
+fluxum_bufferpool_evictions_total{shard=\"0\",kind=\"spill\"} 3
+fluxum_table_rows{shard=\"0\",table=\"Chat\"} 42
+";
+        let (sample, shards) = parse_pool_metrics(body, 1.5);
+        assert_eq!(sample.t_secs, 1.5);
+        assert_eq!(sample.pool_bytes, 350, "summed across shards");
+        assert_eq!(sample.capacity_bytes, 2000);
+        assert_eq!(sample.evictions, 10, "clean + spill");
+        assert_eq!(shards, vec![(0, 100, 1000), (1, 250, 1000)]);
+    }
+
+    #[test]
+    fn pool_metrics_tolerate_unlabelled_series_and_ignore_noise() {
+        // An older server without the shard label still parses (folded into
+        // shard 0), and unrelated series never leak into the totals.
+        let body = "fluxum_bufferpool_bytes 64\n\
+                    fluxum_bufferpool_capacity_bytes 128\n\
+                    fluxum_memstore_bytes{shard=\"0\"} 999999\n\
+                    garbage line\n";
+        let (sample, shards) = parse_pool_metrics(body, 0.0);
+        assert_eq!(sample.pool_bytes, 64);
+        assert_eq!(sample.capacity_bytes, 128);
+        assert_eq!(sample.evictions, 0);
+        assert_eq!(shards, vec![(0, 64, 128)]);
+    }
+
+    #[test]
+    fn shard_pools_take_each_shards_own_peak_and_capacity() {
+        // Two scrapes per shard; the peak wins and a zero capacity reading
+        // (a scrape racing startup) never overwrites a real one.
+        let readings = [(0, 10, 0), (0, 90, 100), (1, 300, 100), (1, 50, 100)];
+        let pools = shard_pools(&readings);
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0].peak_pool_bytes, 90);
+        assert_eq!(pools[0].capacity_bytes, 100);
+        assert!(pools[0].within_capacity);
+        assert_eq!(pools[1].peak_pool_bytes, 300);
+        assert!(!pools[1].within_capacity, "shard 1 blew its pool");
+    }
+
+    #[test]
+    fn a_shard_with_no_capacity_witness_is_not_a_silent_pass() {
+        // Capacity never scraped: there is nothing to judge against, and
+        // treating that as "within" would let a broken scrape pass a soak.
+        let pools = shard_pools(&[(3, 5, 0)]);
+        assert_eq!(pools[0].capacity_bytes, 0);
+        assert!(!pools[0].within_capacity);
+    }
+
+    #[test]
+    fn eviction_and_idle_witnesses_are_gated_by_the_profile() {
+        let never = [PoolSample::default()];
+        let evicted = [PoolSample {
+            evictions: 1,
+            ..PoolSample::default()
+        }];
+        assert!(eviction_engaged(&evicted));
+        assert!(!eviction_engaged(&never));
+        assert!(!eviction_engaged(&[]), "no samples is no witness");
+        // Required only on the validation profiles.
+        assert!(!eviction_ok(&never, true));
+        assert!(eviction_ok(&never, false));
+        assert!(eviction_ok(&evicted, true));
+
+        assert!(idle_rss_ok(99_000_000, true));
+        assert!(!idle_rss_ok(100_000_000, true), "the ceiling is exclusive");
+        assert!(
+            idle_rss_ok(4_000_000_000, false),
+            "not enforced off-profile"
+        );
     }
 
     #[test]
@@ -572,9 +960,25 @@ mod tests {
             idle_rss_bytes: 80 * 1024 * 1024,
             peak_rss_bytes: 500 * 1024 * 1024,
             within_budget: true,
+            idle_rss_ok: true,
+            idle_ceiling_enforced: true,
+            eviction_engaged: true,
+            eviction_required: true,
             rss_samples: vec![RssSample {
                 t_secs: 0.0,
                 rss_bytes: 80 * 1024 * 1024,
+            }],
+            pool_samples: vec![PoolSample {
+                t_secs: 0.0,
+                pool_bytes: 400 * 1024 * 1024,
+                capacity_bytes: 410 * 1024 * 1024,
+                evictions: 9001,
+            }],
+            shard_pools: vec![ShardPool {
+                shard: 0,
+                peak_pool_bytes: 400 * 1024 * 1024,
+                capacity_bytes: 410 * 1024 * 1024,
+                within_capacity: true,
             }],
             write: Summary::from_runs(&[RunResult {
                 ops: 6000,
@@ -588,16 +992,69 @@ mod tests {
         assert!(md.contains("PASS"));
         assert!(md.contains("1000000000"));
         assert!(md.contains("within budget: yes"));
+        // The TST-111/112 witnesses have to be legible in the artifact, not
+        // only in the JSON.
+        assert!(md.contains("eviction engaged (TST-111): yes"), "{md}");
+        assert!(md.contains("idle RSS < 100 MB (NFR-12): yes"), "{md}");
+        assert!(md.contains("Buffer pool per shard"), "{md}");
 
         let dir = std::env::temp_dir().join(format!("fluxum-soak-test-{}", std::process::id()));
         report.write_artifacts(&dir, "soak-report").unwrap();
         let json = std::fs::read_to_string(dir.join("soak-report.json")).unwrap();
         assert!(json.contains("\"pass\": true"));
         assert!(dir.join("soak-report.md").exists());
-        // Round-trips as the report shape.
-        let back: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(back["rows_loaded"], 1_000_000_000i64);
+        // The JSON is the source of truth: it round-trips back into the
+        // report and re-renders identically (the parity-report convention).
+        let back: SoakReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.rows_loaded, 1_000_000_000);
+        assert_eq!(back.markdown(), md);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsampled_pool_says_so_rather_than_implying_a_clean_run() {
+        // No `--metrics-addr`: the artifact must not read as if the shards
+        // were checked and found healthy.
+        let mut report = SoakReport {
+            harness_version: "0.2.0".into(),
+            date: "2026-07-27".into(),
+            hardware: hardware(),
+            rows_loaded: 1000,
+            duration_secs: 1.0,
+            budget_bytes: 1024,
+            tolerance_bytes: 102,
+            idle_rss_bytes: 10,
+            peak_rss_bytes: 20,
+            within_budget: true,
+            idle_rss_ok: true,
+            idle_ceiling_enforced: false,
+            eviction_engaged: false,
+            eviction_required: false,
+            rss_samples: Vec::new(),
+            pool_samples: Vec::new(),
+            shard_pools: Vec::new(),
+            write: Summary::from_runs(&[RunResult {
+                ops: 1,
+                wall: Duration::from_secs(1),
+                latencies_ns: vec![1],
+            }]),
+            subscription_deliveries: 1,
+            pass: true,
+        };
+        let md = report.markdown();
+        assert!(md.contains("not sampled"), "{md}");
+        assert!(md.contains("not required for this profile"), "{md}");
+        // And with the profile demanding the witnesses, the same absence is
+        // a failure rather than a footnote.
+        report.eviction_required = true;
+        assert!(!soak_pass(
+            report.within_budget,
+            report.write.total_ops,
+            report.subscription_deliveries,
+            &report.shard_pools,
+            eviction_ok(&report.pool_samples, true),
+            report.idle_rss_ok,
+        ));
     }
 
     // --- driver test over a mock side --------------------------------------
@@ -686,6 +1143,11 @@ mod tests {
             budget_bytes: 1_000_000,
             tolerance_bytes: 0,
             sample_interval: Duration::from_millis(20),
+            // No live server behind this mock, so no pool scrape — and
+            // therefore no eviction/idle witness to demand of it.
+            metrics_addr: None,
+            require_eviction: false,
+            enforce_idle_ceiling: false,
         };
         // A sampler that stays well under budget.
         let rss = |_: ()| 500_000u64;
@@ -721,6 +1183,9 @@ mod tests {
             budget_bytes: 1000,
             tolerance_bytes: 0,
             sample_interval: Duration::from_millis(20),
+            metrics_addr: None,
+            require_eviction: false,
+            enforce_idle_ceiling: false,
         };
         // RSS far over budget → the soak must fail even though load succeeds.
         let report = run_soak(

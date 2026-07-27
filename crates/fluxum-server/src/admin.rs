@@ -598,6 +598,30 @@ fn health(ctx: &Arc<ShardContext>) -> AdminResponse {
 
 // --- GET /metrics (Prometheus text; T5.6 expands the metric set) ----------------
 
+/// HELP/TYPE headers for the SPEC-015 TIER-080 pager series, in the order
+/// [`fluxum_core::store::pager::MetricsSnapshot::samples`] emits them. Kept
+/// beside the sample loop so a new counter there is a visible omission here.
+const TIER_080_HEADERS: &str = "\
+# HELP fluxum_bufferpool_bytes Bytes currently resident in the buffer pool (TIER-004).
+# TYPE fluxum_bufferpool_bytes gauge
+# HELP fluxum_bufferpool_capacity_bytes The pool's configured ceiling (TIER-003).
+# TYPE fluxum_bufferpool_capacity_bytes gauge
+# HELP fluxum_bufferpool_hits_total Page requests served from the pool.
+# TYPE fluxum_bufferpool_hits_total counter
+# HELP fluxum_bufferpool_misses_total Page requests that faulted from the cold tier.
+# TYPE fluxum_bufferpool_misses_total counter
+# HELP fluxum_bufferpool_evictions_total Pages evicted, by kind (clean drop vs spill).
+# TYPE fluxum_bufferpool_evictions_total counter
+# HELP fluxum_page_reads_total Pages read from the cold tier, by index/data.
+# TYPE fluxum_page_reads_total counter
+# HELP fluxum_page_writes_total Pages written to the cold tier.
+# TYPE fluxum_page_writes_total counter
+# HELP fluxum_page_compression_raw_bytes_total Pre-compression page bytes (TIER-024).
+# TYPE fluxum_page_compression_raw_bytes_total counter
+# HELP fluxum_page_compression_stored_bytes_total Post-compression page bytes (TIER-024).
+# TYPE fluxum_page_compression_stored_bytes_total counter
+";
+
 async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
     let health = ctx.health();
     // OBS-012: publish the live queue depth before rendering the gauge.
@@ -742,6 +766,26 @@ async fn metrics(ctx: &Arc<ShardContext>) -> AdminResponse {
              # TYPE fluxum_memstore_bytes gauge\n\
              fluxum_memstore_bytes{{shard=\"{shard}\"}} {estimated_bytes}",
         );
+    }
+    // SPEC-015 TIER-080: the buffer-pool and page-I/O series. Unlike
+    // `fluxum_memstore_bytes` above these are *exact* — the pool's own
+    // accounting, the enforced side of the TIER-004 budget — which is what
+    // makes them the in-process witness SPEC-013 TST-111 samples alongside
+    // process RSS, and what proves eviction engaged under pressure.
+    {
+        let shard = health.shard_id;
+        let pager = ctx.store().pager().metrics().snapshot();
+        text.push_str(TIER_080_HEADERS);
+        for (series, value) in pager.samples() {
+            // A series may already carry labels (`name{kind="clean"}`); the
+            // shard label is spliced into the existing set either way.
+            let line = match series.split_once('{') {
+                Some((name, rest)) => format!("{name}{{shard=\"{shard}\",{rest} {value}"),
+                None => format!("{series}{{shard=\"{shard}\"}} {value}"),
+            };
+            text.push_str(&line);
+            text.push('\n');
+        }
     }
     // SPEC-017 CT-014/034: transform read-error and signature-verify meters.
     if let Some(engine) = ctx.store().transform_engine() {

@@ -107,6 +107,26 @@ fn run(args: Vec<String>) -> Result<(), String> {
             "--tolerance" => opts.tolerance = parse(&value("--tolerance")?)?,
             "--duration-secs" => opts.duration_secs = parse(&value("--duration-secs")?)?,
             "--shards" => opts.shards = parse(&value("--shards")?)?,
+            "--require-eviction" => opts.require_eviction = true,
+            "--enforce-idle-ceiling" => opts.enforce_idle_ceiling = true,
+            // The validation profiles of SPEC-013 §12, as one flag each so a
+            // runbook command carries its own exit criteria rather than
+            // relying on the operator to remember them.
+            "--profile" => match value("--profile")?.as_str() {
+                // TST-110/111: 1 vCPU / 512 MB, dataset ≥ 10x the budget.
+                "droplet" => {
+                    opts.require_eviction = true;
+                    opts.enforce_idle_ceiling = true;
+                }
+                // TST-112: billion-row soak; the idle ceiling is an NFR-12
+                // droplet requirement and does not apply here.
+                "billion" => opts.require_eviction = true,
+                other => {
+                    return Err(format!(
+                        "unknown --profile {other:?} (expected `droplet` or `billion`)"
+                    ));
+                }
+            },
             other => return Err(format!("unknown flag {other}\n{}", usage())),
         }
     }
@@ -581,6 +601,11 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
         tolerance_bytes: 0,
         // ~60 samples over the window, at least one per second.
         sample_interval: Duration::from_secs((opts.duration_secs / 60).max(1)),
+        // TST-111 wants the engine's own buffer-pool accounting sampled
+        // beside process RSS; the admin listener is where it is published.
+        metrics_addr: Some(format!("127.0.0.1:{}", server.http_port)),
+        require_eviction: opts.require_eviction,
+        enforce_idle_ceiling: opts.enforce_idle_ceiling,
     };
     println!(
         "== soak: {} rows into {} shard(s), budget {budget_str}, sustain {}s \
@@ -621,10 +646,45 @@ fn run_soak_command(opts: &Opts) -> Result<(), String> {
         report.subscription_deliveries,
         out.display()
     );
+    // The TST-111/112 witnesses, named individually — a bare FAIL on an
+    // hours-long run should not send the operator digging through JSON to
+    // find which criterion broke.
+    println!(
+        "  witnesses: eviction engaged {} ({}) | idle < 100 MB {} ({}) | shards within pool \
+         capacity {}/{}",
+        yes_no(report.eviction_engaged),
+        if report.eviction_required {
+            "required"
+        } else {
+            "informational"
+        },
+        yes_no(report.idle_rss_ok),
+        if report.idle_ceiling_enforced {
+            "enforced"
+        } else {
+            "informational"
+        },
+        report
+            .shard_pools
+            .iter()
+            .filter(|s| s.within_capacity)
+            .count(),
+        report.shard_pools.len(),
+    );
+    if report.shard_pools.is_empty() {
+        println!(
+            "  note: no buffer-pool samples were collected — the TIER-080 gauges could not be \
+             scraped, so the TST-111 witnesses above are not evidence."
+        );
+    }
     if !report.pass {
         return Err("soak did not pass its budget/liveness criteria (see the report)".to_owned());
     }
     Ok(())
+}
+
+fn yes_no(b: bool) -> &'static str {
+    if b { "yes" } else { "NO" }
 }
 
 /// A closure reading the RSS (bytes) of the server child `pid`, cross-platform
@@ -1288,6 +1348,13 @@ struct Opts {
     duration_secs: u64,
     /// `soak`: shard count for the sharded + tiered deployment.
     shards: u32,
+    /// `soak`: fail the run unless eviction was observed engaging (TST-111).
+    /// Off by default so a small smoke run, which never reaches pool
+    /// pressure, is not reported as a failure.
+    require_eviction: bool,
+    /// `soak`: fail the run unless idle RSS < 100 MB (NFR-12). Applies to
+    /// the droplet profile; `--profile droplet` sets it.
+    enforce_idle_ceiling: bool,
 }
 
 impl Default for Opts {
@@ -1327,14 +1394,22 @@ impl Default for Opts {
             tolerance: 0.2,
             duration_secs: 3600,
             shards: 4,
+            require_eviction: false,
+            enforce_idle_ceiling: false,
         }
     }
 }
 
 fn parse<T: std::str::FromStr>(value: &str) -> Result<T, String> {
-    value
-        .parse()
-        .map_err(|_| format!("cannot parse {value:?} as a number"))
+    // Naming the target type matters for the out-of-range case: `--rows`
+    // holds a `u32`, so a value past ~4.29e9 fails here even though it is
+    // plainly a number, and "cannot parse as a number" would misdirect.
+    value.parse().map_err(|_| {
+        format!(
+            "cannot parse {value:?} as {} (out of range?)",
+            std::any::type_name::<T>()
+        )
+    })
 }
 
 fn usage() -> String {
@@ -1353,7 +1428,9 @@ fn usage() -> String {
      \x20      fluxum-bench fanout [--url URL] [--subscribers N] [--messages N] [--rate N]   \
      (NFR-04/TST-061: commit->receipt p99)\n\
      \x20      fluxum-bench soak [--rows N] [--duration-secs N] [--shards N] [--memory-budget SIZE] \
-     [--clients N] [--subscribers N] [--out DIR]   (T7.7/NFR-12-13: sharded+tiered soak, RSS vs budget)\n\
+     [--clients N] [--subscribers N] [--out DIR] [--profile droplet|billion] \
+     [--require-eviction] [--enforce-idle-ceiling]   \
+     (T7.7/NFR-12-13: sharded+tiered soak, RSS + buffer-pool gauges vs budget)\n\
      \x20      fluxum-bench regression --current PATH --published PATH [--tolerance FRAC]\n\
      \x20      fluxum-bench baseline-server --database-url URL --port N [--max-connections N]"
         .to_owned()

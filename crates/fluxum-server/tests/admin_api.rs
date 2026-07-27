@@ -480,6 +480,35 @@ async fn metrics_serves_prometheus_text() {
         text.contains("# TYPE fluxum_shard_last_tx_id gauge"),
         "{text}"
     );
+    // SPEC-015 TIER-080: the buffer-pool series are the in-process witness
+    // SPEC-013 TST-111 samples continuously alongside process RSS, so they
+    // have to actually reach the exposition — every one of them, shard-
+    // labelled, with labelled series keeping their own labels too.
+    let shard = SHARD;
+    for series in [
+        "# TYPE fluxum_bufferpool_bytes gauge".to_owned(),
+        "# TYPE fluxum_bufferpool_capacity_bytes gauge".to_owned(),
+        "# TYPE fluxum_bufferpool_evictions_total counter".to_owned(),
+        "# TYPE fluxum_page_reads_total counter".to_owned(),
+        format!("fluxum_bufferpool_bytes{{shard=\"{shard}\"}}"),
+        format!("fluxum_bufferpool_capacity_bytes{{shard=\"{shard}\"}}"),
+        format!("fluxum_bufferpool_evictions_total{{shard=\"{shard}\",kind=\"clean\"}}"),
+        format!("fluxum_page_reads_total{{shard=\"{shard}\",index=\"true\"}}"),
+    ] {
+        assert!(text.contains(&series), "missing `{series}` in:\n{text}");
+    }
+    // The capacity gauge must carry the real ceiling, not a zero placeholder
+    // — a soak comparing RSS against 0 would "pass" vacuously.
+    let capacity = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(&format!(
+                "fluxum_bufferpool_capacity_bytes{{shard=\"{shard}\"}} "
+            ))
+        })
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("capacity gauge missing or unparseable:\n{text}"));
+    assert!(capacity > 0, "buffer-pool capacity reported as 0");
     server.shutdown();
 }
 
