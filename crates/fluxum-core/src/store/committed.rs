@@ -30,10 +30,13 @@ use crate::store::unique::UniqueIndex;
 /// tree — the paged analogue of the `imbl`+`Arc` structural sharing this
 /// field used to provide (phase6_memstore-structural-sharing; TIER-061).
 /// `row_count` mirrors the tree's live entry count (a paged tree has no O(1)
-/// `len`). `indexes` are the secondary B-tree indexes (T2.4) and `spatial`
-/// the SPEC-008 spatial index (T2.5), all maintained together with `rows`
-/// inside the commit merge so a published snapshot's rows and indexes are
-/// always mutually consistent.
+/// `len`). `indexes` (secondary B-trees, T2.4) and `unique` (`#[unique]`
+/// maps, T3.1) are paged onto the same substrate (TIER-050) and follow the
+/// same copy-on-write discipline; `spatial` (SPEC-008) and `fulltext`
+/// (SPEC-019) remain resident rebuild-from-rows structures until the
+/// TIER-051 follow-up. All are maintained together with `rows` inside the
+/// commit merge so a published snapshot's rows and indexes are always
+/// mutually consistent.
 #[derive(Debug, Clone)]
 pub struct TableState {
     /// The table's link-time schema.
@@ -188,7 +191,7 @@ impl TableState {
         let upper = self.encode_bound(index_id, range_ordinal, upper)?;
         let (start, end) = btree::plan_scan(prefix_bytes, lower, upper);
         let mut out = Vec::new();
-        for pk in index.scan_pks(start, end) {
+        for pk in &index.scan_pks(start, end)? {
             match self.row_at(pk)? {
                 Some(row) => out.push(row),
                 None => debug_assert!(
@@ -309,22 +312,25 @@ impl TableState {
         }
     }
 
-    /// STG-007 rule 2 check: every secondary index equals (bit-identically)
-    /// a freshly built index over this table's committed rows.
+    /// STG-007 rule 2 check: every secondary index's contents equal a fresh
+    /// rebuild over this table's committed rows (paged indexes compare by
+    /// their materialized `(key, pk)` entries; resident spatial/full-text
+    /// structures compare structurally).
     pub(crate) fn verify_index_integrity(&self, table_id: TableId) -> Result<()> {
         // Materialize the paged rows once (encoded-PK order) and rebuild each
-        // resident index over them.
+        // index's expected contents over them.
         let mut rows: Vec<(PkBytes, Row)> = Vec::with_capacity(self.row_count as usize);
         self.for_each_row(|pk, row| {
             rows.push((pk, row));
             Ok(())
         })?;
         for (index_id, index) in &self.indexes {
-            let mut rebuilt = BTreeIndex::new(index.columns());
+            let mut expected: Vec<(Vec<u8>, PkBytes)> = Vec::with_capacity(rows.len());
             for (pk, row) in &rows {
-                rebuilt.insert(row, pk.clone())?;
+                expected.push((index.entry_key(row, pk)?, pk.clone()));
             }
-            if rebuilt != *index {
+            expected.sort();
+            if index.entries()? != expected {
                 return Err(FluxumError::Storage(format!(
                     "index {index_id} on table `{}` ({table_id}) diverged from a fresh \
                      rebuild over CommittedState (STG-007)",
@@ -364,11 +370,12 @@ impl TableState {
             }
         }
         for constraint in &self.unique {
-            let mut rebuilt = UniqueIndex::new(constraint.columns());
+            let mut expected: Vec<(Vec<u8>, PkBytes)> = Vec::with_capacity(rows.len());
             for (pk, row) in &rows {
-                rebuilt.insert(row, pk.clone())?;
+                expected.push((constraint.key_of_values(row.values())?, pk.clone()));
             }
-            if rebuilt != *constraint {
+            expected.sort();
+            if constraint.entries()? != expected {
                 return Err(FluxumError::Storage(format!(
                     "#[unique] map on table `{}` ({table_id}) diverged from a fresh rebuild \
                      over CommittedState (STG-007, TXN-041)",
@@ -693,11 +700,11 @@ mod tests {
         dir
     }
 
-    /// A paged primary tree over `CovTable` holding `entries`.
-    fn paged_rows(entries: &[(PkBytes, Row)]) -> PagedTree {
+    /// A throwaway pager rooted at a fresh temp directory.
+    fn test_pager() -> Arc<crate::store::pager::Pager> {
         use crate::config::PageCompression;
         use crate::store::pager::{Pager, PagerOptions};
-        let pager = Pager::open(
+        Pager::open(
             temp_page_dir(),
             PagerOptions {
                 shard_id: 0,
@@ -709,8 +716,15 @@ mod tests {
                 compression_min_bytes: 1024,
             },
         )
-        .unwrap_or_else(|e| panic!("{e}"));
-        let mut tree = PagedTree::create(&pager, TableId::of("CovTable"), false)
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// A paged primary tree over `CovTable` holding `entries`.
+    fn paged_rows(
+        pager: &Arc<crate::store::pager::Pager>,
+        entries: &[(PkBytes, Row)],
+    ) -> PagedTree {
+        let mut tree = PagedTree::create(pager, TableId::of("CovTable"), false)
             .unwrap_or_else(|e| panic!("{e}"));
         for (pk, row) in entries {
             let bytes = encode_row_paged(&COV, row.values()).unwrap_or_else(|e| panic!("{e}"));
@@ -720,33 +734,40 @@ mod tests {
         tree
     }
 
-    /// A hand-built table state (the corruption seam for invariant tests).
-    fn state_with_rows() -> TableState {
+    /// A hand-built table state plus its pager (the corruption seam for
+    /// invariant tests).
+    fn state_with_rows() -> (Arc<crate::store::pager::Pager>, TableState) {
+        let pager = test_pager();
         let entries = [(pk(1), row(1, 1.0, 2.0))];
-        TableState {
+        let state = TableState {
             schema: &COV,
-            rows: paged_rows(&entries),
+            rows: paged_rows(&pager, &entries),
             row_count: entries.len() as u64,
             indexes: BTreeMap::new(),
             spatial: None,
             fulltext: Vec::new(),
             unique: Vec::new(),
             auto_inc_high_water: 0,
-        }
+        };
+        (pager, state)
     }
 
     #[test]
     fn row_count_reflects_the_row_map() {
-        let state = state_with_rows();
+        let (_pager, state) = state_with_rows();
         assert_eq!(state.row_count(), 1);
         assert_eq!(state.schema().name, "CovTable");
     }
 
     #[test]
     fn out_of_range_index_ordinals_are_an_invariant_breach() {
-        let mut state = state_with_rows();
+        let (pager, mut state) = state_with_rows();
         let index_id = IndexId::from_raw(0xC0);
-        state.indexes.insert(index_id, BTreeIndex::new(&[9]));
+        state.indexes.insert(
+            index_id,
+            BTreeIndex::new(&[9], &pager, TableId::of("CovTable"))
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
         let err = match state.index_scan(
             index_id,
             &[RowValue::U64(1)],
@@ -764,7 +785,7 @@ mod tests {
     fn a_range_bound_without_a_range_column_is_an_invariant_breach() {
         // encode_bound is only reachable with a range column via index_scan;
         // the defensive arm still reports rather than panics.
-        let state = state_with_rows();
+        let (_pager, state) = state_with_rows();
         let bound = RowValue::F64(1.0);
         let err = match state.encode_bound(IndexId::from_raw(0xC1), None, Bound::Included(&bound)) {
             Ok(_) => panic!("bound without a range column encoded"),
@@ -775,11 +796,13 @@ mod tests {
 
     #[test]
     fn integrity_check_reports_a_diverged_btree_index() {
-        let mut state = state_with_rows();
+        let (pager, mut state) = state_with_rows();
         // An empty index over a populated row map cannot equal a rebuild.
-        state
-            .indexes
-            .insert(IndexId::from_raw(0xC2), BTreeIndex::new(&[1]));
+        state.indexes.insert(
+            IndexId::from_raw(0xC2),
+            BTreeIndex::new(&[1], &pager, TableId::of("CovTable"))
+                .unwrap_or_else(|e| panic!("{e}")),
+        );
         let err = match state.verify_index_integrity(TableId::of("CovTable")) {
             Ok(()) => panic!("diverged btree index verified"),
             Err(e) => e.to_string(),
@@ -790,7 +813,7 @@ mod tests {
 
     #[test]
     fn integrity_check_reports_a_diverged_spatial_index() {
-        let mut state = state_with_rows();
+        let (_pager, mut state) = state_with_rows();
         // Ready but empty while rows exist: a rebuild must differ.
         state.spatial = Some(SpatialIndexState::quadtree(
             &[1, 2],
@@ -808,8 +831,11 @@ mod tests {
 
     #[test]
     fn integrity_check_reports_a_diverged_unique_map() {
-        let mut state = state_with_rows();
-        state.unique = vec![UniqueIndex::new(&[1])];
+        let (pager, mut state) = state_with_rows();
+        state.unique = vec![
+            UniqueIndex::new(&[1], &pager, TableId::of("CovTable"))
+                .unwrap_or_else(|e| panic!("{e}")),
+        ];
         let err = match state.verify_index_integrity(TableId::of("CovTable")) {
             Ok(()) => panic!("diverged unique map verified"),
             Err(e) => e.to_string(),

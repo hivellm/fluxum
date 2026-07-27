@@ -82,9 +82,17 @@
 //! analogue of the `imbl`+`Arc` structural sharing this map used to give. Rows
 //! are stored in the same self-describing MessagePack-over-`LogValue` form the
 //! commit log and checkpoints use, so `#[encrypted]`/`#[signed]` columns and
-//! mid-migration layouts (SPEC-010) round-trip exactly. Secondary/spatial/
-//! full-text indexes and `#[unique]` maps remain resident this pass; paging
-//! them onto the same substrate (TIER-050/051) is the tracked follow-up.
+//! mid-migration layouts (SPEC-010) round-trip exactly. Secondary B-tree
+//! indexes and `#[unique]` maps are paged onto the same substrate
+//! (TIER-050): each is a [`pager::PagedTree`] of
+//! `memcomparable index key ++ encoded PK → encoded PK` entries — the exact
+//! layout of the checkpoint spill target — maintained copy-on-write inside
+//! the commit merge, so index memory counts against the one budget and an
+//! index-dominated dataset stays bounded (TIER-070). Spatial and full-text
+//! indexes remain resident: they are unpersisted rebuild-from-rows
+//! structures (quadtree/R-tree geometry, BM25 posting lists) whose paging
+//! (TIER-051) needs a linear-key redesign — the tracked follow-up
+//! `phase2_paged-spatial-fulltext-indexes`.
 //! [`pager::ColdTable::spill_snapshot`] materializes a published snapshot as a
 //! standalone paged copy for the checkpoint path.
 //!

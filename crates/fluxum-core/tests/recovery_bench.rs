@@ -19,10 +19,14 @@
 //! archives the output.
 //!
 //! Workload shape: update-heavy small writes (the SPEC-002 target profile) —
-//! transactions of 16 × 2 KiB row upserts cycling over a bounded key space,
-//! so the log is large while the live state stays bounded; the checkpoint is
-//! recent (covers the whole log), making replay scan-dominated exactly like
-//! a production restart after a healthy checkpoint cadence.
+//! transactions of 16 × ~1.9 KiB row upserts cycling over a bounded key
+//! space, so the log is large while the live state stays bounded; the
+//! checkpoint is recent (covers the whole log), making replay scan-dominated
+//! exactly like a production restart after a healthy checkpoint cadence.
+//! The payload sits just under the paged B-tree's index-key cap (~2 KB at
+//! 4 KiB pages, the Postgres-parity index-row limit — SPEC-015 TIER-050):
+//! `User.name` is a secondary-indexed column, and since the phase2 cutover
+//! the live index is a paged tree whose keys are bounded like PG's.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -40,7 +44,8 @@ use fluxum_core::store::TableId;
 use crash_support::{EPOCH, SHARD, fingerprint, mem_store, segment_files};
 
 const ROWS_PER_TX: u64 = 16;
-const PAYLOAD_BYTES: usize = 2048;
+/// Just under the ~2 KB paged-index key cap (module docs): `name` is indexed.
+const PAYLOAD_BYTES: usize = 1900;
 const KEY_SPACE: u64 = 20_000;
 const TEN_GIB: u64 = 10 * 1024 * 1024 * 1024;
 

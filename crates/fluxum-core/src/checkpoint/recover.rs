@@ -9,10 +9,12 @@ use std::sync::Arc;
 use crate::commitlog::record::TxRecord;
 use crate::commitlog::replay::{ReplayReport, replay};
 use crate::error::{FluxumError, Result};
+use crate::index::btree::BTreeIndex;
 use crate::schema::TableSchema;
 use crate::store::committed::{CommittedState, TableState};
 use crate::store::pager::PagedTree;
 use crate::store::row::{PkBytes, Row, encode_pk_of_row, encode_row_paged};
+use crate::store::unique::UniqueIndex;
 use crate::store::{MemStore, TableId};
 
 /// A checkpoint that failed verification during recovery and was skipped
@@ -137,17 +139,24 @@ pub fn recover(
 
     // Assemble the final CommittedState: PkBytes keys and secondary/spatial
     // indexes rebuilt from the recovered rows (bit-identical to a fresh
-    // rebuild by construction, STG-007 rule 2). The empty index structures
-    // are cloned from the fresh store's own tables, so recovery always uses
-    // exactly the store's index configuration (B-tree columns, spatial
-    // bounds and bucket size).
+    // rebuild by construction, STG-007 rule 2). Paged B-tree/unique indexes
+    // are built as *fresh* trees and bulk-loaded sorted — never clones of
+    // the fresh store's handles, whose empty roots version 0 still reads —
+    // while the resident spatial/full-text structures clone the store's own
+    // empty configuration (B-tree columns, spatial bounds and bucket size).
     let mut tables = HashMap::with_capacity(working.len());
     for (id, table) in working {
         let empty = base.state.table(id)?;
-        let mut indexes = empty.indexes.clone();
         let mut spatial = empty.spatial.clone();
         let mut fulltext = empty.fulltext.clone();
-        let mut unique = empty.unique.clone();
+        // Sorted entry staging per paged index (bulk_load wants strict order).
+        let mut index_entries: BTreeMap<crate::index::IndexId, BTreeMap<Vec<u8>, Vec<u8>>> = empty
+            .indexes
+            .keys()
+            .map(|&i| (i, BTreeMap::new()))
+            .collect();
+        let mut unique_entries: Vec<BTreeMap<Vec<u8>, Vec<u8>>> =
+            vec![BTreeMap::new(); empty.unique.len()];
         // The working rows are already keyed by encoded PK in byte order
         // (`BTreeMap`), exactly what the paged primary tree bulk-loads.
         let mut paged: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(table.rows.len());
@@ -155,8 +164,13 @@ pub fn recover(
         for (pk_bytes, row) in table.rows {
             let pk = PkBytes::from_bytes(pk_bytes.clone());
             debug_assert_eq!(pk, encode_pk_of_row(table.schema, row.values())?);
-            for index in indexes.values_mut() {
-                index.insert(&row, pk.clone())?;
+            for (index_id, index) in &empty.indexes {
+                if let Some(staged) = index_entries.get_mut(index_id) {
+                    staged.insert(index.entry_key(&row, &pk)?, pk_bytes.clone());
+                }
+            }
+            for (constraint, staged) in empty.unique.iter().zip(unique_entries.iter_mut()) {
+                staged.insert(constraint.key_of_values(row.values())?, pk_bytes.clone());
             }
             if let Some(spatial) = &mut spatial {
                 spatial.insert_row(&row, pk.clone())?;
@@ -164,11 +178,20 @@ pub fn recover(
             for fulltext in &mut fulltext {
                 fulltext.insert_row(&row, pk.clone())?;
             }
-            for constraint in &mut unique {
-                constraint.insert(&row, pk.clone())?;
-            }
             paged.push((pk_bytes, encode_row_paged(table.schema, row.values())?));
             row_count += 1;
+        }
+        let mut indexes = BTreeMap::new();
+        for (index_id, index) in &empty.indexes {
+            let mut fresh = BTreeIndex::new(index.columns(), store.pager(), id)?;
+            fresh.bulk_load(index_entries.remove(index_id).unwrap_or_default())?;
+            indexes.insert(*index_id, fresh);
+        }
+        let mut unique = Vec::with_capacity(empty.unique.len());
+        for (constraint, staged) in empty.unique.iter().zip(unique_entries) {
+            let mut fresh = UniqueIndex::new(constraint.columns(), store.pager(), id)?;
+            fresh.bulk_load(staged)?;
+            unique.push(fresh);
         }
         let mut rows = PagedTree::create(store.pager(), id, false)?;
         rows.bulk_load(paged)?;

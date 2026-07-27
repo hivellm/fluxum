@@ -307,16 +307,20 @@ impl MemStore {
                     existing.name, table.name
                 )));
             }
+            let mut unique = Vec::with_capacity(table.unique.len());
+            for columns in table.unique {
+                unique.push(UniqueIndex::new(columns, &pager, id)?);
+            }
             tables.insert(
                 id,
                 Arc::new(TableState {
                     schema: table,
                     rows: PagedTree::create(&pager, id, false)?,
                     row_count: 0,
-                    indexes: build_btree_indexes(table)?,
+                    indexes: build_btree_indexes(table, &pager, id)?,
                     spatial: build_spatial_index(table, &options)?,
                     fulltext: build_fulltext_indexes(table),
-                    unique: table.unique.iter().map(|c| UniqueIndex::new(c)).collect(),
+                    unique,
                     auto_inc_high_water: 0,
                 }),
             );
@@ -680,10 +684,10 @@ impl MemStore {
             for (pk, _old) in &table_diff.deletes {
                 if let Some(existing) = table.take_row(pk, &mut sup)? {
                     for constraint in &mut table.unique {
-                        constraint.remove(&existing, pk)?;
+                        constraint.remove(&existing, pk, &mut sup)?;
                     }
                     for index in table.indexes.values_mut() {
-                        index.remove(&existing, pk)?;
+                        index.remove(&existing, pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
                         spatial.remove_row(&existing, pk)?;
@@ -699,10 +703,10 @@ impl MemStore {
                 // row's index entries come out before the new row's go in.
                 if let Some(existing) = table.put_row(&pk, row, &mut sup)? {
                     for constraint in &mut table.unique {
-                        constraint.remove(&existing, &pk)?;
+                        constraint.remove(&existing, &pk, &mut sup)?;
                     }
                     for index in table.indexes.values_mut() {
-                        index.remove(&existing, &pk)?;
+                        index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
                         spatial.remove_row(&existing, &pk)?;
@@ -712,10 +716,10 @@ impl MemStore {
                     }
                 }
                 for index in table.indexes.values_mut() {
-                    index.insert(row, pk.clone())?;
+                    index.insert(row, pk.clone(), &mut sup)?;
                 }
                 for constraint in &mut table.unique {
-                    constraint.insert(row, pk.clone())?;
+                    constraint.insert(row, pk.clone(), &mut sup)?;
                 }
                 if let Some(spatial) = &mut table.spatial {
                     spatial.insert_row(row, pk.clone())?;
@@ -782,10 +786,10 @@ impl MemStore {
                 let pk = PkBytes::from_bytes(pk);
                 if let Some(existing) = table.take_row(&pk, &mut sup)? {
                     for constraint in &mut table.unique {
-                        constraint.remove(&existing, &pk)?;
+                        constraint.remove(&existing, &pk, &mut sup)?;
                     }
                     for index in table.indexes.values_mut() {
-                        index.remove(&existing, &pk)?;
+                        index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
                         spatial.remove_row(&existing, &pk)?;
@@ -803,10 +807,10 @@ impl MemStore {
                 // row's index entries first, mirroring recovery semantics.
                 if let Some(existing) = table.put_row(&pk, &row, &mut sup)? {
                     for constraint in &mut table.unique {
-                        constraint.remove(&existing, &pk)?;
+                        constraint.remove(&existing, &pk, &mut sup)?;
                     }
                     for index in table.indexes.values_mut() {
-                        index.remove(&existing, &pk)?;
+                        index.remove(&existing, &pk, &mut sup)?;
                     }
                     if let Some(spatial) = &mut table.spatial {
                         spatial.remove_row(&existing, &pk)?;
@@ -816,10 +820,10 @@ impl MemStore {
                     }
                 }
                 for index in table.indexes.values_mut() {
-                    index.insert(&row, pk.clone())?;
+                    index.insert(&row, pk.clone(), &mut sup)?;
                 }
                 for constraint in &mut table.unique {
-                    constraint.insert(&row, pk.clone())?;
+                    constraint.insert(&row, pk.clone(), &mut sup)?;
                 }
                 if let Some(spatial) = &mut table.spatial {
                     spatial.insert_row(&row, pk.clone())?;
@@ -1292,10 +1296,10 @@ impl Tx<'_> {
             // Committed owner — unless it is the row being written, or this
             // transaction tx-deleted/tx-replaced it (an Update whose new row
             // still carries the value was already caught just above).
-            if let Some(owner) = constraint.owner(&key) {
-                let shadowed = owner == pk
+            if let Some(owner) = constraint.owner(&key)? {
+                let shadowed = owner == *pk
                     || ops
-                        .and_then(|m| m.get(owner))
+                        .and_then(|m| m.get(&owner))
                         .is_some_and(|op| matches!(op, PendingOp::Delete | PendingOp::Update(_)));
                 if !shadowed {
                     return Err(unique::violation_error(
@@ -1783,7 +1787,7 @@ impl Tx<'_> {
                 if matches!(op, PendingOp::Delete | PendingOp::Update(_)) {
                     let old = table.row_at(pk)?.ok_or_else(invariant_missing_row)?;
                     for constraint in &mut table.unique {
-                        constraint.remove(&old, pk)?;
+                        constraint.remove(&old, pk, &mut sup)?;
                     }
                 }
             }
@@ -1795,7 +1799,7 @@ impl Tx<'_> {
                 match op {
                     PendingOp::Insert(row) => {
                         for index in table.indexes.values_mut() {
-                            index.insert(&row, pk.clone())?;
+                            index.insert(&row, pk.clone(), &mut sup)?;
                         }
                         if let Some(spatial) = &mut table.spatial {
                             spatial.insert_row(&row, pk.clone())?;
@@ -1804,7 +1808,7 @@ impl Tx<'_> {
                             fulltext.insert_row(&row, pk.clone())?;
                         }
                         for constraint in &mut table.unique {
-                            constraint.insert(&row, pk.clone())?;
+                            constraint.insert(&row, pk.clone(), &mut sup)?;
                         }
                         table.put_row(&pk, &row, &mut sup)?;
                         diff.inserts.push(row);
@@ -1814,7 +1818,7 @@ impl Tx<'_> {
                             .take_row(&pk, &mut sup)?
                             .ok_or_else(invariant_missing_row)?;
                         for index in table.indexes.values_mut() {
-                            index.remove(&old, &pk)?;
+                            index.remove(&old, &pk, &mut sup)?;
                         }
                         if let Some(spatial) = &mut table.spatial {
                             spatial.remove_row(&old, &pk)?;
@@ -1829,8 +1833,8 @@ impl Tx<'_> {
                             .put_row(&pk, &row, &mut sup)?
                             .ok_or_else(invariant_missing_row)?;
                         for index in table.indexes.values_mut() {
-                            index.remove(&old, &pk)?;
-                            index.insert(&row, pk.clone())?;
+                            index.remove(&old, &pk, &mut sup)?;
+                            index.insert(&row, pk.clone(), &mut sup)?;
                         }
                         if let Some(spatial) = &mut table.spatial {
                             // SPX-032: old coordinates out, new coordinates
@@ -1848,7 +1852,7 @@ impl Tx<'_> {
                         // The old row's unique values were released in the
                         // two-pass removal above; claim the new row's.
                         for constraint in &mut table.unique {
-                            constraint.insert(&row, pk.clone())?;
+                            constraint.insert(&row, pk.clone(), &mut sup)?;
                         }
                         diff.deletes.push((pk, old));
                         diff.inserts.push(row);
@@ -2238,7 +2242,11 @@ fn blob_ordinals(schema: &TableSchema) -> Vec<u16> {
         .collect()
 }
 
-fn build_btree_indexes(table: &'static TableSchema) -> Result<BTreeMap<IndexId, BTreeIndex>> {
+fn build_btree_indexes(
+    table: &'static TableSchema,
+    pager: &Arc<Pager>,
+    table_id: TableId,
+) -> Result<BTreeMap<IndexId, BTreeIndex>> {
     let mut indexes = BTreeMap::new();
     for index in table.indexes {
         let IndexSchema::BTree { columns } = index else {
@@ -2256,7 +2264,10 @@ fn build_btree_indexes(table: &'static TableSchema) -> Result<BTreeMap<IndexId, 
             names.push(column.name);
         }
         let id = IndexId::of(table.name, &names);
-        if indexes.insert(id, BTreeIndex::new(columns)).is_some() {
+        if indexes
+            .insert(id, BTreeIndex::new(columns, pager, table_id)?)
+            .is_some()
+        {
             return Err(FluxumError::Schema(format!(
                 "IndexId collision: two #[index(btree(...))] declarations on table `{}` \
                  hash to {id} (STG-051)",
@@ -2638,11 +2649,30 @@ mod tests {
 
     #[test]
     fn btree_index_builders_guard_ordinals_and_id_collisions() {
+        let dir = tempfile::Builder::new()
+            .prefix("fluxum-idx-build-")
+            .tempdir()
+            .unwrap_or_else(|e| panic!("{e}"));
+        let pager = Pager::open(
+            dir.path(),
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 64 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: crate::config::PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        let table_id = TableId::of("Item");
+
         static OUT_OF_RANGE: TableSchema = TableSchema {
             indexes: &[IndexSchema::BTree { columns: &[9] }],
             ..ITEM
         };
-        let err = match build_btree_indexes(&OUT_OF_RANGE) {
+        let err = match build_btree_indexes(&OUT_OF_RANGE, &pager, table_id) {
             Ok(_) => panic!("out-of-range index ordinal accepted"),
             Err(e) => e.to_string(),
         };
@@ -2655,7 +2685,7 @@ mod tests {
             ],
             ..ITEM
         };
-        let err = match build_btree_indexes(&DUPLICATED) {
+        let err = match build_btree_indexes(&DUPLICATED, &pager, table_id) {
             Ok(_) => panic!("duplicate index declarations accepted"),
             Err(e) => e.to_string(),
         };

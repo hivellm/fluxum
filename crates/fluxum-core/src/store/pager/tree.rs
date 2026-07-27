@@ -163,10 +163,17 @@ impl PagedTree {
         self.node_budget() / 4
     }
 
-    /// Largest accepted key (keys are PKs or index keys; anything larger is
-    /// a schema-abuse error, not an overflow case).
+    /// Largest accepted key: two interior routing entries (`2 + key + 8`
+    /// bytes each) must always fit one node, so interior fan-out is ≥ 2 for
+    /// *any* key mix — `bulk_load`'s level building strictly shrinks (no
+    /// 1-entry-per-node livelock) and tree depth stays logarithmic even for
+    /// uniformly huge keys. Keys are PKs or memcomparable index keys; the
+    /// resulting ~2 KB cap at 4 KiB pages is the Postgres-parity index-row
+    /// limit (PG caps at ~page/3; ours is ~page/2), surfaced as a schema
+    /// error — an index over multi-KB values wants full-text (SPEC-019) or
+    /// the tracked overflow-key follow-up, not a B-tree entry.
     fn max_key(&self) -> usize {
-        self.node_budget() / 8
+        self.node_budget() / 2 - 10
     }
 
     /// Bytes of value chunk per overflow page.
@@ -937,7 +944,7 @@ mod tests {
     use crate::config::PageCompression;
     use crate::store::pager::{Pager, PagerOptions};
 
-    const PAGE_SIZE: usize = 256; // budget 223, max_key 27, inline cap 55
+    const PAGE_SIZE: usize = 256; // budget 223, max_key 101, inline cap 55
 
     fn fixture() -> (tempfile::TempDir, Arc<Pager>, TableId) {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));

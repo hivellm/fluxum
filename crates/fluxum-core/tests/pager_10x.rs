@@ -569,3 +569,140 @@ fn tampered_pages_are_never_served_and_content_hashes_round_trip() {
         Err(FluxumError::PageCorrupt { .. })
     ));
 }
+
+// --- phase2 1.3: the LIVE store's paged indexes under a tiny budget ---------
+
+/// `Reading` with a `#[unique]` constraint on `seq` (unique per row by
+/// construction: `seq = id*7 - 500`), under its own name so the live-store
+/// suite gets distinct page files and index ids.
+static READING_LIVE: TableSchema = TableSchema {
+    name: "ReadingLive",
+    unique: &[&[2]],
+    ..READING
+};
+
+/// TIER-050/070 on the *live* serving path: a `MemStore` built over a tiny
+/// 256 KiB pool serves a dataset whose rows *and* secondary/unique index
+/// pages far exceed the budget — index queries, uniqueness checks, MVCC
+/// snapshot isolation, and the STG-007 rule-2 integrity check all stay
+/// correct while index pages fault and evict continuously.
+#[test]
+fn live_store_pages_btree_and_unique_indexes_under_a_tiny_budget() {
+    use fluxum_core::store::StoreOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let pager = tiny_pager(dir.path());
+    let schema = Schema::from_tables([&READING_LIVE]).expect("schema assembles");
+    let store = MemStore::with_pager(&schema, StoreOptions::default(), Arc::clone(&pager))
+        .expect("store builds over the tiny pool");
+    let table = store.table_id("ReadingLive").expect("table registered");
+    let by_device_seq = store
+        .index_id("ReadingLive", &["device", "seq"])
+        .expect("composite index");
+    let by_seq = store.index_id("ReadingLive", &["seq"]).expect("seq index");
+
+    // 8k rows in 1k-row transactions; long device names inflate the
+    // composite index tree well past the 256 KiB pool.
+    let mut rng = Rng(11);
+    let mut inserted = 0u64;
+    let mut pinned = None; // snapshot pinned after the 4th batch (4 000 rows)
+    while inserted < 8_000 {
+        let mut tx = store.begin();
+        for _ in 0..1_000 {
+            let mut row = reading(inserted, &mut rng, 16);
+            row[1] = RowValue::Str(format!("very-long-device-name-{:0100}", inserted % 40));
+            tx.insert(table, row).expect("insert");
+            inserted += 1;
+        }
+        tx.commit().expect("commit");
+        assert_budget_held(&pager);
+        if inserted == 4_000 {
+            pinned = Some(store.snapshot());
+        }
+    }
+    let pinned = pinned.expect("snapshot pinned mid-run");
+    let snap = store.snapshot();
+
+    // TXN-041 through the paged unique map: a duplicate `seq` is rejected
+    // eagerly (the check faults constraint pages in on demand).
+    {
+        let mut tx = store.begin();
+        let mut dup = reading(8_000, &mut rng, 16);
+        dup[2] = RowValue::I64(-500); // seq of row id 0 (0*7 - 500)
+        let err = match tx.insert(table, dup) {
+            Ok(_) => panic!("duplicate #[unique] seq accepted"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("unique constraint violation"), "{err}");
+        tx.rollback();
+    }
+
+    // Every index query answers correctly against the full-scan oracle
+    // while pages fault/evict (uniform coverage over all 40 buckets).
+    let all: Vec<Row> = snap.scan(table).expect("scan");
+    assert_eq!(all.len(), 8_000);
+    for bucket in 0..40u64 {
+        let device = format!("very-long-device-name-{bucket:0100}");
+        let hits: Vec<Row> = snap
+            .index_eq(table, by_device_seq, &[RowValue::Str(device.clone())])
+            .expect("live index scan");
+        let oracle = all
+            .iter()
+            .filter(|row| matches!(row.value(1), Some(RowValue::Str(d)) if *d == device))
+            .count();
+        assert_eq!(hits.len(), oracle, "bucket {bucket} diverged");
+        assert_budget_held(&pager);
+    }
+    let range: Vec<Row> = snap
+        .index_scan(
+            table,
+            by_seq,
+            &[],
+            Bound::Included(&RowValue::I64(1_000)),
+            Bound::Excluded(&RowValue::I64(9_000)),
+        )
+        .expect("live range scan");
+    let oracle = all
+        .iter()
+        .filter(|row| matches!(row.value(2), Some(RowValue::I64(s)) if (1_000..9_000).contains(s)))
+        .count();
+    assert_eq!(range.len(), oracle, "seq range diverged");
+    assert!(!range.is_empty());
+
+    // MVCC: the snapshot pinned at 4 000 rows still answers its own version
+    // — the paged index roots it holds were never disturbed by the four
+    // later commits (TIER-061: superseded pages outlive pinned versions).
+    let old: Vec<Row> = pinned.scan(table).expect("pinned scan");
+    assert_eq!(
+        old.len(),
+        4_000,
+        "pinned snapshot must not see later commits"
+    );
+    let bucket0 = format!("very-long-device-name-{:0100}", 0u64);
+    let old_hits: Vec<Row> = pinned
+        .index_eq(table, by_device_seq, &[RowValue::Str(bucket0.clone())])
+        .expect("pinned index scan");
+    let new_hits: Vec<Row> = snap
+        .index_eq(table, by_device_seq, &[RowValue::Str(bucket0)])
+        .expect("live index scan");
+    assert_eq!(old_hits.len(), 100, "40 buckets over 4 000 rows");
+    assert_eq!(new_hits.len(), 200, "40 buckets over 8 000 rows");
+
+    // STG-007 rule 2 over the paged structures: every index and unique map
+    // matches a fresh rebuild over the committed rows.
+    snap.verify_index_integrity(table)
+        .expect("paged indexes bit-identical to a rebuild");
+
+    // TIER-050 witness on the live path: index pages faulted through the
+    // pool, and the pool never exceeded its budget.
+    let m = pager.metrics().snapshot();
+    assert!(
+        m.page_reads_index > 0,
+        "live index pages must fault under pressure: {m:?}"
+    );
+    assert!(
+        m.evictions_total() > 0,
+        "no evictions in a 10x live run: {m:?}"
+    );
+    assert_budget_held(&pager);
+}

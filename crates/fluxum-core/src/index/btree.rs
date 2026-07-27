@@ -38,35 +38,48 @@
 //! `[start, end)` byte range over the index map.
 
 use std::ops::Bound;
+use std::sync::Arc;
 
 use crate::error::{FluxumError, Result};
+use crate::store::TableId;
+use crate::store::pager::{PagedTree, Pager};
 use crate::store::row::{PkBytes, Row, RowValue};
 
-/// One secondary B-tree index: memcomparable key bytes → the PKs of the
-/// rows carrying that key (non-unique: one key maps to N rows).
+/// One secondary B-tree index, served through the paged cold tier
+/// (SPEC-015 TIER-050): a [`PagedTree`] whose entries are
+/// `memcomparable index key ++ encoded PK → encoded PK` — the same layout
+/// the checkpoint spill target uses (`store::pager::cold`), so index nodes
+/// fault in and evict under `memory.budget` exactly like data pages, and an
+/// index-dominated dataset stays bounded (TIER-070).
 ///
 /// Lives inside the committed `TableState` and is copy-on-write together
-/// with the row map, so a snapshot's rows and indexes are always mutually
-/// consistent (see the module docs of [`super`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// with the row tree: the commit merge writes through
+/// [`insert`](Self::insert)/[`remove`](Self::remove) on the private pre-swap
+/// copy, superseded pages are retired against the published version
+/// (TIER-061), and a snapshot on the old roots keeps reading a mutually
+/// consistent rows+indexes view (see the module docs of [`super`]).
+#[derive(Debug, Clone)]
 pub struct BTreeIndex {
     /// Indexed column ordinals in declared key order (DM-030/DM-031).
     columns: &'static [u16],
-    /// Memcomparable key → PKs of the rows with that key. PKs within one
-    /// key are in encoded-PK byte order (deterministic, not numeric).
-    /// Persistent maps/sets so the commit merge's copy-on-write clones the
-    /// handle in O(1) and path-copies only what a write touches
-    /// (phase6_memstore-structural-sharing).
-    map: imbl::OrdMap<Vec<u8>, imbl::OrdSet<PkBytes>>,
+    /// The paged index tree. Composite keys sort by memcomparable index key
+    /// first, then by encoded PK within one key (deterministic, not
+    /// numeric) — the same order the resident `imbl` map produced.
+    tree: PagedTree,
 }
 
 impl BTreeIndex {
-    /// An empty index over `columns` (ordinals into the table's schema).
-    pub(crate) fn new(columns: &'static [u16]) -> Self {
-        Self {
+    /// An empty paged index over `columns` (ordinals into the table's
+    /// schema), allocating its pages from `table_id`'s page file.
+    pub(crate) fn new(
+        columns: &'static [u16],
+        pager: &Arc<Pager>,
+        table_id: TableId,
+    ) -> Result<Self> {
+        Ok(Self {
             columns,
-            map: imbl::OrdMap::new(),
-        }
+            tree: PagedTree::create(pager, table_id, true)?,
+        })
     }
 
     /// The indexed column ordinals in declared key order.
@@ -74,7 +87,7 @@ impl BTreeIndex {
         self.columns
     }
 
-    /// The memcomparable index key of `row`.
+    /// The memcomparable index key of `row` (no PK suffix).
     fn key_of(&self, row: &Row) -> Result<Vec<u8>> {
         let mut key = Vec::new();
         for &ordinal in self.columns {
@@ -90,47 +103,73 @@ impl BTreeIndex {
         Ok(key)
     }
 
-    /// Add `row`'s index entry (commit merge, insert side).
-    pub(crate) fn insert(&mut self, row: &Row, pk: PkBytes) -> Result<()> {
-        let key = self.key_of(row)?;
-        // Clone-modify-reinsert: the set handle clone is O(1) (persistent
-        // set), and the map insert path-copies O(log n).
-        let mut pks = self.map.get(&key).cloned().unwrap_or_default();
-        pks.insert(pk);
-        self.map.insert(key, pks);
+    /// The composite entry key of `row` at `pk`: memcomparable index key
+    /// with the encoded PK appended. Per-column prefix-freedom makes the
+    /// concatenation order like the `(index key, pk)` tuple.
+    pub(crate) fn entry_key(&self, row: &Row, pk: &PkBytes) -> Result<Vec<u8>> {
+        let mut key = self.key_of(row)?;
+        key.extend_from_slice(pk.as_bytes());
+        Ok(key)
+    }
+
+    /// Add `row`'s index entry (commit merge, insert side). Copy-on-write:
+    /// the pages the write superseded are appended to `superseded` for the
+    /// version reclaimer (TIER-061), never freed here.
+    pub(crate) fn insert(
+        &mut self,
+        row: &Row,
+        pk: PkBytes,
+        superseded: &mut Vec<u64>,
+    ) -> Result<()> {
+        let key = self.entry_key(row, &pk)?;
+        self.tree.insert_cow(&key, pk.as_bytes(), superseded)
+    }
+
+    /// Remove `row`'s index entry (commit merge, delete side). Copy-on-write
+    /// like [`insert`](Self::insert). Removing an absent entry is a
+    /// structural no-op (nothing rewritten).
+    pub(crate) fn remove(
+        &mut self,
+        row: &Row,
+        pk: &PkBytes,
+        superseded: &mut Vec<u64>,
+    ) -> Result<()> {
+        let key = self.entry_key(row, pk)?;
+        self.tree.delete_cow(&key, superseded)?;
         Ok(())
     }
 
-    /// Remove `row`'s index entry (commit merge, delete side). Empty key
-    /// slots are dropped so the map stays bit-identical to a fresh rebuild.
-    pub(crate) fn remove(&mut self, row: &Row, pk: &PkBytes) -> Result<()> {
-        let key = self.key_of(row)?;
-        if let Some(existing) = self.map.get(&key) {
-            let mut pks = existing.clone();
-            pks.remove(pk);
-            if pks.is_empty() {
-                self.map.remove(&key);
-            } else {
-                self.map.insert(key, pks);
-            }
-        }
-        Ok(())
+    /// The PKs of every entry in `[start, end)` over the *index-key* space
+    /// (`end: None` = unbounded), in index-key order then encoded-PK order
+    /// within one key. The bounds carry no PK suffix; entry keys extending a
+    /// bound sort correctly because per-column encodings are prefix-free.
+    pub(crate) fn scan_pks(&self, start: Vec<u8>, end: Option<Vec<u8>>) -> Result<Vec<PkBytes>> {
+        let mut pks = Vec::new();
+        self.tree.scan(&start, end.as_deref(), &mut |_, pk| {
+            pks.push(PkBytes::from_bytes(pk.to_vec()));
+            Ok(true)
+        })?;
+        Ok(pks)
     }
 
-    /// Iterate the PKs of every entry in `[start, end)` (`end: None` =
-    /// unbounded), in index-key order then encoded-PK order within one key.
-    pub(crate) fn scan_pks(
-        &self,
-        start: Vec<u8>,
-        end: Option<Vec<u8>>,
-    ) -> impl Iterator<Item = &PkBytes> {
-        let upper = match end {
-            Some(e) => Bound::Excluded(e),
-            None => Bound::Unbounded,
-        };
-        self.map
-            .range((Bound::Included(start), upper))
-            .flat_map(|(_, pks)| pks.iter())
+    /// Every `(composite key, pk)` entry in key order — the STG-007 rule-2
+    /// integrity-check surface (compared against a rebuild over the rows).
+    pub(crate) fn entries(&self) -> Result<Vec<(Vec<u8>, PkBytes)>> {
+        let mut out = Vec::new();
+        self.tree.scan(&[], None, &mut |key, pk| {
+            out.push((key.to_vec(), PkBytes::from_bytes(pk.to_vec())));
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+
+    /// Bulk-load sorted `(composite key, pk)` entries into this **empty**
+    /// index (the recovery fold — pages enter the pool scan-resistant).
+    pub(crate) fn bulk_load(
+        &mut self,
+        entries: impl IntoIterator<Item = (Vec<u8>, Vec<u8>)>,
+    ) -> Result<()> {
+        self.tree.bulk_load(entries)
     }
 }
 
@@ -475,21 +514,102 @@ mod tests {
         assert_eq!(bytes, vec![3, 1]);
     }
 
+    /// A throwaway pager for index-unit tests — one fresh directory per
+    /// call, so concurrently running tests never share page files.
+    fn test_pager() -> Arc<Pager> {
+        use crate::config::PageCompression;
+        use crate::store::pager::PagerOptions;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "fluxum-btree-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        Pager::open(
+            dir,
+            PagerOptions {
+                shard_id: 0,
+                page_size: 4096,
+                pool_capacity_bytes: 64 * 4096,
+                high_watermark: 0.95,
+                low_watermark: 0.90,
+                compression: PageCompression::None,
+                compression_min_bytes: 1024,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{e}"))
+    }
+
     #[test]
     fn index_maintenance_guards_ordinals_and_tolerates_absent_keys() {
-        let mut index = BTreeIndex::new(&[9]);
+        let pager = test_pager();
+        let table = TableId::of("BtreeCov");
+        let mut index = BTreeIndex::new(&[9], &pager, table).unwrap_or_else(|e| panic!("{e}"));
         let row = Row::new(vec![RowValue::U64(1)]);
         let pk = pk_of(1);
-        let err = match index.insert(&row, pk.clone()) {
+        let mut sup = Vec::new();
+        let err = match index.insert(&row, pk.clone(), &mut sup) {
             Ok(()) => panic!("out-of-range index ordinal accepted"),
             Err(e) => e.to_string(),
         };
         assert!(err.contains("index ordinal 9 out of range"), "{err}");
 
         // remove() of a key that was never indexed is a structural no-op.
-        let mut index = BTreeIndex::new(&[0]);
-        index.remove(&row, &pk).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(index.scan_pks(Vec::new(), None).count(), 0);
+        let mut index = BTreeIndex::new(&[0], &pager, table).unwrap_or_else(|e| panic!("{e}"));
+        index
+            .remove(&row, &pk, &mut sup)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            index
+                .scan_pks(Vec::new(), None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn paged_index_snapshot_keeps_reading_the_old_root_after_cow_writes() {
+        let pager = test_pager();
+        let table = TableId::of("BtreeCowCov");
+        let mut index = BTreeIndex::new(&[0], &pager, table).unwrap_or_else(|e| panic!("{e}"));
+        let mut sup = Vec::new();
+        for i in 0..50u64 {
+            index
+                .insert(&Row::new(vec![RowValue::U64(i % 5)]), pk_of(i), &mut sup)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        // A snapshot handle pinned at the current version.
+        let snap = index.clone();
+
+        // CoW removals publish a new root; the snapshot still reads the old.
+        for i in 0..50u64 {
+            index
+                .remove(&Row::new(vec![RowValue::U64(i % 5)]), &pk_of(i), &mut sup)
+                .unwrap_or_else(|e| panic!("{e}"));
+        }
+        assert_eq!(
+            index
+                .scan_pks(Vec::new(), None)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .len(),
+            0
+        );
+        let snap_pks = snap
+            .scan_pks(Vec::new(), None)
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(snap_pks.len(), 50, "the old version must stay complete");
+        assert!(!sup.is_empty(), "CoW index writes report superseded pages");
+
+        // Within one index key, PKs come back in encoded-PK byte order.
+        let (start, end) = plan_scan(enc(&RowValue::U64(2)), Bound::Unbounded, Bound::Unbounded);
+        let key2 = snap.scan_pks(start, end).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(key2.len(), 10);
+        let mut sorted = key2.clone();
+        sorted.sort();
+        assert_eq!(key2, sorted);
     }
 
     fn pk_of(n: u64) -> PkBytes {
