@@ -19,14 +19,16 @@
     <RepositoryType>git</RepositoryType>
     <PackageTags>fluxum;realtime;database;live-queries;subscriptions;client;sdk</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageIcon>icon.png</PackageIcon>
     <!-- Zero third-party dependencies (SDK-080). -->
   </PropertyGroup>
 
-  <!-- README + LICENSE live one level up (sdks/csharp/) so the repo page and
-       the NuGet page share them; packed into the nupkg root. -->
+  <!-- README + LICENSE + icon live one level up (sdks/csharp/) so the repo
+       page and the NuGet page share them; packed into the nupkg root. -->
   <ItemGroup>
     <None Include="../README.md" Pack="true" PackagePath="/" />
     <None Include="../LICENSE" Pack="true" PackagePath="/" />
+    <None Include="../icon.png" Pack="true" PackagePath="/" />
   </ItemGroup>
 
 </Project>
