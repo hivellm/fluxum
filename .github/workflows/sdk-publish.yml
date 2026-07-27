@@ -1,0 +1,300 @@
+name: Publish SDKs
+
+# Publishes the four SDKs that live in this repository to their registries when
+# a GitHub Release is published, or on demand for an existing tag. Mirrors the
+# proven hivellm/synap sdk-publish.yml.
+#
+# Auth differs per registry, by design:
+# All four registries authenticate via Trusted Publishing (OIDC) — crates.io,
+# npm, PyPI and NuGet. No long-lived publish credential is stored in this
+# repository; each job exchanges a short-lived GitHub id-token for one.
+#
+# That is also why this is a separate workflow from the CI ones: `id-token:
+# write` is granted per job here, so no other workflow ever sees a credential
+# that could publish a package.
+#
+# NOT covered here — `sdks/go` is a git submodule pointing at its own
+# repository (hivellm/fluxum-go). Go publishes by tag on that repo via the
+# module proxy, so nothing in this repository can push it. Tag it there.
+#
+# Registry-side setup (one-time, per registry):
+#   crates.io → fluxum-sdk → Settings → Trusted Publishing:
+#     repository hivellm/fluxum, workflow sdk-publish.yml, no environment.
+#   npm → @hivehub/fluxum → package Settings → Trusted publisher:
+#     GitHub Actions, hivellm/fluxum, workflow sdk-publish.yml.
+#   PyPI → fluxum → Manage → Publishing → Add trusted publisher:
+#     owner hivellm, repository fluxum, workflow sdk-publish.yml, no environment.
+#   nuget.org → Fluxum.Sdk → Trusted Publishing policy owned by the account in
+#     the `NUGET_USER` repository variable: repo hivellm/fluxum, workflow
+#     sdk-publish.yml.
+#
+# The per-SDK conformance suites all skip gracefully without a built
+# fluxum-server, so the publish gate here is each SDK's self-contained unit
+# suite; the full corpus gates on the per-SDK CI workflows instead.
+#
+# Every job is independent: a registry outage on one does not block the others.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish from (e.g., v0.2.1)"
+        required: true
+        type: string
+      sdks:
+        description: "Which SDKs to publish"
+        required: false
+        default: all
+        type: choice
+        options: [all, rust, typescript, python, csharp]
+
+# Read-only by default; the publish jobs widen this themselves.
+permissions:
+  contents: read
+
+env:
+  # `release:published` → github.ref_name holds the tag
+  # `workflow_dispatch`  → the free-form `tag` input above
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # crates.io — Trusted Publisher (OIDC). `crates-io-auth-action` exchanges the
+  # id-token below for a token that expires in 30 minutes.
+  publish-rust:
+    if: github.event_name == 'release' || inputs.sdks == 'all' || inputs.sdks == 'rust'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@v2
+
+      # A tag and a manifest that disagree is how you ship a version whose
+      # contents are not what the number says. Fail before anything is built.
+      - name: Verify the manifest version matches the tag
+        run: |
+          version="${RELEASE_TAG#v}"
+          manifest=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "fluxum-sdk") | .version')
+          echo "tag=$version manifest=$manifest"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::fluxum-sdk is $manifest but the tag says $version"
+            exit 1
+          fi
+
+      - name: Check whether this version is already on crates.io
+        id: check
+        run: |
+          version="${RELEASE_TAG#v}"
+          if curl -sfo /dev/null -H 'User-Agent: fluxum-release-ci' \
+               "https://crates.io/api/v1/crates/fluxum-sdk/$version"; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::fluxum-sdk $version is already on crates.io — skipping"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The client_e2e suite skips itself without a fluxum-server binary; what
+      # runs here is the SDK's self-contained unit + conformance-decode suite.
+      - name: Test
+        if: steps.check.outputs.published == 'false'
+        run: cargo test -p fluxum-sdk
+
+      - name: Exchange the OIDC token for a short-lived crates.io token
+        if: steps.check.outputs.published == 'false'
+        uses: rust-lang/crates-io-auth-action@v1
+        id: crates-auth
+
+      - name: Publish
+        if: steps.check.outputs.published == 'false'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: cargo publish -p fluxum-sdk
+
+  # npm — Trusted Publisher (OIDC). No NODE_AUTH_TOKEN anywhere: npm mints a
+  # short-lived credential from the id-token below, and attaches provenance.
+  publish-typescript:
+    if: github.event_name == 'release' || inputs.sdks == 'all' || inputs.sdks == 'typescript'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdks/typescript
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      # Node 24: `node --test` runs the .ts unit files with default type
+      # stripping (the suite's server-bound tests skip themselves).
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # Trusted publishing needs npm >= 11.5.1, which is newer than the npm
+      # bundled with any current Node LTS.
+      - name: Upgrade npm
+        run: npm install -g npm@latest
+
+      - name: Verify the manifest version matches the tag
+        run: |
+          version="${RELEASE_TAG#v}"
+          manifest=$(node -p "require('./package.json').version")
+          echo "tag=$version manifest=$manifest"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::@hivehub/fluxum is $manifest but the tag says $version"
+            exit 1
+          fi
+
+      - name: Check whether this version is already on npm
+        id: check
+        run: |
+          version="${RELEASE_TAG#v}"
+          if npm view "@hivehub/fluxum@$version" version > /dev/null 2>&1; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::@hivehub/fluxum $version is already on npm — skipping"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install dependencies
+        if: steps.check.outputs.published == 'false'
+        run: npm ci
+
+      # `prepublishOnly` reruns the build during `npm publish`; running the
+      # tests here too means a failure is attributed to the right step.
+      - name: Test
+        if: steps.check.outputs.published == 'false'
+        run: npm test
+
+      - name: Publish
+        if: steps.check.outputs.published == 'false'
+        run: npm publish
+
+  # PyPI — Trusted Publisher (OIDC). Configure the publisher on PyPI against
+  # this repository and this workflow filename (no environment).
+  publish-python:
+    if: github.event_name == 'release' || inputs.sdks == 'all' || inputs.sdks == 'python'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify the manifest version matches the tag
+        working-directory: sdks/python
+        run: |
+          version="${RELEASE_TAG#v}"
+          manifest=$(python -c "import tomllib,pathlib;print(tomllib.loads(pathlib.Path('pyproject.toml').read_text())['project']['version'])")
+          echo "tag=$version manifest=$manifest"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::fluxum is $manifest but the tag says $version"
+            exit 1
+          fi
+
+      - name: Check whether this version is already on PyPI
+        id: check
+        run: |
+          version="${RELEASE_TAG#v}"
+          if curl -sfo /dev/null "https://pypi.org/pypi/fluxum/$version/json"; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::fluxum $version is already on PyPI — skipping"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The SDK ships zero runtime dependencies (SDK-080); only the harness
+      # needs pytest. The conformance suite skips without a fluxum-server.
+      - name: Install dependencies
+        if: steps.check.outputs.published == 'false'
+        run: python -m pip install --upgrade pip build pytest
+
+      - name: Test
+        if: steps.check.outputs.published == 'false'
+        working-directory: sdks/python
+        run: python -m pytest -q
+
+      - name: Build distributions
+        if: steps.check.outputs.published == 'false'
+        working-directory: sdks/python
+        run: python -m build
+
+      - name: Publish
+        if: steps.check.outputs.published == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: sdks/python/dist
+
+  # NuGet — Trusted Publisher (OIDC). `NuGet/login` exchanges the id-token below
+  # for a short-lived API key, so no long-lived key is stored in this repo.
+  # `vars.NUGET_USER` must hold the nuget.org account that owns the policy.
+  publish-csharp:
+    if: github.event_name == 'release' || inputs.sdks == 'all' || inputs.sdks == 'csharp'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: sdks/csharp
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      - name: Verify the manifest version matches the tag
+        run: |
+          version="${RELEASE_TAG#v}"
+          manifest=$(sed -n 's:.*<Version>\(.*\)</Version>.*:\1:p' Fluxum.Sdk/Fluxum.Sdk.csproj | head -1)
+          echo "tag=$version manifest=$manifest"
+          if [ "$manifest" != "$version" ]; then
+            echo "::error::Fluxum.Sdk is $manifest but the tag says $version"
+            exit 1
+          fi
+
+      # The conformance corpus skips without a fluxum-server binary; the unit
+      # suite is the publish gate here.
+      - name: Test
+        run: dotnet test Fluxum.Sdk.Tests/Fluxum.Sdk.Tests.csproj -c Release
+
+      - name: Pack
+        run: dotnet pack Fluxum.Sdk/Fluxum.Sdk.csproj -c Release --output ./artifacts
+
+      - name: Exchange the OIDC token for a short-lived NuGet key
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: ${{ vars.NUGET_USER }}
+
+      # `--skip-duplicate` makes a rerun a no-op instead of an error when the
+      # version is already on NuGet.
+      - name: Publish
+        run: |
+          dotnet nuget push ./artifacts/*.nupkg \
+            --source https://api.nuget.org/v3/index.json \
+            --api-key "${{ steps.nuget-login.outputs.NUGET_API_KEY }}" \
+            --skip-duplicate
