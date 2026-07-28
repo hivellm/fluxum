@@ -187,35 +187,35 @@ process — not the driver.
 
 ## Status
 
-The drivers, reports, witnesses and CI workflow are in place, and the
-witnesses have been observed firing on a real pressure run (200k rows under a
-128 MiB budget: pool peaked at 101.8 MiB against a 102.4 MiB capacity with
-~730k evictions, `eviction_engaged: true`).
+The drivers, reports, witnesses and CI workflow are in place; the witnesses
+have been observed firing on real pressure runs, and the sharded clause is
+validated (2-shard 200k/384 MiB run: `shards_observed 2/2`, both pools peaking
+identically under their per-shard capacity, eviction engaged).
 
-Three things stand between here and G7:
+Where the launch-defining runs stand (task owner-archived 2026-07-28):
 
-1. **The billion-row run has not been performed.** The committed
-   `docs/reports/soak-report.*` is a 1M-row / 60 s plumbing proof on a 32-core
-   workstation. Measured load throughput is ~3 600–4 400 rows/s under a
-   128 MiB budget and does **not** improve with more writers or a deeper
-   pipeline (32 clients × pipeline 128 was *slower* than 8 clients), so 1e9
-   rows is on the order of **60+ hours of load alone** — the
-   `--duration-secs 3600` sustain window is a rounding error next to it. Plan
-   the run accordingly, or raise load throughput first.
-
-   Note for anyone tracking the storage work: the RV-020 temporal-window fix
-   (which removed a 24× write-throughput cliff for *large* transactions) did
-   **not** move this number, and was not expected to. The soak writes one row
-   per `add_task` reducer call, and single-row commits pin so little
-   superseded state that the window's byte ceiling never binds. What limits
-   the soak's load phase is the per-transaction path itself — one serialized
-   commit per row, plus genuine tiering once the dataset exceeds the budget.
-   Batching rows per transaction is the lever here, and it needs a bulk
-   reducer in the demo module rather than a storage change.
+1. **The scale criterion is owner-redefined: a 10M-row continuous run in
+   place of 1e9** (measured load throughput ~4-5k rows/s makes 1e9 a 60+ hour
+   run; it does not improve with more writers or a deeper pipeline —
+   batching rows per transaction via a bulk reducer is the lever if it is
+   ever revisited). The 10M run was performed and **FAILED `within_budget`:
+   peak RSS 1067.2 MiB vs 384+38 MiB**, with both shard pools correctly
+   capped throughout — the committed `docs/reports/soak-report.*` is that
+   FAIL evidence, kept deliberately. The failure is an engine defect, not a
+   harness defect: the checkpoint worker holds a store snapshot across the
+   whole checkpoint write, freezing the TIER-061 reclamation floor; at scale
+   checkpoints run back-to-back, so CoW garbage bookkeeping accumulates
+   resident (~150-200 B per single-row commit) and page-file extents are
+   never reused (16.8 GiB on disk for a ~1 GiB live dataset), while the
+   RV-020 byte ceiling empties the temporal window without freeing anything
+   (`AS OF` reach collapses to 0 under sustained writes). Confirmed
+   experimentally: `fluxum_reclaim_pending_pages` sawtooths in lockstep with
+   checkpoint boundaries (peaks ~730k pages/shard) and
+   `fluxum_temporal_window_snapshots` sits at 0 for entire runs. Until that
+   is fixed, any long soak legitimately fails — re-run the 10M criterion
+   after the fix. When diagnosing, scrape the `fluxum_reclaim_*` and
+   `fluxum_temporal_window_*` gauges alongside `fluxum_bufferpool_*`; the
+   pool gauges alone cannot distinguish live pages from unreclaimable
+   garbage.
 2. **No cgroup-enforced droplet artifact exists.** Run the `droplet-profile`
    workflow (Actions → Run workflow) or a real droplet.
-3. **TST-112's "sharded" clause is now reachable** — the server assembles
-   `sharding.shards` hosts (see the `--shards` note above) — but the demo
-   module's tables are unpartitioned, so identity affinity routes every
-   session to shard 0 and the siblings idle. Partitioning a demo table is
-   the remaining piece for a load-spread sharded run.
