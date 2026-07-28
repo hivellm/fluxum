@@ -64,7 +64,28 @@ module, stated honestly in the UI.
       `/schema` document today; rendered when the document carries them.
       Verified in a real browser against the release binary (Playwright);
       shell view-inventory pinned by a unit test.
-- [ ] 1.3 Data explorer: SQL console with keyset pagination + EXPLAIN display; live mode (query → subscription → TxUpdate-driven updates); row inspector
+- [x] 1.3 Data explorer (2026-07-27). The Query view grew into the SQL
+      console: **Explain** panel from `POST /query/explain` (QP-051 —
+      access path with index columns/probes/bounds or full_scan, residual
+      filter, order served-by-index vs sorted-at-execution, limit, cursor,
+      normalized SQL); **keyset pagination** — Next page builds
+      `… AFTER (order value, pk value)` from the last row with
+      schema-typed SQL literals, enabled on a full page + ORDER BY +
+      single-column pk (QP-040/041; a non-indexed order column surfaces
+      the server's QP-040 refusal verbatim — the demo module has no
+      secondary index, verified); **live mode** — Go live re-executes the
+      armed query on every commit touching its table via the
+      `/console/watch` stream (TxUpdate-driven, debounced 250 ms, dropped
+      markers also re-run; DEV-031 lock discipline — no /rpc SDK bundle
+      embedded, the one-file stance holds); **row inspector** — click a
+      result row for a read-only typed field view (edits stay in the Data
+      view through POST /rows). The shell outgrew the 1500-line
+      convention and is now assembled at compile time from console.html
+      (markup+styles) + console.js (script) via `concat!`, pinned by a
+      unit test; self-containment unchanged. All verified in a real
+      browser against the release binary (Playwright): explain render,
+      cursor SQL construction + refusal, live grid refresh on a curl'd
+      commit, inspector fields.
 - [ ] 1.4 Reducer console: signature-driven typed argument forms, invoke/result, rate-limit display, recent invocations from the audit trail
 - [ ] 1.5 Sessions & subscriptions: connected-client list with queue/backpressure state, active queries, kick, bans/blocklist management (additive JSON endpoints where today CLI-only)
 - [ ] 1.6 Observability: metrics dashboards parsed from `/metrics`, `/logs` tail, audit-trail viewer with filters

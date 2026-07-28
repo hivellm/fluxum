@@ -36,8 +36,16 @@ use fluxum_core::subscription::row_value_to_json;
 use fluxum_core::txn::CommitMeta;
 
 /// The console shell: one self-contained HTML document (inline CSS + JS, no
-/// external requests — the page's CSP forbids any non-self origin).
-pub const CONSOLE_HTML: &str = include_str!("console.html");
+/// external requests — the page's CSP forbids any non-self origin). Served
+/// as a single page, assembled at compile time from `console.html` (markup +
+/// styles) and `console.js` (the script) so each source file stays inside
+/// the 1500-line convention.
+pub const CONSOLE_HTML: &str = concat!(
+    include_str!("console.html"),
+    "<script>\n",
+    include_str!("console.js"),
+    "</script>\n</body>\n</html>\n",
+);
 
 /// A console route (under `GET /console`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +187,16 @@ mod tests {
         assert!(is_console_path("/console/watch?table=Chat"));
         assert!(!is_console_path("/consoles"));
         assert!(!is_console_path("/health"));
+    }
+
+    #[test]
+    fn the_shell_assembles_into_one_complete_document() {
+        // The compile-time concat of console.html + console.js must yield a
+        // whole page: script opened and closed, document terminated.
+        assert!(CONSOLE_HTML.starts_with("<!doctype html>"));
+        assert!(CONSOLE_HTML.ends_with("</html>\n"));
+        assert_eq!(CONSOLE_HTML.matches("<script>").count(), 1);
+        assert_eq!(CONSOLE_HTML.matches("</script>").count(), 1);
     }
 
     #[test]
