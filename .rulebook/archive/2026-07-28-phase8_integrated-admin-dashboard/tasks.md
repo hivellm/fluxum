@@ -184,7 +184,8 @@ module, stated honestly in the UI.
       leaves-rotation contract). Runs in ~0.6 s.
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [x] 2.1 Docs (2026-07-27): `docs/CONSOLE.md` — the operator guide (every
+- [x] 2.1 Update or create documentation covering the implementation
+      (2026-07-27): `docs/CONSOLE.md` — the operator guide (every
       view, auth posture, security model, known limits stated where they
       bite). SPEC-024 updated additively: DEV-033..036 specify the
       dashboard capability areas, the `POST /rows` commit contract, the
@@ -192,13 +193,15 @@ module, stated honestly in the UI.
       hardening; the "no row edits" non-goal rewritten to what phase8
       actually shipped (user-directed scalar edits through the TxPipeline;
       runtime CREATE TABLE and structured-column writes stay out).
-- [x] 2.2 Tests: unit (route resolution, shell assembly/self-containment/
+- [x] 2.2 Write tests covering the new behavior: unit (route resolution,
+      shell assembly/self-containment/
       view inventory, SEC-054 audit inventory), integration (console
       routes+auth+watch, /rows, sessions listing with subscriptions+queue,
       backup create/verify/tamper over HTTP), and the spawned-binary e2e
       smoke sweeping the full console contract. Browser-level flows
       verified per increment against the release binary (Playwright).
-- [x] 2.3 Full fluxum-core + fluxum-server suites green (0 failing
+- [x] 2.3 Run tests and confirm they pass: full fluxum-core +
+      fluxum-server suites green (0 failing
       suites); fmt + clippy --all-features + codespell clean. **Coverage
       floor recovered: 90.01% lines** (2026-07-28, gate command of
       record, PG + STDB drivers live) after dipping to 89.49% under the
