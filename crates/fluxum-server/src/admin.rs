@@ -1379,3 +1379,54 @@ fn json_to_flux(value: &Value) -> Option<FluxValue> {
 fn status_of(e: &FluxumError) -> u16 {
     fluxum_protocol::codes::entry(e.to_wire().code).map_or(500, |entry| entry.http_status)
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// SEC-054 (phase8 1.8): every state-changing admin route is in the
+    /// audit inventory, and no read is. A new mutating route added to
+    /// [`is_admin_path`] without joining [`is_mutating_route`] fails here,
+    /// not in a security review.
+    #[test]
+    fn the_audit_inventory_covers_every_mutating_route() {
+        for (method, path) in [
+            ("POST", "/reducer/send_chat"),
+            ("POST", "/rows"),
+            ("POST", "/drain"),
+            ("POST", "/backup"),
+            ("POST", "/checkpoint"),
+            ("POST", "/config/reload"),
+            ("POST", "/plugins/x/disable"),
+            ("POST", "/plugins/x/enable"),
+            ("POST", "/bans"),
+            ("DELETE", "/bans/10.0.0.0/8"),
+            ("DELETE", "/sessions/abc"),
+            ("DELETE", "/sessions?identity=00"),
+        ] {
+            assert!(
+                is_mutating_route(method, path),
+                "`{method} {path}` mutates state but is not audited (SEC-054)"
+            );
+        }
+        for (method, path) in [
+            ("GET", "/health"),
+            ("GET", "/metrics"),
+            ("GET", "/schema"),
+            ("POST", "/query"),
+            ("POST", "/query/explain"),
+            ("POST", "/backup/verify"), // re-hashes files, writes nothing
+            ("POST", "/audit"),         // reads the trail, never writes it
+            ("GET", "/sessions"),
+            ("GET", "/bans"),
+            ("GET", "/plugins"),
+            ("GET", "/view/x"),
+        ] {
+            assert!(
+                !is_mutating_route(method, path),
+                "`{method} {path}` is a read; auditing it would flood the trail"
+            );
+        }
+    }
+}

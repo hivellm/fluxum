@@ -62,6 +62,39 @@ Given the console open on the `OnlineUser` table
 When users connect and disconnect
 Then the console shows rows appear and vanish in real time via a live subscription.
 
+### Requirement: Integrated admin dashboard (phase8)
+- **DEV-033** [P1] The console SHALL grow into the integrated admin dashboard: an operator
+  **overview** (health, shard/replication posture, memory-budget occupancy, hardware probe with
+  provenance, storage paths, per-table rows), a **data explorer** (SQL console with `EXPLAIN`
+  via `POST /query/explain`, keyset pagination per QP-040, a TxUpdate-driven live mode riding
+  `/console/watch`, and a read-only row inspector), a **reducer console** (signature-driven typed
+  argument forms from `/schema`, `POST /reducer/:name` invoke, rate display, and an OPS-020
+  audit panel), a **sessions view** (the SEC-053 directory with per-session subscriptions and
+  outbound-queue occupancy, kick, and SEC-033 ban management), an **ops view** (reloadable
+  config + `POST /config/reload`, checkpoint, drain, backup create/verify, replication posture,
+  per-tenant usage), and **observability** (sampled metric tiles from `/metrics`, `/logs` tail
+  with a minimum-severity filter, audit filters). See `docs/CONSOLE.md` for the operator guide.
+- **DEV-034** [P1] Console row edits (`POST /rows`, `op: upsert | delete`) MUST commit through the
+  shard's own `TxPipeline` with `CommitMeta { caller: admin identity, reducer_name:
+  "__console.row_edit" }` — constraints enforced, subscriptions fanned out, commit logged, audit
+  trail attributed — and MUST refuse structured column types (enum/struct/blob/crdt) with a
+  pointer at reducers, whose invariants live in module code.
+- **DEV-035** [P2] Where a capability was CLI-only, the dashboard adds **additive** JSON
+  endpoints rather than widening existing ones: `POST /backup` (REP-060, server-side hot backup),
+  `POST /backup/verify` (REP-064), and the enriched `GET /sessions` (per-session subscription
+  queries + queue occupancy, SUB-042).
+- **DEV-036** [P1] The shell MUST stay one self-contained served page — assembled at compile time
+  from `console.html` + `console*.js`, CSP `default-src 'none'` with no external origins — and
+  every state-changing route the dashboard drives MUST be in the SEC-054 audit inventory. A
+  spawned-binary e2e smoke (`tests/console_e2e_smoke.rs`) SHALL sweep the whole console contract
+  against the real server.
+
+#### Scenario: Kick a slow consumer
+Given the sessions view showing a client whose outbound queue is near capacity
+When the operator clicks Kick and confirms
+Then the session is terminated over `DELETE /sessions/{id}`, the action lands in the audit
+trail, and a well-behaved SDK reconnects with a fresh session.
+
 ## 5. Seeding & migration dry-run (`DEV-04x`)
 
 ### Requirement: Fixtures and safe migration preview
@@ -80,4 +113,8 @@ and changes nothing.
 
 - Hot-swapping module code without a restart (deployment is a fast binary restart, per ARCHITECTURE).
 - A hosted cloud dashboard (the console is the single-binary, self-hosted surface).
-- Editing rows directly in the console outside reducers (all mutations go through reducers).
+- Runtime `CREATE TABLE` (tables are compiled in via `#[fluxum::table]`; the console's designer
+  emits the Rust snippet instead of pretending otherwise) and console writes to structured
+  column types — those invariants live in module code, so those edits go through reducers.
+  Scalar row edits are in scope (DEV-034, user-directed in phase8) and commit through the same
+  `TxPipeline` as any reducer: constraints, subscriptions, commit log, audit.

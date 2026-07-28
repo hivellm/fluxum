@@ -353,3 +353,163 @@ pub(super) fn hex_bytes(s: &str) -> Result<Vec<u8>, String> {
         .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| format!("bad hex at offset {i}")))
         .collect()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use fluxum_core::schema::FluxType as T;
+    use fluxum_core::store::RowValue as V;
+    use serde_json::json;
+
+    use super::*;
+
+    fn conv(ty: &T, v: Value) -> Result<fluxum_core::store::RowValue, String> {
+        json_to_row_value(ty, &v)
+    }
+
+    /// Every scalar arm accepts exactly the shape `row_value_to_json`
+    /// renders — numbers as numbers, 64-bit values also as strings (the
+    /// grid shows them that way), hex for bytes/identity, micros for
+    /// timestamps.
+    #[test]
+    fn every_scalar_type_round_trips_its_rendered_shape() {
+        assert_eq!(conv(&T::Bool, json!(true)).unwrap(), V::Bool(true));
+        assert_eq!(conv(&T::I8, json!(-5)).unwrap(), V::I8(-5));
+        assert_eq!(conv(&T::I16, json!(-300)).unwrap(), V::I16(-300));
+        assert_eq!(conv(&T::I32, json!(70_000)).unwrap(), V::I32(70_000));
+        assert_eq!(conv(&T::I64, json!(-9)).unwrap(), V::I64(-9));
+        assert!(conv(&T::I64, json!("‑1")).is_err()); // non-ASCII minus refused
+        assert_eq!(conv(&T::I64, json!(" -12 ")).unwrap(), V::I64(-12));
+        assert_eq!(conv(&T::U8, json!(200)).unwrap(), V::U8(200));
+        assert_eq!(conv(&T::U16, json!(60_000)).unwrap(), V::U16(60_000));
+        assert_eq!(conv(&T::U32, json!(4_000_000)).unwrap(), V::U32(4_000_000));
+        assert_eq!(
+            conv(&T::U64, json!("18446744073709551615")).unwrap(),
+            V::U64(u64::MAX),
+            "64-bit values ride as strings"
+        );
+        assert!(matches!(conv(&T::F32, json!(1.5)).unwrap(), V::F32(_)));
+        assert!(matches!(conv(&T::F64, json!(2.25)).unwrap(), V::F64(_)));
+        assert_eq!(conv(&T::Str, json!("hi")).unwrap(), V::Str("hi".into()));
+        assert_eq!(
+            conv(&T::Bytes, json!("0aff")).unwrap(),
+            V::Bytes(vec![0x0a, 0xff])
+        );
+        let identity = "11".repeat(32);
+        assert!(matches!(
+            conv(&T::Identity, json!(identity)).unwrap(),
+            V::Identity(_)
+        ));
+        assert!(matches!(
+            conv(&T::ConnectionId, json!("7")).unwrap(),
+            V::ConnectionId(_)
+        ));
+        assert!(matches!(
+            conv(&T::ConnectionId, json!(7)).unwrap(),
+            V::ConnectionId(_)
+        ));
+        assert!(matches!(
+            conv(&T::EntityId, json!(42)).unwrap(),
+            V::EntityId(_)
+        ));
+        assert!(matches!(
+            conv(&T::Timestamp, json!(1_785_196_924_389_486_i64)).unwrap(),
+            V::Timestamp(_)
+        ));
+    }
+
+    /// Range and shape violations name the offending value — the editor
+    /// shows these verbatim, so they must be precise.
+    #[test]
+    fn narrowing_and_shape_errors_name_the_value() {
+        assert!(conv(&T::I8, json!(128)).unwrap_err().contains("outside"));
+        assert!(conv(&T::I16, json!(40_000)).unwrap_err().contains("outside"));
+        assert!(conv(&T::I32, json!(i64::MAX)).unwrap_err().contains("outside"));
+        assert!(conv(&T::U8, json!(256)).unwrap_err().contains("overflows u8"));
+        assert!(conv(&T::U16, json!(70_000)).unwrap_err().contains("overflows u16"));
+        assert!(
+            conv(&T::U32, json!(5_000_000_000_u64))
+                .unwrap_err()
+                .contains("overflows u32")
+        );
+        assert!(conv(&T::U64, json!(-1)).unwrap_err().contains("unsigned"));
+        assert!(conv(&T::U64, json!("nope")).unwrap_err().contains("unsigned"));
+        assert!(conv(&T::I64, json!("x")).unwrap_err().contains("not an integer"));
+        assert!(conv(&T::I64, json!(true)).unwrap_err().contains("expected an integer"));
+        assert!(conv(&T::Bool, json!(1)).unwrap_err().contains("expected a boolean"));
+        assert!(conv(&T::F64, json!("1")).unwrap_err().contains("expected a number"));
+        assert!(conv(&T::F32, json!(null)).unwrap_err().contains("expected a number"));
+        assert!(conv(&T::Str, json!(1)).unwrap_err().contains("expected a string"));
+        assert!(conv(&T::Bytes, json!(1)).unwrap_err().contains("hex string"));
+        assert!(conv(&T::Identity, json!("zz")).unwrap_err().contains("bad identity"));
+        assert!(conv(&T::Identity, json!(1)).unwrap_err().contains("64-hex-char"));
+        assert!(
+            conv(&T::ConnectionId, json!("x"))
+                .unwrap_err()
+                .contains("not a connection id")
+        );
+        assert!(
+            conv(&T::ConnectionId, json!(true))
+                .unwrap_err()
+                .contains("connection id")
+        );
+    }
+
+    /// Option and List recurse through the same converter; structured
+    /// types refuse with the pointer at reducers.
+    #[test]
+    fn containers_recurse_and_structured_types_refuse() {
+        assert_eq!(conv(&T::Option(&T::U32), json!(null)).unwrap(), V::Optional(None));
+        assert_eq!(
+            conv(&T::Option(&T::U32), json!(7)).unwrap(),
+            V::Optional(Some(Box::new(V::U32(7))))
+        );
+        assert!(conv(&T::Option(&T::U32), json!("x")).is_err());
+        assert_eq!(
+            conv(&T::List(&T::I32), json!([1, 2])).unwrap(),
+            V::List(vec![V::I32(1), V::I32(2)])
+        );
+        assert!(
+            conv(&T::List(&T::I32), json!("no"))
+                .unwrap_err()
+                .contains("expected an array")
+        );
+        assert!(
+            conv(&T::List(&T::I32), json!([1, "x"])).is_err(),
+            "a bad element fails the whole list"
+        );
+        for ty in [T::Blob, T::CrdtText] {
+            assert!(conv(&ty, json!("x")).unwrap_err().contains("through reducers"));
+        }
+    }
+
+    #[test]
+    fn decimal_literals_parse_exactly_and_refuse_noise() {
+        let d = parse_decimal("-12.34").unwrap();
+        assert_eq!(format!("{d}"), "-12.34");
+        assert_eq!(format!("{}", parse_decimal("0.5").unwrap()), "0.5");
+        assert_eq!(format!("{}", parse_decimal("+7").unwrap()), "7");
+        assert!(parse_decimal("").unwrap_err().contains("not a decimal"));
+        assert!(parse_decimal(".").unwrap_err().contains("not a decimal"));
+        assert!(parse_decimal("1e5").unwrap_err().contains("not a decimal"));
+        assert!(parse_decimal("12a").unwrap_err().contains("not a decimal"));
+        assert!(
+            parse_decimal(&"9".repeat(60))
+                .unwrap_err()
+                .contains("overflows the decimal range")
+        );
+        // Both JSON shapes reach the same parser.
+        assert!(matches!(conv(&T::Decimal, json!("1.25")).unwrap(), V::Decimal(_)));
+        assert!(matches!(conv(&T::Decimal, json!(3)).unwrap(), V::Decimal(_)));
+        assert!(conv(&T::Decimal, json!(true)).unwrap_err().contains("decimal string"));
+    }
+
+    #[test]
+    fn hex_decoding_is_strict() {
+        assert_eq!(hex_bytes("00ff10").unwrap(), vec![0x00, 0xff, 0x10]);
+        assert_eq!(hex_bytes(" 0a ").unwrap(), vec![0x0a], "whitespace trimmed");
+        assert!(hex_bytes("abc").unwrap_err().contains("even length"));
+        assert!(hex_bytes("zz").unwrap_err().contains("bad hex at offset 0"));
+        assert!(hex_bytes("00qq").unwrap_err().contains("offset 2"));
+    }
+}

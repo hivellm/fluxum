@@ -166,9 +166,43 @@ module, stated honestly in the UI.
       ("nothing changed"), checkpoint at tx 41, backup+verify round-trip
       from the UI (2 files OK), then drain — state shutting_down and /rpc
       refusing 503 while the admin surface kept answering.
-- [ ] 1.8 Hardening: every mutating action audited; CSP with no external origins; dashboard e2e smoke against a live server (spawned like the SDK conformance runners)
+- [x] 1.8 Hardening (2026-07-27). **Audit**: a unit test pins the SEC-054
+      `is_mutating_route` inventory — every state-changing route the
+      dashboard drives (reducer, rows, drain, backup, checkpoint,
+      config/reload, plugin toggles, bans, session kills) asserts audited,
+      every read asserts not; a new mutating route that forgets the list
+      fails the test, not a security review. **CSP**: already pinned at
+      build time (no absolute URLs in the shell) and at runtime
+      (`default-src 'none'` header + meta), re-asserted by the smoke.
+      **E2e smoke** (`tests/console_e2e_smoke.rs`): spawns the REAL
+      `fluxum-server` binary (the conformance-runner pattern, off-default
+      ports, skip-loudly-if-unbuilt) and sweeps the whole console contract
+      over plain HTTP — shell+CSP+complete document, boot state, schema,
+      row edit → SQL round-trip, explain, reducer invoke, metrics,
+      sessions, ban/unban, checkpoint, backup create+verify, then drain
+      asserting /rpc 503 AND /health answering 503 (the load-balancer
+      leaves-rotation contract). Runs in ~0.6 s.
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)
-- [ ] 2.1 Update or create documentation covering the implementation (dashboard guide in docs/, SPEC addition/update for the console contract)
-- [ ] 2.2 Write tests covering the new behavior (route/auth tests, state/watch endpoints, e2e smoke)
-- [ ] 2.3 Run tests and confirm they pass
+- [x] 2.1 Docs (2026-07-27): `docs/CONSOLE.md` — the operator guide (every
+      view, auth posture, security model, known limits stated where they
+      bite). SPEC-024 updated additively: DEV-033..036 specify the
+      dashboard capability areas, the `POST /rows` commit contract, the
+      additive ops endpoints, and the self-containment/audit/e2e-smoke
+      hardening; the "no row edits" non-goal rewritten to what phase8
+      actually shipped (user-directed scalar edits through the TxPipeline;
+      runtime CREATE TABLE and structured-column writes stay out).
+- [x] 2.2 Tests: unit (route resolution, shell assembly/self-containment/
+      view inventory, SEC-054 audit inventory), integration (console
+      routes+auth+watch, /rows, sessions listing with subscriptions+queue,
+      backup create/verify/tamper over HTTP), and the spawned-binary e2e
+      smoke sweeping the full console contract. Browser-level flows
+      verified per increment against the release binary (Playwright).
+- [ ] 2.3 Full fluxum-core + fluxum-server suites green (0 failing
+      suites); fmt + clippy --all-features + codespell clean. **Coverage
+      gate open**: 89.49% lines (gate command of record, PG + STDB drivers
+      live, 2026-07-27) vs the 90% floor — the phase8 surface pulled it
+      under (standing was 90.13%). Remediation so far: `admin/rows.rs`
+      41% → 93.5% via the converter unit suite; next: the `admin.rs`
+      error/guard arms (~123 missed lines) and a re-run. The task stays
+      unarchived until the floor holds.
