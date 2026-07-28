@@ -37,7 +37,13 @@ fluxum_core::schema::inventory::submit! {
 // --- Tables -----------------------------------------------------------------
 
 /// A chat message. Public: every subscriber sees every message.
-#[fluxum::table(public)]
+///
+/// Partitioned by `channel` (SHD-012): on a multi-shard deployment rows
+/// spread by channel and session affinity follows — which is what lets a
+/// TST-112 sharded soak actually load every shard instead of parking the
+/// whole demo on shard 0 (the T7.7 load-spread caveat). On a single shard
+/// the attribute is routing metadata with no behavior change.
+#[fluxum::table(public, partition_by(channel))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatMessage {
     /// Server-assigned message id.

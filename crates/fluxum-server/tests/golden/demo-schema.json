@@ -102,7 +102,7 @@
       ],
       "indexes": [],
       "name": "ChatMessage",
-      "partition_by": null,
+      "partition_by": "channel",
       "primary_key": [
         0
       ],

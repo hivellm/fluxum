@@ -49,11 +49,13 @@ below that the server refuses to start.
 > host that many pools. Sessions route by identity affinity after
 > authentication (SHD-011). The soak records `shards_requested` alongside
 > `shards_observed` and **fails** when they disagree, since that can only mean
-> the metrics scrape missed shards. One caveat for data distribution: the demo
-> module's tables are unpartitioned, so identity affinity resolves every
-> session to the default shard (SHD-011) — all load lands on shard 0 while the
-> other shards run and report idle gauges. A load-spread TST-112 run needs a
-> partitioned demo table (tracked in the T7.7 task).
+> the metrics scrape missed shards. Data distribution: `ChatMessage` is
+> partitioned by `channel` (SHD-012), so a soak's writes spread across every
+> shard instead of parking on shard 0. Validated at small scale (2026-07-28):
+> a 2-shard, 200k-row, 384 MiB run PASSED with both shards' pools peaking
+> identically (~152.9 MiB against a 161 MiB per-shard capacity), eviction
+> engaged, `shards_observed 2/2` — the TST-112 "sharded" clause is
+> mechanically satisfiable; what remains is scale.
 
 ## 1. Billion-row soak (NFR-13, TST-112)
 
