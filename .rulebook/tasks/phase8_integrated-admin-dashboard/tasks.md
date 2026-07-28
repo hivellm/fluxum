@@ -198,11 +198,15 @@ module, stated honestly in the UI.
       backup create/verify/tamper over HTTP), and the spawned-binary e2e
       smoke sweeping the full console contract. Browser-level flows
       verified per increment against the release binary (Playwright).
-- [ ] 2.3 Full fluxum-core + fluxum-server suites green (0 failing
+- [x] 2.3 Full fluxum-core + fluxum-server suites green (0 failing
       suites); fmt + clippy --all-features + codespell clean. **Coverage
-      gate open**: 89.49% lines (gate command of record, PG + STDB drivers
-      live, 2026-07-27) vs the 90% floor — the phase8 surface pulled it
-      under (standing was 90.13%). Remediation so far: `admin/rows.rs`
-      41% → 93.5% via the converter unit suite; next: the `admin.rs`
-      error/guard arms (~123 missed lines) and a re-run. The task stays
-      unarchived until the floor holds.
+      floor recovered: 90.01% lines** (2026-07-28, gate command of
+      record, PG + STDB drivers live) after dipping to 89.49% under the
+      phase8 surface. Recovery was behavior suites, never padding:
+      `/rows` converter 41→93.5%, admin dispatch arms
+      (`tests/admin_arms.rs` — audit pk coercion across every key type,
+      ops refusals, reducer policing, health lifecycle, FTS schema
+      render), demo reducers (`tests/demo_reducers.rs` — move_player
+      spawn/move/clamp + validations), the full metrics exposition
+      (112→3 missed), config validate() refusals (63→5), and the CLI
+      dispatch arms (95→~45). Standing recorded in docs/COVERAGE.md.

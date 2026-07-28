@@ -5,8 +5,23 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.13% lines** — 2026-07-26, gate command below (PG + SpacetimeDB
-drivers live), after phase7_csharp-sdk (T7.6, completing the FIVE-SDK set): the Rust
+**Current standing:** **90.01% lines** — 2026-07-28, gate command below (PG + SpacetimeDB
+drivers live), after phase8_integrated-admin-dashboard + the chat-latency and MMO samples.
+The dashboard surface (console views, `POST /rows`, `POST /backup`, richer `/sessions`,
+the demo module's `Player`/`move_player`) initially pulled the standing to 89.49%; the
+floor was recovered with behavior suites, each pinning a named diagnostic: the `/rows`
+JSON→RowValue converter (41%→93.5%: every scalar arm, narrowing errors, Option/List
+recursion, decimal/hex parsers), the admin dispatch arms (`tests/admin_arms.rs`: audit pk
+coercion across every supported key type on one composite key, checkpoint/backup/sessions/
+bans refusals, reducer argument policing, `/health` lifecycle statuses, `/schema` FTS
+rendering), the demo reducers (`tests/demo_reducers.rs`: move_player spawn/move/clamp,
+chat/task validations), the full metrics exposition (`fluxum-core/tests/metrics_render.rs`:
+every reason label + the replication-peer and CDC-sink conditional blocks, 112→3 missed),
+the config `validate()` refusals (63→5), and the CLI dispatch arms
+(`fluxum-cli/tests/cli_dispatch_arms.rs`, 95→~45). Measured as one accumulated profdata:
+the full-workspace gate run plus the new suites merged via `cargo llvm-cov --no-report`
+(no production code changed between runs — only tests were added). Prior: 90.13% —
+2026-07-26, after phase7_csharp-sdk (T7.6, completing the FIVE-SDK set): the Rust
 surface grew only by `generate/csharp.rs` (the `fluxum generate --lang csharp` codegen),
 covered by its emit/determinism/unmodelled-type unit tests — the SDK itself is C# (out of
 the Rust llvm-cov scope; validated by its own 13-test xUnit suite, 11 conformance

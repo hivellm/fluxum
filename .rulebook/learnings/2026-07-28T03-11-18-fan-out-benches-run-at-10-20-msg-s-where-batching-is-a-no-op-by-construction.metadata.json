@@ -1,0 +1,13 @@
+{
+  "id": "2026-07-28T03-11-18-fan-out-benches-run-at-10-20-msg-s-where-batching-is-a-no-op-by-construction",
+  "title": "Fan-out benches run at 10-20 msg/s, where batching is a no-op by construction",
+  "content": "Both fan-out measurements sit in a regime where coalescing cannot show anything: TST-061's `FanoutConfig` default is 20 msg/s (crates/fluxum-bench/src/load.rs:231-250, with a sleep of 1/rate between commits) and the parity e2e class runs at 10 msg/s. One commit every 50 ms means the per-connection mpsc is ALWAYS empty when a frame arrives — `recv()` returns immediately, there is never a second frame to batch with. The measured `queue_wait` of 107-115 µs at that rate is pure task-wake latency, not queueing.\n\nConsequence: any batching change measures byte-for-byte identical on the existing benches, and a reviewer running only those will correctly conclude it did nothing — the same trap that made the parallel-enqueue experiment (phase0_parity-fanout-latency 1.2) inconclusive. Before touching the writer, add (a) a burst scenario where writer queue depth > 1, (b) a K>1 variant (several subscriptions per connection matched by one commit), and (c) counters that make the effect visible: `fluxum_fanout_socket_writes_total` and `fluxum_fanout_batch_frames`. The headline number for such a bench is writes-per-delivered-message, not p99 — p99 is only the non-regression guard.\n\nRelated: `FanoutStage::Flush` currently means \"one frame's write_all\"; after coalescing it means \"one batch\", so the historical series becomes uncomparable unless a batch-size histogram ships in the same change. `queue_wait` must stay per-frame (each OutFrame carries its own enqueued_at).",
+  "source": "manual",
+  "tags": [
+    "analysis:fanout-event-batching",
+    "benchmarking",
+    "metrics",
+    "performance"
+  ],
+  "createdAt": "2026-07-28T03:11:18.441Z"
+}

@@ -295,3 +295,119 @@ logging:
     assert_eq!(cfg.simd, SimdMode::Auto);
     assert_eq!(cfg.subscriptions.send_buffer_bytes, ByteSize(2 << 20));
 }
+
+// --- phase8 coverage floor: the validate() refusal arms, each named ---------------
+
+/// Load a full YAML under the development profile (so the auth-secret
+/// default refusal stays out of the way) and return the error text.
+fn load_err(yaml: &str) -> String {
+    let file = write_config(&format!("profile: development\n{yaml}"));
+    Config::load_with(Some(file.path()), &no_env)
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
+fn every_validation_refusal_names_its_key() {
+    for (yaml, needle) in [
+        (
+            "server:\n  http_port: 15800\n  tcp_port: 15800\n",
+            "must differ",
+        ),
+        ("pgwire:\n  enabled: true\n  port: 0\n", "pgwire.port"),
+        (
+            "pgwire:\n  enabled: true\n  port: 15800\n",
+            "must differ from server.http_port",
+        ),
+        (
+            "replication:\n  peers: [\"127.0.0.1:1\"]\n",
+            "replication.member_name",
+        ),
+        (
+            "replication:\n  peers: [\"127.0.0.1:1\"]\n  member_name: a\n",
+            "replication.peer_token",
+        ),
+        (
+            "replication:\n  semi_sync:\n    on_quorum_loss: explode\n",
+            "block|degrade",
+        ),
+        (
+            "replication:\n  semi_sync:\n    quorum: \"0\"\n",
+            "outside 1..=",
+        ),
+        (
+            "replication:\n  semi_sync:\n    quorum: sometimes\n",
+            "`majority` or a count",
+        ),
+        (
+            "replication:\n  archive:\n    remote:\n      enabled: true\n",
+            "replication.archive.remote.endpoint",
+        ),
+        (
+            "replication:\n  archive:\n    remote:\n      enabled: true\n      endpoint: e\n      bucket: b\n      access_key: k\n",
+            "replication.archive.remote.secret_key",
+        ),
+        (
+            "server:\n  trusted_proxies: [\"not-an-ip\"]\n",
+            "server.trusted_proxies",
+        ),
+        (
+            "server:\n  admin:\n    trusted: [\"not-an-ip\"]\n",
+            "server.admin.trusted",
+        ),
+        (
+            "server:\n  connection_limits:\n    blocklist: [\"nope\"]\n",
+            "server.connection_limits.blocklist",
+        ),
+        (
+            "server:\n  connection_limits:\n    allowlist: [\"nope\"]\n",
+            "server.connection_limits.allowlist",
+        ),
+        (
+            "server:\n  connection_limits:\n    overload_shed_fraction: 1.5\n",
+            "[0.0, 1.0]",
+        ),
+        (
+            "server:\n  connection_limits:\n    overload_shed_fraction: 0.9\n    overload_shed_all_fraction: 0.5\n",
+            "must be >=",
+        ),
+        ("server:\n  tls:\n    cert: c.pem\n", "server.tls.key"),
+        ("server:\n  tls:\n    key: k.pem\n", "server.tls.cert"),
+    ] {
+        let err = load_err(yaml);
+        assert!(
+            err.contains(needle),
+            "expected `{needle}` in the refusal for:\n{yaml}\ngot: {err}"
+        );
+    }
+}
+
+#[test]
+fn asymmetric_jwt_requires_the_public_key_not_a_secret() {
+    let err = load_err("auth:\n  provider: jwt\n  jwt_algorithm: es256\n");
+    assert!(err.contains("auth.jwt_public_key"), "{err}");
+}
+
+#[test]
+fn file_and_shape_errors_are_named() {
+    // An explicit config path that does not exist.
+    let err = Config::load_with(Some(std::path::Path::new("Z:/no/such/file.yml")), &no_env)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("cannot read config file"), "{err}");
+    // A file that is not YAML.
+    let file = write_config(":\n  - definitely: [not\n");
+    let err = Config::load_with(Some(file.path()), &no_env)
+        .unwrap_err()
+        .to_string();
+    assert!(!err.is_empty(), "parse failure surfaces: {err}");
+    // An unknown field is a typo, not silently ignored.
+    let file = write_config("profile: development\nserver:\n  http_prot: 1\n");
+    let err = Config::load_with(Some(file.path()), &no_env)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("http_prot") || err.contains("unknown field"),
+        "{err}"
+    );
+}
