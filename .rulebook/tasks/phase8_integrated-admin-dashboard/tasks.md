@@ -103,7 +103,27 @@ module, stated honestly in the UI.
       the release binary with a configured `auth.server_peers` peer:
       send_chat(7, "…") invoked from the form, row confirmed by SQL, and
       the same invocation surfaced in the audit grid via the peer token.
-- [ ] 1.5 Sessions & subscriptions: connected-client list with queue/backpressure state, active queries, kick, bans/blocklist management (additive JSON endpoints where today CLI-only)
+- [x] 1.5 Sessions & subscriptions (2026-07-27). **Additive server surface**:
+      `GET /sessions` now attaches to each session its live subscription
+      queries (`query_id` + the plan's normalized SQL, via a new
+      `SubscriptionManager::subscriptions_by_connection`) and its
+      outbound-queue occupancy (`queued`/`capacity` from the ConnHandle
+      sink — SUB-042: near-full is a slow consumer about to be dropped);
+      gathered across every shard host (the `/metrics` pattern; namespace
+      sessions remain out, as the console serves the default database).
+      **Sessions view**: connected-client grid (session/identity prefixes,
+      connection, age, bound IP, queue occupancy, query count), row click →
+      typed detail incl. every subscription SQL, and a two-step **Kick**
+      (`DELETE /sessions/{id}`). **Bans panel**: `GET /bans` static +
+      runtime with remaining TTL, ban form (`POST /bans`, entry + optional
+      ttl), Unban per runtime row (`DELETE /bans/{entry}`, raw CIDR `/`
+      rides path-rejoin). Integration test: authenticate + SubscribeSingle
+      over real loopback HTTP, then assert the listing carries the
+      normalized SQL and queue fields. Browser e2e (Playwright) with the
+      served demo app as a live client: session appeared with 3
+      subscriptions + 0/1024 queue, detail modal, CIDR ban/unban round-trip,
+      and Kick terminated the session — the SDK's auto-reconnect then
+      minted a fresh one, proving both sides.
 - [ ] 1.6 Observability: metrics dashboards parsed from `/metrics`, `/logs` tail, audit-trail viewer with filters
 - [ ] 1.7 Ops: config view/edit + hot-reload apply, checkpoint trigger, drain, backup create/verify + PITR restore-point browser (incl. S3 archive), replication status/promote, namespaces + quotas
 - [ ] 1.8 Hardening: every mutating action audited; CSP with no external origins; dashboard e2e smoke against a live server (spawned like the SDK conformance runners)

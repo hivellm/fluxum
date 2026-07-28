@@ -208,6 +208,7 @@ mod tests {
             "view-data",
             "view-query",
             "view-reducers",
+            "view-sessions",
             "view-live",
             "view-logs",
             "view-metrics",

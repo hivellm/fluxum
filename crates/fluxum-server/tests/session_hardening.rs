@@ -23,7 +23,7 @@ use fluxum_core::schema::{
 use fluxum_core::store::MemStore;
 use fluxum_core::subscription::{SubscriptionLimits, SubscriptionManager};
 use fluxum_core::txn::{TxPipeline, TxPipelineOptions};
-use fluxum_protocol::{Authenticate, ClientMessage, FrameCodec};
+use fluxum_protocol::{Authenticate, ClientMessage, FrameCodec, SubscribeSingle};
 use fluxum_server::ShardContext;
 use fluxum_server::http::{self, CONTENT_TYPE, HttpOptions};
 use fluxum_server::session_sec::SessionPolicy;
@@ -451,6 +451,51 @@ async fn an_operator_can_list_and_terminate_sessions() {
     assert_eq!(
         admin(addr, "DELETE", "/sessions/deadbeef").await.status,
         404
+    );
+
+    server.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_listing_carries_subscriptions_and_queue_state() {
+    let (_ctx, server) = start(SessionConfig::default()).await;
+    let addr = server.local_addr;
+
+    let token = authenticate(addr, b"alice", None).await;
+
+    // Subscribe on the session, so the listing has a query to attribute.
+    let codec = FrameCodec::default();
+    let sub = codec
+        .encode(
+            &ClientMessage::SubscribeSingle(SubscribeSingle {
+                id: 2,
+                query: "SELECT * FROM Chat".into(),
+            })
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let resp = post(addr, &sub, &[("Fluxum-Session", &token)]).await;
+    assert_eq!(resp.status, 200, "subscribe ok: {}", resp.body);
+
+    let list = admin(addr, "GET", "/sessions").await;
+    assert_eq!(list.status, 200);
+    // The session entry carries its live queries (query id + normalized
+    // SQL) and its outbound-queue occupancy (SUB-042).
+    assert!(
+        list.body.contains("\"subscriptions\":[{"),
+        "subscriptions attached: {}",
+        list.body
+    );
+    assert!(
+        list.body.contains("SELECT * FROM Chat"),
+        "the plan's normalized SQL is listed: {}",
+        list.body
+    );
+    assert!(
+        list.body.contains("\"queue\":{") && list.body.contains("\"capacity\":"),
+        "queue occupancy attached: {}",
+        list.body
     );
 
     server.shutdown();

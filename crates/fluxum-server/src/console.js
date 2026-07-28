@@ -29,8 +29,8 @@ function toast(kind, msg) {
 
 // --- view switching ----------------------------------------------------------
 const VIEW_TITLES = { overview: "Overview", data: "Data", query: "Query",
-  reducers: "Reducers", live: "Live", logs: "Logs", metrics: "Metrics",
-  schema: "Schema", designer: "New table" };
+  reducers: "Reducers", sessions: "Sessions", live: "Live", logs: "Logs",
+  metrics: "Metrics", schema: "Schema", designer: "New table" };
 function showView(view) {
   document.querySelectorAll("nav.views button").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
   document.querySelectorAll(".view").forEach((s) => s.classList.toggle("on", s.id === "view-" + view));
@@ -39,6 +39,7 @@ function showView(view) {
   const active = document.querySelector("nav.views button.on svg");
   $("route-ic").innerHTML = active ? active.outerHTML : "";
   if (view === "overview") { renderOverview(); refreshOverview(); }
+  if (view === "sessions") { loadSessions(); loadBans(); }
   if (view === "metrics" && !metricRows.length) loadMetrics();
   if (view === "designer") renderDesigner();
 }
@@ -895,6 +896,123 @@ $("a-refresh").addEventListener("click", async () => {
     renderGrid(grid, ["tx", "time", "caller", "reducer", "change"], rows, null);
     note.textContent = p.count + " entr" + (p.count === 1 ? "y" : "ies");
   } catch (e) { note.textContent = String(e.message || e); }
+});
+
+// --- sessions & bans (SEC-053 directory, SUB-042 queues, SEC-033 bans) --------------
+function sessionCell(tr, text, mono) {
+  const cell = tr.insertCell();
+  cell.textContent = text;
+  if (mono === false) cell.style.fontFamily = "system-ui, sans-serif";
+  return cell;
+}
+async function loadSessions() {
+  const note = $("ss-note");
+  const grid = $("ss-grid");
+  try {
+    const p = await apiJson("/sessions");
+    const sessions = p.sessions || [];
+    $("ss-count").textContent = sessions.length + " session(s)";
+    grid.textContent = "";
+    note.textContent = sessions.length ? "" :
+      "no live HTTP sessions — clients appear here once they authenticate over /rpc";
+    if (!sessions.length) return;
+    const tbl = gridTable(["session", "identity", "connection", "age", "client ip", "queue", "subscriptions", ""]);
+    const tb = tbl.createTBody();
+    for (const s of sessions) {
+      const tr = tb.insertRow();
+      tr.className = "click";
+      tr.title = "click for details";
+      sessionCell(tr, (s.id || "").slice(0, 12) + "…");
+      sessionCell(tr, (s.identity || "").slice(0, 12) + "…");
+      sessionCell(tr, s.connection_id);
+      sessionCell(tr, fmtUp(s.age_secs || 0));
+      sessionCell(tr, s.client_ip || "–");
+      sessionCell(tr, s.queue ? s.queue.queued + " / " + s.queue.capacity : "–");
+      const subs = s.subscriptions || [];
+      sessionCell(tr, subs.length ? subs.length + " quer" + (subs.length === 1 ? "y" : "ies") : "none");
+      const actions = tr.insertCell();
+      const kick = dom("button", "btn sm danger", "Kick");
+      kick.addEventListener("click", async (e) => {
+        e.stopPropagation();
+        // Two-step confirm, like row delete.
+        if (kick.textContent === "Kick") { kick.textContent = "Confirm?"; return; }
+        try {
+          await apiJson("/sessions/" + encodeURIComponent(s.id), { method: "DELETE" });
+          toast("ok", "session terminated");
+          loadSessions();
+        } catch (err) { toast("err", String(err.message || err)); }
+      });
+      actions.appendChild(kick);
+      tr.addEventListener("click", () => openInspector("session", {
+        id: s.id,
+        identity: s.identity,
+        connection_id: s.connection_id,
+        age: fmtUp(s.age_secs || 0),
+        client_ip: s.client_ip || null,
+        queue: s.queue ? s.queue.queued + " / " + s.queue.capacity : null,
+        subscriptions: subs.length
+          ? subs.map((x) => "#" + x.query_id + " " + x.sql).join("  ·  ")
+          : null,
+      }));
+    }
+    grid.appendChild(tbl);
+  } catch (e) { grid.textContent = ""; note.textContent = String(e.message || e); }
+}
+$("ss-refresh").addEventListener("click", loadSessions);
+
+async function loadBans() {
+  const note = $("b-note");
+  const grid = $("b-grid");
+  try {
+    const p = await apiJson("/bans");
+    grid.textContent = "";
+    const statics = p.static || [];
+    const runtime = p.runtime || [];
+    note.textContent = (statics.length || runtime.length) ? "" : "no bans in force";
+    const tbl = gridTable(["entry", "kind", "expires", ""]);
+    const tb = tbl.createTBody();
+    for (const entry of statics) {
+      const tr = tb.insertRow();
+      sessionCell(tr, entry);
+      sessionCell(tr, "static (config blocklist)");
+      sessionCell(tr, "never — edit config + reload to lift");
+      tr.insertCell();
+    }
+    for (const ban of runtime) {
+      const tr = tb.insertRow();
+      sessionCell(tr, ban.entry);
+      sessionCell(tr, "runtime");
+      sessionCell(tr, ban.remaining_ttl_ms == null ? "no expiry"
+        : "in " + Math.ceil(ban.remaining_ttl_ms / 1000) + " s");
+      const actions = tr.insertCell();
+      const lift = dom("button", "btn sm ghost", "Unban");
+      lift.addEventListener("click", async () => {
+        try {
+          // A CIDR entry carries `/` — the server rejoins path segments, so
+          // the raw entry rides in the path unencoded.
+          await apiJson("/bans/" + ban.entry, { method: "DELETE" });
+          toast("ok", "unbanned " + ban.entry);
+          loadBans();
+        } catch (e) { toast("err", String(e.message || e)); }
+      });
+      actions.appendChild(lift);
+    }
+    if (statics.length || runtime.length) grid.appendChild(tbl);
+  } catch (e) { grid.textContent = ""; note.textContent = String(e.message || e); }
+}
+$("b-refresh").addEventListener("click", loadBans);
+$("b-ban").addEventListener("click", async () => {
+  const entry = $("b-entry").value.trim();
+  if (!entry) { $("b-note").textContent = "enter an IP or CIDR to ban"; return; }
+  const ttl = parseInt($("b-ttl").value, 10);
+  const body = { entry };
+  if (Number.isFinite(ttl) && ttl > 0) body.ttl_secs = ttl;
+  try {
+    await apiJson("/bans", { method: "POST", body: JSON.stringify(body) });
+    toast("ok", "banned " + entry);
+    $("b-entry").value = "";
+    loadBans();
+  } catch (e) { $("b-note").textContent = String(e.message || e); }
 });
 
 // --- NDJSON stream reader -----------------------------------------------------------

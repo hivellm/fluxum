@@ -59,6 +59,21 @@ impl ConnectionRegistry {
         self.handles.lock().await.remove(&connection_id);
     }
 
+    /// Outbound-queue occupancy per live connection, for the SEC-053 admin
+    /// session listing: `(connection, queued frames, queue capacity)`. A
+    /// queue near capacity is a slow consumer approaching the SUB-042 drop.
+    pub async fn queue_depths(&self) -> Vec<(u128, usize, usize)> {
+        let guard = self.handles.lock().await;
+        guard
+            .iter()
+            .map(|(connection, handle)| {
+                let capacity = handle.sink.max_capacity();
+                let queued = capacity.saturating_sub(handle.sink.capacity());
+                (*connection, queued, capacity)
+            })
+            .collect()
+    }
+
     /// Handles for a set of subscriber ids (fan-out targets).
     pub(crate) async fn handles_for(&self, connections: &[u128]) -> Vec<(u128, ConnHandle)> {
         let guard = self.handles.lock().await;

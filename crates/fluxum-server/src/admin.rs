@@ -34,6 +34,7 @@
 //! `/metrics` stay ungated when `server.admin.open_health_metrics`. Admin
 //! reducer calls additionally honor `client_callable` (SEC-055).
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -292,7 +293,7 @@ pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminRe
         // The entry may itself contain `/` (a CIDR block), so everything
         // after `/bans/` is rejoined into one entry.
         ("DELETE", ["bans", entry @ ..]) if !entry.is_empty() => ban_delete(ctx, &entry.join("/")),
-        ("GET", ["sessions"]) => sessions_list(ctx),
+        ("GET", ["sessions"]) => sessions_list(ctx).await,
         ("DELETE", ["sessions"]) => sessions_terminate_query(ctx, path),
         ("DELETE", ["sessions", id]) => sessions_terminate(ctx, id),
         _ => AdminResponse::err(404, None, "not found"),
@@ -406,16 +407,55 @@ async fn checkpoint_now(ctx: &Arc<ShardContext>) -> AdminResponse {
 // --- /sessions (SPEC-026 SEC-053: session revocation) ----------------------------
 
 /// `GET /sessions`: every live HTTP session — id, identity, connection,
-/// age, bound IP — never any token material.
-fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
+/// age, bound IP — never any token material. Each entry additionally
+/// carries its live subscription queries (query id + normalized SQL) and
+/// its outbound-queue occupancy (SUB-042: queued/capacity — near-full is a
+/// slow consumer about to be dropped). Per-connection state lives on the
+/// shard the session bound to, so a multi-shard deployment gathers across
+/// every host (the `/metrics` pattern).
+async fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
     let Some(admin) = ctx.session_admin() else {
         // A TCP-only / embedded assembly has no HTTP session directory.
         return AdminResponse::ok(None, json!({ "sessions": [] }));
     };
+    let hosts: Vec<Arc<ShardContext>> = match ctx.coord() {
+        Some(coord) => coord
+            .shard_ids()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|s| coord.host(s).cloned())
+            .collect(),
+        None => vec![Arc::clone(ctx)],
+    };
+    let mut subs: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut queues: HashMap<String, (usize, usize)> = HashMap::new();
+    for host in &hosts {
+        let listing = host
+            .subscriptions
+            .lock()
+            .await
+            .subscriptions_by_connection();
+        for (connection, query_id, sql) in listing {
+            subs.entry(connection.to_string())
+                .or_default()
+                .push(json!({ "query_id": query_id, "sql": sql }));
+        }
+        for (connection, queued, capacity) in host.connections.queue_depths().await {
+            queues.insert(connection.to_string(), (queued, capacity));
+        }
+    }
     let sessions: Vec<Value> = admin
         .list()
         .iter()
-        .map(crate::SessionInfo::to_json)
+        .map(|info| {
+            let mut entry = info.to_json();
+            entry["subscriptions"] =
+                Value::Array(subs.remove(&info.connection_id).unwrap_or_default());
+            if let Some((queued, capacity)) = queues.get(&info.connection_id) {
+                entry["queue"] = json!({ "queued": queued, "capacity": capacity });
+            }
+            entry
+        })
         .collect();
     AdminResponse::ok(None, json!({ "sessions": sessions }))
 }

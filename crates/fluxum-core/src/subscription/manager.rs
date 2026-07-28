@@ -339,6 +339,25 @@ impl SubscriptionManager {
         self.connections.get(&connection).map_or(0, HashMap::len)
     }
 
+    /// Every live subscription as `(connection, query_id, normalized SQL)`,
+    /// sorted — the SEC-053 admin session listing joins these onto its
+    /// directory. Metadata only: the plan's normalized text, never rows.
+    pub fn subscriptions_by_connection(&self) -> Vec<(u128, u32, String)> {
+        let mut out = Vec::new();
+        for (connection, handles) in &self.connections {
+            for (query_id, hash) in handles {
+                let sql = self
+                    .queries
+                    .get(hash)
+                    .map(|q| q.plan.normalized.clone())
+                    .unwrap_or_default();
+                out.push((*connection, *query_id, sql));
+            }
+        }
+        out.sort();
+        out
+    }
+
     /// Register one subscription `sql` for `connection` on behalf of
     /// `subscriber` (SUB-001/002/020/030/044): compile, enforce the
     /// public-table and admission policies, dedup (or reuse) the plan under

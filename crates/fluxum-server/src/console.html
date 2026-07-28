@@ -317,6 +317,7 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
     <button data-view="data"><svg class="ic" viewBox="0 0 24 24"><path d="M3 5h18v14H3z"/><path d="M3 10h18M9 10v9"/></svg>Data</button>
     <button data-view="query"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>Query</button>
     <button data-view="reducers"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 5 4-5 4V8"/></svg>Reducers</button>
+    <button data-view="sessions"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a7 7 0 0 1 14 0v2M19 8v6M22 11h-6"/></svg>Sessions</button>
     <button data-view="live"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12h4l3-8 4 16 3-8h6"/></svg>Live</button>
     <button data-view="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Logs</button>
     <button data-view="metrics"><svg class="ic" viewBox="0 0 24 24"><path d="M3 21V3M3 21h18"/><path d="m7 15 4-6 3 3 5-8"/></svg>Metrics</button>
@@ -396,6 +397,28 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
         </h3>
         <div class="muted" id="a-note"></div>
         <div id="a-grid" style="overflow-x:auto"></div>
+      </div>
+    </section>
+    <section class="view" id="view-sessions">
+      <div class="card rpane">
+        <h3>Connected clients
+          <span class="mut2" id="ss-count"></span>
+          <span class="spacer"></span>
+          <button class="btn sm" id="ss-refresh"><svg class="ic sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>Refresh</button>
+        </h3>
+        <div class="muted" id="ss-note"></div>
+        <div id="ss-grid" style="overflow-x:auto"></div>
+      </div>
+      <div class="card rpane">
+        <h3>Bans &amp; blocklist
+          <span class="spacer"></span>
+          <input type="text" id="b-entry" placeholder="IP or CIDR" size="16" style="font-family:var(--mono)">
+          <input type="text" id="b-ttl" placeholder="ttl s" size="5">
+          <button class="btn sm danger" id="b-ban">Ban</button>
+          <button class="btn sm" id="b-refresh"><svg class="ic sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>Refresh</button>
+        </h3>
+        <div class="muted" id="b-note"></div>
+        <div id="b-grid" style="overflow-x:auto"></div>
       </div>
     </section>
     <section class="view" id="view-live">
