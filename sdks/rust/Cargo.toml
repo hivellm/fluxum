@@ -18,11 +18,18 @@ exclude = ["data/"]
 # `crates/fluxum-protocol` (see that module's docs) so this crate publishes on
 # its own, without releasing an internal server crate to crates.io alongside it.
 [dependencies]
+# RPC-008 stream decompression, only under the `compression` feature — the
+# default client stays zero-extra-dep and simply never negotiates gzip.
+flate2 = { workspace = true, optional = true }
 rmp-serde.workspace = true
 serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true
 thunder-rpc.workspace = true
+
+[features]
+# Opt into negotiating the RPC-008 gzip stream (WirePreferences::compression).
+compression = ["dep:flate2"]
 
 # Test-only: the conformance runner (tests/conformance.rs) reads the shared
 # JSON corpus (tests/conformance/ at the repo root). Not a runtime dependency

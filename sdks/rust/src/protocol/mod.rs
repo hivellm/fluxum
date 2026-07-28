@@ -38,6 +38,8 @@
 //! (SPEC-016), not something a client speaks.
 
 pub mod codes;
+#[cfg(feature = "compression")]
+pub mod compress;
 pub mod fluxbin;
 pub mod frame;
 pub mod messages;

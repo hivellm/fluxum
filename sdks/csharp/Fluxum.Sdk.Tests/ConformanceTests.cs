@@ -273,8 +273,11 @@ public class ConformanceTests
                     byte[] token = body.TryGetProperty("token", out var tok) && tok.ValueKind != JsonValueKind.Null
                         ? System.Text.Encoding.UTF8.GetBytes(tok.GetString()!)
                         : Array.Empty<byte>();
+                    // RPC-035: the light-updates scenario negotiates TxUpdateLight.
+                    bool light = body.TryGetProperty("light_updates", out var lightProp)
+                        && lightProp.ValueKind == JsonValueKind.True;
                     using (var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)))
-                        _clients[name] = await Connection.ConnectAsync(_srv.TcpUrl, token, TableSchemas(), cts.Token);
+                        _clients[name] = await Connection.ConnectAsync(_srv.TcpUrl, token, TableSchemas(), light, cts.Token);
                     break;
                 case "close":
                     await Client(body.GetProperty("client")).CloseAsync();

@@ -127,6 +127,9 @@ public sealed class Connection : IAsyncDisposable
     private readonly byte[] _token;
     private readonly Dictionary<string, TableSchema> _schemas;
     private readonly Cache _cache;
+    // RPC-035: negotiate TxUpdateLight broadcasts (provenance stripped, row
+    // diffs + resume cursor kept); re-applied on every reconnect.
+    private readonly bool _lightUpdates;
 
     private TcpClient? _tcp;
     private NetworkStream? _stream;
@@ -139,11 +142,12 @@ public sealed class Connection : IAsyncDisposable
     private volatile bool _closed;
     private Task? _readerTask;
 
-    private Connection(string host, int port, byte[] token, IEnumerable<TableSchema> tables)
+    private Connection(string host, int port, byte[] token, IEnumerable<TableSchema> tables, bool lightUpdates)
     {
         _host = host;
         _port = port;
         _token = token;
+        _lightUpdates = lightUpdates;
         _schemas = new();
         foreach (var t in tables) _schemas[t.Name] = t;
         _cache = new Cache(_schemas.Values);
@@ -154,10 +158,16 @@ public sealed class Connection : IAsyncDisposable
 
     /// <summary>Open and authenticate a session. <paramref name="url"/> is
     /// <c>fluxum://host:port</c> or a bare <c>host:port</c> (TCP).</summary>
-    public static async Task<Connection> ConnectAsync(string url, byte[] token, IEnumerable<TableSchema> tables, CancellationToken ct = default)
+    public static Task<Connection> ConnectAsync(string url, byte[] token, IEnumerable<TableSchema> tables, CancellationToken ct = default)
+        => ConnectAsync(url, token, tables, lightUpdates: false, ct);
+
+    /// <summary><see cref="ConnectAsync(string, byte[], IEnumerable{TableSchema}, CancellationToken)"/>
+    /// with the RPC-035 negotiation: <paramref name="lightUpdates"/> asks for
+    /// <c>TxUpdateLight</c> broadcasts.</summary>
+    public static async Task<Connection> ConnectAsync(string url, byte[] token, IEnumerable<TableSchema> tables, bool lightUpdates, CancellationToken ct = default)
     {
         var (host, port) = ParseUrl(url);
-        var conn = new Connection(host, port, token, tables);
+        var conn = new Connection(host, port, token, tables, lightUpdates);
         await conn.EstablishAsync(ct).ConfigureAwait(false);
         conn._readerTask = Task.Run(conn.ReadLoopAsync);
         return conn;
@@ -184,8 +194,10 @@ public sealed class Connection : IAsyncDisposable
         _stream = tcp.GetStream();
         _frames = new();
 
+        // Payload: [id, token, compression, tx_updates, namespace].
         int authId = AllocId();
-        await SendRawAsync("Authenticate", new List<object?> { authId, _token, null, null, null }, ct).ConfigureAwait(false);
+        object? txUpdates = _lightUpdates ? "light" : null;
+        await SendRawAsync("Authenticate", new List<object?> { authId, _token, null, txUpdates, null }, ct).ConfigureAwait(false);
         while (true)
         {
             var msg = await ReadInlineAsync(ct).ConfigureAwait(false);
@@ -260,7 +272,7 @@ public sealed class Connection : IAsyncDisposable
 
     private void Route(ServerMessage msg)
     {
-        if (msg.Tag == "TxUpdate") { ApplyTxUpdate(msg); return; }
+        if (msg.Tag is "TxUpdate" or "TxUpdateLight") { ApplyTxUpdate(msg); return; }
         int id = MsgId(msg);
         if (id >= 0 && _pending.TryGetValue(id, out var ch)) ch.Writer.TryWrite(msg);
     }
@@ -330,7 +342,7 @@ public sealed class Connection : IAsyncDisposable
         {
             var msg = await ReadInlineAsync(ct).ConfigureAwait(false);
             if (msg.Tag == "Error" && MsgId(msg) == id) throw ErrorFrom(msg);
-            if (msg.Tag == "TxUpdate") { ApplyTxUpdate(msg); continue; }
+            if (msg.Tag is "TxUpdate" or "TxUpdateLight") { ApplyTxUpdate(msg); continue; }
             if (msg.Tag != "InitialData" || Protocol.ToInt(msg.Payload[0]) != id) continue;
             queryIds.AddRange(ApplyInitialData(msg));
         }
@@ -379,9 +391,13 @@ public sealed class Connection : IAsyncDisposable
         throw new FluxumException(0, $"unexpected reply to reducer call: {msg.Tag}");
     }
 
+    // Handles both broadcast forms: the enriched TxUpdate carries tables at
+    // index 5; the RPC-035 TxUpdateLight ([tx_id, timestamp, tables,
+    // shard_id, tx_offset]) at index 2 — same row diffs, provenance stripped.
     private void ApplyTxUpdate(ServerMessage msg)
     {
-        if (msg.Payload.Count < 6 || msg.Payload[5] is not List<object?> tables) return;
+        int tablesAt = msg.Tag == "TxUpdateLight" ? 2 : 5;
+        if (msg.Payload.Count <= tablesAt || msg.Payload[tablesAt] is not List<object?> tables) return;
         lock (_cache.Lock)
             foreach (var entry in tables)
             {

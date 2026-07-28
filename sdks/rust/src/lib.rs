@@ -38,7 +38,7 @@ pub mod resume;
 pub use cache::{RowCache, RowEvent, TableDiff, TableSchema, TableSnapshot};
 pub use client::{
     Connection, Error as ClientError, PendingReducer, ReconnectPolicy, RejectedListener,
-    RowListener,
+    RowListener, WirePreferences,
 };
 pub use idempotency::{OfflineQueue, QueueSnapshot, QueuedCall};
 pub use optimistic::{OptimisticOp, OptimisticStore, SyncedCache};

@@ -1,0 +1,27 @@
+{
+  "name": "light-updates",
+  "description": "RPC-035 tx_updates:light — a light session receives TxUpdateLight broadcasts that apply identically to the enriched form: two subscribers to one query, one full and one light, converge to the same rows whichever side commits.",
+  "steps": [
+    { "connect": { "client": "full", "token": "full" } },
+    { "connect": { "client": "lite", "token": "lite", "light_updates": true } },
+    { "subscribe": { "client": "full", "queries": ["SELECT * FROM ChatMessage"] } },
+    { "subscribe": { "client": "lite", "queries": ["SELECT * FROM ChatMessage"] } },
+
+    { "call": { "client": "full", "reducer": "send_chat", "args": [7, "from the enriched side"] } },
+    { "await_row": { "client": "full", "table": "ChatMessage", "where": { "id": "1", "content": "from the enriched side" } } },
+    { "await_row": { "client": "lite", "table": "ChatMessage", "where": { "id": "1", "content": "from the enriched side" } } },
+
+    { "call": { "client": "lite", "reducer": "send_chat", "args": [7, "from the light side"] } },
+    { "await_row": { "client": "full", "table": "ChatMessage", "where": { "id": "2", "content": "from the light side" } } },
+    { "await_row": { "client": "lite", "table": "ChatMessage", "where": { "id": "2", "content": "from the light side" } } },
+
+    { "expect_cache": { "client": "lite", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:full", "channel": 7, "content": "from the enriched side", "sent_at": "*" },
+      { "id": "2", "sender": "$identity:lite", "channel": 7, "content": "from the light side", "sent_at": "*" }
+    ] } },
+    { "expect_cache": { "client": "full", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:full", "channel": 7, "content": "from the enriched side", "sent_at": "*" },
+      { "id": "2", "sender": "$identity:lite", "channel": 7, "content": "from the light side", "sent_at": "*" }
+    ] } }
+  ]
+}

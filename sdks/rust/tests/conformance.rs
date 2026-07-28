@@ -407,7 +407,26 @@ fn run_step(session: &mut Session<'_>, step: &Value) {
                 .unwrap_or_default();
             let schemas = session.schemas();
             let url = session.transport.url(&session.server);
-            let conn = Connection::connect(&url, &token, schemas).expect("connect");
+            // RPC-035: the light-updates scenario negotiates TxUpdateLight.
+            let light = body
+                .get("light_updates")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let conn = if light {
+                fluxum_sdk::Connection::connect_wire(
+                    &url,
+                    &token,
+                    schemas,
+                    fluxum_sdk::ReconnectPolicy::default(),
+                    fluxum_sdk::WirePreferences {
+                        light_updates: true,
+                        compression: false,
+                    },
+                )
+                .expect("connect (light)")
+            } else {
+                Connection::connect(&url, &token, schemas).expect("connect")
+            };
             session.clients.insert(name, conn);
         }
         "close" => {

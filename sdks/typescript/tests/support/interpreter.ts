@@ -48,7 +48,11 @@ export interface RunnerHooks {
    * cache hooks and token; the environment supplies the URL (a spawned
    * server's address in Node, `location.origin` in a page).
    */
-  connect(options: { tables: TableSchema[]; token?: Uint8Array }): Promise<FluxumClient>;
+  connect(options: {
+    tables: TableSchema[];
+    token?: Uint8Array;
+    lightUpdates?: boolean;
+  }): Promise<FluxumClient>;
   /**
    * Crash-and-recover the scenario's server (same ports, same data dir).
    * Only Node can do this; the Chromium driver intercepts `restart_server`
@@ -184,6 +188,8 @@ export class ScenarioRunner {
           await this.#hooks.connect({
             tables: this.tableSchemas(),
             ...(token === undefined ? {} : { token: new TextEncoder().encode(String(token)) }),
+            // RPC-035: the light-updates scenario negotiates TxUpdateLight.
+            ...(body['light_updates'] === true ? { lightUpdates: true } : {}),
           }),
         );
         return;

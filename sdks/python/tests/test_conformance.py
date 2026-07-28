@@ -120,7 +120,11 @@ class Interpreter:
         token = body.get("token")
         token_bytes = b"" if token is None else str(token).encode("utf-8")
         self._clients[name] = await Connection.connect(
-            self._server.tcp_url, token_bytes, self._table_schemas()
+            self._server.tcp_url,
+            token_bytes,
+            self._table_schemas(),
+            # RPC-035: the light-updates scenario negotiates TxUpdateLight.
+            light_updates=bool(body.get("light_updates", False)),
         )
 
     async def _step_close(self, body) -> None:

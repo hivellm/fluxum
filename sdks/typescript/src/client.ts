@@ -114,6 +114,14 @@ export interface FluxumClientOptions {
   /** Reconnect tuning, or `false` to fail instead of retrying. */
   reconnect?: BackoffOptions | false;
   /**
+   * Negotiate RPC-035 `TxUpdateLight` broadcasts: commit provenance
+   * (reducer name, caller, duration) stripped, row diffs and the resume
+   * cursor kept. Own-call attribution via `caller` never fires in this
+   * mode; optimistic overlays still drop on `ReducerResult`. Re-applied on
+   * every reconnect.
+   */
+  lightUpdates?: boolean;
+  /**
    * Durable local persistence (SPEC-021 CS-040/CS-041), opt-in: subscribed
    * rows and the offline mutation queue are written through to `backend`
    * under `(url, clientId)`, and a reload hydrates from it — the cache
@@ -617,11 +625,12 @@ export class FluxumClient {
       if (!this.#closed) this.#onDisconnected(reason);
     });
 
+    // Payload: [id, token, compression, tx_updates, namespace] (RPC-020).
     const auth = await this.#request('Authenticate', (id) => [
       id,
       this.#options.token ?? new Uint8Array(0),
       null,
-      null,
+      this.#options.lightUpdates ? 'light' : null,
       null,
     ]);
     const identity = auth.payload[1];
@@ -873,6 +882,16 @@ export class FluxumClient {
             [...this.#toDiffsByQuery(message.payload[5]).entries()],
             own ? String(message.payload[2] ?? '') : null,
           ),
+        );
+        void this.#persistState();
+        return;
+      }
+      case 'TxUpdateLight': {
+        // RPC-035: [tx_id, timestamp, tables, shard_id, tx_offset] — the
+        // same row diffs with provenance stripped, so own-call attribution
+        // never fires here (by design; the overlay drops on ReducerResult).
+        this.#dispatch(
+          this.#cache.applyTx([...this.#toDiffsByQuery(message.payload[2]).entries()], null),
         );
         void this.#persistState();
         return;

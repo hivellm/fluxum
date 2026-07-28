@@ -1092,6 +1092,7 @@ dependencies = [
 name = "fluxum-sdk"
 version = "0.2.0"
 dependencies = [
+ "flate2",
  "rmp-serde",
  "serde",
  "serde_bytes",

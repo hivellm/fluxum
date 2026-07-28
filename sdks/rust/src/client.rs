@@ -119,6 +119,23 @@ impl From<ErrorMessage> for Error {
     }
 }
 
+/// Wire options to negotiate at `Authenticate` (RPC-008/RPC-035), opt-in
+/// and re-applied on every reconnect. The server's `AuthResult` echo is
+/// authoritative: the client arms its decompressor and its update-form
+/// expectations off the echo alone, never off this request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WirePreferences {
+    /// Ask for `TxUpdateLight` broadcasts (RPC-035): commit provenance
+    /// (reducer name, caller, duration) stripped, row diffs and the resume
+    /// cursor kept. Own-call attribution via `TxUpdate.caller` is
+    /// unavailable in this mode by design.
+    pub light_updates: bool,
+    /// Ask for the RPC-008 gzip push stream. Requires the `compression`
+    /// cargo feature and the TCP transport (`fluxum://`); refused at
+    /// connect time otherwise.
+    pub compression: bool,
+}
+
 /// How the client re-establishes a dropped session (SDK-047): exponential
 /// backoff with jitter, on by default.
 #[derive(Debug, Clone)]
@@ -304,6 +321,8 @@ struct Shared {
     hydrated_identity: Mutex<Option<[u8; 32]>>,
     /// The 32-byte identity the server derived for this session (SPEC-009).
     identity: Mutex<[u8; 32]>,
+    /// The wire options to negotiate on every `Authenticate` (RPC-008/035).
+    wire: WirePreferences,
     /// The write half of the current session. `None` while disconnected, so
     /// sends fail fast instead of writing into a dead session.
     writer: Mutex<Option<WriteHalf>>,
@@ -368,8 +387,8 @@ impl Shared {
         let auth = crate::protocol::Authenticate {
             id,
             token: self.token.clone(),
-            compression: None,
-            tx_updates: None,
+            compression: self.wire.compression.then(|| "gzip".to_string()),
+            tx_updates: self.wire.light_updates.then(|| "light".to_string()),
             namespace: None,
         };
         (id, ClientMessage::Authenticate(auth))
@@ -415,7 +434,30 @@ impl Connection {
         schemas: impl IntoIterator<Item = TableSchema>,
         policy: ReconnectPolicy,
     ) -> Result<Self, Error> {
-        Self::connect_impl(url, token, schemas, policy, None, &[])
+        Self::connect_impl(
+            url,
+            token,
+            schemas,
+            policy,
+            None,
+            &[],
+            WirePreferences::default(),
+        )
+    }
+
+    /// [`Connection::connect_with`] with negotiated wire options
+    /// (RPC-008/RPC-035): ask for `TxUpdateLight` broadcasts and/or the
+    /// gzip push stream. The server's `AuthResult` echo is authoritative —
+    /// a server with compression disabled degrades this client to plain
+    /// frames, nothing breaks. The preferences re-apply on every reconnect.
+    pub fn connect_wire(
+        url: &str,
+        token: &[u8],
+        schemas: impl IntoIterator<Item = TableSchema>,
+        policy: ReconnectPolicy,
+        wire: WirePreferences,
+    ) -> Result<Self, Error> {
+        Self::connect_impl(url, token, schemas, policy, None, &[], wire)
     }
 
     /// Connect to a **replica set** (SPEC-014 REP-033): the first URL is
@@ -439,7 +481,15 @@ impl Connection {
         let first = urls
             .first()
             .ok_or_else(|| Error::Url("connect_replica_set needs at least one endpoint".into()))?;
-        Self::connect_impl(first, token, schemas, policy, None, &urls[1..])
+        Self::connect_impl(
+            first,
+            token,
+            schemas,
+            policy,
+            None,
+            &urls[1..],
+            WirePreferences::default(),
+        )
     }
 
     /// [`Connection::connect_with`] with **durable local persistence**
@@ -469,9 +519,18 @@ impl Connection {
     ) -> Result<Self, Error> {
         let client_id = client_id.into();
         let store = ClientStore::new(backend, url, &client_id);
-        Self::connect_impl(url, token, schemas, policy, Some((store, client_id)), &[])
+        Self::connect_impl(
+            url,
+            token,
+            schemas,
+            policy,
+            Some((store, client_id)),
+            &[],
+            WirePreferences::default(),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn connect_impl(
         url: &str,
         token: &[u8],
@@ -479,8 +538,26 @@ impl Connection {
         policy: ReconnectPolicy,
         persistence: Option<(ClientStore, String)>,
         extra_endpoints: &[&str],
+        wire: WirePreferences,
     ) -> Result<Self, Error> {
+        // RPC-008: without the `compression` feature this client has no
+        // inflater, and the SDK's own HTTP transport does not read the
+        // tagged GET stream yet — refuse up front rather than desync after
+        // the server honors the request.
+        if wire.compression {
+            #[cfg(not(feature = "compression"))]
+            return Err(Error::Url(
+                "WirePreferences::compression needs the `compression` cargo feature".into(),
+            ));
+        }
         let target = parse_url(url)?;
+        if wire.compression && matches!(target, Target::Http(_)) {
+            return Err(Error::Url(
+                "gzip negotiation over the SDK's HTTP transport is not supported yet; \
+                 use fluxum:// (TCP) or drop WirePreferences::compression"
+                    .into(),
+            ));
+        }
         let (addr, http) = match &target {
             Target::Tcp(addr) => (addr.clone(), None),
             Target::Http(addr) => (String::new(), Some(HttpEndpoint { addr: addr.clone() })),
@@ -538,6 +615,7 @@ impl Connection {
             persist,
             hydrated_identity: Mutex::new(hydrated_identity),
             identity: Mutex::new([0u8; 32]),
+            wire,
             writer: Mutex::new(None),
             push_socket: Mutex::new(None),
             next_id: AtomicU32::new(1),

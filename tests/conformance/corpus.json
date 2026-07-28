@@ -44,6 +44,7 @@
     "rate-limit",
     "reconnect-resync",
     "unsubscribe",
-    "error-mapping"
+    "error-mapping",
+    "light-updates"
   ]
 }

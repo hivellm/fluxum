@@ -368,6 +368,10 @@ pub(super) struct MessageStream {
     stream: TcpStream,
     codec: FrameCodec,
     buf: Vec<u8>,
+    /// RPC-008: armed after an `AuthResult` echoed gzip — every later frame
+    /// body starts with the compression tag.
+    #[cfg(feature = "compression")]
+    inflate: Option<crate::protocol::compress::StreamDecompressor>,
 }
 
 impl MessageStream {
@@ -376,7 +380,34 @@ impl MessageStream {
             stream,
             codec: FrameCodec::default(),
             buf: Vec::new(),
+            #[cfg(feature = "compression")]
+            inflate: None,
         }
+    }
+
+    /// Arm the RPC-008 tagged-stream decoder (the `AuthResult` that echoed
+    /// gzip was already consumed untagged; everything after it is tagged).
+    #[cfg(feature = "compression")]
+    pub(super) fn arm_gzip(&mut self) {
+        self.inflate = Some(crate::protocol::compress::StreamDecompressor::new());
+    }
+
+    /// Undo the RPC-008 tag on one frame body: pass-through when unarmed,
+    /// tag-dispatch when armed. `None` = the stream is broken (reconnect).
+    fn untag(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        #[cfg(feature = "compression")]
+        if let Some(inflate) = &mut self.inflate {
+            use crate::protocol::compress::{TAG_GZIP_STREAM, TAG_UNCOMPRESSED};
+            let (tag, payload) = (*body.first()?, body.get(1..)?);
+            return match tag {
+                TAG_GZIP_STREAM => inflate
+                    .inflate_chunk(payload, crate::protocol::DEFAULT_MAX_FRAME_BYTES as usize)
+                    .ok(),
+                TAG_UNCOMPRESSED => Some(payload.to_vec()),
+                _ => None,
+            };
+        }
+        Some(body.to_vec())
     }
 
     /// The next decodable server message; `None` on EOF, socket error, or a
@@ -393,10 +424,11 @@ impl MessageStream {
                     Err(_) => return None,
                 };
                 self.buf.drain(..consumed);
-                if let Some(body) = frame_body
-                    && let Ok(message) = ServerMessage::decode(&body)
-                {
-                    return Some(message);
+                if let Some(body) = frame_body {
+                    let body = self.untag(&body)?;
+                    if let Ok(message) = ServerMessage::decode(&body) {
+                        return Some(message);
+                    }
                 }
             }
             match self.stream.read(&mut chunk) {
@@ -595,6 +627,11 @@ pub(super) fn try_tcp_session(shared: &Arc<Shared>) -> Result<ReadHalf, Error> {
         match messages.next() {
             None => return Err(Error::Disconnected),
             Some(ServerMessage::AuthResult(result)) if result.id == auth_id => {
+                // RPC-008: arm off the echo alone — never off the request.
+                #[cfg(feature = "compression")]
+                if result.compression.as_deref() == Some("gzip") {
+                    messages.arm_gzip();
+                }
                 break result.identity;
             }
             Some(ServerMessage::Error(err)) if err.id == Some(auth_id) => {
@@ -872,7 +909,25 @@ pub(super) fn route(shared: &Shared, message: ServerMessage) {
                 let _ = tx.send(Ok(ServerMessage::ReducerResult(result)));
             }
         }
-        ServerMessage::TxUpdateLight(_) => {}
+        // RPC-035: a light broadcast applies exactly like the enriched form
+        // minus provenance — synthesize a zero-provenance TxUpdate so the
+        // resume tracker and cache take one path. `caller` is zeros, so
+        // own-call attribution never fires (by design: light strips it).
+        ServerMessage::TxUpdateLight(light) => {
+            let update = TxUpdate {
+                tx_id: light.tx_id,
+                timestamp: light.timestamp,
+                reducer_name: String::new(),
+                caller: [0u8; 32],
+                duration_us: 0,
+                shard_id: light.shard_id,
+                tx_offset: light.tx_offset,
+                tables: light.tables,
+            };
+            let events = apply_tx_update(shared, &update);
+            dispatch_shared(shared, events);
+            persist_state(shared);
+        }
         ServerMessage::Error(err) => {
             // A null-id error is server-initiated and belongs to nobody.
             if let Some(id) = err.id
@@ -921,6 +976,11 @@ pub(super) fn tcp_authenticate(
         match messages.next() {
             None => return Err(Error::Disconnected),
             Some(ServerMessage::AuthResult(result)) if result.id == auth_id => {
+                // RPC-008: arm off the echo alone — never off the request.
+                #[cfg(feature = "compression")]
+                if result.compression.as_deref() == Some("gzip") {
+                    messages.arm_gzip();
+                }
                 return Ok(result.identity);
             }
             Some(ServerMessage::Error(err)) if err.id == Some(auth_id) => {

@@ -121,10 +121,20 @@ class _Sub:
 class Connection:
     """A live client session. Construct with [`Connection.connect`]."""
 
-    def __init__(self, host: str, port: int, token: bytes, tables: Sequence[TableSchema]) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        token: bytes,
+        tables: Sequence[TableSchema],
+        light_updates: bool = False,
+    ) -> None:
         self._host = host
         self._port = port
         self._token = token
+        # RPC-035: ask for TxUpdateLight broadcasts (provenance stripped,
+        # row diffs + resume cursor kept). Re-applied on every reconnect.
+        self._light_updates = light_updates
         self.cache = Cache(tables)
         self._reader: Optional[asyncio.StreamReader] = None
         self._writer: Optional[asyncio.StreamWriter] = None
@@ -144,11 +154,13 @@ class Connection:
         url: str,
         token: bytes = b"",
         tables: Sequence[TableSchema] = (),
+        light_updates: bool = False,
     ) -> "Connection":
         """Open and authenticate a session. `url` is `fluxum://host:port` or a
-        bare `host:port` (TCP)."""
+        bare `host:port` (TCP). `light_updates=True` negotiates RPC-035
+        TxUpdateLight broadcasts."""
         host, port = _parse_url(url)
-        conn = cls(host, port, token, tables)
+        conn = cls(host, port, token, tables, light_updates=light_updates)
         await conn._establish()
         conn._reader_task = asyncio.ensure_future(conn._read_loop())
         return conn
@@ -187,7 +199,8 @@ class Connection:
         # Authenticate inline (the reader task is not running yet).
         auth_id = self._alloc_id()
         # [id, token, compression, tx_updates, namespace]
-        await self._send_raw("Authenticate", [auth_id, self._token, None, None, None])
+        tx_updates = "light" if self._light_updates else None
+        await self._send_raw("Authenticate", [auth_id, self._token, None, tx_updates, None])
         message = await self._read_message_inline()
         while message.tag != "AuthResult" or int(message.payload[0]) != auth_id:
             if message.tag == "Error" and _msg_id(message) == auth_id:
@@ -215,10 +228,12 @@ class Connection:
             if message.tag == "Error" and _msg_id(message) == mid:
                 raise _error_from(message)
             if message.tag != "InitialData" or int(message.payload[0]) != mid:
-                # A stray TxUpdate can arrive mid-resubscribe; apply it and
+                # A stray update can arrive mid-resubscribe; apply it and
                 # keep waiting for our snapshots.
                 if message.tag == "TxUpdate":
-                    self._apply_tx_update(message)
+                    self._apply_tables(message.payload[5])
+                elif message.tag == "TxUpdateLight":
+                    self._apply_tables(message.payload[2])
                 continue
             for entry in message.payload[2]:
                 qid, inserts, deletes = protocol.table_update(entry)
@@ -284,7 +299,13 @@ class Connection:
     def _route(self, message: protocol.ServerMessage) -> None:
         tag = message.tag
         if tag == "TxUpdate":
-            self._apply_tx_update(message)
+            # [tx_id, timestamp, reducer_name, caller, duration_us, tables, ...]
+            self._apply_tables(message.payload[5])
+            return
+        if tag == "TxUpdateLight":
+            # RPC-035: [tx_id, timestamp, tables, shard_id, tx_offset] —
+            # same row diffs, provenance stripped; one apply path.
+            self._apply_tables(message.payload[2])
             return
         mid = _msg_id(message)
         if mid is not None and mid in self._pending:
@@ -394,9 +415,8 @@ class Connection:
 
     # --- TxUpdate -----------------------------------------------------------
 
-    def _apply_tx_update(self, message: protocol.ServerMessage) -> None:
-        # [tx_id, timestamp, reducer_name, caller, duration_us, tables, ...]
-        tables = message.payload[5]
+    def _apply_tables(self, tables) -> None:
+        """Apply one commit's per-table row diffs (TxUpdate or TxUpdateLight)."""
         for entry in tables:
             qid, inserts, deletes = protocol.table_update(entry)
             table = entry[1]
