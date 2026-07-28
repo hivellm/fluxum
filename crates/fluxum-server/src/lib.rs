@@ -652,6 +652,22 @@ impl ShardContext {
         Some(serde_json::Value::Object(out))
     }
 
+    /// The live checkpoint/commit-log directories as a
+    /// [`BackupSource`](fluxum_core::backup::BackupSource) for the admin
+    /// `POST /backup` endpoint (REP-060). `None` before the config is
+    /// installed at boot — an embedded assembly cannot be backed up this way.
+    pub fn backup_source(&self) -> Option<fluxum_core::backup::BackupSource> {
+        let guard = self
+            .config_source
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let config = &guard.as_ref()?.config;
+        Some(fluxum_core::backup::BackupSource {
+            checkpoint_dir: config.storage.checkpoint_dir.clone(),
+            log_dir: config.storage.commit_log_dir.clone(),
+        })
+    }
+
     /// Install the running configuration (OPS-040): publishes every
     /// reloadable value immediately, and records `path` + `log` so a later
     /// [`reload_config`] can re-read the same layers. The assembly calls

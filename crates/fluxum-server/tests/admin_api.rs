@@ -1285,6 +1285,138 @@ async fn admin_errors_carry_403_429_500_statuses() {
     server.shutdown();
 }
 
+// --- POST /backup + /backup/verify (SPEC-014 REP-060/REP-064) --------------------
+
+/// A hot backup round-trips over the admin surface: create against the
+/// server's own layout, verify it clean, then tamper with a file and watch
+/// verification name it.
+#[tokio::test(flavor = "multi_thread")]
+async fn backup_create_and_verify_round_trip_over_http() {
+    let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
+    let schema = Schema::from_tables([&CHAT]).unwrap();
+    let store = Arc::new(MemStore::new(&schema).unwrap());
+    let log_dir = dir.path().join("log");
+    let log = Arc::new(CommitLog::open(&log_dir, SHARD, 1, CommitLogOptions::default()).unwrap());
+    let (pipeline, worker) =
+        TxPipeline::new(Arc::clone(&store), log, TxPipelineOptions::default()).unwrap();
+    tokio::spawn(worker.run());
+    let engine = ReducerEngine::new(
+        pipeline,
+        Arc::new(ReducerRegistry::from_defs([&SEND_CHAT]).unwrap()),
+        LifecycleHooks::none(),
+        SHARD,
+        fluxum_core::auth::server_identity("backup-test"),
+    );
+    let subs = SubscriptionManager::new(Arc::new(schema), SubscriptionLimits::default());
+    let auth = Authenticator::with_provider(Arc::new(NoneProvider), ServerPeerRegistry::empty());
+    let ctx = ShardContext::new(engine, subs, auth, SHARD, 256);
+    // POST /backup reads its source directories from the installed config.
+    let checkpoint_dir = dir.path().join("checkpoints");
+    std::fs::create_dir_all(&checkpoint_dir).unwrap();
+    let mut config = fluxum_core::config::Config::default();
+    config.storage.commit_log_dir.clone_from(&log_dir);
+    config.storage.checkpoint_dir.clone_from(&checkpoint_dir);
+    ctx.install_config(None, config, None);
+    let server = http::serve(ctx, "127.0.0.1:0", HttpOptions::default())
+        .await
+        .unwrap();
+    let addr = server.local_addr;
+
+    // Something in the log to capture.
+    let resp = request(
+        addr,
+        "POST",
+        "/reducer/send_chat",
+        Some(r#"{"payload":["backed up"]}"#),
+    )
+    .await;
+    assert_eq!(resp.status, 200, "{}", String::from_utf8_lossy(&resp.body));
+
+    // Durability is asynchronous to the commit ack (TXN-021: the flush
+    // actor lags), and a hot backup captures the durable prefix at scan
+    // time — so retry into fresh directories until the segment landed.
+    let mut out = dir.path().join("backup-0");
+    let mut payload = Value::Null;
+    for attempt in 0..100 {
+        out = dir.path().join(format!("backup-{attempt}"));
+        let body = format!(
+            r#"{{"out": {}}}"#,
+            serde_json::json!(out.display().to_string())
+        );
+        let created = request(addr, "POST", "/backup", Some(&body)).await;
+        assert_eq!(
+            created.status,
+            200,
+            "{}",
+            String::from_utf8_lossy(&created.body)
+        );
+        payload = created.json()["payload"].clone();
+        if payload["segments"].as_u64().unwrap_or(0) >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(payload["backup_id"].as_str().is_some(), "{payload}");
+    assert!(payload["segments"].as_u64().unwrap() >= 1, "{payload}");
+    assert!(payload["head_tx_id"].as_u64().unwrap() >= 1, "{payload}");
+
+    let body = format!(
+        r#"{{"dir": {}}}"#,
+        serde_json::json!(out.display().to_string())
+    );
+    let clean = request(addr, "POST", "/backup/verify", Some(&body)).await;
+    assert_eq!(
+        clean.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&clean.body)
+    );
+    let verdict = clean.json()["payload"].clone();
+    assert_eq!(verdict["ok"], true, "{verdict}");
+    assert!(verdict["checked"].as_u64().unwrap() >= 1, "{verdict}");
+
+    // Tamper with one captured file → verification names it (REP-064).
+    let victim = walkdir_first_file(&out).expect("a backed-up file");
+    let mut bytes = std::fs::read(&victim).unwrap();
+    bytes.push(0xFF);
+    std::fs::write(&victim, bytes).unwrap();
+    let dirty = request(addr, "POST", "/backup/verify", Some(&body)).await;
+    assert_eq!(
+        dirty.status,
+        200,
+        "{}",
+        String::from_utf8_lossy(&dirty.body)
+    );
+    let verdict = dirty.json()["payload"].clone();
+    assert_eq!(verdict["ok"], false, "tamper detected: {verdict}");
+    assert!(
+        !verdict["errors"].as_array().unwrap().is_empty(),
+        "{verdict}"
+    );
+
+    server.shutdown();
+}
+
+/// First regular file under `root`, depth-first (the backup layout is
+/// `shard-<id>/…` plus a manifest).
+fn walkdir_first_file(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .is_some_and(|n| n.to_string_lossy().ends_with(".zst"))
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn shard_cap_answers_503_on_the_excess_call() {
     let server = start_hardened(1).await;

@@ -337,6 +337,138 @@ $("b-ban").addEventListener("click", async () => {
   } catch (e) { $("b-note").textContent = String(e.message || e); }
 });
 
+// --- ops view (OPS-030/040, REP-060/064/080, OPS-060) --------------------------------
+function renderOps() {
+  // Reloadable values in force, with provenance (OPS-040).
+  const rel = $("op-reloadable");
+  rel.textContent = "";
+  const reloadable = healthDoc && healthDoc.reloadable;
+  if (reloadable && typeof reloadable === "object") {
+    for (const [k, v] of Object.entries(reloadable)) {
+      if (v && typeof v === "object" && v.value !== undefined) {
+        rel.appendChild(kvRow(k, typeof v.value === "object" ? JSON.stringify(v.value) : String(v.value), v.source));
+      } else {
+        rel.appendChild(kvRow(k, typeof v === "object" ? JSON.stringify(v) : String(v)));
+      }
+    }
+  } else {
+    rel.appendChild(dom("div", "muted", "waiting for /health…"));
+  }
+  // Replication posture (REP-080) — read-only here; promote rides the
+  // election/CLI, there is no HTTP promote endpoint to call.
+  const rp = $("op-repl");
+  rp.textContent = "";
+  const shard = healthDoc && healthDoc.shards && healthDoc.shards[0];
+  const repl = shard && shard.replication;
+  if (repl) {
+    rp.appendChild(kvRow("role", repl.role + " (epoch " + repl.epoch + ")"));
+    if (repl.role === "primary") {
+      rp.appendChild(kvRow("connected replicas", String(repl.connected_replicas != null ? repl.connected_replicas : 0)));
+      rp.appendChild(kvRow("zero-loss guarantee", repl.degraded ? "suspended (degraded)" : "in force"));
+    } else {
+      if (repl.primary) rp.appendChild(kvRow("primary", repl.primary));
+      if (repl.lag_tx != null) rp.appendChild(kvRow("lag (tx)", String(repl.lag_tx)));
+      rp.appendChild(kvRow("reads", repl.stale ? "stale" : "fresh"));
+    }
+  } else {
+    rp.appendChild(kvRow("mode", "standalone — no replication configured"));
+  }
+  const pending = metric("fluxum_archive_segments_pending");
+  if (pending != null) rp.appendChild(kvRow("archive segments pending", String(pending)));
+  // Namespaces & quotas from the per-tenant metric series (OPS-051/061).
+  const memByNs = metricByLabel("fluxum_tenant_memory_bytes", "namespace");
+  const ns = $("ns-grid");
+  ns.textContent = "";
+  if (!memByNs.size) {
+    $("ns-note").textContent = "no namespaces configured — tenants bind by name at "
+      + "Authenticate; quotas live in the config (OPS-060) and hot-reload";
+    return;
+  }
+  $("ns-note").textContent = "";
+  const storageByNs = metricByLabel("fluxum_tenant_storage_bytes", "namespace");
+  const subsByNs = metricByLabel("fluxum_tenant_subscriptions_active", "namespace");
+  const tbl = gridTable(["namespace", "memory", "storage", "subscriptions"]);
+  const tb = tbl.createTBody();
+  for (const [name, memory] of [...memByNs.entries()].sort()) {
+    const tr = tb.insertRow();
+    tr.insertCell().textContent = name;
+    tr.insertCell().textContent = fmtBytes(memory);
+    tr.insertCell().textContent = fmtBytes(storageByNs.get(name) || 0);
+    tr.insertCell().textContent = String(subsByNs.get(name) || 0);
+  }
+  ns.appendChild(tbl);
+}
+async function opsTick() {
+  await fetchMetrics().catch(() => {});
+  renderOps();
+}
+$("op-reload").addEventListener("click", async () => {
+  $("op-reload-out").textContent = "";
+  try {
+    const p = await apiJson("/config/reload", { method: "POST", body: "{}" });
+    $("op-reload-out").textContent = (p.changed && p.changed.length)
+      ? "changed: " + p.changed.join(", ")
+      : "reloaded — nothing changed";
+    toast("ok", "config reloaded");
+    pollHealth();
+  } catch (e) { $("op-reload-out").textContent = String(e.message || e); }
+});
+$("op-checkpoint").addEventListener("click", async () => {
+  $("op-checkpoint-out").textContent = "";
+  try {
+    const p = await apiJson("/checkpoint", { method: "POST", body: "{}" });
+    $("op-checkpoint-out").textContent = p.fresh
+      ? "checkpointed at tx " + p.last_tx_id
+      : "already covered at tx " + p.last_tx_id;
+    toast("ok", "checkpoint done");
+  } catch (e) { $("op-checkpoint-out").textContent = String(e.message || e); }
+});
+$("op-drain").addEventListener("click", async () => {
+  const b = $("op-drain");
+  if (b.textContent === "Drain") { b.textContent = "Confirm drain?"; return; }
+  b.textContent = "Drain";
+  try {
+    const p = await apiJson("/drain", { method: "POST", body: "{}" });
+    $("op-drain-out").textContent = "draining — state " + p.state
+      + ", queue " + p.queue_depth + ", last tx " + p.last_tx_id;
+    toast("info", "shard draining; restart the process to serve again");
+  } catch (e) { $("op-drain-out").textContent = String(e.message || e); }
+});
+$("bk-create").addEventListener("click", async () => {
+  const out = $("bk-out").value.trim();
+  const msg = $("bk-msg");
+  if (!out) { msg.textContent = "enter an output directory (on the server's filesystem)"; return; }
+  msg.textContent = "backing up…";
+  $("bk-report").textContent = "";
+  try {
+    const p = await apiJson("/backup", { method: "POST", body: JSON.stringify({ out }) });
+    msg.textContent = "";
+    const box = $("bk-report");
+    box.appendChild(kvRow("backup id", p.backup_id));
+    box.appendChild(kvRow("manifest", p.manifest));
+    box.appendChild(kvRow("shards / segments", p.shards + " / " + p.segments));
+    box.appendChild(kvRow("head tx", String(p.head_tx_id)));
+    $("bk-dir").value = out;
+    toast("ok", "backup created");
+  } catch (e) { msg.textContent = String(e.message || e); }
+});
+$("bk-verify").addEventListener("click", async () => {
+  const dir = $("bk-dir").value.trim();
+  const msg = $("bk-msg");
+  if (!dir) { msg.textContent = "enter the backup directory to verify"; return; }
+  msg.textContent = "verifying…";
+  try {
+    const p = await apiJson("/backup/verify", { method: "POST", body: JSON.stringify({ dir }) });
+    msg.textContent = "";
+    const box = $("bk-report");
+    box.textContent = "";
+    box.appendChild(kvRow("files checked", String(p.checked)));
+    box.appendChild(kvRow("verdict", p.ok ? "OK — every hash matches" : (p.errors || []).length + " failure(s)"));
+    for (const err of p.errors || []) box.appendChild(dom("div", "err-box", err.file + ": " + err.error));
+    toast(p.ok ? "ok" : "err", p.ok ? "backup verified" : "verification failed");
+  } catch (e) { msg.textContent = String(e.message || e); }
+});
+
 // --- NDJSON stream reader -----------------------------------------------------------
 async function streamLines(path, signal, onLine) {
   const r = await api(path, { signal });

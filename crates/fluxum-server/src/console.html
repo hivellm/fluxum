@@ -323,6 +323,7 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
     <button data-view="query"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>Query</button>
     <button data-view="reducers"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 5 4-5 4V8"/></svg>Reducers</button>
     <button data-view="sessions"><svg class="ic" viewBox="0 0 24 24"><circle cx="9" cy="7" r="4"/><path d="M2 21v-2a7 7 0 0 1 14 0v2M19 8v6M22 11h-6"/></svg>Sessions</button>
+    <button data-view="ops"><svg class="ic" viewBox="0 0 24 24"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg>Ops</button>
     <button data-view="live"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12h4l3-8 4 16 3-8h6"/></svg>Live</button>
     <button data-view="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Logs</button>
     <button data-view="metrics"><svg class="ic" viewBox="0 0 24 24"><path d="M3 21V3M3 21h18"/><path d="m7 15 4-6 3 3 5-8"/></svg>Metrics</button>
@@ -427,6 +428,54 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
         </h3>
         <div class="muted" id="b-note"></div>
         <div id="b-grid" style="overflow-x:auto"></div>
+      </div>
+    </section>
+    <section class="view" id="view-ops">
+      <div class="panels" style="overflow-y:visible">
+        <div class="panel">
+          <h3>Config (OPS-040)</h3>
+          <div class="muted">edit the config file, then apply &mdash; env outranks file; a change to a frozen key refuses the whole reload</div>
+          <div class="row">
+            <button class="btn sm" id="op-reload">Reload config</button>
+            <span class="mut2" id="op-reload-out"></span>
+          </div>
+          <div id="op-reloadable" style="display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+        <div class="panel">
+          <h3>Maintenance</h3>
+          <div class="row">
+            <button class="btn sm" id="op-checkpoint">Checkpoint now</button>
+            <span class="mut2" id="op-checkpoint-out"></span>
+          </div>
+          <div class="row">
+            <button class="btn sm danger" id="op-drain">Drain</button>
+            <span class="mut2" id="op-drain-out"></span>
+          </div>
+          <div class="muted">drain refuses new /rpc work with a retryable 503 while in-flight
+            transactions finish; restart the process to serve again (OPS-030)</div>
+          <h3>Replication</h3>
+          <div id="op-repl" style="display:flex;flex-direction:column;gap:6px"></div>
+        </div>
+        <div class="panel">
+          <h3>Backup (REP-060/064)</h3>
+          <div class="row">
+            <input type="text" id="bk-out" placeholder="output dir (server filesystem)" size="26" style="font-family:var(--mono)">
+            <button class="btn sm" id="bk-create">Create</button>
+          </div>
+          <div class="row">
+            <input type="text" id="bk-dir" placeholder="backup dir to verify" size="26" style="font-family:var(--mono)">
+            <button class="btn sm ghost" id="bk-verify">Verify</button>
+          </div>
+          <div class="mut2" id="bk-msg"></div>
+          <div id="bk-report" style="display:flex;flex-direction:column;gap:6px"></div>
+          <div class="muted">restore and PITR run offline via the CLI
+            (<code class="snip">fluxum backup restore</code>) &mdash; never against a live server</div>
+        </div>
+        <div class="panel">
+          <h3>Namespaces &amp; quotas</h3>
+          <div class="muted" id="ns-note"></div>
+          <div id="ns-grid" style="overflow-x:auto"></div>
+        </div>
       </div>
     </section>
     <section class="view" id="view-live">

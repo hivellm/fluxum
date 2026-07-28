@@ -29,8 +29,8 @@ function toast(kind, msg) {
 
 // --- view switching ----------------------------------------------------------
 const VIEW_TITLES = { overview: "Overview", data: "Data", query: "Query",
-  reducers: "Reducers", sessions: "Sessions", live: "Live", logs: "Logs",
-  metrics: "Metrics", schema: "Schema", designer: "New table" };
+  reducers: "Reducers", sessions: "Sessions", ops: "Ops", live: "Live",
+  logs: "Logs", metrics: "Metrics", schema: "Schema", designer: "New table" };
 function showView(view) {
   document.querySelectorAll("nav.views button").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
   document.querySelectorAll(".view").forEach((s) => s.classList.toggle("on", s.id === "view-" + view));
@@ -40,6 +40,7 @@ function showView(view) {
   $("route-ic").innerHTML = active ? active.outerHTML : "";
   if (view === "overview") { renderOverview(); refreshOverview(); }
   if (view === "sessions") { loadSessions(); loadBans(); }
+  if (view === "ops") opsTick();
   if (view === "metrics") metricsTick();
   if (view === "designer") renderDesigner();
 }
@@ -72,6 +73,7 @@ async function pollHealth() {
   // Visible dashboards ride the same 5 s cadence (metrics + re-render).
   if (document.querySelector("#view-overview.on")) refreshOverview();
   if (document.querySelector("#view-metrics.on")) metricsTick();
+  if (document.querySelector("#view-ops.on")) renderOps();
 }
 
 // --- auth boot (DEV-031) ------------------------------------------------------

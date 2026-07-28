@@ -143,7 +143,29 @@ module, stated honestly in the UI.
       ERROR-min filter muted INFO traffic then (all) showed it, and
       tx_from=36 trimmed the Task trail to exactly tx 36-40 minus the
       ChatMessage commit.
-- [ ] 1.7 Ops: config view/edit + hot-reload apply, checkpoint trigger, drain, backup create/verify + PITR restore-point browser (incl. S3 archive), replication status/promote, namespaces + quotas
+- [x] 1.7 Ops (2026-07-27). **Additive server surface**: `POST /backup`
+      `{out}` hot-backs-up every shard to a server-side directory
+      (REP-060 — source dirs from the installed config via a new
+      `ShardContext::backup_source`; file copy on the blocking pool; in
+      `is_mutating_route` for the SEC-054 audit) and `POST /backup/verify`
+      `{dir}` re-hashes a backup against its manifest (REP-064,
+      read-only). **Ops view**: Config panel (reloadable values with
+      provenance + Reload config → changed keys or the frozen-key refusal,
+      OPS-040/041; editing stays in the file — the reload IS the apply);
+      Maintenance (Checkpoint now → fresh/covered + tx; two-step Drain →
+      state display, OPS-030); Replication posture (role/epoch/replicas/
+      lag/stale or standalone + archive-segments-pending — promote rides
+      the election/CLI, no HTTP endpoint exists to call); Backup panel
+      (create + verify with report cards; restore/PITR stated as
+      CLI-offline, never against a live server); Namespaces & quotas from
+      the per-tenant metric series (OPS-051/061), with the honest
+      empty-state. Deferred within this area: an S3-archive restore-point
+      browser (needs a core archive-catalog API that does not exist yet).
+      Integration test: create → verify-clean → tamper → verify names the
+      file, all over loopback HTTP. Browser e2e (Playwright): reload
+      ("nothing changed"), checkpoint at tx 41, backup+verify round-trip
+      from the UI (2 files OK), then drain — state shutting_down and /rpc
+      refusing 503 while the admin surface kept answering.
 - [ ] 1.8 Hardening: every mutating action audited; CSP with no external origins; dashboard e2e smoke against a live server (spawned like the SDK conformance runners)
 
 ## 2. Tail (docs + tests — check or waive with tailWaiver)

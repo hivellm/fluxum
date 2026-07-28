@@ -243,6 +243,7 @@ fn is_mutating_route(method: &str, path: &str) -> bool {
         ("POST", ["reducer", _])
             | ("POST", ["rows"])
             | ("POST", ["drain"])
+            | ("POST", ["backup"])
             | ("POST", ["checkpoint"])
             | ("POST", ["config", "reload"])
             | ("POST", ["plugins", _, "disable" | "enable"])
@@ -288,6 +289,8 @@ pub async fn dispatch(ctx: &Arc<ShardContext>, req: AdminRequest<'_>) -> AdminRe
         ("POST", ["drain"]) => drain(ctx),
         ("POST", ["checkpoint"]) => checkpoint_now(ctx).await,
         ("POST", ["config", "reload"]) => config_reload(ctx),
+        ("POST", ["backup"]) => backup_create(ctx, body).await,
+        ("POST", ["backup", "verify"]) => backup_verify(body).await,
         ("GET", ["bans"]) => bans_list(ctx),
         ("POST", ["bans"]) => ban_create(ctx, body),
         // The entry may itself contain `/` (a CIDR block), so everything
@@ -350,6 +353,8 @@ pub fn is_admin_path(path: &str) -> bool {
             | ["drain"]
             | ["checkpoint"]
             | ["config", "reload"]
+            | ["backup"]
+            | ["backup", "verify"]
             | ["bans", ..]
             | ["sessions", ..]
     )
@@ -401,6 +406,81 @@ async fn checkpoint_now(ctx: &Arc<ShardContext>) -> AdminResponse {
             AdminResponse::ok(None, json!({ "fresh": false, "last_tx_id": durable }))
         }
         Err(e) => AdminResponse::err(500, None, e.to_string()),
+    }
+}
+
+// --- /backup (SPEC-014 REP-060/REP-064: hot backup + offline verify) --------------
+
+/// `POST /backup` `{"out": "<dir>"}`: hot-back-up every shard into `out` on
+/// the **server's own filesystem** (REP-060) — the latest checkpoint plus
+/// the validated log-segment prefixes, no writer stall, no storage lock.
+/// The admin surface is trusted-operator territory (SEC-054), which is what
+/// makes a server-side output path acceptable — the same operator could
+/// already edit the config. The file copy runs on the blocking pool so the
+/// dispatch (and the `/health` latency budget) stays responsive.
+async fn backup_create(ctx: &Arc<ShardContext>, body: &[u8]) -> AdminResponse {
+    let (request_id, payload) = match parse_request(body) {
+        Ok(pair) => pair,
+        Err(e) => return AdminResponse::err(400, None, e),
+    };
+    let rid = request_id.as_deref();
+    let Some(out) = payload.get("out").and_then(Value::as_str) else {
+        return AdminResponse::err(400, rid, "payload.out (directory path) required");
+    };
+    let Some(source) = ctx.backup_source() else {
+        return AdminResponse::err(
+            500,
+            rid,
+            "no configuration installed; the backup source directories are unknown",
+        );
+    };
+    let out = std::path::PathBuf::from(out);
+    match tokio::task::spawn_blocking(move || fluxum_core::backup::create(&source, &out)).await {
+        Ok(Ok(report)) => AdminResponse::ok(
+            rid,
+            json!({
+                "backup_id": report.backup_id,
+                "manifest": report.manifest_path.display().to_string(),
+                "shards": report.shards,
+                "segments": report.segments,
+                "head_tx_id": report.head_tx_id,
+            }),
+        ),
+        Ok(Err(e)) => AdminResponse::err(status_of(&e), rid, e.to_string()),
+        Err(e) => AdminResponse::err(500, rid, format!("backup task failed: {e}")),
+    }
+}
+
+/// `POST /backup/verify` `{"dir": "<backup dir>"}` (REP-064): re-hash every
+/// file in a backup against its manifest. Read-only — safe on a live
+/// server; the I/O runs on the blocking pool like [`backup_create`].
+async fn backup_verify(body: &[u8]) -> AdminResponse {
+    let (request_id, payload) = match parse_request(body) {
+        Ok(pair) => pair,
+        Err(e) => return AdminResponse::err(400, None, e),
+    };
+    let rid = request_id.as_deref();
+    let Some(dir) = payload.get("dir").and_then(Value::as_str) else {
+        return AdminResponse::err(400, rid, "payload.dir (backup directory) required");
+    };
+    let dir = std::path::PathBuf::from(dir);
+    match tokio::task::spawn_blocking(move || fluxum_core::backup::verify(&dir)).await {
+        Ok(Ok(report)) => {
+            let errors: Vec<Value> = report
+                .errors()
+                .map(|f| json!({ "file": f.file, "error": f.error }))
+                .collect();
+            AdminResponse::ok(
+                rid,
+                json!({
+                    "ok": report.ok(),
+                    "checked": report.files.len(),
+                    "errors": errors,
+                }),
+            )
+        }
+        Ok(Err(e)) => AdminResponse::err(status_of(&e), rid, e.to_string()),
+        Err(e) => AdminResponse::err(500, rid, format!("verify task failed: {e}")),
     }
 }
 
