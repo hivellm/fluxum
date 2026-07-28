@@ -104,3 +104,34 @@ continue` with no metric, capacity 256 hardcoded).
 Measured baseline to beat (2026-07-27, loopback, release): e2e p50
 5.2 ms / p99 7.9 ms at ~980 commits/s with fan-out stage totals of
 ~19 µs/event; the coalescing must keep those and cut writes/frame.
+
+**Follow-up: delta compression (game-netcode style), layered.** The
+subscription model is already row-level delta (InitialData once, then
+changed rows only). The next layers, in cost/benefit order:
+
+- **P3a — honor `tx_updates: light` (RPC-035)**: `TxUpdateLight` is
+  implemented in the protocol and never emitted; the Authenticate
+  negotiation field is ignored server-side. Strips ~55 B of per-update
+  metadata (caller 32 B, reducer name, duration). Zero wire invention;
+  note the light form lacks `tx_offset`, so resume-cursor semantics
+  must ride `tx_id` (documented as mirroring) or the field must be
+  appended at the tail first.
+- **P3b — per-session stream compression**: `Authenticate.compression`
+  (`"none"|"gzip"|"brotli"`) is negotiated today and no codec exists.
+  Context-carryover compression across frames is the generic delta
+  compressor — repeated identities/names/strings become ~2 B window
+  references. Compress per connection AFTER the shared encode, so
+  encode-once (SUB-024) survives; CPU per connection is the cost to
+  measure.
+- **P4 — column-level update deltas** (own spec + task): an update
+  travels as delete(PK) + FULL row today; a changed-column bitmask can
+  be computed ONCE per commit (TxDiff holds old+new rows) and shared by
+  every subscriber — encode-once survives, unlike per-client acked
+  baselines (Quake/Source style), which are REJECTED: per-client
+  encoding collapses the fan-out cost model. Constraints: inserts and
+  visibility-appearing rows stay full; resume windows (CS-021) store
+  the same form; negotiated via the same `tx_updates` field.
+- Quantization stays app-level (module chooses its coordinate grid).
+
+Rough wire math for the MMO-shape workload (~150 B/move today): light
+≈ 80 B → + session brotli ≈ 30–40 B → + column delta ≈ 20 B.
