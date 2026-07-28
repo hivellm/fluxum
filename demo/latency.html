@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Fluxum — chat latency</title>
+    <link rel="stylesheet" href="./style.css" />
+    <style>
+      /* Additions over the demo stylesheet, same visual language. */
+      .lat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+      .pane { min-height: 220px; max-height: 320px; overflow-y: auto; }
+      .pane li { display: flex; gap: 8px; align-items: baseline; padding: 3px 0;
+                 font-family: var(--mono, ui-monospace, monospace); font-size: 12.5px;
+                 border-bottom: 1px solid rgba(128,128,128,.12); list-style: none; }
+      .pane li .ms { margin-left: auto; font-weight: 600; }
+      .pane li .ms.fast { color: #10b981; }
+      .pane li .ms.slow { color: #f59e0b; }
+      .pane li.foreign { opacity: .55; }
+      .stats .stat .v.small { font-size: 15px; }
+      table.lat { border-collapse: collapse; width: 100%; font-size: 13px; }
+      table.lat th, table.lat td { text-align: right; padding: 4px 10px;
+                 border-bottom: 1px solid rgba(128,128,128,.15); }
+      table.lat th:first-child, table.lat td:first-child { text-align: left; }
+      table.lat td { font-family: var(--mono, ui-monospace, monospace); }
+      #hist { display: flex; align-items: flex-end; gap: 2px; height: 72px; margin-top: 10px; }
+      #hist .b { flex: 1; background: #3b82f6; border-radius: 2px 2px 0 0; min-height: 1px; }
+      #hist-axis { display: flex; justify-content: space-between; font-size: 11px; opacity: .6; }
+      .runrow { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+      .runrow input[type="number"] { width: 72px; }
+      .note { font-size: 12px; opacity: .65; margin-top: 6px; }
+    </style>
+  </head>
+  <body>
+    <header class="bar">
+      <div class="brand">
+        <span class="dot" id="dot"></span>
+        <strong>Fluxum</strong>
+        <span class="muted">chat latency — two real clients, one clock</span>
+      </div>
+      <div class="who"><a class="ghost" href="./index.html" style="text-decoration:none">← demo</a></div>
+    </header>
+
+    <section class="stats">
+      <div class="stat"><span class="k">ack p50 / p99</span><span class="v small" id="s-ack">—</span></div>
+      <div class="stat"><span class="k">e2e p50 / p99</span><span class="v small" id="s-e2e">—</span></div>
+      <div class="stat"><span class="k">samples</span><span class="v" id="s-n">0</span></div>
+      <div class="stat"><span class="k">timeout / rejected</span><span class="v small" id="s-to">0 / 0</span></div>
+      <div class="stat wide"><span class="k">status</span><span class="v small" id="s-status">connecting…</span></div>
+    </section>
+
+    <main>
+      <section class="panel span2">
+        <div class="panel-head">
+          <h2>Measure</h2>
+          <div class="controls runrow">
+            <button id="ping">ping ×1</button>
+            <input id="n" type="number" value="100" min="1" max="5000" aria-label="pings" />
+            <button id="run">run N</button>
+            <input id="rate" type="number" value="20" min="1" max="200" aria-label="per second" />
+            <button id="stream" class="ghost">stream /s</button>
+            <button id="reset" class="ghost">reset</button>
+          </div>
+        </div>
+        <table class="lat">
+          <thead><tr><th>metric</th><th>count</th><th>min</th><th>mean</th><th>p50</th><th>p95</th><th>p99</th><th>max</th></tr></thead>
+          <tbody>
+            <tr><td>ack (send → commit acked)</td><td id="a-n">0</td><td id="a-min">—</td><td id="a-mean">—</td><td id="a-p50">—</td><td id="a-p95">—</td><td id="a-p99">—</td><td id="a-max">—</td></tr>
+            <tr><td>e2e (send → subscriber applied)</td><td id="e-n">0</td><td id="e-min">—</td><td id="e-mean">—</td><td id="e-p50">—</td><td id="e-p95">—</td><td id="e-p99">—</td><td id="e-max">—</td></tr>
+          </tbody>
+        </table>
+        <div id="hist"></div>
+        <div id="hist-axis"><span id="hx-lo">0 ms</span><span>e2e distribution</span><span id="hx-hi">—</span></div>
+        <p class="note">Client A calls <code>send_chat</code>; client B holds the subscription.
+          Both live in this page, so every timestamp comes from one
+          <code>performance.now()</code> — no clock skew. <strong>ack</strong> is the reducer
+          round trip (commit acknowledged); <strong>e2e</strong> is send until B's cache applied
+          the TxUpdate (commit + fan-out + push + decode).</p>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head"><h2>A — sender <span class="tag" id="id-a">…</span></h2></div>
+        <ul class="pane" id="pane-a"></ul>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>B — subscriber <span class="tag" id="id-b">…</span></h2></div>
+        <ul class="pane" id="pane-b"></ul>
+      </section>
+    </main>
+
+    <script type="module" src="./latency.js"></script>
+  </body>
+</html>
