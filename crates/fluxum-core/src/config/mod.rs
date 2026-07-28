@@ -109,6 +109,16 @@ pub struct ServerConfig {
     /// that talks to Fluxum has to come from the same origin. Off by default —
     /// a server nobody configured this on has no file surface.
     pub static_dir: Option<PathBuf>,
+    /// RPC-008 kill-switch: when `false`, every compression negotiation is
+    /// answered `none` (the `AuthResult` echo says so — clients degrade
+    /// explicitly, nothing breaks). Applies to new connections; sessions pin
+    /// their options for their lifetime.
+    pub compression_enabled: bool,
+    /// RPC-008 threshold: frame bodies below this many bytes ride tag
+    /// `0x00`, outside the per-connection stream context. Deliberately low —
+    /// under stream carryover the small realtime frames are where the shared
+    /// window pays.
+    pub compression_threshold_bytes: ByteSize,
 }
 
 impl Default for ServerConfig {
@@ -129,6 +139,8 @@ impl Default for ServerConfig {
             tcp_defer_accept_secs: 0,
             trusted_proxies: Vec::new(),
             static_dir: None,
+            compression_enabled: true,
+            compression_threshold_bytes: ByteSize(64),
         }
     }
 }

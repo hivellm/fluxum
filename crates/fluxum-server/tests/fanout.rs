@@ -322,6 +322,7 @@ async fn a_full_send_buffer_drops_the_slow_subscriber_and_spares_the_healthy_one
             ConnHandle {
                 sink: slow_tx,
                 shutdown: Arc::clone(&slow_shutdown),
+                wire: fluxum_protocol::WireOptions::default(),
             },
         )
         .await;
@@ -372,6 +373,7 @@ async fn a_closed_sink_is_evicted_without_disturbing_the_healthy_subscriber() {
             ConnHandle {
                 sink: dead_tx,
                 shutdown: Arc::new(Notify::new()),
+                wire: fluxum_protocol::WireOptions::default(),
             },
         )
         .await;

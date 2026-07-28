@@ -15,14 +15,20 @@
 //! ([`rowlist::RowList`]).
 
 pub mod codes;
+pub mod compress;
 pub mod fluxbin;
 pub mod frame;
 pub mod messages;
+pub mod negotiate;
 pub mod plugin_rpc;
 pub mod rowlist;
 mod tagged;
 pub mod value;
 
+pub use compress::{
+    CompressError, DecompressError, StreamCompressor, StreamDecompressor, TAG_BROTLI,
+    TAG_GZIP_STREAM, TAG_UNCOMPRESSED,
+};
 pub use fluxbin::{FluxBinError, FluxBinReader, FluxBinWriter};
 pub use frame::{DEFAULT_MAX_FRAME_BYTES, FRAME_HEADER_LEN, Frame, FrameCodec, FrameError};
 pub use messages::{
@@ -30,6 +36,9 @@ pub use messages::{
     ReducerCall, ReducerError, ReducerResult, ReplAck, ReplBatch, ReplCheckpoint, ReplFence,
     ReplHeartbeat, ReplicaHello, Resume, ServerMessage, Subscribe, SubscribeSingle, TableUpdate,
     TxUpdate, TxUpdateLight, Unsubscribe, VoteRequest, VoteResponse,
+};
+pub use negotiate::{
+    NegotiateError, UpdateForm, WireCompression, WireOptions, parse_compression, parse_update_form,
 };
 pub use rowlist::{RowList, RowListBuilder, RowListError, RowSizeHint};
 pub use value::FluxValue;

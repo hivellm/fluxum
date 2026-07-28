@@ -21,10 +21,22 @@ use fluxum_core::reducer::{CallOutcome, FluxValue, ReducerCaller};
 use fluxum_core::subscription::{Resumed, Subscriber};
 use fluxum_core::types::{ConnectionId, Identity, Timestamp};
 use fluxum_protocol::{
-    AuthResult, ClientMessage, ErrorMessage, ReducerResult, ServerMessage, TxUpdate, codes,
+    AuthResult, Authenticate, ClientMessage, ErrorMessage, ReducerResult, ServerMessage, TxUpdate,
+    TxUpdateLight, UpdateForm, WireCompression, WireOptions, codes, negotiate,
 };
 
 use crate::ShardContext;
+
+/// Transport-level wire-option hints (RPC-008/RPC-035): the `?compression=`
+/// and `?tx_updates=` query parameters of the Streamable HTTP `/rpc`
+/// endpoint. The `Authenticate` fields win when both are present.
+#[derive(Debug, Clone, Default)]
+pub struct WireHints {
+    /// `?compression=` value, if the transport saw one.
+    pub compression: Option<String>,
+    /// `?tx_updates=` value, if the transport saw one.
+    pub tx_updates: Option<String>,
+}
 
 /// The result of routing one message: the responses to send. A committed
 /// reducer call's diff is NOT here — the single writer publishes it to the
@@ -58,6 +70,11 @@ pub enum SessionState {
     Authenticated {
         /// Reducer-call caller metadata (identity, connection, shard).
         caller: ReducerCaller,
+        /// Negotiated wire options (RPC-008/RPC-035), fixed at the first
+        /// successful `Authenticate` for the connection's lifetime. Lives in
+        /// the state — not the `Session` — because the Streamable HTTP
+        /// transport rebuilds a `Session` per request from persisted state.
+        wire: WireOptions,
         /// Subscription viewer (RLS bypass for server peers, SUB-031).
         subscriber: Subscriber,
     },
@@ -83,6 +100,9 @@ pub struct Session {
     /// The authenticated server peer's name (SPEC-014 REP-005), when the
     /// credential mapped to one — what admits replication frames.
     peer_name: Option<String>,
+    /// Transport-level wire-option hints (`?compression=`/`?tx_updates=`,
+    /// RPC-008/RPC-035); the `Authenticate` fields win over these.
+    hints: WireHints,
 }
 
 impl Session {
@@ -94,6 +114,7 @@ impl Session {
             namespace: None,
             source_ip: None,
             peer_name: None,
+            hints: WireHints::default(),
         }
     }
 
@@ -133,6 +154,21 @@ impl Session {
         self.source_ip = Some(ip);
     }
 
+    /// Record the transport's wire-option hints (the `/rpc` query
+    /// parameters, RPC-008/RPC-035) before routing an `Authenticate`.
+    pub fn set_wire_hints(&mut self, hints: WireHints) {
+        self.hints = hints;
+    }
+
+    /// The negotiated wire options: fixed at the first successful
+    /// `Authenticate`; the defaults (`none`/`full`) before it.
+    pub fn wire(&self) -> WireOptions {
+        match &self.state {
+            SessionState::Authenticated { wire, .. } => *wire,
+            SessionState::Unauthenticated => WireOptions::default(),
+        }
+    }
+
     /// A session resumed from a persisted [`SessionState`] — the Streamable
     /// HTTP transport rebuilds one per request from its `Fluxum-Session`
     /// entry (SPEC-006 §3; the router core is transport-independent).
@@ -143,6 +179,7 @@ impl Session {
             namespace: None,
             source_ip: None,
             peer_name: None,
+            hints: WireHints::default(),
         };
         // SHD-011: the affinity binding survives in the persisted caller's
         // `shard_id`; a rebuilt session re-resolves it so a per-request
@@ -168,6 +205,7 @@ impl Session {
             namespace,
             source_ip: None,
             peer_name: None,
+            hints: WireHints::default(),
         };
         // A namespaced session stays on the default shard (OPS-050 tenants
         // are single-shard); only the default database rebinds (SHD-011).
@@ -252,7 +290,7 @@ impl Session {
         // other message is a 401 with the connection kept open.
         if !self.is_authenticated() {
             if let ClientMessage::Authenticate(auth) = &message {
-                return self.authenticate(auth.id, &auth.token, auth.namespace.as_deref());
+                return self.authenticate(auth);
             }
             return Routed::reply(error(
                 Some(request_id(&message)),
@@ -277,9 +315,7 @@ impl Session {
         match message {
             // A second Authenticate re-derives identity but keeps the
             // connection id (idempotent re-auth).
-            ClientMessage::Authenticate(auth) => {
-                self.authenticate(auth.id, &auth.token, auth.namespace.as_deref())
-            }
+            ClientMessage::Authenticate(auth) => self.authenticate(&auth),
             ClientMessage::ReducerCall(call) => {
                 self.reducer_call(call.id, call.reducer, call.args, call.idempotency_key)
                     .await
@@ -319,20 +355,75 @@ impl Session {
         }
     }
 
+    /// RPC-008/RPC-035: resolve the wire options this `Authenticate` asks
+    /// for — the message's fields win over the transport hints — and hold
+    /// them against the connection-lifetime rule. An unrecognized or
+    /// unsupported token is a 400 (RPC-020); a re-`Authenticate` naming a
+    /// value different from the pinned one is a 400 too, like the namespace
+    /// binding (OPS-050).
+    fn negotiate_wire(&self, auth: &Authenticate) -> Result<WireOptions, String> {
+        let compression_token = auth
+            .compression
+            .as_deref()
+            .or(self.hints.compression.as_deref());
+        let tx_updates_token = auth
+            .tx_updates
+            .as_deref()
+            .or(self.hints.tx_updates.as_deref());
+        let mut compression =
+            negotiate::parse_compression(compression_token).map_err(|e| e.to_string())?;
+        let update_form =
+            negotiate::parse_update_form(tx_updates_token).map_err(|e| e.to_string())?;
+        // The kill-switch degrades, never errors: the AuthResult echo says
+        // "none" and the client simply does not arm its decompressor.
+        if !self.ctx.wire_policy().compression_enabled {
+            compression = WireCompression::None;
+        }
+        let wanted = WireOptions {
+            compression,
+            update_form,
+        };
+        if let SessionState::Authenticated { wire, .. } = &self.state {
+            // Only an *explicit* differing token is a change request; a
+            // re-auth that names nothing keeps what the connection pinned.
+            let changed_compression =
+                compression_token.is_some() && wanted.compression != wire.compression;
+            let changed_form = tx_updates_token.is_some() && wanted.update_form != wire.update_form;
+            if changed_compression || changed_form {
+                return Err("wire options are fixed for the connection's lifetime; \
+                     reconnect to renegotiate (RPC-008/RPC-035)"
+                    .to_string());
+            }
+            return Ok(*wire);
+        }
+        Ok(wanted)
+    }
+
     /// AUTH-020/021: validate the token, derive the identity, allocate a
     /// `ConnectionId`, and reply `AuthResult`. A failure is a `401` with the
     /// connection kept open.
-    fn authenticate(&mut self, id: u32, token: &[u8], namespace: Option<&str>) -> Routed {
+    fn authenticate(&mut self, auth: &Authenticate) -> Routed {
+        let id = auth.id;
+        let token = &auth.token;
         // OPS-050: resolve the requested database first — an unknown name
         // must not authenticate into *anything*. The binding is fixed for
         // the connection's lifetime, so a re-`Authenticate` naming a
         // different database is refused rather than silently switching the
         // connection's data underneath its live subscriptions.
-        let requested = match self.ctx.resolve_namespace(namespace) {
+        let requested = match self.ctx.resolve_namespace(auth.namespace.as_deref()) {
             Ok(ns) => ns,
             Err(e) => {
                 self.ctx.metrics().note_auth(false);
                 return Routed::reply(from_error(Some(id), &e));
+            }
+        };
+        // RPC-008/RPC-035: refuse a bad negotiation before touching auth
+        // state — a 400, with the connection kept open for a retry.
+        let wire = match self.negotiate_wire(auth) {
+            Ok(wire) => wire,
+            Err(message) => {
+                self.ctx.metrics().note_auth(false);
+                return Routed::reply(error(Some(id), codes::PROTO_MALFORMED, &message));
             }
         };
         if self.is_authenticated() {
@@ -398,11 +489,19 @@ impl Session {
             // SPEC-017 CT-040: the auth layer's roles drive column grants.
             roles: outcome.roles.clone().into(),
         };
-        self.state = SessionState::Authenticated { caller, subscriber };
+        self.state = SessionState::Authenticated {
+            caller,
+            wire,
+            subscriber,
+        };
         Routed::reply(ServerMessage::AuthResult(AuthResult {
             id,
             identity: *outcome.identity.as_bytes(),
             token: outcome.refreshed_token,
+            // The negotiation echo (RPC-030): what the server WILL do,
+            // authoritative over what was asked.
+            compression: Some(wire.compression.echo().to_string()),
+            tx_updates: Some(wire.update_form.echo().to_string()),
         }))
     }
 
@@ -556,11 +655,14 @@ impl Session {
         let snapshot = self.store().snapshot();
         let manager = self.subscriptions().lock().await;
         match manager.resume(connection, query_id, from_offset, &snapshot) {
+            // RPC-035: the retained window stores pre-encode row diffs, so a
+            // replay is served in whatever form THIS session negotiated —
+            // the form is a session property, not a stored-delta property.
             Ok(Some(Resumed::Deltas(deltas))) => Routed {
                 responses: deltas
                     .into_iter()
-                    .map(|(offset, update)| {
-                        ServerMessage::TxUpdate(TxUpdate {
+                    .map(|(offset, update)| match self.wire().update_form {
+                        UpdateForm::Full => ServerMessage::TxUpdate(TxUpdate {
                             tx_id: offset,
                             timestamp: 0,
                             reducer_name: String::new(),
@@ -569,7 +671,14 @@ impl Session {
                             shard_id: self.ctx.shard_id,
                             tx_offset: offset,
                             tables: vec![(*update).clone()],
-                        })
+                        }),
+                        UpdateForm::Light => ServerMessage::TxUpdateLight(TxUpdateLight {
+                            tx_id: offset,
+                            timestamp: 0,
+                            shard_id: self.ctx.shard_id,
+                            tx_offset: offset,
+                            tables: vec![(*update).clone()],
+                        }),
                     })
                     .collect(),
             },
@@ -692,7 +801,9 @@ impl Session {
     /// unwind-free.
     fn authed(&self) -> (ReducerCaller, Subscriber, u128) {
         match &self.state {
-            SessionState::Authenticated { caller, subscriber } => (
+            SessionState::Authenticated {
+                caller, subscriber, ..
+            } => (
                 ReducerCaller {
                     timestamp: Timestamp::now(),
                     ..*caller

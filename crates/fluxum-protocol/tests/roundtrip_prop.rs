@@ -143,13 +143,18 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
         (
             any::<u32>(),
             prop::array::uniform32(any::<u8>()),
-            prop::collection::vec(any::<u8>(), 0..48)
+            prop::collection::vec(any::<u8>(), 0..48),
+            prop::option::of(prop::sample::select(vec!["none", "gzip"])),
+            prop::option::of(prop::sample::select(vec!["full", "light"]))
         )
-            .prop_map(|(id, identity, token)| {
+            .prop_map(|(id, identity, token, compression, tx_updates)| {
                 ServerMessage::AuthResult(AuthResult {
                     id,
                     identity,
                     token,
+                    // RPC-030 negotiation-echo tail roundtrips too.
+                    compression: compression.map(str::to_string),
+                    tx_updates: tx_updates.map(str::to_string),
                 })
             }),
         (
@@ -221,13 +226,18 @@ fn server_message() -> impl Strategy<Value = ServerMessage> {
         (
             any::<u64>(),
             any::<i64>(),
-            prop::collection::vec(table_update(), 0..3)
+            prop::collection::vec(table_update(), 0..3),
+            any::<u32>(),
+            any::<u64>()
         )
-            .prop_map(|(tx_id, timestamp, tables)| {
+            .prop_map(|(tx_id, timestamp, tables, shard_id, tx_offset)| {
                 ServerMessage::TxUpdateLight(TxUpdateLight {
                     tx_id,
                     timestamp,
                     tables,
+                    // RPC-035 tail (SHD-051 + CS-020) roundtrips too.
+                    shard_id,
+                    tx_offset,
                 })
             }),
         (

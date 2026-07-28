@@ -397,6 +397,31 @@ pub struct ShardContext {
     /// limiter in front of subscription registration and one-off queries.
     /// Shard-wide (namespaces share it — the CPU being protected is shared).
     query_limiter: Arc<fluxum_core::reducer::QueryLimiter>,
+    /// RPC-008 wire-compression policy: the `server.compression_enabled`
+    /// kill-switch and the per-frame threshold, applied at negotiation
+    /// (sessions pin their options for their lifetime, so flipping this
+    /// affects new connections only).
+    wire_policy: std::sync::RwLock<WirePolicy>,
+}
+
+/// RPC-008 server-side compression policy, from `server.compression_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WirePolicy {
+    /// The kill-switch: when off, every negotiation echoes `none`.
+    pub compression_enabled: bool,
+    /// Bodies below this many bytes ride tag `0x00` (outside the stream
+    /// context). Deliberately low by default — under stream carryover the
+    /// small realtime frames are where the window pays (RPC-008).
+    pub compression_threshold_bytes: usize,
+}
+
+impl Default for WirePolicy {
+    fn default() -> Self {
+        Self {
+            compression_enabled: true,
+            compression_threshold_bytes: 64,
+        }
+    }
 }
 
 /// A lock-free health snapshot (RPC-053 / OBS-060): read from atomics only,
@@ -493,6 +518,7 @@ impl ShardContext {
             ),
             query_bounds,
             query_limiter,
+            wire_policy: std::sync::RwLock::new(WirePolicy::default()),
         });
         // P0-A 1.3 (TXN-021 steps 9/10): the single writer publishes every
         // commit to this shard's fan-out at commit visibility — delivery
@@ -591,6 +617,23 @@ impl ShardContext {
         if let Ok(value) = serde_json::to_value(effective) {
             let _ = self.effective_config.set(value);
         }
+    }
+
+    /// The RPC-008 compression policy (kill-switch + threshold).
+    pub fn wire_policy(&self) -> WirePolicy {
+        *self
+            .wire_policy
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Install the RPC-008 compression policy (config apply/reload; new
+    /// connections only — pinned sessions keep what they negotiated).
+    pub fn set_wire_policy(&self, policy: WirePolicy) {
+        *self
+            .wire_policy
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
     }
 
     /// The rendered effective configuration, if the assembly installed one.
@@ -1219,7 +1262,7 @@ pub(crate) fn spawn_fanout_for(
     namespace: Option<Arc<crate::namespace::Namespace>>,
     shutdown: Arc<Notify>,
 ) {
-    use fluxum_protocol::{FrameCodec, ServerMessage};
+    use fluxum_protocol::{FrameCodec, ServerMessage, TxUpdateLight, UpdateForm};
 
     tokio::spawn(async move {
         let mut commits = match &namespace {
@@ -1322,14 +1365,46 @@ pub(crate) fn spawn_fanout_for(
                             u64::try_from(t.inserts.len() + t.deletes.len()).unwrap_or(u64::MAX)
                         })
                         .sum();
-                    let body = match ServerMessage::TxUpdate(tx_update).encode() {
-                        Ok(body) => body,
-                        Err(_) => continue,
+                    let handles = ctx.connections.handles_for(&conns).await;
+                    // RPC-035: one shared encode per negotiated form —
+                    // SUB-024 partitions, it does not multiply. The light
+                    // body only clones the tables when the group actually
+                    // mixes forms (the common fleet is homogeneous).
+                    let any_full = handles
+                        .iter()
+                        .any(|(_, h)| h.wire.update_form == UpdateForm::Full);
+                    let any_light = handles
+                        .iter()
+                        .any(|(_, h)| h.wire.update_form == UpdateForm::Light);
+                    let light_bytes = if any_light {
+                        let light = TxUpdateLight {
+                            tx_id: tx_update.tx_id,
+                            timestamp: tx_update.timestamp,
+                            shard_id: tx_update.shard_id,
+                            tx_offset: tx_update.tx_offset,
+                            tables: if any_full {
+                                tx_update.tables.clone()
+                            } else {
+                                std::mem::take(&mut tx_update.tables)
+                            },
+                        };
+                        ServerMessage::TxUpdateLight(light)
+                            .encode()
+                            .ok()
+                            .and_then(|body| codec.encode(&body).ok())
+                            .map(Arc::new)
+                    } else {
+                        None
                     };
-                    let Ok(framed) = codec.encode(&body) else {
-                        continue;
+                    let full_bytes = if any_full {
+                        ServerMessage::TxUpdate(tx_update)
+                            .encode()
+                            .ok()
+                            .and_then(|body| codec.encode(&body).ok())
+                            .map(Arc::new)
+                    } else {
+                        None
                     };
-                    let bytes = Arc::new(framed);
                     // Inline enqueue for every size: chunked parallel spawns
                     // were tried here (phase0_parity-fanout-latency 1.2) and
                     // measured NO better than the inline loop at 50
@@ -1337,8 +1412,13 @@ pub(crate) fn spawn_fanout_for(
                     // convoy behind a starved chunk task — the enqueue loop
                     // itself is ~36 µs; the cost lives in the writers'
                     // dispatch and socket writes, not here.
-                    for (conn_id, handle) in ctx.connections.handles_for(&conns).await {
-                        let frame = OutFrame::now(Arc::clone(&bytes));
+                    for (conn_id, handle) in handles {
+                        let bytes = match handle.wire.update_form {
+                            UpdateForm::Full => &full_bytes,
+                            UpdateForm::Light => &light_bytes,
+                        };
+                        let Some(bytes) = bytes else { continue };
+                        let frame = OutFrame::now(Arc::clone(bytes));
                         deliver_frame(&ctx, conn_id, &handle, frame, rows).await;
                     }
                 }

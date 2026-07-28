@@ -509,6 +509,7 @@ async fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
     };
     let mut subs: HashMap<String, Vec<Value>> = HashMap::new();
     let mut queues: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut wires: HashMap<String, Value> = HashMap::new();
     for host in &hosts {
         let listing = host
             .subscriptions
@@ -523,6 +524,16 @@ async fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
         for (connection, queued, capacity) in host.connections.queue_depths().await {
             queues.insert(connection.to_string(), (queued, capacity));
         }
+        // RPC-008/RPC-035: the negotiated wire posture per connection.
+        for (connection, wire) in host.connections.wire_options().await {
+            wires.insert(
+                connection.to_string(),
+                json!({
+                    "tx_updates": wire.update_form.echo(),
+                    "compression": wire.compression.echo(),
+                }),
+            );
+        }
     }
     let sessions: Vec<Value> = admin
         .list()
@@ -533,6 +544,9 @@ async fn sessions_list(ctx: &Arc<ShardContext>) -> AdminResponse {
                 Value::Array(subs.remove(&info.connection_id).unwrap_or_default());
             if let Some((queued, capacity)) = queues.get(&info.connection_id) {
                 entry["queue"] = json!({ "queued": queued, "capacity": capacity });
+            }
+            if let Some(wire) = wires.remove(&info.connection_id) {
+                entry["wire"] = wire;
             }
             entry
         })

@@ -47,7 +47,7 @@ use tokio_rustls::TlsAcceptor;
 use fluxum_core::metrics::SessionRejectReason;
 use fluxum_protocol::{ClientMessage, Frame, FrameCodec, ServerMessage, codes};
 
-use crate::session::{Session, SessionState};
+use crate::session::{Session, SessionState, WireHints};
 use crate::session_sec::token_id;
 use crate::tls::MaybeTls;
 use crate::{ConnHandle, OutFrame, ShardContext};
@@ -463,7 +463,7 @@ async fn serve_connection(
         // dropped with zero response bytes. Under shed-all-new even session
         // reattaches are dropped — but the sockets those sessions already
         // hold keep streaming untouched.
-        if request.path == "/rpc" && matches!(request.method.as_str(), "POST" | "GET") {
+        if is_rpc_path(&request.path) && matches!(request.method.as_str(), "POST" | "GET") {
             use fluxum_core::metrics::OverloadState;
             let shed = match state.ctx.overload_state() {
                 OverloadState::Normal => false,
@@ -494,15 +494,15 @@ async fn serve_connection(
             // rotation), `/metrics` (so the drain is observable) and `/drain`
             // itself. Refusing at accept would blind exactly the tooling the
             // drain depends on.
-            ("POST" | "GET", "/rpc") if state.ctx.is_draining() => {
+            ("POST" | "GET", path) if is_rpc_path(path) && state.ctx.is_draining() => {
                 write_simple(&mut stream, 503, "Service Unavailable").await?;
                 return Ok(());
             }
-            ("POST", "/rpc") => {
+            ("POST", path) if is_rpc_path(path) => {
                 handle_post(&state, &mut stream, ip, &request).await?;
                 true
             }
-            ("GET", "/rpc") => {
+            ("GET", path) if is_rpc_path(path) => {
                 // The GET stream owns the connection for its lifetime.
                 handle_get(&state, stream, &request, server_shutdown).await?;
                 return Ok(());
@@ -1052,6 +1052,10 @@ async fn handle_post(
         // SEC-047: key the source-side query-admission bucket on the
         // resolved client IP (proxy-aware, SEC-035).
         session.set_source_ip(ip);
+        // RPC-008/RPC-035: the `?compression=`/`?tx_updates=` hints ride the
+        // request path; an `Authenticate` in this batch consumes them (its
+        // own fields win).
+        session.set_wire_hints(wire_hints_of(&request.path));
         for message in messages {
             let routed = session.handle(message).await;
             responses.extend(routed.responses);
@@ -1090,6 +1094,10 @@ async fn handle_post(
                 ConnHandle {
                     sink: out_tx,
                     shutdown: Arc::clone(&shutdown),
+                    wire: match &router_state {
+                        SessionState::Authenticated { wire, .. } => *wire,
+                        SessionState::Unauthenticated => fluxum_protocol::WireOptions::default(),
+                    },
                 },
             )
             .await;
@@ -1206,7 +1214,7 @@ async fn handle_get(
         return write_simple(&mut stream, 404, "Not Found").await;
     };
     // Take the outbound receiver + shutdown for this session.
-    let (mut out_rx, shutdown, connection_id) = {
+    let (mut out_rx, shutdown, connection_id, wire) = {
         let mut sessions = state.sessions.lock().await;
         match sessions.get_mut(&token) {
             Some(sess) => {
@@ -1220,8 +1228,12 @@ async fn handle_get(
                         .note_session_rejected(SessionRejectReason::Revoked);
                     return write_simple(&mut stream, 404, "Not Found").await;
                 }
+                let wire = match &sess.state {
+                    SessionState::Authenticated { wire, .. } => *wire,
+                    SessionState::Unauthenticated => fluxum_protocol::WireOptions::default(),
+                };
                 match sess.out_rx.take() {
-                    Some(rx) => (rx, Arc::clone(&sess.shutdown), sess.connection_id),
+                    Some(rx) => (rx, Arc::clone(&sess.shutdown), sess.connection_id, wire),
                     None => {
                         drop(sessions);
                         // A stream is already open for this session.
@@ -1239,6 +1251,15 @@ async fn handle_get(
             }
         }
     };
+    // RPC-008 on Streamable HTTP: the negotiated compression applies to this
+    // GET push stream, one fresh context per stream (a reconnect restarts
+    // it); POST response bodies stay untagged RPC-001 frames.
+    let mut push_wire = (wire.compression == fluxum_protocol::WireCompression::Gzip).then(|| {
+        (
+            fluxum_protocol::StreamCompressor::new(),
+            state.ctx.wire_policy().compression_threshold_bytes,
+        )
+    });
 
     // Chunked streaming response header.
     write_stream_header(&mut stream).await?;
@@ -1282,7 +1303,26 @@ async fn handle_get(
                         fluxum_core::metrics::FanoutStage::QueueWait,
                         u64::try_from(frame.enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
-                    if write_chunk(&mut stream, &frame.bytes).await.is_err() {
+                    // RPC-008: re-frame through this stream's context; the
+                    // shared Arc'd bytes stay shared across subscribers.
+                    let transformed = match &mut push_wire {
+                        Some((compressor, threshold)) => {
+                            match crate::conn::wire_transform(
+                                compressor,
+                                &frame.bytes,
+                                *threshold,
+                                state.ctx.metrics(),
+                            ) {
+                                Ok(bytes) => bytes,
+                                // A broken deflate context cannot
+                                // resynchronize — end the stream.
+                                Err(_) => break Ok(()),
+                            }
+                        }
+                        None => None,
+                    };
+                    let bytes: &[u8] = transformed.as_deref().unwrap_or(&frame.bytes);
+                    if write_chunk(&mut stream, bytes).await.is_err() {
                         // The client vanished mid-stream: a transport blip,
                         // not a goodbye (SPEC-021 CS-021).
                         exit = GetExit::Detached;
@@ -1302,7 +1342,18 @@ async fn handle_get(
                 // RPC-060: idle expiry — 408 frame then close, drop session.
                 let codec = FrameCodec::default();
                 let frame = error_frame(&codec, codes::PROTO_IDLE_TIMEOUT, "idle timeout");
-                let _ = write_chunk(&mut stream, &frame).await;
+                // RPC-008: even the goodbye is a frame on this stream.
+                let transformed = match &mut push_wire {
+                    Some((compressor, threshold)) => crate::conn::wire_transform(
+                        compressor,
+                        &frame,
+                        *threshold,
+                        state.ctx.metrics(),
+                    )
+                    .unwrap_or(None),
+                    None => None,
+                };
+                let _ = write_chunk(&mut stream, transformed.as_deref().unwrap_or(&frame)).await;
                 break Ok(());
             }
         }
@@ -1343,6 +1394,35 @@ fn shard_ctx_of(default: &Arc<ShardContext>, state: &SessionState) -> Arc<ShardC
         return Arc::clone(host);
     }
     Arc::clone(default)
+}
+
+/// `/rpc` with or without a query string (RPC-008/RPC-035 allow
+/// `?compression=` / `?tx_updates=` on the endpoint).
+fn is_rpc_path(path: &str) -> bool {
+    path == "/rpc" || path.starts_with("/rpc?")
+}
+
+/// The RPC-008/RPC-035 wire-option hints from an `/rpc` query string. The
+/// tokens are bare lowercase words, so no percent-decoding applies; an
+/// unrecognized *value* is carried through for `Authenticate` to reject
+/// with its 400 (RPC-020) — dropping it here would silently downgrade.
+fn wire_hints_of(path: &str) -> WireHints {
+    let mut hints = WireHints::default();
+    let Some((_, query)) = path.split_once('?') else {
+        return hints;
+    };
+    for pair in query.split('&') {
+        match pair.split_once('=') {
+            Some(("compression", value)) if !value.is_empty() => {
+                hints.compression = Some(value.to_string());
+            }
+            Some(("tx_updates", value)) if !value.is_empty() => {
+                hints.tx_updates = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+    hints
 }
 
 /// Retire a session for good: drop it from the registry, deregister its

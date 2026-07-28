@@ -432,6 +432,12 @@ pub struct Metrics {
     subscriptions_active: AtomicI64,
     fanout_messages: AtomicU64,
     fanout_rows: AtomicU64,
+    /// RPC-008 stream compression: pre-compression frame-body bytes.
+    wire_compression_raw_bytes: AtomicU64,
+    /// RPC-008 stream compression: post-compression bytes on the wire.
+    wire_compression_sent_bytes: AtomicU64,
+    /// RPC-008 stream compression: CPU spent compressing, µs.
+    wire_compression_cpu_us: AtomicU64,
     fanout_stages: [FanoutStageStat; 6],
     drops_buffer_full: AtomicU64,
     drops_idle: AtomicU64,
@@ -556,6 +562,9 @@ impl Metrics {
             subscriptions_active: AtomicI64::new(0),
             fanout_messages: AtomicU64::new(0),
             fanout_rows: AtomicU64::new(0),
+            wire_compression_raw_bytes: AtomicU64::new(0),
+            wire_compression_sent_bytes: AtomicU64::new(0),
+            wire_compression_cpu_us: AtomicU64::new(0),
             fanout_stages: Default::default(),
             drops_buffer_full: AtomicU64::new(0),
             drops_idle: AtomicU64::new(0),
@@ -868,6 +877,18 @@ impl Metrics {
     pub fn note_fanout(&self, rows: u64) {
         self.fanout_messages.fetch_add(1, Ordering::Relaxed);
         self.fanout_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// RPC-008: one frame body went through a session's compression stream —
+    /// `raw` bytes in, `sent` bytes out (tag excluded), `cpu_us` spent. The
+    /// ratio the operator wants is `sent/raw` over any scrape interval.
+    pub fn note_wire_compression(&self, raw: u64, sent: u64, cpu_us: u64) {
+        self.wire_compression_raw_bytes
+            .fetch_add(raw, Ordering::Relaxed);
+        self.wire_compression_sent_bytes
+            .fetch_add(sent, Ordering::Relaxed);
+        self.wire_compression_cpu_us
+            .fetch_add(cpu_us, Ordering::Relaxed);
     }
 
     /// OBS-023: one observation of a fan-out delivery-pipeline stage.
@@ -1278,6 +1299,22 @@ impl Metrics {
             self.subscriptions_active.load(Ordering::Relaxed).max(0),
             self.fanout_messages.load(Ordering::Relaxed),
             self.fanout_rows.load(Ordering::Relaxed),
+        );
+        // --- RPC-008 wire compression ---
+        let _ = writeln!(
+            out,
+            "# HELP fluxum_wire_compression_raw_bytes_total Pre-compression frame-body bytes (RPC-008).\n\
+             # TYPE fluxum_wire_compression_raw_bytes_total counter\n\
+             fluxum_wire_compression_raw_bytes_total{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_wire_compression_sent_bytes_total Post-compression bytes on the wire (RPC-008).\n\
+             # TYPE fluxum_wire_compression_sent_bytes_total counter\n\
+             fluxum_wire_compression_sent_bytes_total{{shard=\"{shard}\"}} {}\n\
+             # HELP fluxum_wire_compression_cpu_us_total CPU spent compressing, microseconds (RPC-008).\n\
+             # TYPE fluxum_wire_compression_cpu_us_total counter\n\
+             fluxum_wire_compression_cpu_us_total{{shard=\"{shard}\"}} {}",
+            self.wire_compression_raw_bytes.load(Ordering::Relaxed),
+            self.wire_compression_sent_bytes.load(Ordering::Relaxed),
+            self.wire_compression_cpu_us.load(Ordering::Relaxed),
         );
         // --- fan-out stage latency histogram (OBS-023) ---
         out.push_str(

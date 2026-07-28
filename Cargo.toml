@@ -43,6 +43,9 @@ hmac = "0.12"
 imbl = "7"
 inventory = "0.3"
 jsonwebtoken = "9"
+# RPC-008 stream compression (raw DEFLATE with sync flush). Default backend
+# is the pure-Rust miniz_oxide — no C toolchain in the dependency budget.
+flate2 = "1"
 lz4 = "1"
 proc-macro2 = "1"
 proptest = "1"

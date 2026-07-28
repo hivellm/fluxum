@@ -161,22 +161,50 @@ hot path.
   three algorithms: `none` (default) | `gzip` | `brotli`. The client selects the algorithm via
   the `compression` field of `Authenticate` (RPC-020) or, for Streamable HTTP, the
   `?compression=` query parameter on `/rpc` (the `Authenticate` field wins if both are present).
-  Rules: *(adopted from SpacetimeDB analysis, file 06)*
+  The server SHALL echo the algorithm it actually applies in `AuthResult.compression` (RPC-030);
+  a client SHALL enable decompression only on that echo — never on its own request — so a server
+  with compression disabled (or one predating this field) degrades to `none` without ambiguity.
+  Rules: *(adopted from SpacetimeDB analysis, file 06; stream semantics amended by
+  phase9_delta-compression)*
 
-  - When any algorithm other than `none` is negotiated, every server→client frame body SHALL
+  - When any algorithm other than `none` is **in effect**, every server→client frame body SHALL
     begin with a 1-byte compression tag (`0x00` = uncompressed, `0x01` = gzip, `0x02` = brotli)
-    followed by the (possibly compressed) MessagePack envelope; the `u32 LE` length prefix
-    (RPC-001) counts tag + payload. The tag is written first into the uncompressed buffer so
-    that skipping compression requires no byte-shifting. When `none` is negotiated (or nothing
-    was negotiated), no tag byte is present and framing is exactly RPC-001.
-  - Compression SHALL be applied only to payloads whose uncompressed body size is at or above
-    `compression_threshold_bytes` (default: 1,024, configurable) — in practice large `TxUpdate`
-    and `InitialData` payloads; smaller frames are sent with tag `0x00`. Recommended encoder
-    setting: brotli quality 1 (measured 7–10× on large subscription updates).
+    followed by the payload; the `u32 LE` length prefix (RPC-001) counts tag + payload.
+    Zero-length keep-alive frames (RPC-001/006) have no body and therefore carry no tag. When
+    `none` is in effect, no tag byte is present and framing is exactly RPC-001.
+  - **`gzip` is a connection-lifetime DEFLATE stream, not per-frame compression.** The server
+    maintains one raw DEFLATE (RFC 1951) compression context per ordered server→client byte
+    stream. Each tag-`0x01` frame's payload is the next chunk of that stream, terminated by a
+    sync flush (byte-aligned, trailing `00 00 FF FF`), so the receiver can fully inflate every
+    frame at its boundary while both sides keep the 32 KiB sliding window. Repeated bytes across
+    consecutive frames — identities, table and reducer names, near-identical rows — become
+    window back-references: this context carryover is the protocol's generic delta layer, and it
+    is exactly what per-frame compression cannot provide at realtime frame sizes. Frames sent
+    with tag `0x00` SHALL NOT touch either side's stream context.
+  - Compression takes effect with the first frame **after** the `AuthResult` that accepted the
+    negotiation; the `AuthResult` itself is untagged. On TCP the stream context then spans the
+    rest of the connection. On Streamable HTTP the negotiated compression applies to the GET
+    push stream only, one fresh context per GET (a reconnect restarts the stream); POST response
+    bodies remain untagged RPC-001 frames (standard HTTP `Content-Encoding` stays available for
+    those, outside this rule).
+  - Frames whose uncompressed body is smaller than `compression_threshold_bytes` (default:
+    **64**, configurable) are sent with tag `0x00`. The default is deliberately low: under
+    stream carryover, small realtime frames are precisely where the shared window pays — a
+    position-sync `TxUpdateLight` compresses to a fraction of its size against the previous
+    frame's bytes. (The old per-frame default of 1,024 would exempt the workload this feature
+    exists for.)
+  - `compression` is fixed for the connection's lifetime at the first successful
+    `Authenticate`; a re-`Authenticate` naming a different value SHALL be rejected with a 400
+    error, like the namespace binding (OPS-050).
+  - `brotli` (tag `0x02`) is a reserved negotiation token: a server build without a brotli codec
+    SHALL reject the negotiation with a 400 error rather than silently degrade — the client
+    falls back explicitly. (The reference server ships `gzip` only; brotli's dependency cost is
+    not justified while the stream-deflate layer exists.)
   - Client→server messages SHALL always be uncompressed.
   - Compression SHALL execute in the per-connection send path, off the commit path, and SHALL
     never be shared across subscribers (SPEC-005 SUB-024: share the row encoding, never the
-    compression).
+    compression). Observability (SPEC-012): the server exports pre/post-compression byte
+    counters and compression CPU time per transport.
 
 ---
 
@@ -324,8 +352,17 @@ hot path.
       pub id: u32,              // echoes Authenticate.id
       pub identity: [u8; 32],   // derived 256-bit identity (SPEC-009)
       pub token: Vec<u8>,       // refreshed/rotated token (MAY be same as input)
+      // --- Additive tail (RPC-011): append only, never reorder above -------
+      pub compression: Option<String>, // algorithm the server will apply (RPC-008);
+                                       // None (older server) reads as "none"
+      pub tx_updates: Option<String>,  // update form the server will send (RPC-035);
+                                       // None (older server) reads as "full"
   }
   ```
+
+  The two tail fields are the negotiation echo: the server states what it will actually do,
+  which is authoritative over what the client asked for. A client SHALL key its decompressor
+  (RPC-008) and its update-form expectations (RPC-035) off this echo alone.
 
 - **RPC-031** [P0] **ReducerResult.**
 
@@ -444,25 +481,80 @@ hot path.
 - **RPC-035** [P1] **TxUpdate metadata mode (`tx_updates: full | light`).** The default remains
   the enriched `TxUpdate` of RPC-033 (FR-43). A connection MAY opt out via the per-connection
   option `tx_updates: light`, set in `Authenticate` (RPC-020) or, for Streamable HTTP, via the
-  `?tx_updates=` query parameter on `/rpc`. Under `light`, the server SHALL send `TxUpdateLight`
-  instead of `TxUpdate`, omitting `reducer_name`, `caller`, and `duration_us` for
-  bandwidth-critical clients:
+  `?tx_updates=` query parameter on `/rpc` (the `Authenticate` field wins if both are present).
+  The server SHALL echo the form it will send in `AuthResult.tx_updates` (RPC-030). Under
+  `light`, the server SHALL send `TxUpdateLight` instead of `TxUpdate`, omitting `reducer_name`,
+  `caller`, and `duration_us` for bandwidth-critical clients:
 
   ```rust
   pub struct TxUpdateLight {
       pub tx_id: u64,               // as RPC-033
       pub timestamp: i64,           // as RPC-033
       pub tables: Vec<TableUpdate>,
+      // --- Additive tail (RPC-011): append only, never reorder above -------
+      pub shard_id: u32,            // as RPC-033 (SPEC-007 SHD-051)
+      pub tx_offset: u64,           // as RPC-033 (SPEC-021 CS-020)
   }
   ```
 
   `TxUpdateLight` carries identical row-diff semantics (SPEC-005 SUB-003) and the same `tx_id`
-  gap-detection contract (RPC-062). The mode affects only broadcast updates: the caller of a
-  reducer always receives its `ReducerResult` (RPC-031) regardless of mode. Lesson: SpacetimeDB
-  broadcast v1-style enriched updates, regretted the per-commit metadata fan-out cost (bandwidth
-  pressure even pushed users toward one-letter reducer names), and stripped metadata entirely in
-  its v2 protocol; Fluxum keeps enrichment as the default but makes it opt-out per connection
-  instead. *(adopted from SpacetimeDB analysis, file 06)*
+  gap-detection contract (RPC-062). **The light form strips commit provenance, never the resume
+  cursor**: `tx_offset` (and `shard_id`, in the same tail order as RPC-033) rides the additive
+  tail, so a light session retains and echoes `Resume.from_offset` exactly like a full one, and
+  the offset space stays free to diverge from tx ids without breaking either mode. Frames
+  replayed from a retained delta window — a `Resume` answer (CS-021) — are served in the
+  session's negotiated form too: the window retains pre-encode row diffs, not encoded frames, so
+  the form is a property of the session, not of the stored delta. `tx_updates` is fixed for the
+  connection's lifetime at the first successful `Authenticate` (a mid-stream switch would tear
+  SDK cache attribution); a re-`Authenticate` naming a different value SHALL be rejected with a
+  400 error. An unrecognized value SHALL be rejected with a 400 error (RPC-020). The mode
+  affects only broadcast updates: the caller of a reducer always receives its `ReducerResult`
+  (RPC-031) regardless of mode. Lesson: SpacetimeDB broadcast v1-style enriched updates,
+  regretted the per-commit metadata fan-out cost (bandwidth pressure even pushed users toward
+  one-letter reducer names), and stripped metadata entirely in its v2 protocol; Fluxum keeps
+  enrichment as the default but makes it opt-out per connection instead. *(adopted from
+  SpacetimeDB analysis, file 06; tail + resume semantics amended by phase9_delta-compression)*
+
+- **RPC-036** [P2] **Column-level update deltas (`tx_updates: delta`) — SPECIFIED, NOT YET
+  IMPLEMENTED.** Implementation lives in its own task; a server that does not implement this
+  form SHALL reject `tx_updates: delta` with a 400 error, and the `AuthResult.tx_updates` echo
+  (RPC-030) is what tells a client the form is live. Rationale: an update today travels as
+  delete(PK) + full inserted row, so a position-sync row re-sends its identity, name and every
+  unchanged column per move; game netcode solves this with per-entity changed-field deltas, and
+  the shared-encode shape of Fluxum's fan-out admits the same trick once per commit. Rules:
+
+  - `tx_updates: delta` implies the light envelope (RPC-035) and additionally replaces the
+    delete+insert pair of an **update** — a delete and an insert bearing the same primary key
+    within one committed `TableUpdate` — with one entry in a third row lane:
+
+    ```rust
+    pub struct TableUpdateDelta {          // rides TableUpdate's additive tail
+        pub row_count: u32,                // update entries in this lane
+        pub rows_data: Vec<u8>,            // concatenated update entries (below)
+    }
+    // One update entry, in schema column order:
+    //   pk_fields   — FluxBIN primary-key field(s), exactly as the deletes lane (RPC-042)
+    //   mask_len    — u8: bitmask length in bytes = ceil(column_count / 8)
+    //   mask        — changed-column bitmask, bit i = schema column i changed
+    //   values      — FluxBIN values of the set columns only, in schema order
+    ```
+
+  - The mask+values entry is computed **once per commit** from the committed diff's old+new row
+    pair and shared by every delta subscriber — the encode-once model (SPEC-005 SUB-024)
+    survives; nothing is computed per subscriber.
+  - Inserts, deletes of rows that do not reappear, and rows **appearing or disappearing through
+    a visibility change** (SPEC-005 DM-060: owner/RLS boundary movement) SHALL use the full-row
+    lanes unchanged: a delta is only legal against a row the recipient is guaranteed to hold.
+  - A client applying a delta entry whose primary key is absent from its cache holds a broken
+    invariant (SDK-045): it SHALL treat the subscription as desynced and re-subscribe (the
+    `cache_reset` path of CS-022), never guess.
+  - Retained delta windows (SPEC-021 CS-021) keep the full new row **and** the changed-column
+    mask per update, so one stored delta serves a resuming session in whichever form it
+    negotiated (full, light, or delta); the stored form is never the wire form.
+  - Composition: the delta lane rides *inside* the envelope that stream compression (RPC-008)
+    sees, so the layers multiply (batch × light × delta × stream-deflate), and quantization
+    stays application-level — the module chooses its coordinate grid; the database does not
+    degrade user data.
 
 ---
 
@@ -700,19 +792,26 @@ green.
     streamed `TxUpdate` delivery, keep-alive messages) works unmodified through a standard HTTP reverse
     proxy (e.g. nginx/HAProxy) with response buffering disabled for `/rpc`; the required proxy
     configuration is documented as a deployment note.
-16. **Compression negotiation** (RPC-008) *(adopted from SpacetimeDB analysis, file 06)* — a
-    connection negotiating `brotli` (via `Authenticate` field and, separately, via
-    `?compression=` on `/rpc`) receives large `TxUpdate`/`InitialData` frames tagged `0x02` and
-    correctly decompressed by the SDK; frames below `compression_threshold_bytes` arrive tagged
-    `0x00`; a `none` (default) connection sees no tag byte and byte-identical RPC-001 framing;
-    client→server frames are never compressed; an unrecognized algorithm is rejected with a 400
-    error.
+16. **Compression negotiation** (RPC-008) *(adopted from SpacetimeDB analysis, file 06; stream
+    semantics amended by phase9_delta-compression)* — a connection negotiating `gzip` (via
+    `Authenticate` field and, separately, via `?compression=` on `/rpc`) gets the echo in
+    `AuthResult.compression`, an untagged `AuthResult`, and then tagged frames: bodies at or
+    above `compression_threshold_bytes` arrive tagged `0x01` as sync-flushed chunks of one
+    per-stream DEFLATE context — a sequence of frames repeating the same identity bytes
+    compresses far smaller than the same frames compressed independently (the carryover
+    witness); bodies below the threshold arrive tagged `0x00` and do not disturb the stream
+    context; zero-length keep-alives stay zero-length. A `none` (default) connection sees no
+    tag byte and byte-identical RPC-001 framing; with `server.compression.enabled: false` the
+    echo says `none` and no tag appears despite the request; client→server frames are never
+    compressed; an unrecognized algorithm — and `brotli` on a build without a brotli codec — is
+    rejected with a 400 error.
 17. **TxUpdate light mode** (RPC-035) *(adopted from SpacetimeDB analysis, file 06)* — with two
     subscribers to the same query, one `tx_updates: full` and one `tx_updates: light`, a
     committed reducer call delivers the enriched `TxUpdate` (criterion 9) to the first and a
-    `TxUpdateLight` (same `tx_id`, `timestamp`, and row diffs; no `reducer_name`/`caller`/
-    `duration_us`) to the second; the reducer's caller receives its `ReducerResult` in both
-    modes.
+    `TxUpdateLight` (same `tx_id`, `timestamp`, row diffs, `shard_id` and `tx_offset`; no
+    `reducer_name`/`caller`/`duration_us`) to the second; the reducer's caller receives its
+    `ReducerResult` in both modes; a light session that drops its transport resumes via
+    `Resume.from_offset` and replays the missed window as `TxUpdateLight` frames.
 18. **Queue overflow kick** (RPC-064) *(adopted from SpacetimeDB analysis, file 06)* — a
     subscriber whose outgoing queue is driven past `outgoing_queue_frames` is disconnected
     without any measurable stall of fan-out to other subscribers (cross-checked against the

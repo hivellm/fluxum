@@ -15,6 +15,13 @@ pub struct OutFrame {
     pub enqueued_at: Instant,
     /// The encoded frame bytes.
     pub bytes: Arc<Vec<u8>>,
+    /// Bypass the RPC-008 compression transform for this frame. Set only on
+    /// the `AuthResult` that *accepts* a compression negotiation: it is
+    /// enqueued before the writer's transform arms, but a lagging writer may
+    /// dequeue it after — the flag pins the spec's boundary ("compression
+    /// takes effect with the first frame after the accepting AuthResult")
+    /// against that race.
+    pub raw: bool,
 }
 
 impl OutFrame {
@@ -24,8 +31,54 @@ impl OutFrame {
         Self {
             enqueued_at: Instant::now(),
             bytes,
+            raw: false,
         }
     }
+}
+
+/// Apply the RPC-008 per-connection send transform to one framed message:
+/// strip the RPC-001 prefix, run the body through the connection's stream
+/// context (or tag it `0x00` below `threshold`), and re-frame as
+/// `u32 LE (1 + payload)` + tag + payload. Zero-length keep-alive frames
+/// pass through untouched (they have no body to tag).
+///
+/// Returns the bytes to write, or `None` when the frame is a keep-alive
+/// (write the original), and an error when the deflate context is broken —
+/// connection-fatal, the stream cannot resynchronize.
+pub(crate) fn wire_transform(
+    compressor: &mut fluxum_protocol::StreamCompressor,
+    framed: &[u8],
+    threshold: usize,
+    metrics: &fluxum_core::metrics::Metrics,
+) -> Result<Option<Vec<u8>>, fluxum_protocol::CompressError> {
+    let body = &framed[fluxum_protocol::FRAME_HEADER_LEN.min(framed.len())..];
+    if body.is_empty() {
+        return Ok(None); // keep-alive: no body, no tag (RPC-008)
+    }
+    let mut out;
+    if body.len() >= threshold {
+        let began = Instant::now();
+        let chunk = compressor.compress_chunk(body)?;
+        let cpu = u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX);
+        metrics.note_wire_compression(
+            body.len() as u64,
+            u64::try_from(chunk.len()).unwrap_or(u64::MAX),
+            cpu,
+        );
+        out = Vec::with_capacity(fluxum_protocol::FRAME_HEADER_LEN + 1 + chunk.len());
+        let len = u32::try_from(1 + chunk.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.push(fluxum_protocol::TAG_GZIP_STREAM);
+        out.extend_from_slice(&chunk);
+    } else {
+        // Below threshold: tagged uncompressed, outside the stream context.
+        out = Vec::with_capacity(fluxum_protocol::FRAME_HEADER_LEN + 1 + body.len());
+        let len = u32::try_from(1 + body.len()).unwrap_or(u32::MAX);
+        out.extend_from_slice(&len.to_le_bytes());
+        out.push(fluxum_protocol::TAG_UNCOMPRESSED);
+        out.extend_from_slice(body);
+    }
+    Ok(Some(out))
 }
 
 /// A live connection's fan-out handle: a bounded outbound queue (drained by
@@ -38,6 +91,11 @@ pub struct ConnHandle {
     pub sink: mpsc::Sender<OutFrame>,
     /// Forces the connection to close (slow-consumer drop, SUB-042).
     pub shutdown: Arc<Notify>,
+    /// The wire options this connection negotiated (RPC-008/RPC-035).
+    /// Registration happens at authentication, after the options pinned, so
+    /// the fan-out can partition a delivery group by form without a lookup
+    /// — and `GET /sessions` can report the posture per connection.
+    pub wire: fluxum_protocol::WireOptions,
 }
 
 /// Live connection registry: `connection_id` → its fan-out handle. The
@@ -71,6 +129,16 @@ impl ConnectionRegistry {
                 let queued = capacity.saturating_sub(handle.sink.capacity());
                 (*connection, queued, capacity)
             })
+            .collect()
+    }
+
+    /// Per-connection negotiated wire options, for the SEC-053 session
+    /// listing: `(connection, options)`.
+    pub async fn wire_options(&self) -> Vec<(u128, fluxum_protocol::WireOptions)> {
+        let guard = self.handles.lock().await;
+        guard
+            .iter()
+            .map(|(connection, handle)| (*connection, handle.wire))
             .collect()
     }
 

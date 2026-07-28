@@ -254,6 +254,17 @@ pub struct AuthResult {
     /// Refreshed/rotated token (MAY be the same as the input).
     #[serde(with = "serde_bytes")]
     pub token: Vec<u8>,
+    // --- Additive tail (RPC-011): append only, never reorder above ---------
+    /// The compression algorithm the server will actually apply (RPC-008) —
+    /// the negotiation echo, authoritative over what the client asked for. A
+    /// client keys its decompressor off this alone; `None` (an older server)
+    /// reads as `"none"`.
+    #[serde(default)]
+    pub compression: Option<String>,
+    /// The update form the server will actually send (RPC-035); `None` (an
+    /// older server) reads as `"full"`.
+    #[serde(default)]
+    pub tx_updates: Option<String>,
 }
 
 /// RPC-031 — response to `ReducerCall`.
@@ -357,6 +368,16 @@ pub struct TxUpdateLight {
     pub timestamp: i64,
     /// As [`TxUpdate::tables`].
     pub tables: Vec<TableUpdate>,
+    // --- Additive tail (RPC-011): append only, never reorder above ---------
+    /// As [`TxUpdate::shard_id`] (SPEC-007 SHD-051). Same tail order as
+    /// `TxUpdate` so the two forms stay mechanically comparable.
+    #[serde(default)]
+    pub shard_id: u32,
+    /// As [`TxUpdate::tx_offset`] (SPEC-021 CS-020): light sessions resume
+    /// from the same cursor space as full ones — the light form strips
+    /// commit *provenance* (reducer, caller, duration), never the cursor.
+    #[serde(default)]
+    pub tx_offset: u64,
 }
 
 /// RPC-034 — error response (wire tag `"Error"`), structured per the

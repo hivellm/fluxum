@@ -412,6 +412,44 @@
       ]
     },
     {
+      "id": 38,
+      "type": "timeseries",
+      "title": "Wire compression (RPC-008)",
+      "description": "Stream-deflate push compression: bytes before/after, ratio, and CPU spent. sent/raw well under 1.0 means the shared window is paying.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 0,
+        "y": 29
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(fluxum_wire_compression_raw_bytes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "raw B/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fluxum_wire_compression_sent_bytes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "sent B/s",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(fluxum_wire_compression_sent_bytes_total{shard=~\"$shard\"}[1m])) / sum(rate(fluxum_wire_compression_raw_bytes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "sent/raw ratio",
+          "refId": "C"
+        },
+        {
+          "expr": "sum(rate(fluxum_wire_compression_cpu_us_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "compress CPU µs/s",
+          "refId": "D"
+        }
+      ]
+    },
+    {
       "id": 22,
       "type": "timeseries",
       "title": "Fan-out stage latency p99 (µs)",

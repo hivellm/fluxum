@@ -358,7 +358,15 @@ async fn drive_connection(
     // keep the writer — and the socket — alive after the server "died",
     // and a killed primary would keep heartbeating through it forever.
     let conn_closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let writer = tokio::spawn(writer_task(write_half, out_rx, Arc::clone(ctx.metrics())));
+    // RPC-008: armed (with the threshold) after the AuthResult that accepts
+    // a gzip negotiation; the writer transforms every later frame.
+    let send_wire: Arc<std::sync::OnceLock<usize>> = Arc::new(std::sync::OnceLock::new());
+    let writer = tokio::spawn(writer_task(
+        write_half,
+        out_rx,
+        Arc::clone(ctx.metrics()),
+        Arc::clone(&send_wire),
+    ));
 
     let mut session = Session::new(Arc::clone(&ctx));
     // SEC-047: key the source-side query-admission bucket on the resolved
@@ -420,6 +428,7 @@ async fn drive_connection(
                                 &out_tx,
                                 &conn_shutdown,
                                 &conn_closed,
+                                &send_wire,
                             )
                             .await
                         {
@@ -518,6 +527,7 @@ async fn route_frame(
     out_tx: &mpsc::Sender<OutFrame>,
     conn_shutdown: &Arc<Notify>,
     conn_closed: &Arc<std::sync::atomic::AtomicBool>,
+    send_wire: &Arc<std::sync::OnceLock<usize>>,
 ) -> bool {
     let message = match ClientMessage::decode(body) {
         Ok(message) => message,
@@ -647,6 +657,7 @@ async fn route_frame(
                 ConnHandle {
                     sink: out_tx.clone(),
                     shutdown: Arc::clone(conn_shutdown),
+                    wire: session.wire(),
                 },
             )
             .await;
@@ -660,22 +671,37 @@ async fn route_frame(
     }
 
     for response in routed.responses {
-        let Ok(frame) = frame_message(codec, &response) else {
+        let Ok(mut frame) = frame_message(codec, &response) else {
             continue;
         };
+        // RPC-008: the AuthResult that accepts a gzip negotiation is the
+        // last untagged frame — mark it raw, send it, THEN arm the writer's
+        // transform so everything after it is tagged.
+        let arming = send_wire.get().is_none()
+            && matches!(response, ServerMessage::AuthResult(_))
+            && session.wire().compression == fluxum_protocol::WireCompression::Gzip;
+        frame.raw = arming;
         if out_tx.send(frame).await.is_err() {
             return false;
+        }
+        if arming {
+            let _ = send_wire.set(session.ctx().wire_policy().compression_threshold_bytes);
         }
     }
     true
 }
 
-/// The writer task: drain the outbound queue to the socket in order.
+/// The writer task: drain the outbound queue to the socket in order. Once
+/// `send_wire` arms (RPC-008: gzip accepted), every non-`raw` frame is
+/// re-framed through this connection's stream context — the shared `Arc`'d
+/// bytes stay shared; the transform is strictly per-connection (SUB-024).
 async fn writer_task(
     mut write_half: WriteHalf<MaybeTls>,
     mut out_rx: mpsc::Receiver<OutFrame>,
     metrics: Arc<fluxum_core::metrics::Metrics>,
+    send_wire: Arc<std::sync::OnceLock<usize>>,
 ) {
+    let mut compressor: Option<fluxum_protocol::StreamCompressor> = None;
     while let Some(frame) = out_rx.recv().await {
         // OBS-023: queue + writer-wake latency, then the socket write.
         let us = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
@@ -683,8 +709,21 @@ async fn writer_task(
             fluxum_core::metrics::FanoutStage::QueueWait,
             us(frame.enqueued_at.elapsed()),
         );
+        let transformed = match (frame.raw, send_wire.get()) {
+            (false, Some(&threshold)) => {
+                let ctx = compressor.get_or_insert_with(fluxum_protocol::StreamCompressor::new);
+                match crate::conn::wire_transform(ctx, &frame.bytes, threshold, &metrics) {
+                    Ok(bytes) => bytes,
+                    // A broken deflate context cannot resynchronize —
+                    // connection-fatal by construction.
+                    Err(_) => break,
+                }
+            }
+            _ => None,
+        };
         let began = std::time::Instant::now();
-        if write_half.write_all(&frame.bytes).await.is_err() {
+        let bytes: &[u8] = transformed.as_deref().unwrap_or(&frame.bytes);
+        if write_half.write_all(bytes).await.is_err() {
             break;
         }
         metrics.note_fanout_stage(

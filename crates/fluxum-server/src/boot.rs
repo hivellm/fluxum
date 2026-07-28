@@ -594,6 +594,15 @@ pub async fn serve(config: Config) -> Result<Server, BootError> {
     };
     let max_frame_bytes = u32::try_from(config.server.max_frame_bytes.as_u64())
         .unwrap_or(fluxum_protocol::DEFAULT_MAX_FRAME_BYTES);
+    // RPC-008: the compression kill-switch + threshold, consulted at every
+    // negotiation (sessions pin what they negotiated for their lifetime).
+    ctx.set_wire_policy(crate::WirePolicy {
+        compression_enabled: config.server.compression_enabled,
+        compression_threshold_bytes: usize::try_from(
+            config.server.compression_threshold_bytes.as_u64(),
+        )
+        .unwrap_or(64),
+    });
 
     let http_addr = format!("{}:{}", config.server.tcp_host, config.server.http_port);
     let tcp_addr = format!("{}:{}", config.server.tcp_host, config.server.tcp_port);
