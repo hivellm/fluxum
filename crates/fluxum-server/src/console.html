@@ -261,6 +261,20 @@ pre.raw { font-family: var(--mono); font-size: 12px; padding: 16px; white-space:
 .scard table.grid th { position: static; }
 .scard .ft { padding: 10px 16px; border-top: 1px solid var(--line2); font-size: 12px; color: var(--t2); font-family: var(--mono); }
 .scard td .badge { margin-right: 4px; }
+/* --- reducer console ----------------------------------------------------------------- */
+.reducer-grid { display: grid; grid-template-columns: minmax(240px, 300px) 1fr; gap: 16px; }
+.rpane { padding: 20px; display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+.rpane h3 { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.rlist { display: flex; flex-direction: column; max-height: 300px; overflow-y: auto; }
+.rlist .item {
+  display: flex; align-items: center; gap: 8px; padding: 8px 10px; border-radius: 4px;
+  cursor: pointer; font-family: var(--mono); font-size: 12.5px; transition: background 150ms;
+}
+.rlist .item:hover, .rlist .item.on { background: var(--hov); }
+.rlist .item .rate { margin-left: auto; }
+.hist-line { padding: 4px 10px; border-left: 4px solid transparent; font-size: 12px; }
+.hist-line.ok { border-left-color: var(--ok); }
+.hist-line.fail { border-left-color: var(--err); color: var(--err); }
 /* --- login + toasts (solid saturated fills, top-right) ---------------------------- */
 #login { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: none; align-items: center; justify-content: center; z-index: 50; }
 #login.on { display: flex; }
@@ -302,6 +316,7 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
     <button data-view="overview" class="on"><svg class="ic" viewBox="0 0 24 24"><path d="m12 14 3.5-3.5"/><path d="M20.5 18a9 9 0 1 0-17 0"/></svg>Overview</button>
     <button data-view="data"><svg class="ic" viewBox="0 0 24 24"><path d="M3 5h18v14H3z"/><path d="M3 10h18M9 10v9"/></svg>Data</button>
     <button data-view="query"><svg class="ic" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>Query</button>
+    <button data-view="reducers"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m10 8 5 4-5 4V8"/></svg>Reducers</button>
     <button data-view="live"><svg class="ic" viewBox="0 0 24 24"><path d="M2 12h4l3-8 4 16 3-8h6"/></svg>Live</button>
     <button data-view="logs"><svg class="ic" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Logs</button>
     <button data-view="metrics"><svg class="ic" viewBox="0 0 24 24"><path d="M3 21V3M3 21h18"/><path d="m7 15 4-6 3 3 5-8"/></svg>Metrics</button>
@@ -353,6 +368,35 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
       <div class="panel" id="q-explain-box" style="display:none"></div>
       <div class="err-box" id="q-err"></div>
       <div class="scroll" id="q-grid"></div>
+    </section>
+    <section class="view" id="view-reducers">
+      <div class="reducer-grid">
+        <div class="card rpane">
+          <h3>Reducers <span class="n mut2" id="r-n"></span></h3>
+          <div id="r-list" class="rlist"></div>
+        </div>
+        <div class="card rpane">
+          <h3 id="r-title" style="font-family:var(--mono)">&mdash;</h3>
+          <div class="row" id="r-meta"></div>
+          <div id="r-args" style="display:flex;flex-direction:column;gap:14px"></div>
+          <div class="row">
+            <button class="btn sm" id="r-invoke" disabled><svg class="ic sm" viewBox="0 0 24 24"><path d="m6 4 14 8-14 8V4z"/></svg>Invoke</button>
+            <span class="err-box" id="r-err"></span>
+          </div>
+          <div class="mut2" id="r-history-head" style="display:none">Invocations (this session)</div>
+          <div id="r-history" class="stream"></div>
+        </div>
+      </div>
+      <div class="card rpane">
+        <h3>Recent commits from the audit trail
+          <span class="spacer"></span>
+          <select id="a-table"></select>
+          <input type="text" id="a-limit" value="20" size="3">
+          <button class="btn sm" id="a-refresh"><svg class="ic sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>Refresh</button>
+        </h3>
+        <div class="muted" id="a-note"></div>
+        <div id="a-grid" style="overflow-x:auto"></div>
+      </div>
     </section>
     <section class="view" id="view-live">
       <div class="row">

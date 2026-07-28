@@ -28,8 +28,9 @@ function toast(kind, msg) {
 }
 
 // --- view switching ----------------------------------------------------------
-const VIEW_TITLES = { overview: "Overview", data: "Data", query: "Query", live: "Live",
-  logs: "Logs", metrics: "Metrics", schema: "Schema", designer: "New table" };
+const VIEW_TITLES = { overview: "Overview", data: "Data", query: "Query",
+  reducers: "Reducers", live: "Live", logs: "Logs", metrics: "Metrics",
+  schema: "Schema", designer: "New table" };
 function showView(view) {
   document.querySelectorAll("nav.views button").forEach((b) => b.classList.toggle("on", b.dataset.view === view));
   document.querySelectorAll(".view").forEach((s) => s.classList.toggle("on", s.id === "view-" + view));
@@ -375,6 +376,8 @@ async function loadSchema() {
     }
     $("s-json").textContent = JSON.stringify(schemaDoc, null, 2);
     renderSchemaDoc();
+    renderReducerList();
+    renderAuditTables();
     if (!currentTable && tables.length) { currentTable = tables[0].name; browse(); }
   } catch (e) { $("tbl-list").textContent = String(e.message || e); }
 }
@@ -685,6 +688,214 @@ function openInspector(table, row) {
 }
 $("in-close").addEventListener("click", () => $("ioverlay").classList.remove("on"));
 $("ioverlay").addEventListener("click", (e) => { if (e.target === $("ioverlay")) $("ioverlay").classList.remove("on"); });
+
+// --- reducer console (signature-driven forms, RPC-051 invoke, audit) ----------------
+let currentReducer = null; // the selected /schema reducer descriptor
+let reducerFields = [];    // [{ name, build() -> JSON arg (throws on bad input) }]
+const invokeHistory = [];  // this session's invocations, latest first
+// "Option<u64>" / "Vec<String>" / "u64" → { opt, vec, base } (Rust source types, SDK-001).
+function parseRustTy(ty) {
+  let opt = false, vec = false, base = (ty || "").trim();
+  if (base.startsWith("Option<") && base.endsWith(">")) { opt = true; base = base.slice(7, -1).trim(); }
+  if (base.startsWith("Vec<") && base.endsWith(">")) { vec = true; base = base.slice(4, -1).trim(); }
+  return { opt, vec, base };
+}
+const RUST_INTS = ["u8", "u16", "u32", "u64", "usize", "i8", "i16", "i32", "i64", "isize"];
+// One scalar input string → the JSON argument (json_to_flux universe: the
+// admin surface maps numbers to I64/F64 and strings to Str).
+function rustScalarToJson(base, raw) {
+  const s = String(raw).trim();
+  if (RUST_INTS.includes(base)) {
+    if (!/^[+-]?\d+$/.test(s)) throw new Error("expected an integer");
+    const n = Number(s);
+    if (!Number.isSafeInteger(n)) throw new Error("integer too large for the JSON admin surface");
+    return n;
+  }
+  if (base === "f32" || base === "f64") {
+    const n = Number(s);
+    if (!Number.isFinite(n)) throw new Error("expected a number");
+    return n;
+  }
+  if (base === "bool") return s === "true";
+  if (base === "String" || base === "&str" || base === "str") return String(raw);
+  // Identity/Timestamp/module types: accept JSON if it parses, else a string.
+  if (s === "") return "";
+  try { return JSON.parse(s); } catch { return String(raw); }
+}
+function reducerField(param) {
+  const t = parseRustTy(param.ty !== undefined ? param.ty : param.type);
+  const field = dom("div", "field");
+  const label = dom("label", null, param.name + " ");
+  label.appendChild(dom("span", "ty", param.type || param.ty));
+  field.appendChild(label);
+  let build;
+  if (t.base === "bool" && !t.vec && !t.opt) {
+    const wrap = dom("label", "checkwrap");
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    wrap.append(cb, document.createTextNode(" true"));
+    field.appendChild(wrap);
+    build = () => cb.checked;
+  } else {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.spellcheck = false;
+    input.style.fontFamily = "var(--mono)";
+    if (t.vec) input.placeholder = "JSON array, e.g. [1, 2]";
+    else if (!RUST_INTS.includes(t.base) && !["f32", "f64", "String", "&str", "str", "bool"].includes(t.base)) {
+      input.placeholder = "JSON value or string";
+    }
+    let nullCb = null;
+    if (t.opt) {
+      const wrap = dom("div", "nullrow");
+      nullCb = document.createElement("input");
+      nullCb.type = "checkbox";
+      nullCb.addEventListener("change", () => { input.disabled = nullCb.checked; });
+      const nl = dom("label", "checkwrap");
+      nl.append(nullCb, document.createTextNode(" null"));
+      wrap.append(input, nl);
+      field.appendChild(wrap);
+    } else {
+      field.appendChild(input);
+    }
+    build = () => {
+      if (nullCb && nullCb.checked) return null;
+      if (t.vec) {
+        const parsed = JSON.parse(input.value || "[]");
+        if (!Array.isArray(parsed)) throw new Error("expected a JSON array");
+        return parsed.map((item) => (typeof item === "string" ? rustScalarToJson(t.base, item) : item));
+      }
+      if (t.base === "bool") return input.value.trim() === "true";
+      return rustScalarToJson(t.base, input.value);
+    };
+  }
+  return { field, build, name: param.name };
+}
+function renderReducerList() {
+  const list = $("r-list");
+  if (!list) return;
+  list.textContent = "";
+  const reducers = (schemaDoc && schemaDoc.reducers) || [];
+  $("r-n").textContent = reducers.length;
+  for (const r of reducers) {
+    const item = dom("div", "item");
+    item.appendChild(dom("span", null, r.name));
+    const rate = dom("span", "rate badge " + (r.client_callable ? "auto" : "opt"),
+      r.client_callable ? (r.max_rate_per_sec ? r.max_rate_per_sec + "/s" : "open") : "sched");
+    item.appendChild(rate);
+    item.addEventListener("click", () => selectReducer(r));
+    list.appendChild(item);
+  }
+  if (currentReducer && !reducers.some((r) => r.name === currentReducer.name)) {
+    currentReducer = null;
+    $("r-title").textContent = "—";
+    $("r-args").textContent = "";
+    $("r-invoke").disabled = true;
+  }
+}
+function selectReducer(r) {
+  currentReducer = r;
+  document.querySelectorAll("#r-list .item").forEach((i) =>
+    i.classList.toggle("on", i.firstChild.textContent === r.name));
+  const params = r.params || [];
+  $("r-title").textContent = r.name + "(" + params.map((p) => p.name).join(", ") + ")";
+  const meta = $("r-meta");
+  meta.textContent = "";
+  meta.appendChild(dom("span", "badge " + (r.client_callable ? "auto" : "opt"),
+    r.client_callable ? "client callable" : "schedule-only"));
+  meta.appendChild(dom("span", "badge opt",
+    r.max_rate_per_sec ? "rate " + r.max_rate_per_sec + "/s" : "no rate limit"));
+  if (r.return_type) meta.appendChild(dom("span", "mut2", "returns " + r.return_type));
+  const box = $("r-args");
+  box.textContent = "";
+  reducerFields = [];
+  for (const p of params) {
+    const f = reducerField(p);
+    reducerFields.push(f);
+    box.appendChild(f.field);
+  }
+  if (!params.length) box.appendChild(dom("div", "muted", "no arguments"));
+  $("r-invoke").disabled = !r.client_callable; // the server refuses 403 anyway (F-004)
+  $("r-err").textContent = r.client_callable ? "" : "schedule-only — not invocable over HTTP";
+}
+function pushHistory(entry) {
+  invokeHistory.unshift(entry);
+  if (invokeHistory.length > 20) invokeHistory.pop();
+  const box = $("r-history");
+  $("r-history-head").style.display = "";
+  box.textContent = "";
+  for (const h of invokeHistory) {
+    const line = dom("div", "hist-line " + (h.ok ? "ok" : "fail"),
+      h.at + "  " + h.reducer + "(" + h.args + ") — " + h.outcome);
+    box.appendChild(line);
+  }
+}
+$("r-invoke").addEventListener("click", async () => {
+  if (!currentReducer) return;
+  $("r-err").textContent = "";
+  const args = [];
+  try {
+    for (const f of reducerFields) args.push(f.build());
+  } catch (e) {
+    $("r-err").textContent = String(e.message || e);
+    return;
+  }
+  const preview = args.map((a) => JSON.stringify(a)).join(", ");
+  const at = new Date().toTimeString().slice(0, 8);
+  try {
+    await apiJson("/reducer/" + encodeURIComponent(currentReducer.name), {
+      method: "POST", body: JSON.stringify(args),
+    });
+    toast("ok", currentReducer.name + " committed");
+    pushHistory({ at, reducer: currentReducer.name, args: preview, ok: true, outcome: "committed" });
+    if (document.querySelector("#view-data.on")) browse();
+  } catch (e) {
+    const msg = String(e.message || e);
+    $("r-err").textContent = msg;
+    pushHistory({ at, reducer: currentReducer.name, args: preview, ok: false, outcome: msg });
+  }
+});
+
+// The audit-trail panel (OPS-020/021): commit provenance for a table —
+// tx, time, caller, reducer, row deltas. Metadata only, and it requires a
+// server-peer operator token; without one the panel says so instead of
+// pretending to be empty.
+function renderAuditTables() {
+  const sel = $("a-table");
+  if (!sel) return;
+  const was = sel.value;
+  sel.textContent = "";
+  for (const t of (schemaDoc && schemaDoc.tables) || []) sel.add(new Option(t.name, t.name));
+  if (was) sel.value = was;
+}
+$("a-refresh").addEventListener("click", async () => {
+  const note = $("a-note");
+  const grid = $("a-grid");
+  grid.textContent = "";
+  if (!token) {
+    note.textContent = "audit requires a server-peer operator token (OPS-021) — set one via the Operator token button";
+    return;
+  }
+  note.textContent = "";
+  const table = $("a-table").value;
+  const limit = parseInt($("a-limit").value, 10) || 20;
+  try {
+    const p = await apiJson("/audit", {
+      method: "POST",
+      body: JSON.stringify({ token, table, limit }),
+    });
+    const rows = (p.entries || []).map((e) => ({
+      tx: e.tx_id,
+      time: e.timestamp ? new Date(e.timestamp / 1000).toISOString().replace("T", " ").slice(0, 19) : "",
+      caller: (e.caller || "").slice(0, 12),
+      reducer: e.reducer_name || "(internal)",
+      // inserted/deleted are booleans: both = an in-place update.
+      change: e.inserted && e.deleted ? "update" : e.inserted ? "insert" : e.deleted ? "delete" : "?",
+    }));
+    renderGrid(grid, ["tx", "time", "caller", "reducer", "change"], rows, null);
+    note.textContent = p.count + " entr" + (p.count === 1 ? "y" : "ies");
+  } catch (e) { note.textContent = String(e.message || e); }
+});
 
 // --- NDJSON stream reader -----------------------------------------------------------
 async function streamLines(path, signal, onLine) {

@@ -86,7 +86,23 @@ module, stated honestly in the UI.
       browser against the release binary (Playwright): explain render,
       cursor SQL construction + refusal, live grid refresh on a curl'd
       commit, inspector fields.
-- [ ] 1.4 Reducer console: signature-driven typed argument forms, invoke/result, rate-limit display, recent invocations from the audit trail
+- [x] 1.4 Reducer console (2026-07-27). New Reducers view: list from the
+      `/schema` reducer descriptors with rate badges (`open` / `N per s` /
+      `sched`); selecting one renders a **signature-driven typed form**
+      (Rust source types SDK-001 — ints validated as safe integers, floats,
+      bool checkbox, String, `Vec<T>` as JSON array, `Option<T>` with a
+      null toggle, unknown module types accept JSON-or-string) and invokes
+      via `POST /reducer/:name` (RPC-051 argument array; F-004
+      schedule-only reducers render disabled). Result: committed toast or
+      the error envelope verbatim, plus a session-local invocation history
+      (latest first, capped 20). **Audit panel**: recent commits for a
+      chosen table from `POST /audit` (OPS-020) — tx, time, caller,
+      reducer, insert/update/delete — token-aware: without a server-peer
+      operator token it states the OPS-021 requirement instead of showing
+      empty. Verified end to end in a real browser (Playwright) against
+      the release binary with a configured `auth.server_peers` peer:
+      send_chat(7, "…") invoked from the form, row confirmed by SQL, and
+      the same invocation surfaced in the audit grid via the peer token.
 - [ ] 1.5 Sessions & subscriptions: connected-client list with queue/backpressure state, active queries, kick, bans/blocklist management (additive JSON endpoints where today CLI-only)
 - [ ] 1.6 Observability: metrics dashboards parsed from `/metrics`, `/logs` tail, audit-trail viewer with filters
 - [ ] 1.7 Ops: config view/edit + hot-reload apply, checkpoint trigger, drain, backup create/verify + PITR restore-point browser (incl. S3 archive), replication status/promote, namespaces + quotas
