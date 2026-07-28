@@ -252,6 +252,11 @@ pre.raw { font-family: var(--mono); font-size: 12px; padding: 16px; white-space:
 .src { font-size: 10px; font-family: var(--mono); color: var(--t3); border: 1px solid var(--line2); border-radius: 4px; padding: 1px 5px; }
 .bar { height: 6px; border-radius: 3px; background: var(--bg3); overflow: hidden; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width 300ms; }
+/* sparkline: a single-series 2px accent line, no grid/axes (the tile title
+   names the series, so no legend either) */
+.tile .spark { margin-top: 8px; }
+.tile .spark svg { width: 100%; height: 28px; display: block; }
+.tile .spark polyline { fill: none; stroke: var(--accent); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 /* --- schema browser ----------------------------------------------------------------- */
 .scroll-plain { overflow: auto; flex: 1; min-height: 0; }
 .scard { border: 1px solid var(--line2); border-radius: 12px; background: var(--bg1); margin-bottom: 16px; overflow: hidden; }
@@ -392,6 +397,9 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
         <h3>Recent commits from the audit trail
           <span class="spacer"></span>
           <select id="a-table"></select>
+          <input type="text" id="a-pk" placeholder="pk" size="8" style="font-family:var(--mono)" title="primary-key value(s), comma-separated for a composite key">
+          <input type="text" id="a-txfrom" placeholder="tx &ge;" size="5">
+          <input type="text" id="a-txto" placeholder="tx &le;" size="5">
           <input type="text" id="a-limit" value="20" size="3">
           <button class="btn sm" id="a-refresh"><svg class="ic sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>Refresh</button>
         </h3>
@@ -435,6 +443,13 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
       <div class="row">
         <button class="btn sm" id="l-toggle">Follow</button>
         <button class="btn sm ghost" id="l-clear">Clear</button>
+        <select id="l-level">
+          <option value="">(all levels)</option>
+          <option value="ERROR">ERROR</option>
+          <option value="WARN">WARN+</option>
+          <option value="INFO">INFO+</option>
+          <option value="DEBUG">DEBUG+</option>
+        </select>
         <input type="text" id="l-filter" placeholder="filter&hellip;" size="24">
         <label class="checkwrap"><input type="checkbox" id="l-reducers"> reducer events only</label>
         <span class="muted">slow-reducer warnings highlighted</span>
@@ -443,11 +458,14 @@ code.snip { font-family: var(--mono); font-size: 12px; background: var(--bg3); b
     </section>
     <section class="view" id="view-metrics">
       <div class="row">
+        <button class="btn sm ghost" id="m-mode">Series</button>
         <button class="btn sm" id="m-refresh"><svg class="ic sm" viewBox="0 0 24 24"><path d="M21 12a9 9 0 1 1-2.6-6.3M21 3v6h-6"/></svg>Refresh</button>
         <input type="text" id="m-filter" placeholder="filter series&hellip;" size="28">
         <span class="muted" id="m-count"></span>
+        <span class="muted" id="m-dash-note"></span>
       </div>
-      <div class="scroll" id="m-grid"></div>
+      <div class="tiles" id="m-dash"></div>
+      <div class="scroll" id="m-grid" style="display:none"></div>
     </section>
     <section class="view" id="view-schema">
       <div class="row">

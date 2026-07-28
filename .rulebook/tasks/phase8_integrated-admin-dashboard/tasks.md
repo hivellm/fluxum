@@ -124,7 +124,25 @@ module, stated honestly in the UI.
       subscriptions + 0/1024 queue, detail modal, CIDR ban/unban round-trip,
       and Kick terminated the session — the SDK's auto-reconnect then
       minted a fresh one, proving both sides.
-- [ ] 1.6 Observability: metrics dashboards parsed from `/metrics`, `/logs` tail, audit-trail viewer with filters
+- [x] 1.6 Observability (2026-07-27). **Metrics dashboard**: the Metrics
+      view defaults to stat tiles sampled from `/metrics` every 5 s while
+      visible (60-sample history): tx rate, connections, subscriptions,
+      queue depth, fan-out msgs/s, avg fan-out latency (delta sum/count of
+      the stage histogram), buffer-pool hit rate (delta hits/(hits+misses)),
+      pool occupancy gauge, memstore — each a single-series 2px accent
+      sparkline (no legend/grid — the tile title names it, per the dataviz
+      method; SVG born via innerHTML so no namespace URL breaks the
+      self-containment test). The raw series grid stays behind a toggle.
+      **Logs**: minimum-severity filter (ERROR/WARN+/INFO+/DEBUG+) beside
+      the text and reducer-only filters. **Audit viewer**: pk (composite via
+      comma-separated values), tx_from/tx_to range filters added to the
+      OPS-020 panel. The shell's script crossed 1500 lines and now
+      assembles from console.js + console_ops.js. Browser-verified against
+      the release binary (Playwright): sparklines carried a live traffic
+      burst (tx-rate hump, hit-rate curve, memstore climb), series toggle,
+      ERROR-min filter muted INFO traffic then (all) showed it, and
+      tx_from=36 trimmed the Task trail to exactly tx 36-40 minus the
+      ChatMessage commit.
 - [ ] 1.7 Ops: config view/edit + hot-reload apply, checkpoint trigger, drain, backup create/verify + PITR restore-point browser (incl. S3 archive), replication status/promote, namespaces + quotas
 - [ ] 1.8 Hardening: every mutating action audited; CSP with no external origins; dashboard e2e smoke against a live server (spawned like the SDK conformance runners)
 

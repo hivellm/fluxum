@@ -38,12 +38,15 @@ use fluxum_core::txn::CommitMeta;
 /// The console shell: one self-contained HTML document (inline CSS + JS, no
 /// external requests — the page's CSP forbids any non-self origin). Served
 /// as a single page, assembled at compile time from `console.html` (markup +
-/// styles) and `console.js` (the script) so each source file stays inside
-/// the 1500-line convention.
+/// styles), `console.js` (core: boot, overview, data, query) and
+/// `console_ops.js` (reducers, sessions, streams, metrics, schema, designer)
+/// so each source file stays inside the 1500-line convention.
 pub const CONSOLE_HTML: &str = concat!(
     include_str!("console.html"),
     "<script>\n",
     include_str!("console.js"),
+    "\n",
+    include_str!("console_ops.js"),
     "</script>\n</body>\n</html>\n",
 );
 
