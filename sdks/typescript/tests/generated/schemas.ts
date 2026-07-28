@@ -48,6 +48,20 @@ export function tableSchemaOnlineUser(): TableSchema {
 }
 
 /**
+ * The SDK cache hooks for `Player` (SDK-040): stable primary-key
+ * projections over the full-row and delete-entry wire layouts.
+ */
+export function tableSchemaPlayer(): TableSchema {
+  const rowPlan = [['ConnectionId', true]] as ReadonlyArray<readonly [FluxType, boolean]>;
+  const deletePlan = [['ConnectionId', true]] as ReadonlyArray<readonly [FluxType, boolean]>;
+  return {
+    name: 'Player',
+    pkOfRow: (row) => projectKey(row, rowPlan),
+    pkOfDelete: (entry) => projectKey(entry, deletePlan),
+  };
+}
+
+/**
  * The SDK cache hooks for `Task` (SDK-040): stable primary-key
  * projections over the full-row and delete-entry wire layouts.
  */
@@ -80,5 +94,5 @@ export function tableSchema__idempotency__(): TableSchema {
  * `tables` option of `FluxumClient.connect`.
  */
 export function allTableSchemas(): TableSchema[] {
-  return [tableSchemaChatMessage(), tableSchemaOnlineUser(), tableSchemaTask(), tableSchema__idempotency__()];
+  return [tableSchemaChatMessage(), tableSchemaOnlineUser(), tableSchemaPlayer(), tableSchemaTask(), tableSchema__idempotency__()];
 }

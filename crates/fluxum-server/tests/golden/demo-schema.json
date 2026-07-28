@@ -42,6 +42,22 @@
     },
     {
       "client_callable": true,
+      "max_rate_per_sec": 60,
+      "name": "move_player",
+      "params": [
+        {
+          "name": "x",
+          "type": "i32"
+        },
+        {
+          "name": "y",
+          "type": "i32"
+        }
+      ],
+      "return_type": "Result < (), String >"
+    },
+    {
+      "client_callable": true,
       "max_rate_per_sec": 20,
       "name": "send_chat",
       "params": [
@@ -114,6 +130,46 @@
       ],
       "indexes": [],
       "name": "OnlineUser",
+      "partition_by": null,
+      "primary_key": [
+        0
+      ],
+      "unique": [],
+      "visibility": {
+        "kind": "public_all"
+      }
+    },
+    {
+      "access": "Ephemeral",
+      "auto_inc": null,
+      "columns": [
+        {
+          "name": "connection",
+          "type": "ConnectionId"
+        },
+        {
+          "name": "identity",
+          "type": "Identity"
+        },
+        {
+          "name": "name",
+          "type": "Str"
+        },
+        {
+          "name": "x",
+          "type": "I32"
+        },
+        {
+          "name": "y",
+          "type": "I32"
+        },
+        {
+          "name": "hue",
+          "type": "U32"
+        }
+      ],
+      "indexes": [],
+      "name": "Player",
       "partition_by": null,
       "primary_key": [
         0

@@ -423,26 +423,82 @@ mod tests {
     #[test]
     fn narrowing_and_shape_errors_name_the_value() {
         assert!(conv(&T::I8, json!(128)).unwrap_err().contains("outside"));
-        assert!(conv(&T::I16, json!(40_000)).unwrap_err().contains("outside"));
-        assert!(conv(&T::I32, json!(i64::MAX)).unwrap_err().contains("outside"));
-        assert!(conv(&T::U8, json!(256)).unwrap_err().contains("overflows u8"));
-        assert!(conv(&T::U16, json!(70_000)).unwrap_err().contains("overflows u16"));
+        assert!(
+            conv(&T::I16, json!(40_000))
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            conv(&T::I32, json!(i64::MAX))
+                .unwrap_err()
+                .contains("outside")
+        );
+        assert!(
+            conv(&T::U8, json!(256))
+                .unwrap_err()
+                .contains("overflows u8")
+        );
+        assert!(
+            conv(&T::U16, json!(70_000))
+                .unwrap_err()
+                .contains("overflows u16")
+        );
         assert!(
             conv(&T::U32, json!(5_000_000_000_u64))
                 .unwrap_err()
                 .contains("overflows u32")
         );
         assert!(conv(&T::U64, json!(-1)).unwrap_err().contains("unsigned"));
-        assert!(conv(&T::U64, json!("nope")).unwrap_err().contains("unsigned"));
-        assert!(conv(&T::I64, json!("x")).unwrap_err().contains("not an integer"));
-        assert!(conv(&T::I64, json!(true)).unwrap_err().contains("expected an integer"));
-        assert!(conv(&T::Bool, json!(1)).unwrap_err().contains("expected a boolean"));
-        assert!(conv(&T::F64, json!("1")).unwrap_err().contains("expected a number"));
-        assert!(conv(&T::F32, json!(null)).unwrap_err().contains("expected a number"));
-        assert!(conv(&T::Str, json!(1)).unwrap_err().contains("expected a string"));
-        assert!(conv(&T::Bytes, json!(1)).unwrap_err().contains("hex string"));
-        assert!(conv(&T::Identity, json!("zz")).unwrap_err().contains("bad identity"));
-        assert!(conv(&T::Identity, json!(1)).unwrap_err().contains("64-hex-char"));
+        assert!(
+            conv(&T::U64, json!("nope"))
+                .unwrap_err()
+                .contains("unsigned")
+        );
+        assert!(
+            conv(&T::I64, json!("x"))
+                .unwrap_err()
+                .contains("not an integer")
+        );
+        assert!(
+            conv(&T::I64, json!(true))
+                .unwrap_err()
+                .contains("expected an integer")
+        );
+        assert!(
+            conv(&T::Bool, json!(1))
+                .unwrap_err()
+                .contains("expected a boolean")
+        );
+        assert!(
+            conv(&T::F64, json!("1"))
+                .unwrap_err()
+                .contains("expected a number")
+        );
+        assert!(
+            conv(&T::F32, json!(null))
+                .unwrap_err()
+                .contains("expected a number")
+        );
+        assert!(
+            conv(&T::Str, json!(1))
+                .unwrap_err()
+                .contains("expected a string")
+        );
+        assert!(
+            conv(&T::Bytes, json!(1))
+                .unwrap_err()
+                .contains("hex string")
+        );
+        assert!(
+            conv(&T::Identity, json!("zz"))
+                .unwrap_err()
+                .contains("bad identity")
+        );
+        assert!(
+            conv(&T::Identity, json!(1))
+                .unwrap_err()
+                .contains("64-hex-char")
+        );
         assert!(
             conv(&T::ConnectionId, json!("x"))
                 .unwrap_err()
@@ -459,7 +515,10 @@ mod tests {
     /// types refuse with the pointer at reducers.
     #[test]
     fn containers_recurse_and_structured_types_refuse() {
-        assert_eq!(conv(&T::Option(&T::U32), json!(null)).unwrap(), V::Optional(None));
+        assert_eq!(
+            conv(&T::Option(&T::U32), json!(null)).unwrap(),
+            V::Optional(None)
+        );
         assert_eq!(
             conv(&T::Option(&T::U32), json!(7)).unwrap(),
             V::Optional(Some(Box::new(V::U32(7))))
@@ -479,7 +538,11 @@ mod tests {
             "a bad element fails the whole list"
         );
         for ty in [T::Blob, T::CrdtText] {
-            assert!(conv(&ty, json!("x")).unwrap_err().contains("through reducers"));
+            assert!(
+                conv(&ty, json!("x"))
+                    .unwrap_err()
+                    .contains("through reducers")
+            );
         }
     }
 
@@ -499,9 +562,19 @@ mod tests {
                 .contains("overflows the decimal range")
         );
         // Both JSON shapes reach the same parser.
-        assert!(matches!(conv(&T::Decimal, json!("1.25")).unwrap(), V::Decimal(_)));
-        assert!(matches!(conv(&T::Decimal, json!(3)).unwrap(), V::Decimal(_)));
-        assert!(conv(&T::Decimal, json!(true)).unwrap_err().contains("decimal string"));
+        assert!(matches!(
+            conv(&T::Decimal, json!("1.25")).unwrap(),
+            V::Decimal(_)
+        ));
+        assert!(matches!(
+            conv(&T::Decimal, json!(3)).unwrap(),
+            V::Decimal(_)
+        ));
+        assert!(
+            conv(&T::Decimal, json!(true))
+                .unwrap_err()
+                .contains("decimal string")
+        );
     }
 
     #[test]

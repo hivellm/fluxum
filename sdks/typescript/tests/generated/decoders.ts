@@ -7,7 +7,7 @@
 
 import { decodeRow } from '@hivehub/fluxum';
 import type { FluxType } from '@hivehub/fluxum';
-import type { ChatMessage, OnlineUser, Task, __idempotency__ } from './types.ts';
+import type { ChatMessage, OnlineUser, Player, Task, __idempotency__ } from './types.ts';
 
 /**
  * Column layout of `ChatMessage`, in FluxBIN wire order.
@@ -33,6 +33,19 @@ const OnlineUserColumns = [{ name: 'connection', type: 'ConnectionId' as FluxTyp
  */
 export function decodeOnlineUser(row: Uint8Array): OnlineUser {
   return decodeRow(row, OnlineUserColumns) as unknown as OnlineUser;
+}
+
+/**
+ * Column layout of `Player`, in FluxBIN wire order.
+ */
+const PlayerColumns = [{ name: 'connection', type: 'ConnectionId' as FluxType }, { name: 'identity', type: 'Identity' as FluxType }, { name: 'name', type: 'Str' as FluxType }, { name: 'x', type: 'I32' as FluxType }, { name: 'y', type: 'I32' as FluxType }, { name: 'hue', type: 'U32' as FluxType }] as const;
+
+/**
+ * Decode one `Player` row from its FluxBIN bytes.
+ * The columns are read in declaration order; a length mismatch throws.
+ */
+export function decodePlayer(row: Uint8Array): Player {
+  return decodeRow(row, PlayerColumns) as unknown as Player;
 }
 
 /**

@@ -42,6 +42,14 @@ export class Reducers {
   }
 
   /**
+   * Call the `move_player` reducer.
+   * Rate-limited to 60/s per identity (RED-050); over that the call rejects with a retryable 429.
+   */
+  move_player(x: number, y: number): Promise<void> {
+    return this.#client.callReducer('move_player', [x, y]);
+  }
+
+  /**
    * Call the `send_chat` reducer.
    * Rate-limited to 20/s per identity (RED-050); over that the call rejects with a retryable 429.
    */

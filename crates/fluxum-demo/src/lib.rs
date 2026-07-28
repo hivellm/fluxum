@@ -101,6 +101,38 @@ pub struct OnlineUser {
     pub connected_at: Timestamp,
 }
 
+/// A live avatar in the MMO position-sync sample — one per **connection**,
+/// like [`OnlineUser`]: `ephemeral` + `#[owner]` (DMX-011) despawns the
+/// avatar atomically on disconnect, and positions from a previous server run
+/// are never true.
+///
+/// Coordinates are integer world units on purpose: RPC-010 decoding is
+/// strict (no int→float coercion), so integer coords keep every SDK's plain
+/// numbers valid — and fixed-point positions are the MMO idiom anyway.
+#[fluxum::table(ephemeral)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct Player {
+    /// The connection this avatar belongs to; despawned when it closes.
+    #[primary_key]
+    #[owner]
+    pub connection: ConnectionId,
+    /// Who is steering it.
+    pub identity: Identity,
+    /// Display name, derived from the identity at spawn.
+    pub name: String,
+    /// World x, `0..=WORLD_W`.
+    pub x: i32,
+    /// World y, `0..=WORLD_H`.
+    pub y: i32,
+    /// Color hue (degrees, 0..360), derived from the identity at spawn.
+    pub hue: u32,
+}
+
+/// The MMO sample's world width, in world units.
+pub const WORLD_W: i32 = 2000;
+/// The MMO sample's world height, in world units.
+pub const WORLD_H: i32 = 1200;
+
 // --- Reducers ---------------------------------------------------------------
 
 /// Post a message to a channel.
@@ -168,6 +200,44 @@ fn complete_task(ctx: &ReducerContext, id: u64) -> Result<(), String> {
 
     ctx.tx
         .upsert(Task { done: true, ..task })
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Spawn-or-move the caller's avatar (the MMO sample's only verb).
+///
+/// The first call spawns — name and hue derive from the identity, so the
+/// client sends nothing but coordinates. Later calls just move. Positions
+/// clamp to the world instead of erroring: a client at the edge keeps
+/// sliding along it, which is what a game expects.
+///
+/// The admission rate is per `(identity, reducer)` (RED-050), so it caps a
+/// runaway client at 60 moves/s without throttling the rest of the fleet.
+#[fluxum::reducer(max_rate = "60/s")]
+fn move_player(ctx: &ReducerContext, x: i32, y: i32) -> Result<(), String> {
+    let x = x.clamp(0, WORLD_W);
+    let y = y.clamp(0, WORLD_H);
+    let existing = ctx
+        .tx
+        .query_pk::<Player>(ctx.connection_id)
+        .map_err(|e| e.to_string())?;
+    let (name, hue) = match &existing {
+        Some(p) => (p.name.clone(), p.hue),
+        None => {
+            let hex = ctx.identity.to_string();
+            let hue = u32::from_str_radix(&hex[..4], 16).unwrap_or(0) % 360;
+            (format!("p-{}", &hex[..6]), hue)
+        }
+    };
+    ctx.tx
+        .upsert(Player {
+            connection: ctx.connection_id,
+            identity: ctx.identity,
+            name,
+            x,
+            y,
+            hue,
+        })
         .map_err(|e| e.to_string())?;
     Ok(())
 }

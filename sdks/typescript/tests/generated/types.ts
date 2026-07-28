@@ -50,6 +50,27 @@ export interface OnlineUser {
 export type OnlineUserKey = [ConnectionId];
 
 /**
+ * Row of the `Player` table.
+ * Primary key: `connection`.
+ */
+export interface Player {
+  /**
+   * Primary key.
+   */
+  connection: ConnectionId;
+  identity: Identity;
+  name: string;
+  x: number;
+  y: number;
+  hue: number;
+}
+
+/**
+ * Primary key of `Player`, in declaration order.
+ */
+export type PlayerKey = [ConnectionId];
+
+/**
  * Row of the `Task` table.
  * Primary key: `id`.
  * `id` is auto-inc: send 0 on insert and the server assigns it.
