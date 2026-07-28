@@ -5,8 +5,19 @@ hard floor, never the goal. Measured with `cargo llvm-cov --workspace` locally (
 closed with behavior tests — asserting a specific diagnostic, error, or state transition — never
 with padding. What cannot be covered is listed here with a reason; nothing is silently ignored.
 
-**Current standing:** **90.01% lines** — 2026-07-28, gate command below (PG + SpacetimeDB
-drivers live), after phase8_integrated-admin-dashboard + the chat-latency and MMO samples.
+**Current standing:** **90.06% lines** — 2026-07-28, gate command below (PG + SpacetimeDB
+drivers live), after phase9_delta-compression (RPC-035 light updates + the RPC-008
+stream-deflate push compression). The new surface carries its own behavior suites:
+`fluxum-protocol/negotiate` (parse matrix) and `compress` (round-trip, carryover witness,
+zip-bomb bound, corrupt stream), the server's `tests/wire_negotiation.rs` e2e (light/full
+split, light resume replay, 400 matrix, re-auth pinning, tagged-stream carryover,
+kill-switch echo), `tests/wire_layers_measure.rs` (the per-layer byte/latency regression
+guard), and the SDK-side `sdks/rust/tests/wire_compression.rs` (feature-gated inflate
+path; the vendored `src/protocol/` stays out of scope by the gate's ignore regex). Honest
+residual from this phase: the Streamable-HTTP GET-stream compression arm in `http.rs` is
+exercised only indirectly (the SDK refuses gzip-over-HTTP for now, so no client drives it
+e2e; the transform itself is the same `conn::wire_transform` the TCP writer covers).
+Prior: 90.01% after phase8_integrated-admin-dashboard + the chat-latency and MMO samples.
 The dashboard surface (console views, `POST /rows`, `POST /backup`, richer `/sessions`,
 the demo module's `Player`/`move_player`) initially pulled the standing to 89.49%; the
 floor was recovered with behavior suites, each pinning a named diagnostic: the `/rows`

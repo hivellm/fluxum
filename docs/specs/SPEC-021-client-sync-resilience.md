@@ -51,6 +51,9 @@ Then the SDK removes the optimistic row and the local cache matches server state
 - **CS-021** [P1] On reconnect the client MAY send `Resume { query_id, from_offset }`; the server SHALL
   reply with only the committed deltas after `from_offset` for that compiled query, followed by live
   `TxUpdate`s — never a full `InitialData` — when the offset is still within the retained window.
+  A session that negotiated `tx_updates: light` (SPEC-006 RPC-035) receives the replay as
+  `TxUpdateLight` frames carrying the same `tx_offset` tail — the retained window stores
+  pre-encode row diffs, so the wire form is a session property, never a stored-delta property.
 - **CS-022** [P1] If `from_offset` predates the retained delta window (compacted), the server MUST
   fall back to a full `InitialData` and signal a cache reset so the SDK clears and replays.
 - **CS-023** [P0] The wire additions (`tx_offset`, `Resume` message) are additive and MUST land before

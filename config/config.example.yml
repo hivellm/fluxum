@@ -66,6 +66,8 @@ server:
   tcp_defer_accept_secs: 0     # Linux TCP_DEFER_ACCEPT window; 0 = off (SEC-042)
   trusted_proxies: []          # proxies whose X-Forwarded-For / PROXY v2 is honored (SEC-035)
   static_dir:                  # directory served on unmatched GET paths; empty = none
+  compression_enabled: true    # RPC-008 kill-switch: false answers every negotiation "none"
+  compression_threshold_bytes: 64B # frame bodies below this ride tag 0x00, outside the stream
 
 runtime:
   worker_threads: auto       # auto = effective cores (min 1)

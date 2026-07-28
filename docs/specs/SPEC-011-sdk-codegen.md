@@ -442,6 +442,21 @@ language (published names in SDK-071). Generated code MUST NOT reimplement proto
   reconciles the cache on disconnect — this requirement is claimed as a Fluxum
   differentiator. *(adopted from SpacetimeDB analysis, file 07)*
 
+- **SDK-048** [P1] **Wire-option negotiation (RPC-008/RPC-035).** Every SDK runtime SHALL
+  apply `TxUpdateLight` through the same diff path as the enriched `TxUpdate` (the light form
+  carries the same row diffs and the same additive-tail cursor; only provenance is stripped —
+  own-call attribution therefore never fires under `light`, and optimistic overlays resolve on
+  `ReducerResult` alone, CS-011). SDKs SHOULD expose an opt-in to negotiate `tx_updates:
+  light`; SDKs MAY expose `compression: gzip`, and any SDK that does MUST arm its per-stream
+  decompressor **only** off the `AuthResult` echo (RPC-030) and MUST refuse the option at
+  connect time on a transport whose tagged stream it cannot read (failing loud beats
+  desyncing). Support matrix as of phase9_delta-compression: `light` — all five SDKs
+  (Rust `WirePreferences`, TypeScript `lightUpdates`, Python `light_updates`, Go
+  `ConnectLight`, C# `ConnectAsync(lightUpdates:)`), exercised by the shared corpus scenario
+  `light-updates`; `gzip` decode — Rust behind the `compression` cargo feature (TCP
+  transport); the TS/Python/Go/C# inflate paths are follow-up work and those SDKs simply do
+  not negotiate it.
+
 ## 7. Rust client SDK — `fluxum-sdk`
 
 - **SDK-050** [P1] The workspace crate `sdks/rust` (`fluxum-sdk`) SHALL provide the Rust client

@@ -24,8 +24,11 @@ use std::path::PathBuf;
 
 /// The mirrored file set. `no_vendored_file_is_left_behind_or_missing` pins
 /// this against what is actually on disk, so it cannot quietly go stale.
-const VENDORED_MODULES: [&str; 7] = [
-    "codes", "fluxbin", "frame", "messages", "rowlist", "tagged", "value",
+/// `compress` is gated behind the `compression` feature in `mod.rs`, but the
+/// FILE is vendored verbatim like every other — the gate is a compile-time
+/// property, not a copy-time one.
+const VENDORED_MODULES: [&str; 8] = [
+    "codes", "compress", "fluxbin", "frame", "messages", "rowlist", "tagged", "value",
 ];
 
 fn sdk_root() -> PathBuf {

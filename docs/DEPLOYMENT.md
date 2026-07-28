@@ -184,6 +184,35 @@ Exposed ports also want the OS-level hardening pass:
 mirrors of the in-process limits, fd budgets) and a deliberate
 `server.connection_limits.max_total_conns`.
 
+### Wire compression posture (RPC-008)
+
+Clients may negotiate `compression: gzip` at `Authenticate`: the server then
+runs one DEFLATE stream per push connection with context carryover across
+frames — repeated bytes (identities, table names, near-identical rows)
+become window back-references, which is what makes it pay at realtime frame
+sizes. Measured on the MMO position-sync shape
+(`crates/fluxum-server/tests/wire_layers_measure.rs`): a ~159 B/update
+enriched baseline drops to ~117 B with `tx_updates: light` and to ~52 B
+with the gzip stream — a 3× compounded cut — at ~25 µs of server CPU per
+compressed frame and +75 µs e2e p50 on loopback.
+
+Recommended posture:
+
+- **WAN / browser / mobile clients**: have the client negotiate gzip (and
+  `tx_updates: light` when it does not need per-commit provenance) — the
+  bandwidth win dwarfs the CPU cost.
+- **Loopback / LAN services**: leave it off (the default). Sub-millisecond
+  links gain nothing from a 3× byte cut and pay the per-frame CPU.
+- The server enforces policy, not clients: `server.compression_enabled:
+  false` is the kill-switch (every negotiation echoes `none`; nothing
+  breaks — clients key off the `AuthResult` echo), and
+  `server.compression_threshold_bytes` (default 64) keeps tiny frames out
+  of the stream. Both apply to new connections; live sessions keep what
+  they negotiated.
+- Observability: `fluxum_wire_compression_{raw,sent,cpu_us}_*` in
+  `/metrics` (ratio + CPU), and `GET /sessions` reports each connection's
+  negotiated posture.
+
 ## 7. Data directory layout
 
 All durable state lives under `storage.data_dir` (default `./data`,

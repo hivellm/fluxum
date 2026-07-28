@@ -46,7 +46,10 @@ loopback always passes; remote IPs must be in `server.admin.trusted`.
 - **Sessions** — the live HTTP session directory (SEC-053): identity,
   connection, age, bound IP, **outbound-queue occupancy** (a near-full queue is
   a slow consumer about to be dropped, SUB-042) and each session's active
-  subscription queries. Kick terminates a session (`DELETE /sessions/{id}`).
+  subscription queries. The listing also carries each connection's negotiated
+  wire posture (`wire.tx_updates` / `wire.compression`, RPC-008/RPC-035) so an
+  operator can see who opted into light updates or the gzip stream. Kick
+  terminates a session (`DELETE /sessions/{id}`).
   The bans panel manages the SEC-033 runtime blocklist (IP or CIDR, optional
   TTL); static config-file entries are listed but lift only via config+reload.
 - **Ops** — day-two actions:
