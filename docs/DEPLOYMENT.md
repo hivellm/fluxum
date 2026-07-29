@@ -122,7 +122,7 @@ attestations, tagged with the workspace version and `latest`:
 docker login
 docker buildx build --platform linux/amd64,linux/arm64 \
   --sbom=true --provenance=mode=max \
-  -t hivehub/fluxum:0.1.0 -t hivehub/fluxum:latest --push .
+  -t hivehub/fluxum:0.3.0 -t hivehub/fluxum:latest --push .
 ```
 
 Bump the version in two places when releasing: the tag above and the

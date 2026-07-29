@@ -49,9 +49,12 @@ curl -X POST http://localhost:15800/reducer/send_chat -d '[1, "hello"]'
 
 | Tag | Contents |
 |---|---|
-| `latest`, `0.1.0-alpha` | First public cut: the full engine (MVCC single-writer commits, tiered storage under a memory budget, live subscriptions with resume), five first-party SDKs (Rust / TypeScript / Python / Go / C#), semi-sync replication with elections + fencing, hot backup / PITR with S3 archival, multi-shard hosting, the integrated admin console, full-text search (BM25), and the read-only pgwire endpoint. |
+| `latest`, `0.3.0` | Everything in 0.1.0 plus the realtime wire stack: negotiated `tx_updates: light` broadcasts, per-session stream compression (RPC-008 DEFLATE with cross-frame context — position-sync updates drop ~3× compounded), writer coalescing with merged multi-table `TxUpdate`s (burst p50 −51%), and the `wire`/batch-factor observability that goes with them. Storage sub-directories now follow `storage.data_dir` (see the CHANGELOG upgrade note). |
+| `0.1.0-alpha` | First public cut: the full engine (MVCC single-writer commits, tiered storage under a memory budget, live subscriptions with resume), five first-party SDKs (Rust / TypeScript / Python / Go / C#), semi-sync replication with elections + fencing, hot backup / PITR with S3 archival, multi-shard hosting, the integrated admin console, full-text search (BM25), and the read-only pgwire endpoint. |
 
 Pin a specific tag for production. `latest` floats forward on every release.
+The image tag always equals the version of the server **and** of the five
+SDKs — one release train, enforced in-repo.
 
 ## Image layout
 

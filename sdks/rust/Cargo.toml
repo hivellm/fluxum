@@ -1,9 +1,11 @@
 [package]
 name = "fluxum-sdk"
 description = "Fluxum Rust client SDK: typed tables, reducer calls, and live subscriptions over FluxRPC (SPEC-011 SDK-050)"
-# Versioned independently of the workspace: SDK releases track the five-SDK
-# store train (npm/PyPI/NuGet/Go are at 0.2.0), not the server binary.
-version = "0.2.0"
+# The server and every SDK share ONE version — the release train moves
+# together (owner rule, 2026-07-29). `tests/version_sync.rs` enforces it
+# against the workspace manifest and the four sibling SDK manifests; the Go
+# SDK rides the same number as its git tag (v<version> on hivellm/fluxum-go).
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

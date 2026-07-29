@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-29
+
+One release train: from this version on, the server image and all five SDKs
+(Rust / TypeScript / Python / Go / C#) carry the SAME version number —
+previously the server sat at 0.1.0 while the SDKs drifted across 0.2.0/0.2.1.
+`sdks/rust/tests/version_sync.rs` now enforces the alignment across every
+manifest; the Go SDK's git tag (`v0.3.0` on `hivellm/fluxum-go`) rides the
+same number.
+
+### Added
+
+- **`tx_updates: light` honored end to end (RPC-035):** sessions that
+  negotiate it receive `TxUpdateLight` broadcasts (provenance stripped, row
+  diffs + resume cursor kept, `shard_id`/`tx_offset` on the additive tail);
+  resume replays serve the negotiated form. All five SDKs can negotiate and
+  apply it; the `AuthResult` tail echoes what the server will do.
+- **Per-session stream compression (RPC-008):** negotiated `gzip` runs one
+  raw-DEFLATE stream per push connection with cross-frame context carryover —
+  measured ~3× compounded byte cut on position-sync updates at ~25 µs of
+  server CPU per frame. Kill-switch `server.compression_enabled`, threshold
+  `server.compression_threshold_bytes`, `fluxum_wire_compression_*` metrics,
+  per-connection posture in `GET /sessions`. Client decode: TypeScript-ready
+  wire, Rust SDK behind the `compression` cargo feature.
+- **Writer coalescing + merged `TxUpdate`s (OBS-024):** both transports drain
+  already-queued frames into one buffered socket write (64 frames / 256 KiB
+  budgets, no timer — idle latency untouched), and one commit matching K of a
+  connection's queries arrives as ONE multi-table `TxUpdate`. Burst-profile
+  e2e p50 9.64 → 4.68 ms (−51%), p99 −36%; `fluxum_writer_*` metrics +
+  Grafana/console panels; `fluxum-bench fanout-burst` is the attribution rig.
+- **RPC-036 specified** (column-level update deltas, `tx_updates: delta`) —
+  spec only; negotiating it is refused until its implementation task lands.
+
 ### Changed
 
 - **BREAKING (behavioral): the storage sub-directories now follow

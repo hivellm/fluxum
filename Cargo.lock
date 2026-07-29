@@ -978,7 +978,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-bench"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "axum",
  "fluxum-sdk",
@@ -994,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-cli"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "serde",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-core"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "arc-swap",
  "chacha20poly1305",
@@ -1043,7 +1043,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-demo"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "fluxum-macros",
@@ -1051,7 +1051,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-dst"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "tempfile",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-macros"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "fluxum-protocol",
@@ -1077,7 +1077,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-protocol"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "proptest",
@@ -1090,7 +1090,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-sdk"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "flate2",
  "rmp-serde",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "fluxum-cli",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-testkit"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "fluxum-demo",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "fluxum-testmod"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "fluxum-core",
  "fluxum-macros",

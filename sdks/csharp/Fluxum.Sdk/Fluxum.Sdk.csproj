@@ -9,7 +9,7 @@
 
     <!-- NuGet package metadata (SDK-060): distributed as Fluxum.Sdk. -->
     <PackageId>Fluxum.Sdk</PackageId>
-    <Version>0.2.1</Version>
+    <Version>0.3.0</Version>
     <Authors>HiveLLM</Authors>
     <Company>HiveLLM</Company>
     <Description>Async/await .NET client for the Fluxum realtime database: typed tables, reducer calls, and live query subscriptions over FluxRPC.</Description>

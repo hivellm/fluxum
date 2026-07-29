@@ -9,14 +9,19 @@
 # debug via `docker logs` and the HTTP admin API. The container HEALTHCHECK
 # uses the binary itself (`fluxum-server --healthcheck`).
 #
+# The image tag ALWAYS matches the workspace version (Cargo.toml
+# [workspace.package].version) — server and SDKs ride one release train
+# (sdks/rust/tests/version_sync.rs enforces the manifests; this comment and
+# the LABEL below are the image's part of the contract).
+#
 # HOW TO BUILD (single arch, local):
-#   docker build -t hivehub/fluxum:0.1.0 -t hivehub/fluxum:latest .
+#   docker build -t hivehub/fluxum:0.3.0 -t hivehub/fluxum:latest .
 #
 # HOW TO BUILD + PUBLISH MULTI-ARCH (Docker Hub — hivehub/fluxum):
 #   docker login
 #   docker buildx build --platform linux/amd64,linux/arm64 \
 #     --sbom=true --provenance=mode=max \
-#     -t hivehub/fluxum:0.1.0 -t hivehub/fluxum:latest --push .
+#     -t hivehub/fluxum:0.3.0 -t hivehub/fluxum:latest --push .
 #
 #   Each platform builds NATIVELY (arm64 under qemu/binfmt on an amd64
 #   host — same pattern as the Nexus/Synap Dockerfiles). No cross-toolchain:
@@ -131,7 +136,7 @@ FROM scratch
 # pushed tag.
 LABEL org.opencontainers.image.title="Fluxum" \
       org.opencontainers.image.description="General-purpose realtime database: in-memory MVCC engine with a tiered on-disk store, server-side modules, live query subscriptions, and a read-only Postgres wire endpoint" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="0.3.0" \
       org.opencontainers.image.vendor="HiveLLM" \
       org.opencontainers.image.source="https://github.com/hivellm/fluxum" \
       org.opencontainers.image.documentation="https://github.com/hivellm/fluxum/blob/main/docs/DEPLOYMENT.md" \

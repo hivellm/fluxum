@@ -1,6 +1,6 @@
 {
   "name": "@hivehub/fluxum",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Fluxum realtime database client — typed bindings over the HiveLLM binary wire (Thunder)",
   "type": "module",
   "license": "Apache-2.0",
