@@ -31,6 +31,7 @@
 pub mod baseline;
 pub mod baseline_side;
 pub mod droplet;
+pub mod fanout;
 pub mod fluxum_side;
 pub mod load;
 pub mod measure;

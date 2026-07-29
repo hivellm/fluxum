@@ -452,6 +452,156 @@ async fn get_stream_pushes_txupdate_on_commit() {
     server.shutdown();
 }
 
+/// RPC-008 over Streamable HTTP: a session that negotiated gzip gets an
+/// untagged POST surface (AuthResult echo + InitialData decode as plain
+/// frames) and a GET push stream whose frames are TAGGED — the compressed
+/// ones inflating through one per-stream DEFLATE context. Composed with
+/// tx_updates:light, this is the full delta stack on the browser transport.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_gzip_session_streams_tagged_frames_over_the_http_push_stream() {
+    let server = start(HttpOptions::default()).await;
+    let addr = server.local_addr;
+
+    // Authenticate asking for gzip + light; the echo must accept both, and
+    // the POST response body itself stays untagged (it decoded just fine).
+    let auth = ClientMessage::Authenticate(Authenticate {
+        id: 1,
+        token: b"gzip-subscriber".to_vec(),
+        compression: Some("gzip".into()),
+        tx_updates: Some("light".into()),
+        namespace: None,
+    });
+    let resp = post(addr, None, CONTENT_TYPE, &[frame(&auth)]).await;
+    assert_eq!(resp.status, 200);
+    let Some(ServerMessage::AuthResult(result)) = resp.messages().into_iter().next() else {
+        panic!("expected AuthResult");
+    };
+    assert_eq!(result.compression.as_deref(), Some("gzip"));
+    assert_eq!(result.tx_updates.as_deref(), Some("light"));
+    let session = resp
+        .header("fluxum-session")
+        .expect("Fluxum-Session issued")
+        .to_owned();
+
+    // Subscribe over POST: still an untagged RPC-001 body (the negotiated
+    // compression applies to the GET stream only).
+    let sub = ClientMessage::SubscribeSingle(SubscribeSingle {
+        id: 3,
+        query: "SELECT * FROM Chat".into(),
+    });
+    let resp = post(addr, Some(&session), CONTENT_TYPE, &[frame(&sub)]).await;
+    assert!(matches!(
+        resp.messages().first(),
+        Some(ServerMessage::InitialData(_))
+    ));
+
+    // Open the GET push stream — every frame on it carries the RPC-008 tag.
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let get = format!("GET /rpc HTTP/1.1\r\nHost: x\r\nFluxum-Session: {session}\r\n\r\n");
+    stream.write_all(get.as_bytes()).await.unwrap();
+    let mut header = Vec::new();
+    loop {
+        let mut b = [0u8; 1];
+        stream.read_exact(&mut b).await.unwrap();
+        header.push(b[0]);
+        if header.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    // A body comfortably over the 64-byte threshold, so the frame rides the
+    // stream context (tag 0x01) rather than the 0x00 bypass.
+    let writer = authenticate(addr, b"writer").await;
+    let call = ClientMessage::ReducerCall(ReducerCall {
+        id: 1,
+        reducer: "send_chat".into(),
+        version: None,
+        args: vec![FluxValue::Str(
+            "a chat body long enough to clear the compression threshold with room".into(),
+        )],
+        idempotency_key: None,
+    });
+    let resp = post(addr, Some(&writer), CONTENT_TYPE, &[frame(&call)]).await;
+    assert!(matches!(
+        resp.messages().first(),
+        Some(ServerMessage::ReducerResult(_))
+    ));
+
+    let mut inflate = fluxum_protocol::StreamDecompressor::new();
+    let update = read_gzip_stream_message(&mut stream, &mut inflate, Duration::from_secs(3))
+        .await
+        .expect("a tagged streamed update");
+    match update {
+        // light was negotiated: the push stream carries TxUpdateLight.
+        ServerMessage::TxUpdateLight(u) => assert_eq!(u.tables[0].inserts.len(), 1),
+        other => panic!("expected a streamed TxUpdateLight, got {other:?}"),
+    }
+    server.shutdown();
+}
+
+/// Like [`read_stream_message`], for a gzip-negotiated stream: every body
+/// frame starts with the RPC-008 tag; `0x01` payloads inflate through the
+/// caller's per-stream context, `0x00` payloads are used as-is. Zero-length
+/// keep-alives stay untagged and are skipped.
+async fn read_gzip_stream_message(
+    stream: &mut TcpStream,
+    inflate: &mut fluxum_protocol::StreamDecompressor,
+    timeout: Duration,
+) -> Option<ServerMessage> {
+    let codec = FrameCodec::default();
+    let mut frames = Vec::new();
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut raw = Vec::new();
+    loop {
+        while let Some(nl) = find(&raw, b"\r\n") {
+            let size_str = String::from_utf8_lossy(&raw[..nl]).into_owned();
+            let Ok(size) = usize::from_str_radix(size_str.trim(), 16) else {
+                break;
+            };
+            if raw.len() < nl + 2 + size + 2 {
+                break;
+            }
+            let data = raw[nl + 2..nl + 2 + size].to_vec();
+            raw.drain(..nl + 2 + size + 2);
+            frames.extend_from_slice(&data);
+        }
+        if let Ok(Some((frame, consumed))) = codec.decode(&frames) {
+            let msg = match frame {
+                Frame::Body(body) => {
+                    let (tag, payload) = (body[0], &body[1..]);
+                    let decoded = match tag {
+                        fluxum_protocol::TAG_GZIP_STREAM => {
+                            let inflated = inflate.inflate_chunk(payload, 16 << 20).unwrap();
+                            ServerMessage::decode(&inflated).unwrap()
+                        }
+                        fluxum_protocol::TAG_UNCOMPRESSED => {
+                            ServerMessage::decode(payload).unwrap()
+                        }
+                        other => panic!("unexpected compression tag {other:#x}"),
+                    };
+                    Some(decoded)
+                }
+                Frame::KeepAlive => None,
+            };
+            frames.drain(..consumed);
+            if let Some(msg) = msg {
+                return Some(msg);
+            }
+            continue;
+        }
+        let remaining = deadline.checked_duration_since(tokio::time::Instant::now())?;
+        let mut chunk = [0u8; 4096];
+        let n = tokio::time::timeout(remaining, stream.read(&mut chunk))
+            .await
+            .ok()?
+            .ok()?;
+        if n == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..n]);
+    }
+}
+
 /// Read chunks from a chunked HTTP stream until one carries a FluxRPC body
 /// frame; keep-alive (zero-length) frames are skipped.
 async fn read_stream_message(stream: &mut TcpStream, timeout: Duration) -> Option<ServerMessage> {
