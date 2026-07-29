@@ -224,11 +224,21 @@ pub(super) async fn write_stream_header(stream: &mut MaybeTls) -> io::Result<()>
     stream.flush().await
 }
 
+/// Append one HTTP chunk (header + payload + CRLF) to an assembly buffer —
+/// the F-002 fix: the three legs travel as ONE write when the caller
+/// flushes the buffer, instead of three writes (three TCP segments or TLS
+/// records under `TCP_NODELAY`) per frame.
+pub(super) fn push_chunk(buffer: &mut Vec<u8>, data: &[u8]) {
+    use std::io::Write as _;
+    let _ = write!(buffer, "{:x}\r\n", data.len());
+    buffer.extend_from_slice(data);
+    buffer.extend_from_slice(b"\r\n");
+}
+
 pub(super) async fn write_chunk(stream: &mut MaybeTls, data: &[u8]) -> io::Result<()> {
-    let header = format!("{:x}\r\n", data.len());
-    stream.write_all(header.as_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.write_all(b"\r\n").await?;
+    let mut buffer = Vec::with_capacity(data.len() + 16);
+    push_chunk(&mut buffer, data);
+    stream.write_all(&buffer).await?;
     stream.flush().await
 }
 

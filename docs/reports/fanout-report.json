@@ -1,0 +1,19 @@
+{
+  "harness_version": 1,
+  "subscribers": 50,
+  "writers": 64,
+  "rate_target": 1000,
+  "duration_secs": 20,
+  "sent": 20032,
+  "deliveries": 1001600,
+  "deliveries_per_sec": 49998.243622002956,
+  "e2e_us": {
+    "p50": 4683,
+    "p95": 8175,
+    "p99": 9539,
+    "max": 32150
+  },
+  "frames_per_write": 1.999561652413847,
+  "writer_frames": 1021796,
+  "writer_writes": 511010
+}

@@ -4,6 +4,18 @@
 **Scope:** reducing per-packet and per-syscall overhead on the realtime push path
 (commit → `TxUpdate` → subscriber socket). Findings numbered globally **F-001..F-020**.
 
+> **Outcome (2026-07-28, phase9_fanout-event-batching):** implemented as analyzed.
+> Writer coalescing (F-001/F-002: opportunistic drain, 64 frames / 256 KiB per buffered
+> write, HTTP chunks assembled into one buffer) + the merged multi-table `TxUpdate`
+> (F-005/F-017, proven by the 5-SDK corpus `merged-txupdate` scenario) + the OBS-024
+> batch-factor metrics + the `fluxum-bench fanout-burst` rig (F-015). Measured on the
+> burst profile (1k commits/s in 64-commit bursts × 50 subscribers, release, loopback):
+> e2e p50 9.64 → 4.68 ms (−51%), p99 14.9 → 9.54 ms (−36%), zero loss, frames/write 2.0
+> observed; the paced low-rate guards are byte-identical to the pre-change path (empty
+> queue ⇒ no coalescing, by construction). The sibling layers (RPC-035 light + RPC-008
+> stream-deflate) landed first in `phase9_delta-compression`; batch × light × compression
+> compose.
+
 ## Executive summary
 
 The fan-out path above the socket is already well engineered: one plan compilation per

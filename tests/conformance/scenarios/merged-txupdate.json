@@ -1,0 +1,21 @@
+{
+  "name": "merged-txupdate",
+  "description": "F-005/F-017: one commit matching two of a connection's queries arrives as ONE TxUpdate carrying two TableUpdate lanes (RPC-033 tables[], RPC-032 query_id correlation). The SDK applies both lanes — the row is owned by both query_ids — so dropping one subscription keeps the row and dropping the last removes it (SDK-044 refcount).",
+  "steps": [
+    { "connect": { "client": "writer", "token": "writer" } },
+    { "connect": { "client": "reader", "token": "reader" } },
+    { "subscribe": { "client": "reader", "queries": ["SELECT * FROM ChatMessage WHERE channel = 5"], "as": "narrow" } },
+    { "subscribe": { "client": "reader", "queries": ["SELECT * FROM ChatMessage"], "as": "broad" } },
+
+    { "call": { "client": "writer", "reducer": "send_chat", "args": [5, "both lanes"] } },
+    { "await_row": { "client": "reader", "table": "ChatMessage", "where": { "content": "both lanes" } } },
+
+    { "unsubscribe": { "client": "reader", "handles": "narrow" } },
+    { "expect_cache": { "client": "reader", "table": "ChatMessage", "rows": [
+      { "id": "1", "sender": "$identity:writer", "channel": 5, "content": "both lanes", "sent_at": "*" }
+    ] } },
+
+    { "unsubscribe": { "client": "reader", "handles": "broad" } },
+    { "await_gone": { "client": "reader", "table": "ChatMessage", "where": { "content": "both lanes" } } }
+  ]
+}

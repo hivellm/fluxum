@@ -1329,42 +1329,70 @@ pub(crate) fn spawn_fanout_for(
             let had_deltas = !deltas.is_empty();
             let enqueue_started = Instant::now();
 
-            for delta in deltas {
-                // Group the targets by the query_id THEY know this query by
-                // (SUB-001: ids are assigned per connection). The rows were
-                // encoded once per delta (SUB-024); what is re-encoded per
-                // distinct id is only the envelope, and in the common case —
-                // clients subscribing in the same order — there is exactly
-                // one group. Without the stamp every TxUpdate said query_id
-                // 0 and no SDK could attribute rows to a subscription, which
-                // is what unsubscribe refcounting (SDK-044) hangs off.
-                let mut by_query_id: std::collections::BTreeMap<u32, Vec<u128>> =
-                    std::collections::BTreeMap::new();
+            // F-005: ONE TxUpdate per (commit, connection). A connection
+            // subscribed to K matched queries used to receive K
+            // single-table frames; RPC-033 already declares
+            // `tables: Vec<TableUpdate>` and RPC-032 correlates rows by
+            // `query_id`, so the merged frame is wire-legal today (F-017 —
+            // proven by the corpus, not assumed). Connections are grouped
+            // by their (delta, query_id) signature, so the encode still
+            // happens once per distinct frame content (SUB-024): the common
+            // fleet — same queries, subscribed in the same order — is
+            // exactly one class, and a mixed fleet pays one encode per
+            // distinct signature, never per connection.
+            let mut by_conn: std::collections::HashMap<u128, Vec<(usize, u32)>> =
+                std::collections::HashMap::new();
+            for (ix, delta) in deltas.iter().enumerate() {
                 for &(conn, query_id) in &delta.subscribers {
-                    by_query_id.entry(query_id).or_default().push(conn);
+                    by_conn.entry(conn).or_default().push((ix, query_id));
                 }
-                for (query_id, conns) in by_query_id {
-                    let mut tx_update = SubscriptionManager::tx_update(&diff, &delta);
-                    // SPEC-007 SHD-051: tag the originating shard so a client
-                    // subscribed on several shards can attribute per-shard order.
-                    tx_update.shard_id = ctx.shard_id;
-                    // RPC-033 provenance: which reducer committed this, and
-                    // for whom. This is what lets a client attribute its own
-                    // commits and drop the matching optimistic overlay in the
-                    // same update (SPEC-021 CS-011).
-                    tx_update.reducer_name = meta.reducer_name.clone();
-                    tx_update.caller = *meta.caller.as_bytes();
-                    for table in &mut tx_update.tables {
-                        table.query_id = query_id;
-                    }
+            }
+            // `deltas` is sorted by query_hash and every per-connection
+            // signature is built in that iteration order, so table order
+            // inside a merged frame is deterministic.
+            let mut classes: std::collections::BTreeMap<Vec<(usize, u32)>, Vec<u128>> =
+                std::collections::BTreeMap::new();
+            for (conn, sig) in by_conn {
+                classes.entry(sig).or_default().push(conn);
+            }
+            {
+                for (sig, conns) in classes {
+                    let tables: Vec<fluxum_protocol::TableUpdate> = sig
+                        .iter()
+                        .map(|&(ix, query_id)| {
+                            // One clone per CLASS per table (the query_id
+                            // stamp forces it) — not per delivery group as
+                            // the old per-query path did.
+                            let mut table = (*deltas[ix].update).clone();
+                            table.query_id = query_id;
+                            table
+                        })
+                        .collect();
                     // OBS-021: rows delivered per TxUpdate (insert + delete).
-                    let rows: u64 = tx_update
-                        .tables
+                    let rows: u64 = tables
                         .iter()
                         .map(|t| {
                             u64::try_from(t.inserts.len() + t.deletes.len()).unwrap_or(u64::MAX)
                         })
                         .sum();
+                    let mut tx_update = fluxum_protocol::TxUpdate {
+                        tx_id: diff.tx_id,
+                        timestamp: 0,
+                        // RPC-033 provenance: which reducer committed this,
+                        // and for whom — what lets a client attribute its
+                        // own commits and drop the matching optimistic
+                        // overlay in the same update (SPEC-021 CS-011).
+                        reducer_name: meta.reducer_name.clone(),
+                        caller: *meta.caller.as_bytes(),
+                        duration_us: 0,
+                        // SPEC-007 SHD-051: tag the originating shard so a
+                        // client subscribed on several shards can attribute
+                        // per-shard order.
+                        shard_id: ctx.shard_id,
+                        // CS-020: the resume cursor clients retain and echo.
+                        tx_offset: diff.tx_id,
+                        tables,
+                    };
                     let handles = ctx.connections.handles_for(&conns).await;
                     // RPC-035: one shared encode per negotiated form —
                     // SUB-024 partitions, it does not multiply. The light

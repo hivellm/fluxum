@@ -1297,37 +1297,76 @@ async fn handle_get(
             _ = server_shutdown.notified() => break Ok(()),
             _ = shutdown.notified() => break Ok(()),
             frame = out_rx.recv() => match frame {
-                Some(frame) => {
-                    // OBS-023: same queue_wait stage as the TCP writer.
-                    state.ctx.metrics().note_fanout_stage(
-                        fluxum_core::metrics::FanoutStage::QueueWait,
-                        u64::try_from(frame.enqueued_at.elapsed().as_micros()).unwrap_or(u64::MAX),
-                    );
-                    // RPC-008: re-frame through this stream's context; the
-                    // shared Arc'd bytes stay shared across subscribers.
-                    let transformed = match &mut push_wire {
-                        Some((compressor, threshold)) => {
-                            match crate::conn::wire_transform(
-                                compressor,
-                                &frame.bytes,
-                                *threshold,
-                                state.ctx.metrics(),
-                            ) {
-                                Ok(bytes) => bytes,
-                                // A broken deflate context cannot
-                                // resynchronize — end the stream.
-                                Err(_) => break Ok(()),
+                Some(first) => {
+                    // F-001/F-002: drain what is ALREADY queued (no timer)
+                    // and assemble every chunk — header + payload + CRLF —
+                    // into ONE buffer: one write + one flush per batch,
+                    // instead of three writes + a flush per frame.
+                    let mut assembly: Vec<u8> = Vec::with_capacity(4096);
+                    let mut batched = 0u64;
+                    let mut next = Some(first);
+                    let mut broken = false;
+                    while let Some(frame) = next {
+                        // OBS-023: same queue_wait stage as the TCP writer.
+                        state.ctx.metrics().note_fanout_stage(
+                            fluxum_core::metrics::FanoutStage::QueueWait,
+                            u64::try_from(frame.enqueued_at.elapsed().as_micros())
+                                .unwrap_or(u64::MAX),
+                        );
+                        // RPC-008: re-frame through this stream's context;
+                        // the shared Arc'd bytes stay shared across
+                        // subscribers.
+                        let transformed = match &mut push_wire {
+                            Some((compressor, threshold)) => {
+                                match crate::conn::wire_transform(
+                                    compressor,
+                                    &frame.bytes,
+                                    *threshold,
+                                    state.ctx.metrics(),
+                                ) {
+                                    Ok(bytes) => bytes,
+                                    // A broken deflate context cannot
+                                    // resynchronize — end the stream.
+                                    Err(_) => {
+                                        broken = true;
+                                        break;
+                                    }
+                                }
                             }
-                        }
-                        None => None,
-                    };
-                    let bytes: &[u8] = transformed.as_deref().unwrap_or(&frame.bytes);
-                    if write_chunk(&mut stream, bytes).await.is_err() {
+                            None => None,
+                        };
+                        push_chunk(&mut assembly, transformed.as_deref().unwrap_or(&frame.bytes));
+                        batched += 1;
+                        next = if (batched as usize) < crate::conn::WRITE_COALESCE_FRAMES
+                            && assembly.len() < crate::conn::WRITE_COALESCE_BYTES
+                        {
+                            out_rx.try_recv().ok()
+                        } else {
+                            None
+                        };
+                    }
+                    if broken {
+                        break Ok(());
+                    }
+                    let began = Instant::now();
+                    if stream.write_all(&assembly).await.is_err()
+                        || stream.flush().await.is_err()
+                    {
                         // The client vanished mid-stream: a transport blip,
                         // not a goodbye (SPEC-021 CS-021).
                         exit = GetExit::Detached;
                         break Ok(());
                     }
+                    // OBS-023 Flush (previously TCP-only) + OBS-024.
+                    state.ctx.metrics().note_fanout_stage(
+                        fluxum_core::metrics::FanoutStage::Flush,
+                        u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX),
+                    );
+                    state.ctx.metrics().note_writer_write(
+                        fluxum_core::metrics::WriterTransport::Http,
+                        batched,
+                        u64::try_from(assembly.len()).unwrap_or(u64::MAX),
+                    );
                 }
                 None => break Ok(()), // the connection's sink was dropped
             },

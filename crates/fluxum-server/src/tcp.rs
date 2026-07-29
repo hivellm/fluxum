@@ -691,47 +691,89 @@ async fn route_frame(
     true
 }
 
-/// The writer task: drain the outbound queue to the socket in order. Once
-/// `send_wire` arms (RPC-008: gzip accepted), every non-`raw` frame is
-/// re-framed through this connection's stream context — the shared `Arc`'d
-/// bytes stay shared; the transform is strictly per-connection (SUB-024).
+use crate::conn::{WRITE_COALESCE_BYTES, WRITE_COALESCE_FRAMES};
+
+/// The writer task: drain the outbound queue to the socket, coalescing
+/// whatever is already queued into one buffered `write_all` per batch
+/// (F-001 — one syscall per BATCH, not per frame). Once `send_wire` arms
+/// (RPC-008: gzip accepted), every non-`raw` frame is re-framed through
+/// this connection's stream context before joining the batch — the shared
+/// `Arc`'d bytes stay shared; the transform is strictly per-connection
+/// (SUB-024). QueueWait stays per frame (its meaning is the frame's queue
+/// time); Flush stays "time inside `write_all`", now per batch.
 async fn writer_task(
     mut write_half: WriteHalf<MaybeTls>,
     mut out_rx: mpsc::Receiver<OutFrame>,
     metrics: Arc<fluxum_core::metrics::Metrics>,
     send_wire: Arc<std::sync::OnceLock<usize>>,
 ) {
+    let us = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
     let mut compressor: Option<fluxum_protocol::StreamCompressor> = None;
-    while let Some(frame) = out_rx.recv().await {
-        // OBS-023: queue + writer-wake latency, then the socket write.
-        let us = |d: std::time::Duration| u64::try_from(d.as_micros()).unwrap_or(u64::MAX);
-        metrics.note_fanout_stage(
-            fluxum_core::metrics::FanoutStage::QueueWait,
-            us(frame.enqueued_at.elapsed()),
-        );
-        let transformed = match (frame.raw, send_wire.get()) {
-            (false, Some(&threshold)) => {
-                let ctx = compressor.get_or_insert_with(fluxum_protocol::StreamCompressor::new);
-                match crate::conn::wire_transform(ctx, &frame.bytes, threshold, &metrics) {
-                    Ok(bytes) => bytes,
-                    // A broken deflate context cannot resynchronize —
-                    // connection-fatal by construction.
-                    Err(_) => break,
+    let mut frames: Vec<OutFrame> = Vec::with_capacity(WRITE_COALESCE_FRAMES);
+    let mut batch: Vec<u8> = Vec::with_capacity(16 * 1024);
+    'conn: loop {
+        if out_rx.recv_many(&mut frames, WRITE_COALESCE_FRAMES).await == 0 {
+            break; // the sink closed
+        }
+        batch.clear();
+        let mut batched = 0u64;
+        for frame in frames.drain(..) {
+            metrics.note_fanout_stage(
+                fluxum_core::metrics::FanoutStage::QueueWait,
+                us(frame.enqueued_at.elapsed()),
+            );
+            let transformed = match (frame.raw, send_wire.get()) {
+                (false, Some(&threshold)) => {
+                    let ctx = compressor.get_or_insert_with(fluxum_protocol::StreamCompressor::new);
+                    match crate::conn::wire_transform(ctx, &frame.bytes, threshold, &metrics) {
+                        Ok(bytes) => bytes,
+                        // A broken deflate context cannot resynchronize —
+                        // connection-fatal by construction.
+                        Err(_) => break 'conn,
+                    }
                 }
+                _ => None,
+            };
+            batch.extend_from_slice(transformed.as_deref().unwrap_or(&frame.bytes));
+            batched += 1;
+            // The byte cap bounds the assembly buffer, not correctness: an
+            // oversized batch flushes early and the loop keeps filling.
+            if batch.len() >= WRITE_COALESCE_BYTES {
+                if !flush_batch(&mut write_half, &batch, batched, &metrics).await {
+                    break 'conn;
+                }
+                batch.clear();
+                batched = 0;
             }
-            _ => None,
-        };
-        let began = std::time::Instant::now();
-        let bytes: &[u8] = transformed.as_deref().unwrap_or(&frame.bytes);
-        if write_half.write_all(bytes).await.is_err() {
+        }
+        if batched > 0 && !flush_batch(&mut write_half, &batch, batched, &metrics).await {
             break;
         }
-        metrics.note_fanout_stage(
-            fluxum_core::metrics::FanoutStage::Flush,
-            us(began.elapsed()),
-        );
     }
     let _ = write_half.shutdown().await;
+}
+
+/// One coalesced socket write + its OBS-023 Flush and OBS-024 records.
+async fn flush_batch(
+    write_half: &mut WriteHalf<MaybeTls>,
+    batch: &[u8],
+    frames: u64,
+    metrics: &fluxum_core::metrics::Metrics,
+) -> bool {
+    let began = std::time::Instant::now();
+    if write_half.write_all(batch).await.is_err() {
+        return false;
+    }
+    metrics.note_fanout_stage(
+        fluxum_core::metrics::FanoutStage::Flush,
+        u64::try_from(began.elapsed().as_micros()).unwrap_or(u64::MAX),
+    );
+    metrics.note_writer_write(
+        fluxum_core::metrics::WriterTransport::Tcp,
+        frames,
+        u64::try_from(batch.len()).unwrap_or(u64::MAX),
+    );
+    true
 }
 
 /// What one bounded read produced.

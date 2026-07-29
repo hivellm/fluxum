@@ -313,6 +313,27 @@ impl ReducerStat {
     }
 }
 
+/// The connection-writer transport of an OBS-024 coalesced write: the
+/// `transport` label of `fluxum_writer_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriterTransport {
+    /// The FluxRPC binary TCP writer task.
+    Tcp = 0,
+    /// The Streamable HTTP GET push-stream writer.
+    Http = 1,
+}
+
+impl WriterTransport {
+    /// The exposition label value.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Http => "http",
+        }
+    }
+}
+
 /// One delivery-pipeline stage of the commit→subscriber fan-out path
 /// (OBS-023, phase0_parity-fanout-latency 1.1): the `stage` label of
 /// `fluxum_fanout_stage_us{shard,stage}`.
@@ -432,6 +453,16 @@ pub struct Metrics {
     subscriptions_active: AtomicI64,
     fanout_messages: AtomicU64,
     fanout_rows: AtomicU64,
+    /// OBS-024 writer coalescing: socket writes per transport (0 = TCP,
+    /// 1 = HTTP GET stream).
+    writer_writes: [AtomicU64; 2],
+    /// OBS-024: frames carried by those writes.
+    writer_frames: [AtomicU64; 2],
+    /// OBS-024: bytes carried by those writes.
+    writer_bytes: [AtomicU64; 2],
+    /// OBS-024: frames-per-write histogram, buckets 1,2,4,8,16,32,64,+Inf —
+    /// the observable batch factor (1.0 = the old one-write-per-frame path).
+    writer_batch_buckets: [AtomicU64; 8],
     /// RPC-008 stream compression: pre-compression frame-body bytes.
     wire_compression_raw_bytes: AtomicU64,
     /// RPC-008 stream compression: post-compression bytes on the wire.
@@ -562,6 +593,10 @@ impl Metrics {
             subscriptions_active: AtomicI64::new(0),
             fanout_messages: AtomicU64::new(0),
             fanout_rows: AtomicU64::new(0),
+            writer_writes: [AtomicU64::new(0), AtomicU64::new(0)],
+            writer_frames: [AtomicU64::new(0), AtomicU64::new(0)],
+            writer_bytes: [AtomicU64::new(0), AtomicU64::new(0)],
+            writer_batch_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
             wire_compression_raw_bytes: AtomicU64::new(0),
             wire_compression_sent_bytes: AtomicU64::new(0),
             wire_compression_cpu_us: AtomicU64::new(0),
@@ -877,6 +912,29 @@ impl Metrics {
     pub fn note_fanout(&self, rows: u64) {
         self.fanout_messages.fetch_add(1, Ordering::Relaxed);
         self.fanout_rows.fetch_add(rows, Ordering::Relaxed);
+    }
+
+    /// OBS-024: one coalesced socket write on a connection writer —
+    /// `frames` frames, `bytes` bytes, over `transport`. The batch factor
+    /// (frames/writes) is 1.0 on an idle connection by construction and
+    /// grows with load; the histogram makes its distribution visible.
+    pub fn note_writer_write(&self, transport: WriterTransport, frames: u64, bytes: u64) {
+        let t = transport as usize;
+        self.writer_writes[t].fetch_add(1, Ordering::Relaxed);
+        self.writer_frames[t].fetch_add(frames, Ordering::Relaxed);
+        self.writer_bytes[t].fetch_add(bytes, Ordering::Relaxed);
+        // Buckets 1,2,4,8,16,32,64,+Inf.
+        let bucket = match frames {
+            0..=1 => 0,
+            2 => 1,
+            3..=4 => 2,
+            5..=8 => 3,
+            9..=16 => 4,
+            17..=32 => 5,
+            33..=64 => 6,
+            _ => 7,
+        };
+        self.writer_batch_buckets[bucket].fetch_add(1, Ordering::Relaxed);
     }
 
     /// RPC-008: one frame body went through a session's compression stream —
@@ -1300,6 +1358,55 @@ impl Metrics {
             self.fanout_messages.load(Ordering::Relaxed),
             self.fanout_rows.load(Ordering::Relaxed),
         );
+        // --- OBS-024 writer coalescing ---
+        out.push_str(
+            "# HELP fluxum_writer_writes_total Coalesced socket writes per connection-writer transport (OBS-024).\n\
+             # TYPE fluxum_writer_writes_total counter\n\
+             # HELP fluxum_writer_coalesced_frames_total Frames carried by those writes (OBS-024).\n\
+             # TYPE fluxum_writer_coalesced_frames_total counter\n\
+             # HELP fluxum_writer_coalesced_bytes_total Bytes carried by those writes (OBS-024).\n\
+             # TYPE fluxum_writer_coalesced_bytes_total counter\n",
+        );
+        for transport in [WriterTransport::Tcp, WriterTransport::Http] {
+            let t = transport as usize;
+            let label = transport.label();
+            let _ = writeln!(
+                out,
+                "fluxum_writer_writes_total{{shard=\"{shard}\",transport=\"{label}\"}} {}\n\
+                 fluxum_writer_coalesced_frames_total{{shard=\"{shard}\",transport=\"{label}\"}} {}\n\
+                 fluxum_writer_coalesced_bytes_total{{shard=\"{shard}\",transport=\"{label}\"}} {}",
+                self.writer_writes[t].load(Ordering::Relaxed),
+                self.writer_frames[t].load(Ordering::Relaxed),
+                self.writer_bytes[t].load(Ordering::Relaxed),
+            );
+        }
+        out.push_str(
+            "# HELP fluxum_writer_frames_per_write Frames-per-write distribution (OBS-024): the observable batch factor.\n\
+             # TYPE fluxum_writer_frames_per_write histogram\n",
+        );
+        {
+            const BOUNDS: [&str; 7] = ["1", "2", "4", "8", "16", "32", "64"];
+            let mut cumulative = 0u64;
+            for (i, bound) in BOUNDS.iter().enumerate() {
+                cumulative += self.writer_batch_buckets[i].load(Ordering::Relaxed);
+                let _ = writeln!(
+                    out,
+                    "fluxum_writer_frames_per_write_bucket{{shard=\"{shard}\",le=\"{bound}\"}} {cumulative}"
+                );
+            }
+            cumulative += self.writer_batch_buckets[7].load(Ordering::Relaxed);
+            let total_frames: u64 = self
+                .writer_frames
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum();
+            let _ = writeln!(
+                out,
+                "fluxum_writer_frames_per_write_bucket{{shard=\"{shard}\",le=\"+Inf\"}} {cumulative}\n\
+                 fluxum_writer_frames_per_write_sum{{shard=\"{shard}\"}} {total_frames}\n\
+                 fluxum_writer_frames_per_write_count{{shard=\"{shard}\"}} {cumulative}"
+            );
+        }
         // --- RPC-008 wire compression ---
         let _ = writeln!(
             out,

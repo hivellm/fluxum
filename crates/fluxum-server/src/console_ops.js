@@ -666,6 +666,7 @@ const MDASH_SERIES = [
   "fluxum_fanout_stage_us_count", "fluxum_bufferpool_hits_total",
   "fluxum_bufferpool_misses_total", "fluxum_bufferpool_bytes",
   "fluxum_bufferpool_capacity_bytes", "fluxum_memstore_bytes",
+  "fluxum_writer_writes_total", "fluxum_writer_coalesced_frames_total",
 ];
 function pushSample() {
   for (const name of MDASH_SERIES) {
@@ -745,6 +746,10 @@ function renderMetricsDash() {
   // Avg fan-out stage latency over each interval, µs -> ms.
   const lat = deltaRatio(hist("fluxum_fanout_stage_us_sum"), hist("fluxum_fanout_stage_us_count"), 0.001);
   box.appendChild(dashTile("Fan-out latency", fmtNum(last(lat)), lat, "ms avg"));
+  // OBS-024: the writer batch factor — 1.0 idle, grows under load.
+  const batch = deltaRatio(hist("fluxum_writer_coalesced_frames_total"),
+    hist("fluxum_writer_writes_total"), 1);
+  box.appendChild(dashTile("Frames/write", fmtNum(last(batch)), batch, "batch factor"));
   const hits = deltaRatio(hist("fluxum_bufferpool_hits_total"),
     hist("fluxum_bufferpool_hits_total").map((v, i) => v + (hist("fluxum_bufferpool_misses_total")[i] || 0)), 100);
   box.appendChild(dashTile("Pool hit rate", fmtNum(last(hits)), hits, "%"));

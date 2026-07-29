@@ -119,7 +119,28 @@ of the correctness contract.
   Attributes the server-side share of change→subscriber latency (NFR-11) stage by stage, so a
   fan-out regression names the stage that moved instead of a single opaque number. Recorded
   lock-free from the fan-out and writer tasks; buckets as in OBS-011. Zero-valued series are
-  emitted for every stage so dashboards can rely on the label set.
+  emitted for every stage so dashboards can rely on the label set. With writer coalescing
+  (OBS-024), `queue_wait` keeps its per-frame meaning; `flush` is one observation per socket
+  write (a batch), which is what the stage always measured — time inside `write_all`.
+
+- **OBS-024** [P1] Writer coalescing (phase9_fanout-event-batching):
+
+  ```
+  fluxum_writer_writes_total{shard, transport}             Counter
+  fluxum_writer_coalesced_frames_total{shard, transport}   Counter
+  fluxum_writer_coalesced_bytes_total{shard, transport}    Counter
+  fluxum_writer_frames_per_write{shard}                    Histogram (buckets 1,2,4,8,16,32,64)
+  ```
+
+  - `transport`: `"tcp"` (the FluxRPC binary writer task) | `"http"` (the Streamable HTTP GET
+    push-stream writer)
+
+  The connection writers drain what is ALREADY queued (up to 64 frames / 256 KiB per batch, no
+  timer — an empty queue behaves exactly like the pre-coalescing path) and issue one buffered
+  socket write per batch. `frames/writes` over a scrape interval is the observable batch
+  factor: 1.0 on an idle deployment by construction, growing with load. The histogram shows
+  its distribution, which is what tells "mostly idle with occasional bursts" apart from
+  "saturated" at the same mean.
 
 ## 5. Storage metrics
 

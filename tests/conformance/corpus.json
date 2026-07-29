@@ -45,6 +45,7 @@
     "reconnect-resync",
     "unsubscribe",
     "error-mapping",
-    "light-updates"
+    "light-updates",
+    "merged-txupdate"
   ]
 }

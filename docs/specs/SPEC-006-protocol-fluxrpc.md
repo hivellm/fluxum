@@ -439,7 +439,11 @@ hot path.
   ```
 
   `TxUpdate` is NOT correlated to any client request. Clients SHALL apply these as incremental
-  diffs to their local cache, using `tx_id` to detect missed updates. Enrichment rationale:
+  diffs to their local cache, using `tx_id` to detect missed updates. Since
+  phase9_fanout-event-batching the server actually emits the multi-table form this struct
+  always declared: one commit matching K of a connection's queries arrives as ONE `TxUpdate`
+  whose `tables` carries K entries, each stamped with its own `query_id` (RPC-032) — never K
+  single-table frames. Client decoders MUST NOT assume `tables.len() == 1`. Enrichment rationale:
   `caller` lets clients attribute changes ("Alice edited this document"); `reducer_name` drives
   client-side event routing; `timestamp` orders events; `duration_us` enables client-side
   profiling.

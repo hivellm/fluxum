@@ -412,6 +412,44 @@
       ]
     },
     {
+      "id": 39,
+      "type": "timeseries",
+      "title": "Writer coalescing (OBS-024)",
+      "description": "Frames per socket write (the batch factor: 1.0 idle, grows under load), writes/s, and coalesced bytes/s per transport. fluxum_writer_frames_per_write is the same data as a distribution.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 7,
+        "w": 8,
+        "x": 8,
+        "y": 29
+      },
+      "targets": [
+        {
+          "expr": "sum(rate(fluxum_writer_coalesced_frames_total{shard=~\"$shard\"}[1m])) / sum(rate(fluxum_writer_writes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "frames/write",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (transport) (rate(fluxum_writer_writes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "writes/s {{transport}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (transport) (rate(fluxum_writer_coalesced_bytes_total{shard=~\"$shard\"}[1m]))",
+          "legendFormat": "bytes/s {{transport}}",
+          "refId": "C"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(fluxum_writer_frames_per_write_bucket{shard=~\"$shard\"}[5m])))",
+          "legendFormat": "frames/write p99",
+          "refId": "D"
+        }
+      ]
+    },
+    {
       "id": 38,
       "type": "timeseries",
       "title": "Wire compression (RPC-008)",

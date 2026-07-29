@@ -36,6 +36,15 @@ impl OutFrame {
     }
 }
 
+/// One drain's worth of writer coalescing (F-018/OBS-024), shared by both
+/// transports: at most this many frames per opportunistic drain, and at
+/// most this many assembled bytes per socket write. An empty queue behaves
+/// exactly as before — the drain takes what is ALREADY queued, never waits
+/// for more, so batching is latency-neutral by construction.
+pub(crate) const WRITE_COALESCE_FRAMES: usize = 64;
+/// See [`WRITE_COALESCE_FRAMES`].
+pub(crate) const WRITE_COALESCE_BYTES: usize = 256 * 1024;
+
 /// Apply the RPC-008 per-connection send transform to one framed message:
 /// strip the RPC-001 prefix, run the body through the connection's stream
 /// context (or tag it `0x00` below `threshold`), and re-frame as
