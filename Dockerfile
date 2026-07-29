@@ -96,8 +96,13 @@ COPY sdks/rust ./sdks/rust
 # mount (only paths outside the mount survive into later stages), and the
 # build fails fast if the result is not statically linked — a dynamic
 # binary would be unrunnable in `scratch`.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
+# Cache mounts are namespaced PER TARGET ARCH: with one shared id (the
+# default — the target path), the amd64 and arm64 legs run two cargos
+# unpacking into the same registry cache concurrently, and the loser dies
+# with `.cargo-ok: File exists`. Distinct ids cost one cold build per arch
+# and remove the race entirely.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH} \
+    --mount=type=cache,target=/app/target,id=fluxum-target-${TARGETARCH} \
     case "${TARGETARCH:-amd64}" in \
       amd64) TARGET_TRIPLE=x86_64-unknown-linux-musl ;; \
       arm64) TARGET_TRIPLE=aarch64-unknown-linux-musl ;; \
