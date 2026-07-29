@@ -62,6 +62,10 @@ mod tests {
 
     #[test]
     fn harness_version_matches_workspace_version() {
-        assert_eq!(harness_version(), "0.1.0");
+        // 0.3.0: the one-train release (server + SDKs + image share the
+        // version; sdks/rust/tests/version_sync.rs holds the broad gate —
+        // this literal is the bench's reminder to read the CHANGELOG when
+        // the train moves).
+        assert_eq!(harness_version(), "0.3.0");
     }
 }
