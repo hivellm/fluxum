@@ -4,13 +4,22 @@ Analysis: `docs/analysis/fanout-event-batching/` (F-001..F-020). Two
 increments, both wire-compatible; P1 lands before P2 so the burst bench
 attributes each win separately.
 
-- [ ] 1.1 Burst-mode fan-out bench FIRST (F-015): a bench/e2e mode that
-      drives the writer queue non-empty (bursts of ≥ 32 queued frames,
-      plus a sustained 1k+ commits/s profile with N subscribers), and
-      records frames-per-write, syscalls/s, and the parity p50/p99. The
-      existing 10–20 msg/s benches keep running as the latency guard —
-      batching must measure as a no-op there. Baseline captured before
-      any writer change.
+- [x] 1.1 Burst-mode fan-out bench FIRST (F-015) — `fluxum-bench fanout-burst`
+      (`--clients W --rate R --subscribers N --duration-secs S`): W writer
+      identities fire simultaneously every `W/R` seconds, so every round lands a
+      W-commit burst in each subscriber's outbound queue while each identity
+      stays under the demo module's 20/s send_chat admission (the command
+      refuses a rate the fleet cannot carry). Per-delivery e2e latency via the
+      parity e2e's embedded-send-instant trick; frames-per-write scraped from
+      /metrics once OBS-024 exists (`null` on the baseline server — that IS the
+      pre-change record), with the Content-Length HTTP read (the phase8
+      read-to-EOF hang, relearned once). The existing paced `fanout` command
+      stays as the low-rate latency guard. **Baseline captured 2026-07-28
+      (release, loopback), before any writer change:** 1,000 commits/s in
+      64-commit bursts × 50 subscribers = 50k deliveries/s, zero loss over
+      1,001,600 deliveries, e2e p50 **9.64 ms** / p95 13.9 ms / p99
+      **14.9 ms** — the queue-backlog cost of one write per frame, exactly
+      what coalescing must cut; frames/write = 1.0 by construction.
 - [ ] 1.2 P1a — TCP writer coalescing (F-001, `tcp.rs:673-696`): after
       the first `recv()`, drain what is already queued (`recv_many`
       with a bounded batch, e.g. 64 frames / 256 KiB) and write the

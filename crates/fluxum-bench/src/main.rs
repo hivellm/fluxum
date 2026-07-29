@@ -56,8 +56,10 @@ use fluxum_bench::workload::{
     e2e_workload, hot_read_workload, mixed_workload, write_workload,
 };
 
+mod fanout_cmd;
 mod report_cmd;
 mod soak_cmd;
+use fanout_cmd::run_fanout_burst_command;
 use report_cmd::run_report;
 use soak_cmd::{run_droplet_command, run_soak_command};
 
@@ -204,6 +206,12 @@ fn run(args: Vec<String>) -> Result<(), String> {
     // asserts it stays within the memory budget throughout.
     if workload == "soak" {
         return run_soak_command(&opts);
+    }
+    // phase9 F-015: the burst-mode fan-out bench — writer queues driven
+    // non-empty so write coalescing has something to measure. The paced
+    // `fanout` command below stays as the low-rate latency guard.
+    if workload == "fanout-burst" {
+        return run_fanout_burst_command(&opts);
     }
     // T7.7 (NFR-12/TST-110): the small-droplet profile validation — a
     // constrained deployment's row sets against an unconstrained reference.
