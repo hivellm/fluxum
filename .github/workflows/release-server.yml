@@ -1,0 +1,144 @@
+# Release artifacts for fluxum-server — the Nexus/Vectorizer family pattern:
+# on a published release (one v* tag: server, SDKs and image ride ONE train,
+# see sdks/rust/tests/version_sync.rs), every platform leg builds its binary
+# and attaches it to the release. Legs are independent jobs so one failing
+# platform never blocks the others.
+#
+# Toolchain note (differs from the siblings on purpose): the workspace pins
+# a dated nightly via rust-toolchain.toml (edition 2024), so NO job runs
+# `rustup default stable` — after checkout, plain `rustup show` installs the
+# pinned toolchain and every cargo/cross invocation resolves it from the
+# file, exactly like a developer checkout.
+name: Build and publish Fluxum Server releases
+permissions:
+  contents: write
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., v0.3.0)"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: "0" # CI starts cold; incremental only adds artifacts
+
+jobs:
+  # Linux GNU build
+  build-linux-x86_64-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake
+          rustup show
+      - name: Build and publish fluxum-server
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum-server
+          manifest_path: crates/fluxum-server/Cargo.toml
+          target: x86_64-unknown-linux-gnu
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Linux MUSL build (fully static, same posture as the Docker image)
+  build-linux-x86_64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned) + musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake musl-tools
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build and publish fluxum-server
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum-server
+          manifest_path: crates/fluxum-server/Cargo.toml
+          target: x86_64-unknown-linux-musl
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Linux ARM64 MUSL build (cross: the qemu-free way to a static aarch64
+  # binary on an amd64 runner; cross honors rust-toolchain.toml)
+  build-linux-aarch64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned)
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-linux-musl
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build musl binary with cross
+        run: |
+          cross build --release --package fluxum-server --target aarch64-unknown-linux-musl
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/fluxum-server dist/fluxum-server-aarch64-unknown-linux-musl
+      - name: Upload musl binary
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*
+          tag: ${{ env.RELEASE_TAG }}
+          overwrite: true
+          file_glob: true
+
+  # macOS builds
+  build-mac-binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned) + target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - name: Build and publish fluxum-server
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum-server
+          manifest_path: crates/fluxum-server/Cargo.toml
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Windows build
+  build-windows-binaries:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and publish fluxum-server
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum-server
+          manifest_path: crates/fluxum-server/Cargo.toml
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}

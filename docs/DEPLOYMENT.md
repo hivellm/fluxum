@@ -24,7 +24,14 @@ deliberately expose it; see [§6 TLS](#6-tls-and-exposure)).
 
 ## 2. Install
 
-Build a release binary (any machine with the Rust toolchain; the SIMD tier
+**Prebuilt binaries** ship with every GitHub release
+(<https://github.com/hivellm/fluxum/releases>): `fluxum-server` and the
+`fluxum` CLI for Linux (gnu + fully static musl, x86-64 and arm64), macOS
+(Intel + Apple Silicon), and Windows — built by the `release-server` /
+`release-cli` workflows when a release is published. The artifact version
+always equals the Docker tag and the five SDKs (one release train).
+
+Or build from source (any machine with the Rust toolchain; the SIMD tier
 is selected at **runtime**, so one x86-64 binary serves AVX-512, AVX2, and
 scalar hosts alike — SPEC-016):
 

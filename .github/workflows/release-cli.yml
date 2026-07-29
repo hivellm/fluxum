@@ -1,0 +1,137 @@
+# Release artifacts for the `fluxum` CLI (crates/fluxum-cli) — same family
+# pattern and the same v* release train as release-server.yml; both attach
+# their artifacts to the one published release. See that file's toolchain
+# note: rust-toolchain.toml pins the dated nightly, so no job overrides the
+# default toolchain.
+name: Build and publish Fluxum CLI releases
+permissions:
+  contents: write
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., v0.3.0)"
+        required: true
+        type: string
+
+env:
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  CARGO_INCREMENTAL: "0" # CI starts cold; incremental only adds artifacts
+
+jobs:
+  # Linux GNU build
+  build-linux-x86_64-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned by rust-toolchain.toml)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake
+          rustup show
+      - name: Build and publish fluxum CLI
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum
+          manifest_path: crates/fluxum-cli/Cargo.toml
+          target: x86_64-unknown-linux-gnu
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Linux MUSL build (fully static)
+  build-linux-x86_64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned) + musl target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake musl-tools
+          rustup show
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build and publish fluxum CLI
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum
+          manifest_path: crates/fluxum-cli/Cargo.toml
+          target: x86_64-unknown-linux-musl
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Linux ARM64 MUSL build (cross)
+  build-linux-aarch64-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned)
+        run: |
+          rustup show
+          rustup target add aarch64-unknown-linux-musl
+      - name: Install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build musl binary with cross
+        run: |
+          cross build --release --package fluxum-cli --target aarch64-unknown-linux-musl
+          mkdir -p dist
+          cp target/aarch64-unknown-linux-musl/release/fluxum dist/fluxum-aarch64-unknown-linux-musl
+      - name: Upload musl binary
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: dist/*
+          tag: ${{ env.RELEASE_TAG }}
+          overwrite: true
+          file_glob: true
+
+  # macOS builds
+  build-mac-binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-apple-darwin
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned) + target
+        run: |
+          rustup show
+          rustup target add ${{ matrix.target }}
+      - name: Build and publish fluxum CLI
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum
+          manifest_path: crates/fluxum-cli/Cargo.toml
+          target: ${{ matrix.target }}
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Windows build
+  build-windows-binaries:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - name: Install toolchain (pinned)
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and publish fluxum CLI
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: fluxum
+          manifest_path: crates/fluxum-cli/Cargo.toml
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          token: ${{ secrets.GITHUB_TOKEN }}
